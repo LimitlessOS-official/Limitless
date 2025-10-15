@@ -1,22 +1,21 @@
 /*
  * LimitlessOS - Physical Memory Manager (Buddy Allocator)
  *
- * This file implements a binary buddy allocator for managing physical page frames.
- * It divides memory into power-of-2-sized blocks and maintains free lists for
- * each block size (order).
+ * Production-grade buddy allocator for managing physical page frames.
+ * Implements power-of-2 sized blocks with efficient coalescing.
  */
 
-#include <linux/list.h>
-#include <linux/spinlock.h>
-#include <linux/atomic.h>
-#include <linux/mm_types.h>
-#include <linux/mmzone.h>
 #include "mm/mm.h"
-
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <string.h>
+
+/* Basic string operations */
+static void* memset(void *s, int c, size_t n) {
+    unsigned char *p = (unsigned char *)s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
 
 // This would be defined in a boot-time memory map parser
 extern uint64_t memory_map_size;
