@@ -120,7 +120,7 @@ KERNEL_S_SOURCES = kernel/src/switch.S kernel/src/isr_asm.S
 KERNEL_C_SOURCES = \
     kernel/src/multiboot2_kernel.c \
     kernel/src/kprintf.c \
-    kernel/src/mm/pmm.c \
+    kernel/src/mm/pmm_simple.c \
     kernel/src/mm/vmm.c \
     kernel/src/mm/slab.c \
     kernel/src/scheduler.c \
