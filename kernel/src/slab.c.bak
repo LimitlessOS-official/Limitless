@@ -1,0 +1,49 @@
+#include "slab.h"
+#include "vmm.h"
+#include "kernel.h"
+
+slab_t* slab_create(size_t obj_size, size_t obj_count) {
+    slab_t* slab = (slab_t*)vmm_kmalloc(sizeof(slab_t), 16);
+    if (!slab) return NULL;
+    slab->obj_size = obj_size;
+    slab->obj_count = obj_count;
+    slab->data = (u8*)vmm_kmalloc(obj_size * obj_count, 16);
+    slab->free_bitmap = (u8*)vmm_kmalloc(obj_count, 8);
+    if (!slab->data || !slab->free_bitmap) { vmm_kfree(slab, sizeof(slab_t)); return NULL; }
+    for (size_t i = 0; i < obj_count; ++i) slab->free_bitmap[i] = 1;
+    for (size_t i = 0; i < obj_count; ++i) slab_poison(slab->data + i * obj_size, obj_size, SLAB_POISON_FREE);
+    slab->next = NULL;
+    return slab;
+}
+
+void slab_destroy(slab_t* slab) {
+    if (!slab) return;
+    vmm_kfree(slab->data, slab->obj_size * slab->obj_count);
+    vmm_kfree(slab->free_bitmap, slab->obj_count);
+    vmm_kfree(slab, sizeof(slab_t));
+}
+
+void* slab_alloc(slab_t* slab) {
+    if (!slab) return NULL;
+    for (size_t i = 0; i < slab->obj_count; ++i) {
+        if (slab->free_bitmap[i]) {
+            slab->free_bitmap[i] = 0;
+            void* obj = slab->data + i * slab->obj_size;
+            slab_poison(obj, slab->obj_size, SLAB_POISON_ALLOC);
+            return obj;
+        }
+    }
+    return NULL;
+}
+
+void slab_free(slab_t* slab, void* obj) {
+    if (!slab || !obj) return;
+    size_t idx = ((u8*)obj - slab->data) / slab->obj_size;
+    if (idx >= slab->obj_count) return;
+    slab->free_bitmap[idx] = 1;
+    slab_poison(obj, slab->obj_size, SLAB_POISON_FREE);
+}
+
+void slab_poison(void* obj, size_t size, u8 val) {
+    k_memset(obj, val, size);
+}

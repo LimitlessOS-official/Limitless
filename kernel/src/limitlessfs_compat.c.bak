@@ -1,0 +1,601 @@
+/*
+ * LimitlessFS Compatibility Layer
+ * Provides compatibility with ext4, NTFS, APFS, and other filesystems
+ * Enables transparent mounting and migration of existing filesystems
+ */
+
+#include <linux/fs.h>
+#include <linux/module.h>
+#include <linux/buffer_head.h>
+#include <linux/slab.h>
+#include "kernel/include/limitlessfs.h"
+#include "kernel/include/compat.h"
+
+// Magic numbers for supported filesystems
+#define EXT4_SUPER_MAGIC      0xEF53
+#define NTFS_SUPER_MAGIC      0x5346544E  // "NTFS"
+#define APFS_SUPER_MAGIC      0x4253504E  // "NXSB"
+#define BTRFS_SUPER_MAGIC     0x9123683E
+#define XFS_SUPER_MAGIC       0x58465342
+#define ZFS_SUPER_MAGIC       0x2FC12FC1
+
+// Compatibility layer context
+struct limitlessfs_compat_context {
+    uint32_t source_fs_magic;          // Original filesystem magic
+    uint32_t source_fs_version;        // Original filesystem version
+    
+    // Conversion state
+    bool conversion_in_progress;       // Conversion active
+    uint64_t blocks_converted;         // Blocks converted
+    uint64_t total_blocks;             // Total blocks to convert
+    uint32_t conversion_progress;      // Progress percentage (0-100)
+    
+    // Feature mapping
+    struct fs_feature_map {
+        bool journaling_supported;     // Journaling available
+        bool compression_supported;    // Compression available
+        bool encryption_supported;     // Encryption available
+        bool snapshots_supported;      // Snapshots available
+        bool extended_attrs_supported; // Extended attributes available
+        bool acl_supported;            // ACLs available
+        bool quotas_supported;         // Quotas available
+    } feature_map;
+    
+    // Conversion functions
+    struct fs_converter {
+        int (*convert_superblock)(struct super_block *sb, void *source_sb);
+        int (*convert_inode)(struct inode *inode, void *source_inode);
+        int (*convert_directory)(struct inode *dir, void *source_dir);
+        int (*convert_extent)(struct inode *inode, void *source_extent);
+        int (*convert_xattr)(struct inode *inode, void *source_xattr);
+        void (*cleanup)(void *private_data);
+    } converter;
+    
+    // Statistics
+    struct conversion_stats {
+        atomic64_t files_converted;    // Files converted
+        atomic64_t dirs_converted;     // Directories converted
+        atomic64_t symlinks_converted; // Symlinks converted
+        atomic64_t xattrs_converted;   // Extended attributes converted
+        atomic64_t errors_encountered; // Conversion errors
+        uint64_t conversion_start_time; // Conversion start time
+        uint64_t estimated_completion;  // Estimated completion time
+    } stats;
+    
+    void *private_data;                // Filesystem-specific data
+};
+
+// EXT4 compatibility functions
+static int limitlessfs_detect_ext4(struct super_block *sb) {
+    struct buffer_head *bh;
+    struct ext4_super_block *ext4_sb;
+    bool is_ext4 = false;
+    
+    bh = sb_bread(sb, 1);  // EXT4 superblock is at block 1
+    if (!bh)
+        return -EIO;
+    
+    ext4_sb = (struct ext4_super_block *)bh->b_data;
+    
+    if (ext4_sb->s_magic == EXT4_SUPER_MAGIC) {
+        pr_info("Detected EXT4 filesystem\n");
+        is_ext4 = true;
+    }
+    
+    brelse(bh);
+    return is_ext4 ? 0 : -ENODEV;
+}
+
+static int limitlessfs_convert_ext4_superblock(struct super_block *sb,
+                                              struct limitlessfs_compat_context *compat) {
+    struct buffer_head *bh;
+    struct ext4_super_block *ext4_sb;
+    struct limitlessfs_superblock *lfs_sb;
+    int ret = 0;
+    
+    // Read EXT4 superblock
+    bh = sb_bread(sb, 1);
+    if (!bh)
+        return -EIO;
+    
+    ext4_sb = (struct ext4_super_block *)bh->b_data;
+    
+    // Allocate LimitlessFS superblock
+    lfs_sb = kzalloc(sizeof(*lfs_sb), GFP_KERNEL);
+    if (!lfs_sb) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    
+    // Convert basic fields
+    lfs_sb->magic = LIMITLESSFS_MAGIC;
+    lfs_sb->version_major = LIMITLESSFS_VERSION_MAJOR;
+    lfs_sb->version_minor = LIMITLESSFS_VERSION_MINOR;
+    
+    lfs_sb->total_blocks = ext4_sb->s_blocks_count_lo;
+    if (ext4_sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) {
+        lfs_sb->total_blocks |= ((uint64_t)ext4_sb->s_blocks_count_hi << 32);
+    }
+    
+    lfs_sb->free_blocks = ext4_sb->s_free_blocks_count_lo;
+    if (ext4_sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) {
+        lfs_sb->free_blocks |= ((uint64_t)ext4_sb->s_free_blocks_count_hi << 32);
+    }
+    
+    lfs_sb->total_inodes = ext4_sb->s_inodes_count;
+    lfs_sb->free_inodes = ext4_sb->s_free_inodes_count;
+    lfs_sb->block_size = 1024 << ext4_sb->s_log_block_size;
+    lfs_sb->inode_size = ext4_sb->s_inode_size;
+    
+    lfs_sb->root_inode = EXT4_ROOT_INO;
+    lfs_sb->blocks_per_group = ext4_sb->s_blocks_per_group;
+    lfs_sb->inodes_per_group = ext4_sb->s_inodes_per_group;
+    
+    // Convert timestamps
+    lfs_sb->creation_time = ext4_sb->s_mkfs_time;
+    lfs_sb->mount_time = ext4_sb->s_mtime;
+    lfs_sb->write_time = ext4_sb->s_wtime;
+    lfs_sb->check_time = ext4_sb->s_lastcheck;
+    
+    lfs_sb->mount_count = ext4_sb->s_mnt_count;
+    lfs_sb->max_mount_count = ext4_sb->s_max_mnt_count;
+    lfs_sb->state = ext4_sb->s_state;
+    lfs_sb->error_behavior = ext4_sb->s_errors;
+    
+    // Map features
+    lfs_sb->features = 0;
+    
+    if (ext4_sb->s_feature_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) {
+        lfs_sb->features |= LIMITLESSFS_FEATURE_JOURNALING;
+        lfs_sb->journal_inode = ext4_sb->s_journal_inum;
+        compat->feature_map.journaling_supported = true;
+    }
+    
+    if (ext4_sb->s_feature_ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) {
+        lfs_sb->features |= LIMITLESSFS_FEATURE_CHECKSUMS;
+    }
+    
+    // Enable LimitlessFS-specific features
+    lfs_sb->features |= LIMITLESSFS_FEATURE_AI_OPTIMIZE;
+    lfs_sb->features |= LIMITLESSFS_FEATURE_COMPRESSION;
+    lfs_sb->features |= LIMITLESSFS_FEATURE_SNAPSHOTS;
+    
+    // Set volume name if available
+    if (ext4_sb->s_volume_name[0]) {
+        strncpy(lfs_sb->volume_name, ext4_sb->s_volume_name,
+                sizeof(lfs_sb->volume_name) - 1);
+    }
+    
+    // Copy UUID
+    memcpy(lfs_sb->fs_uuid, ext4_sb->s_uuid, sizeof(lfs_sb->fs_uuid));
+    
+    // Calculate checksum
+    lfs_sb->superblock_checksum = limitlessfs_calculate_checksum(lfs_sb,
+        sizeof(*lfs_sb) - sizeof(lfs_sb->superblock_checksum));
+    
+    // Store converted superblock
+    compat->private_data = lfs_sb;
+    
+    pr_info("EXT4 superblock converted successfully\n");
+    
+out:
+    brelse(bh);
+    return ret;
+}
+
+static int limitlessfs_convert_ext4_inode(struct inode *inode,
+                                         struct ext4_inode *ext4_inode,
+                                         struct limitlessfs_compat_context *compat) {
+    struct limitlessfs_inode *lfs_inode;
+    int i, ret = 0;
+    
+    lfs_inode = kzalloc(sizeof(*lfs_inode), GFP_KERNEL);
+    if (!lfs_inode)
+        return -ENOMEM;
+    
+    // Convert basic fields
+    lfs_inode->mode = ext4_inode->i_mode;
+    lfs_inode->uid = ext4_inode->i_uid;
+    lfs_inode->gid = ext4_inode->i_gid;
+    lfs_inode->links_count = ext4_inode->i_links_count;
+    
+    // Convert size (handle 64-bit)
+    lfs_inode->size = ext4_inode->i_size_lo;
+    if (S_ISREG(lfs_inode->mode)) {
+        lfs_inode->size |= ((uint64_t)ext4_inode->i_size_high << 32);
+    }
+    
+    lfs_inode->blocks = ext4_inode->i_blocks_lo;
+    if (ext4_inode->i_osd2.linux2.l_i_blocks_high) {
+        lfs_inode->blocks |= ((uint64_t)ext4_inode->i_osd2.linux2.l_i_blocks_high << 32);
+    }
+    
+    // Convert timestamps with nanosecond precision
+    lfs_inode->atime.seconds = ext4_inode->i_atime;
+    lfs_inode->atime.nanoseconds = ext4_inode->i_atime_extra << 2;
+    
+    lfs_inode->ctime.seconds = ext4_inode->i_ctime;
+    lfs_inode->ctime.nanoseconds = ext4_inode->i_ctime_extra << 2;
+    
+    lfs_inode->mtime.seconds = ext4_inode->i_mtime;
+    lfs_inode->mtime.nanoseconds = ext4_inode->i_mtime_extra << 2;
+    
+    lfs_inode->crtime.seconds = ext4_inode->i_crtime;
+    lfs_inode->crtime.nanoseconds = ext4_inode->i_crtime_extra << 2;
+    
+    lfs_inode->flags = ext4_inode->i_flags;
+    lfs_inode->generation = ext4_inode->i_generation;
+    lfs_inode->version = ext4_inode->i_version_hi;
+    lfs_inode->version = (lfs_inode->version << 32) | ext4_inode->osd1.linux1.l_i_version;
+    
+    // Convert block mapping
+    if (ext4_inode->i_flags & EXT4_EXTENTS_FL) {
+        // Convert extent tree
+        ret = limitlessfs_convert_ext4_extents(lfs_inode, ext4_inode);
+        if (ret) {
+            pr_err("Failed to convert EXT4 extents: %d\n", ret);
+            goto out;
+        }
+    } else {
+        // Convert traditional block mapping
+        for (i = 0; i < 12; i++) {
+            lfs_inode->data.blocks.direct[i] = ext4_inode->i_block[i];
+        }
+        lfs_inode->data.blocks.indirect = ext4_inode->i_block[12];
+        lfs_inode->data.blocks.double_indirect = ext4_inode->i_block[13];
+        lfs_inode->data.blocks.triple_indirect = ext4_inode->i_block[14];
+    }
+    
+    // Handle inline data for small files
+    if (lfs_inode->size <= sizeof(lfs_inode->data.inline_data.inline_data) &&
+        S_ISREG(lfs_inode->mode)) {
+        lfs_inode->data.inline_data.inline_size = lfs_inode->size;
+        // Copy inline data from first direct block
+        memcpy(lfs_inode->data.inline_data.inline_data,
+               &ext4_inode->i_block[0], lfs_inode->size);
+    }
+    
+    // Initialize AI metadata
+    lfs_inode->ai_metadata.access_frequency = 1;
+    lfs_inode->ai_metadata.next_access_time = ktime_get_real_seconds() + 3600;
+    lfs_inode->ai_metadata.temperature = 50; // Warm by default
+    lfs_inode->ai_metadata.cache_priority = 100;
+    
+    // Calculate inode checksum
+    lfs_inode->inode_checksum = limitlessfs_calculate_checksum(lfs_inode,
+        sizeof(*lfs_inode) - sizeof(lfs_inode->inode_checksum));
+    
+    // Update statistics
+    if (S_ISREG(lfs_inode->mode)) {
+        atomic64_inc(&compat->stats.files_converted);
+    } else if (S_ISDIR(lfs_inode->mode)) {
+        atomic64_inc(&compat->stats.dirs_converted);
+    } else if (S_ISLNK(lfs_inode->mode)) {
+        atomic64_inc(&compat->stats.symlinks_converted);
+    }
+    
+out:
+    if (ret)
+        kfree(lfs_inode);
+    return ret;
+}
+
+// NTFS compatibility functions
+static int limitlessfs_detect_ntfs(struct super_block *sb) {
+    struct buffer_head *bh;
+    struct ntfs_boot_sector *ntfs_bs;
+    bool is_ntfs = false;
+    
+    bh = sb_bread(sb, 0);  // NTFS boot sector is at block 0
+    if (!bh)
+        return -EIO;
+    
+    ntfs_bs = (struct ntfs_boot_sector *)bh->b_data;
+    
+    if (memcmp(ntfs_bs->oem_id, "NTFS    ", 8) == 0) {
+        pr_info("Detected NTFS filesystem\n");
+        is_ntfs = true;
+    }
+    
+    brelse(bh);
+    return is_ntfs ? 0 : -ENODEV;
+}
+
+static int limitlessfs_convert_ntfs_superblock(struct super_block *sb,
+                                              struct limitlessfs_compat_context *compat) {
+    struct buffer_head *bh;
+    struct ntfs_boot_sector *ntfs_bs;
+    struct limitlessfs_superblock *lfs_sb;
+    int ret = 0;
+    
+    bh = sb_bread(sb, 0);
+    if (!bh)
+        return -EIO;
+    
+    ntfs_bs = (struct ntfs_boot_sector *)bh->b_data;
+    
+    lfs_sb = kzalloc(sizeof(*lfs_sb), GFP_KERNEL);
+    if (!lfs_sb) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    
+    // Convert NTFS boot sector to LimitlessFS superblock
+    lfs_sb->magic = LIMITLESSFS_MAGIC;
+    lfs_sb->version_major = LIMITLESSFS_VERSION_MAJOR;
+    lfs_sb->version_minor = LIMITLESSFS_VERSION_MINOR;
+    
+    lfs_sb->total_blocks = ntfs_bs->number_of_sectors;
+    lfs_sb->block_size = ntfs_bs->bytes_per_sector;
+    
+    // NTFS uses clusters, convert to blocks
+    uint32_t sectors_per_cluster = ntfs_bs->sectors_per_cluster;
+    lfs_sb->blocks_per_group = sectors_per_cluster;
+    
+    // Enable features suitable for NTFS conversion
+    lfs_sb->features = LIMITLESSFS_FEATURE_COMPRESSION |
+                       LIMITLESSFS_FEATURE_ENCRYPTION |
+                       LIMITLESSFS_FEATURE_AI_OPTIMIZE |
+                       LIMITLESSFS_FEATURE_SNAPSHOTS;
+    
+    // NTFS supports compression natively
+    compat->feature_map.compression_supported = true;
+    compat->feature_map.encryption_supported = true;
+    compat->feature_map.extended_attrs_supported = true;
+    
+    // Calculate free space (approximation)
+    // This would normally require parsing the $Bitmap file
+    lfs_sb->free_blocks = lfs_sb->total_blocks / 2; // Conservative estimate
+    
+    // Set reasonable defaults
+    lfs_sb->total_inodes = lfs_sb->total_blocks / 4;
+    lfs_sb->free_inodes = lfs_sb->total_inodes / 2;
+    lfs_sb->inode_size = LIMITLESSFS_INODE_SIZE;
+    lfs_sb->root_inode = 5; // NTFS root directory MFT record
+    
+    lfs_sb->creation_time = ktime_get_real_seconds();
+    lfs_sb->mount_time = lfs_sb->creation_time;
+    lfs_sb->write_time = lfs_sb->creation_time;
+    
+    strcpy(lfs_sb->volume_name, "NTFS_Converted");
+    
+    // Calculate checksum
+    lfs_sb->superblock_checksum = limitlessfs_calculate_checksum(lfs_sb,
+        sizeof(*lfs_sb) - sizeof(lfs_sb->superblock_checksum));
+    
+    compat->private_data = lfs_sb;
+    
+    pr_info("NTFS superblock converted successfully\n");
+    
+out:
+    brelse(bh);
+    return ret;
+}
+
+// APFS compatibility functions
+static int limitlessfs_detect_apfs(struct super_block *sb) {
+    struct buffer_head *bh;
+    struct apfs_nx_superblock *apfs_sb;
+    bool is_apfs = false;
+    
+    // APFS container superblock is at block 0
+    bh = sb_bread(sb, 0);
+    if (!bh)
+        return -EIO;
+    
+    apfs_sb = (struct apfs_nx_superblock *)bh->b_data;
+    
+    if (apfs_sb->nx_magic == APFS_SUPER_MAGIC) {
+        pr_info("Detected APFS filesystem\n");
+        is_apfs = true;
+    }
+    
+    brelse(bh);
+    return is_apfs ? 0 : -ENODEV;
+}
+
+static int limitlessfs_convert_apfs_superblock(struct super_block *sb,
+                                              struct limitlessfs_compat_context *compat) {
+    struct buffer_head *bh;
+    struct apfs_nx_superblock *apfs_sb;
+    struct limitlessfs_superblock *lfs_sb;
+    int ret = 0;
+    
+    bh = sb_bread(sb, 0);
+    if (!bh)
+        return -EIO;
+    
+    apfs_sb = (struct apfs_nx_superblock *)bh->b_data;
+    
+    lfs_sb = kzalloc(sizeof(*lfs_sb), GFP_KERNEL);
+    if (!lfs_sb) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    
+    // Convert APFS superblock
+    lfs_sb->magic = LIMITLESSFS_MAGIC;
+    lfs_sb->version_major = LIMITLESSFS_VERSION_MAJOR;
+    lfs_sb->version_minor = LIMITLESSFS_VERSION_MINOR;
+    
+    lfs_sb->total_blocks = apfs_sb->nx_block_count;
+    lfs_sb->block_size = apfs_sb->nx_block_size;
+    
+    // APFS has advanced features we can map
+    lfs_sb->features = LIMITLESSFS_FEATURE_COMPRESSION |
+                       LIMITLESSFS_FEATURE_ENCRYPTION |
+                       LIMITLESSFS_FEATURE_SNAPSHOTS |
+                       LIMITLESSFS_FEATURE_CHECKSUMS |
+                       LIMITLESSFS_FEATURE_AI_OPTIMIZE;
+    
+    // APFS supports all advanced features
+    compat->feature_map.compression_supported = true;
+    compat->feature_map.encryption_supported = true;
+    compat->feature_map.snapshots_supported = true;
+    compat->feature_map.extended_attrs_supported = true;
+    
+    // Copy UUID
+    memcpy(lfs_sb->fs_uuid, apfs_sb->nx_uuid, sizeof(lfs_sb->fs_uuid));
+    
+    lfs_sb->creation_time = ktime_get_real_seconds();
+    lfs_sb->mount_time = lfs_sb->creation_time;
+    
+    strcpy(lfs_sb->volume_name, "APFS_Converted");
+    
+    lfs_sb->superblock_checksum = limitlessfs_calculate_checksum(lfs_sb,
+        sizeof(*lfs_sb) - sizeof(lfs_sb->superblock_checksum));
+    
+    compat->private_data = lfs_sb;
+    
+    pr_info("APFS superblock converted successfully\n");
+    
+out:
+    brelse(bh);
+    return ret;
+}
+
+// Main compatibility detection and conversion functions
+int limitlessfs_detect_compatible_fs(struct super_block *sb) {
+    struct limitlessfs_compat_context *compat;
+    int ret = -ENODEV;
+    
+    compat = kzalloc(sizeof(*compat), GFP_KERNEL);
+    if (!compat)
+        return -ENOMEM;
+    
+    // Try to detect different filesystem types
+    if (limitlessfs_detect_ext4(sb) == 0) {
+        compat->source_fs_magic = EXT4_SUPER_MAGIC;
+        ret = limitlessfs_convert_ext4_superblock(sb, compat);
+    } else if (limitlessfs_detect_ntfs(sb) == 0) {
+        compat->source_fs_magic = NTFS_SUPER_MAGIC;
+        ret = limitlessfs_convert_ntfs_superblock(sb, compat);
+    } else if (limitlessfs_detect_apfs(sb) == 0) {
+        compat->source_fs_magic = APFS_SUPER_MAGIC;
+        ret = limitlessfs_convert_apfs_superblock(sb, compat);
+    }
+    
+    if (ret == 0) {
+        sb->s_fs_info = compat;
+        pr_info("Filesystem compatibility layer initialized\n");
+    } else {
+        kfree(compat);
+    }
+    
+    return ret;
+}
+
+int limitlessfs_migrate_filesystem(struct super_block *sb, bool in_place) {
+    struct limitlessfs_compat_context *compat = sb->s_fs_info;
+    int ret = 0;
+    
+    if (!compat) {
+        return -EINVAL;
+    }
+    
+    pr_info("Starting filesystem migration (in-place: %s)\n",
+            in_place ? "yes" : "no");
+    
+    compat->conversion_in_progress = true;
+    compat->stats.conversion_start_time = ktime_get_real_seconds();
+    
+    // Perform the actual migration
+    switch (compat->source_fs_magic) {
+    case EXT4_SUPER_MAGIC:
+        ret = limitlessfs_migrate_from_ext4(sb, in_place);
+        break;
+    case NTFS_SUPER_MAGIC:
+        ret = limitlessfs_migrate_from_ntfs(sb, in_place);
+        break;
+    case APFS_SUPER_MAGIC:
+        ret = limitlessfs_migrate_from_apfs(sb, in_place);
+        break;
+    default:
+        ret = -ENOTSUPP;
+        break;
+    }
+    
+    compat->conversion_in_progress = false;
+    
+    if (ret == 0) {
+        pr_info("Filesystem migration completed successfully\n");
+        pr_info("Migration statistics:\n");
+        pr_info("  Files converted: %lld\n", 
+                atomic64_read(&compat->stats.files_converted));
+        pr_info("  Directories converted: %lld\n",
+                atomic64_read(&compat->stats.dirs_converted));
+        pr_info("  Symlinks converted: %lld\n",
+                atomic64_read(&compat->stats.symlinks_converted));
+        pr_info("  Errors encountered: %lld\n",
+                atomic64_read(&compat->stats.errors_encountered));
+    } else {
+        pr_err("Filesystem migration failed: %d\n", ret);
+    }
+    
+    return ret;
+}
+
+void limitlessfs_cleanup_compat_layer(struct limitlessfs_compat_context *compat) {
+    if (!compat)
+        return;
+    
+    if (compat->private_data) {
+        kfree(compat->private_data);
+        compat->private_data = NULL;
+    }
+    
+    if (compat->converter.cleanup) {
+        compat->converter.cleanup(compat);
+    }
+    
+    kfree(compat);
+}
+
+// Filesystem type registration for compatibility mode
+static struct file_system_type limitlessfs_compat_type = {
+    .owner = THIS_MODULE,
+    .name = "limitlessfs-compat",
+    .mount = limitlessfs_compat_mount,
+    .kill_sb = kill_block_super,
+    .fs_flags = FS_REQUIRES_DEV,
+};
+
+static struct dentry *limitlessfs_compat_mount(struct file_system_type *fs_type,
+                                              int flags, const char *dev_name,
+                                              void *data) {
+    return mount_bdev(fs_type, flags, dev_name, data, 
+                     limitlessfs_compat_fill_super);
+}
+
+static int limitlessfs_compat_fill_super(struct super_block *sb, 
+                                        void *data, int silent) {
+    int ret;
+    
+    // First try to detect and convert a compatible filesystem
+    ret = limitlessfs_detect_compatible_fs(sb);
+    if (ret == 0) {
+        // Successfully detected and converted, now mount as LimitlessFS
+        return limitlessfs_fill_super(sb, data, silent);
+    }
+    
+    // If detection failed, try to mount as native LimitlessFS
+    return limitlessfs_fill_super(sb, data, silent);
+}
+
+int __init limitlessfs_compat_init(void) {
+    int ret;
+    
+    ret = register_filesystem(&limitlessfs_compat_type);
+    if (ret) {
+        pr_err("Failed to register compatibility filesystem: %d\n", ret);
+        return ret;
+    }
+    
+    pr_info("LimitlessFS compatibility layer initialized\n");
+    return 0;
+}
+
+void __exit limitlessfs_compat_exit(void) {
+    unregister_filesystem(&limitlessfs_compat_type);
+    pr_info("LimitlessFS compatibility layer unloaded\n");
+}

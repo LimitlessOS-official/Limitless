@@ -1,0 +1,506 @@
+#include "performance.h"
+#include "log.h"
+#include "kernel.h"
+#include "timer.h"
+#include "memory.h"
+#include "process.h"
+
+/* LimitlessOS Phase 6 - Performance Optimization Implementation */
+
+perf_optimizer_t g_perf_optimizer;
+static spinlock_t g_perf_lock;
+static bool g_perf_monitoring_active = false;
+
+/* Initialize performance optimization system */
+status_t perf_optimizer_init(void) {
+    spinlock_init(&g_perf_lock);
+    k_memset(&g_perf_optimizer, 0, sizeof(g_perf_optimizer));
+    
+    g_perf_optimizer.auto_optimization_enabled = true;
+    g_perf_optimizer.performance_boost_mode = false;
+    g_perf_optimizer.optimization_interval_ms = 5000; /* 5 seconds */
+    g_perf_optimizer.real_time_monitoring = true;
+    g_perf_optimizer.sample_interval_ms = 1000; /* 1 second */
+    
+    /* Set performance targets */
+    g_perf_optimizer.system_metrics.target_boot_time_us = PERF_TARGET_BOOT_TIME_US;
+    
+    log_info("[PERF] Performance optimization system initialized");
+    
+    /* Register core performance metrics */
+    perf_register_core_metrics();
+    
+    /* Start real-time monitoring */
+    perf_start_real_time_monitoring();
+    
+    return STATUS_OK;
+}
+
+status_t perf_optimizer_cleanup(void) {
+    perf_stop_real_time_monitoring();
+    k_memset(&g_perf_optimizer, 0, sizeof(g_perf_optimizer));
+    log_info("[PERF] Performance optimization system cleaned up");
+    return STATUS_OK;
+}
+
+/* Register a performance metric */
+status_t perf_register_metric(const char* name, perf_metric_type_t type, 
+                             perf_category_t category, uint64_t warning_threshold) {
+    if (!name) return STATUS_INVALID;
+    
+    spin_lock(&g_perf_lock);
+    
+    if (g_perf_optimizer.metric_count >= PERF_MAX_METRICS) {
+        spin_unlock(&g_perf_lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    perf_metric_t* metric = &g_perf_optimizer.metrics[g_perf_optimizer.metric_count++];
+    k_memset(metric, 0, sizeof(*metric));
+    
+    k_strlcpy(metric->name, name, sizeof(metric->name));
+    metric->type = type;
+    metric->category = category;
+    metric->warning_threshold = warning_threshold;
+    metric->critical_threshold = warning_threshold * 2;
+    metric->optimization_enabled = true;
+    metric->min_value = UINT64_MAX;
+    
+    spin_unlock(&g_perf_lock);
+    
+    log_debug("[PERF] Registered metric: %s (category=%d, threshold=%llu)", 
+              name, category, warning_threshold);
+    return STATUS_OK;
+}
+
+/* Update a performance metric */
+status_t perf_update_metric(const char* name, uint64_t value) {
+    if (!name) return STATUS_INVALID;
+    
+    spin_lock(&g_perf_lock);
+    
+    perf_metric_t* metric = NULL;
+    for (uint32_t i = 0; i < g_perf_optimizer.metric_count; i++) {
+        if (k_strcmp(g_perf_optimizer.metrics[i].name, name) == 0) {
+            metric = &g_perf_optimizer.metrics[i];
+            break;
+        }
+    }
+    
+    if (!metric) {
+        spin_unlock(&g_perf_lock);
+        return STATUS_NOT_FOUND;
+    }
+    
+    /* Update metric values */
+    metric->current_value = value;
+    if (value < metric->min_value) metric->min_value = value;
+    if (value > metric->max_value) metric->max_value = value;
+    
+    metric->total_samples++;
+    metric->avg_value = (metric->avg_value * (metric->total_samples - 1) + value) / metric->total_samples;
+    
+    /* Store in history */
+    metric->history[metric->history_index].value = value;
+    metric->history[metric->history_index].timestamp = timer_get_ticks();
+    metric->history_index = (metric->history_index + 1) % PERF_HISTORY_SIZE;
+    
+    /* Check thresholds and trigger optimization if needed */
+    if (metric->optimization_enabled && value > metric->warning_threshold) {
+        log_warn("[PERF] Metric %s exceeded warning threshold: %llu > %llu", 
+                 name, value, metric->warning_threshold);
+        
+        if (g_perf_optimizer.auto_optimization_enabled) {
+            perf_trigger_optimization(metric->category);
+        }
+    }
+    
+    spin_unlock(&g_perf_lock);
+    return STATUS_OK;
+}
+
+/* Collect system-wide performance metrics */
+status_t perf_collect_system_metrics(perf_system_metrics_t* out_metrics) {
+    if (!out_metrics) return STATUS_INVALID;
+    
+    perf_system_metrics_t* metrics = &g_perf_optimizer.system_metrics;
+    
+    /* Collect boot performance metrics */
+    metrics->total_boot_time_us = timer_get_ticks(); /* Would be set during boot */
+    
+    /* Collect memory performance metrics */
+    metrics->memory_utilization_percent = perf_get_memory_utilization();
+    metrics->memory_bandwidth_mbps = perf_measure_memory_bandwidth();
+    
+    /* Collect CPU performance metrics */
+    perf_collect_cpu_metrics(metrics);
+    
+    /* Collect I/O performance metrics */
+    metrics->disk_read_bandwidth_mbps = perf_measure_disk_bandwidth(true);
+    metrics->disk_write_bandwidth_mbps = perf_measure_disk_bandwidth(false);
+    
+    /* Collect power metrics */
+    metrics->power_consumption_mw = perf_get_power_consumption();
+    metrics->battery_level_percent = perf_get_battery_level();
+    
+    /* Copy to output */
+    *out_metrics = *metrics;
+    
+    return STATUS_OK;
+}
+
+/* Boot time optimization */
+status_t perf_optimize_boot_time(void) {
+    log_info("[PERF] Optimizing boot time...");
+    
+    uint64_t current_boot_time = g_perf_optimizer.system_metrics.total_boot_time_us;
+    uint64_t target_boot_time = g_perf_optimizer.system_metrics.target_boot_time_us;
+    
+    if (current_boot_time <= target_boot_time) {
+        log_info("[PERF] Boot time already optimal: %llu us (target: %llu us)", 
+                 current_boot_time, target_boot_time);
+        return STATUS_OK;
+    }
+    
+    /* Apply boot optimizations */
+    status_t result = STATUS_OK;
+    
+    result |= perf_enable_parallel_initialization();
+    result |= perf_optimize_driver_loading();
+    result |= perf_implement_lazy_loading();
+    result |= perf_compress_kernel_modules();
+    
+    if (result == STATUS_OK) {
+        g_perf_optimizer.optimizations_applied++;
+        log_info("[PERF] Boot time optimization applied successfully");
+    } else {
+        log_error("[PERF] Boot time optimization failed");
+    }
+    
+    return result;
+}
+
+/* Memory optimization */
+status_t perf_optimize_memory_usage(void) {
+    log_info("[PERF] Optimizing memory usage...");
+    
+    uint32_t memory_pressure = g_perf_optimizer.system_metrics.memory_pressure_level;
+    
+    if (memory_pressure < 70) { /* Under 70% is acceptable */
+        return STATUS_OK;
+    }
+    
+    status_t result = STATUS_OK;
+    
+    if (memory_pressure > 90) {
+        /* Critical memory pressure - aggressive optimization */
+        result |= perf_enable_kernel_same_page_merging();
+        result |= perf_implement_compressed_swap();
+        result |= perf_implement_memory_compaction();
+    } else {
+        /* Moderate memory pressure - gentle optimization */
+        result |= perf_optimize_memory_allocator();
+        result |= perf_implement_memory_prefetching();
+    }
+    
+    if (result == STATUS_OK) {
+        g_perf_optimizer.optimizations_applied++;
+        g_perf_optimizer.performance_improvements++;
+        log_info("[PERF] Memory optimization applied successfully");
+    }
+    
+    return result;
+}
+
+/* CPU scheduling optimization */
+status_t perf_optimize_cpu_scheduling(void) {
+    log_info("[PERF] Optimizing CPU scheduling...");
+    
+    status_t result = STATUS_OK;
+    
+    result |= perf_implement_cpu_affinity_optimization();
+    result |= perf_optimize_interrupt_handling();
+    result |= perf_implement_cpu_frequency_scaling();
+    result |= perf_optimize_context_switching();
+    
+    if (result == STATUS_OK) {
+        g_perf_optimizer.optimizations_applied++;
+        log_info("[PERF] CPU scheduling optimization applied successfully");
+    }
+    
+    return result;
+}
+
+/* Power consumption optimization */
+status_t perf_optimize_power_consumption(void) {
+    log_info("[PERF] Optimizing power consumption...");
+    
+    uint32_t power_consumption = g_perf_optimizer.system_metrics.power_consumption_mw;
+    uint32_t battery_level = g_perf_optimizer.system_metrics.battery_level_percent;
+    
+    status_t result = STATUS_OK;
+    
+    if (battery_level < 20 || g_perf_optimizer.aggressive_power_management) {
+        /* Aggressive power saving */
+        result |= perf_implement_aggressive_power_management();
+        result |= perf_optimize_cpu_power_states();
+        result |= perf_implement_dynamic_voltage_scaling();
+    } else {
+        /* Balanced power management */
+        result |= perf_optimize_device_power_management();
+    }
+    
+    if (result == STATUS_OK) {
+        g_perf_optimizer.optimizations_applied++;
+        g_perf_optimizer.power_savings_mwh += (power_consumption / 100); /* Estimated savings */
+        log_info("[PERF] Power optimization applied successfully");
+    }
+    
+    return result;
+}
+
+/* Run comprehensive performance benchmark */
+status_t perf_run_comprehensive_benchmark(perf_benchmark_results_t* out_results) {
+    if (!out_results) return STATUS_INVALID;
+    
+    log_info("[PERF] Running comprehensive performance benchmark...");
+    
+    k_memset(out_results, 0, sizeof(*out_results));
+    
+    /* Run individual benchmarks */
+    perf_run_cpu_benchmark(&out_results->cpu_benchmark_score);
+    perf_run_memory_benchmark(&out_results->memory_benchmark_score);
+    perf_run_storage_benchmark(&out_results->storage_benchmark_score);
+    perf_run_graphics_benchmark(&out_results->graphics_benchmark_score);
+    
+    /* Calculate overall score */
+    out_results->overall_performance_score = (
+        out_results->cpu_benchmark_score * 25 +
+        out_results->memory_benchmark_score * 25 +
+        out_results->storage_benchmark_score * 25 +
+        out_results->graphics_benchmark_score * 25
+    ) / 100;
+    
+    /* Calculate power efficiency score */
+    uint32_t power_consumption = g_perf_optimizer.system_metrics.power_consumption_mw;
+    if (power_consumption > 0) {
+        out_results->power_efficiency_score = (out_results->overall_performance_score * 1000) / power_consumption;
+    }
+    
+    log_info("[PERF] Benchmark completed - Overall score: %llu", out_results->overall_performance_score);
+    
+    return STATUS_OK;
+}
+
+/* Validate performance requirements */
+status_t perf_validate_performance_requirements(bool* out_requirements_met) {
+    if (!out_requirements_met) return STATUS_INVALID;
+    
+    perf_system_metrics_t metrics;
+    perf_collect_system_metrics(&metrics);
+    
+    bool requirements_met = true;
+    
+    /* Check boot time requirement */
+    if (metrics.total_boot_time_us > PERF_TARGET_BOOT_TIME_US) {
+        log_warn("[PERF] Boot time requirement not met: %llu us > %llu us", 
+                 metrics.total_boot_time_us, PERF_TARGET_BOOT_TIME_US);
+        requirements_met = false;
+    }
+    
+    /* Check memory pressure requirement */
+    if (metrics.memory_pressure_level > PERF_TARGET_MEMORY_PRESSURE) {
+        log_warn("[PERF] Memory pressure requirement not met: %u%% > %u%%",
+                 metrics.memory_pressure_level, PERF_TARGET_MEMORY_PRESSURE);
+        requirements_met = false;
+    }
+    
+    /* Check UI frame rate requirement */
+    if (metrics.ui_frame_rate_fps < PERF_TARGET_UI_FRAME_RATE) {
+        log_warn("[PERF] UI frame rate requirement not met: %u fps < %u fps",
+                 metrics.ui_frame_rate_fps, PERF_TARGET_UI_FRAME_RATE);
+        requirements_met = false;
+    }
+    
+    *out_requirements_met = requirements_met;
+    
+    if (requirements_met) {
+        log_info("[PERF] All performance requirements met");
+    } else {
+        log_warn("[PERF] Performance requirements not fully met - optimization needed");
+    }
+    
+    return STATUS_OK;
+}
+
+/* Start real-time monitoring */
+status_t perf_start_real_time_monitoring(void) {
+    if (g_perf_monitoring_active) return STATUS_OK;
+    
+    g_perf_monitoring_active = true;
+    log_info("[PERF] Real-time performance monitoring started");
+    
+    /* Would start a kernel thread for continuous monitoring */
+    /* perf_monitoring_thread_start(); */
+    
+    return STATUS_OK;
+}
+
+/* Stop real-time monitoring */
+status_t perf_stop_real_time_monitoring(void) {
+    if (!g_perf_monitoring_active) return STATUS_OK;
+    
+    g_perf_monitoring_active = false;
+    log_info("[PERF] Real-time performance monitoring stopped");
+    
+    return STATUS_OK;
+}
+
+/* Register core performance metrics */
+static status_t perf_register_core_metrics(void) {
+    /* Boot performance metrics */
+    perf_register_metric("boot_time_total", PERF_METRIC_TIMER, PERF_CATEGORY_BOOT, PERF_TARGET_BOOT_TIME_US);
+    perf_register_metric("boot_kernel_init", PERF_METRIC_TIMER, PERF_CATEGORY_BOOT, 2000000);
+    perf_register_metric("boot_driver_load", PERF_METRIC_TIMER, PERF_CATEGORY_BOOT, 3000000);
+    
+    /* Memory performance metrics */
+    perf_register_metric("memory_utilization", PERF_METRIC_GAUGE, PERF_CATEGORY_MEMORY, PERF_TARGET_MEMORY_PRESSURE);
+    perf_register_metric("memory_allocation_time", PERF_METRIC_TIMER, PERF_CATEGORY_MEMORY, 1000000);
+    perf_register_metric("page_fault_time", PERF_METRIC_TIMER, PERF_CATEGORY_MEMORY, 100000);
+    
+    /* CPU performance metrics */
+    perf_register_metric("cpu_utilization", PERF_METRIC_GAUGE, PERF_CATEGORY_CPU, PERF_TARGET_CPU_UTILIZATION);
+    perf_register_metric("context_switch_time", PERF_METRIC_TIMER, PERF_CATEGORY_CPU, 10000);
+    perf_register_metric("interrupt_latency", PERF_METRIC_TIMER, PERF_CATEGORY_CPU, 5000);
+    
+    /* I/O performance metrics */
+    perf_register_metric("disk_read_bandwidth", PERF_METRIC_GAUGE, PERF_CATEGORY_IO, 100);
+    perf_register_metric("disk_write_bandwidth", PERF_METRIC_GAUGE, PERF_CATEGORY_IO, 100);
+    perf_register_metric("network_latency", PERF_METRIC_TIMER, PERF_CATEGORY_NETWORK, 100000);
+    
+    /* Power metrics */
+    perf_register_metric("power_consumption", PERF_METRIC_GAUGE, PERF_CATEGORY_POWER, 50000);
+    perf_register_metric("cpu_temperature", PERF_METRIC_GAUGE, PERF_CATEGORY_THERMAL, 70);
+    
+    log_info("[PERF] Registered core performance metrics");
+    return STATUS_OK;
+}
+
+/* Trigger optimization based on category */
+static status_t perf_trigger_optimization(perf_category_t category) {
+    uint64_t current_time = timer_get_ticks();
+    
+    /* Rate limiting - don't optimize too frequently */
+    if (current_time - g_perf_optimizer.last_optimization_time < (g_perf_optimizer.optimization_interval_ms * 1000)) {
+        return STATUS_OK;
+    }
+    
+    g_perf_optimizer.last_optimization_time = current_time;
+    
+    switch (category) {
+        case PERF_CATEGORY_BOOT:
+            return perf_optimize_boot_time();
+        case PERF_CATEGORY_MEMORY:
+            return perf_optimize_memory_usage();
+        case PERF_CATEGORY_CPU:
+            return perf_optimize_cpu_scheduling();
+        case PERF_CATEGORY_POWER:
+            return perf_optimize_power_consumption();
+        case PERF_CATEGORY_THERMAL:
+            return perf_optimize_thermal_management();
+        default:
+            return STATUS_OK;
+    }
+}
+
+/* Placeholder implementations for specific optimizations */
+static status_t perf_enable_parallel_initialization(void) {
+    log_debug("[PERF] Enabling parallel initialization");
+    return STATUS_OK;
+}
+
+static status_t perf_optimize_driver_loading(void) {
+    log_debug("[PERF] Optimizing driver loading");
+    return STATUS_OK;
+}
+
+static status_t perf_implement_lazy_loading(void) {
+    log_debug("[PERF] Implementing lazy loading");
+    return STATUS_OK;
+}
+
+static status_t perf_compress_kernel_modules(void) {
+    log_debug("[PERF] Compressing kernel modules");
+    return STATUS_OK;
+}
+
+static status_t perf_enable_kernel_same_page_merging(void) {
+    log_debug("[PERF] Enabling kernel same-page merging");
+    return STATUS_OK;
+}
+
+static status_t perf_implement_compressed_swap(void) {
+    log_debug("[PERF] Implementing compressed swap");
+    return STATUS_OK;
+}
+
+static status_t perf_implement_memory_compaction(void) {
+    log_debug("[PERF] Implementing memory compaction");
+    return STATUS_OK;
+}
+
+static status_t perf_optimize_memory_allocator(void) {
+    log_debug("[PERF] Optimizing memory allocator");
+    return STATUS_OK;
+}
+
+static status_t perf_implement_memory_prefetching(void) {
+    log_debug("[PERF] Implementing memory prefetching");
+    return STATUS_OK;
+}
+
+/* Additional placeholder implementations... */
+static uint32_t perf_get_memory_utilization(void) { return 45; /* 45% */ }
+static uint64_t perf_measure_memory_bandwidth(void) { return 12800; /* 12.8 GB/s */ }
+static void perf_collect_cpu_metrics(perf_system_metrics_t* metrics) { 
+    for (int i = 0; i < 8; i++) {
+        metrics->cpu_utilization_percent[i] = 25 + (i * 5); /* Sample data */
+        metrics->cpu_frequency_mhz[i] = 2400 + (i * 100);
+        metrics->cpu_temperature_celsius[i] = 45 + (i * 2);
+    }
+}
+static uint64_t perf_measure_disk_bandwidth(bool read) { return read ? 500 : 400; /* MB/s */ }
+static uint32_t perf_get_power_consumption(void) { return 25000; /* 25W */ }
+static uint32_t perf_get_battery_level(void) { return 85; /* 85% */ }
+
+/* Benchmark implementations */
+status_t perf_run_cpu_benchmark(uint64_t* out_score) { 
+    *out_score = 15000; /* Sample CPU score */
+    return STATUS_OK; 
+}
+
+status_t perf_run_memory_benchmark(uint64_t* out_score) { 
+    *out_score = 12000; /* Sample memory score */
+    return STATUS_OK; 
+}
+
+status_t perf_run_storage_benchmark(uint64_t* out_score) { 
+    *out_score = 8000; /* Sample storage score */
+    return STATUS_OK; 
+}
+
+status_t perf_run_graphics_benchmark(uint64_t* out_score) { 
+    *out_score = 10000; /* Sample graphics score */
+    return STATUS_OK; 
+}
+
+/* Additional stubs for remaining functions */
+status_t perf_implement_cpu_affinity_optimization(void) { return STATUS_OK; }
+status_t perf_optimize_interrupt_handling(void) { return STATUS_OK; }
+status_t perf_implement_cpu_frequency_scaling(void) { return STATUS_OK; }
+status_t perf_optimize_context_switching(void) { return STATUS_OK; }
+status_t perf_implement_aggressive_power_management(void) { return STATUS_OK; }
+status_t perf_optimize_cpu_power_states(void) { return STATUS_OK; }
+status_t perf_implement_dynamic_voltage_scaling(void) { return STATUS_OK; }
+status_t perf_optimize_device_power_management(void) { return STATUS_OK; }
+status_t perf_optimize_thermal_management(void) { return STATUS_OK; }

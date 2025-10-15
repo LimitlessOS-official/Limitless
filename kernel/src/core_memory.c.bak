@@ -1,0 +1,773 @@
+/*
+ * LimitlessOS Production Kernel - Core Memory Management
+ * Demand paging, page cache, copy-on-write, slab allocator with poisoning
+ */
+
+#include "kernel.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "sched.h"
+#include "percpu.h"
+#include <stdint.h>
+#include <string.h>
+
+/* ============================================================================
+ * DEMAND PAGING IMPLEMENTATION
+ * ============================================================================ */
+
+#define PAGE_FAULT_PRESENT    0x1
+#define PAGE_FAULT_WRITE      0x2
+#define PAGE_FAULT_USER       0x4
+#define PAGE_FAULT_RESERVED   0x8
+#define PAGE_FAULT_FETCH      0x10
+
+typedef struct page_fault_info {
+    uintptr_t fault_addr;
+    uint32_t error_code;
+    uintptr_t fault_ip;
+    uint32_t cpu_id;
+    process_t* process;
+} page_fault_info_t;
+
+typedef struct vma {
+    uintptr_t start;
+    uintptr_t end;
+    uint32_t prot;      /* PROT_READ, PROT_WRITE, PROT_EXEC */
+    uint32_t flags;     /* MAP_PRIVATE, MAP_SHARED, MAP_ANONYMOUS */
+    uint64_t offset;    /* File offset */
+    struct file* file;  /* Backing file */
+    struct vma* next;
+} vma_t;
+
+#define PROT_READ       0x1
+#define PROT_WRITE      0x2
+#define PROT_EXEC       0x4
+#define PROT_NONE       0x0
+
+#define MAP_PRIVATE     0x02
+#define MAP_SHARED      0x01
+#define MAP_ANONYMOUS   0x20
+#define MAP_FIXED       0x10
+
+static spinlock_t page_fault_lock = 0;
+static uint64_t page_fault_count = 0;
+static uint64_t cow_faults = 0;
+static uint64_t demand_zero_faults = 0;
+static uint64_t file_faults = 0;
+
+/* Page fault handler */
+status_t handle_page_fault(uintptr_t fault_addr, uint32_t error_code, uintptr_t fault_ip) {
+    spin_lock(&page_fault_lock);
+    page_fault_count++;
+    
+    process_t* current = process_current();
+    if (!current) {
+        spin_unlock(&page_fault_lock);
+        return STATUS_ERROR;
+    }
+    
+    /* Find VMA containing the fault address */
+    vma_t* vma = find_vma(current->mm, fault_addr);
+    if (!vma) {
+        spin_unlock(&page_fault_lock);
+        /* Segmentation fault */
+        send_signal(current, SIGSEGV);
+        return STATUS_ERROR;
+    }
+    
+    /* Check permissions */
+    if (error_code & PAGE_FAULT_WRITE) {
+        if (!(vma->prot & PROT_WRITE)) {
+            spin_unlock(&page_fault_lock);
+            send_signal(current, SIGSEGV);
+            return STATUS_ERROR;
+        }
+    }
+    
+    if (error_code & PAGE_FAULT_FETCH) {
+        if (!(vma->prot & PROT_EXEC)) {
+            spin_unlock(&page_fault_lock);
+            send_signal(current, SIGSEGV);
+            return STATUS_ERROR;
+        }
+    }
+    
+    uintptr_t page_addr = fault_addr & ~(PAGE_SIZE - 1);
+    
+    /* Handle different types of page faults */
+    if (!(error_code & PAGE_FAULT_PRESENT)) {
+        /* Page not present - demand allocation */
+        if (vma->flags & MAP_ANONYMOUS) {
+            /* Demand zero page */
+            paddr_t phys = pmm_alloc_page();
+            if (!phys) {
+                spin_unlock(&page_fault_lock);
+                send_signal(current, SIGKILL);
+                return STATUS_NO_MEMORY;
+            }
+            
+            /* Zero the page */
+            void* virt = map_temp_page(phys);
+            memset(virt, 0, PAGE_SIZE);
+            unmap_temp_page(virt);
+            
+            /* Map with appropriate permissions */
+            uint64_t pte_flags = PTE_PRESENT | PTE_USER;
+            if (vma->prot & PROT_WRITE) pte_flags |= PTE_WRITABLE;
+            if (!(vma->prot & PROT_EXEC)) pte_flags |= PTE_NX;
+            
+            map_page(current->mm->pgd, page_addr, phys, pte_flags);
+            demand_zero_faults++;
+            
+        } else if (vma->file) {
+            /* File-backed page - load from file */
+            paddr_t phys = pmm_alloc_page();
+            if (!phys) {
+                spin_unlock(&page_fault_lock);
+                send_signal(current, SIGKILL);
+                return STATUS_NO_MEMORY;
+            }
+            
+            /* Read page from file */
+            uint64_t file_offset = vma->offset + (page_addr - vma->start);
+            void* virt = map_temp_page(phys);
+            
+            size_t bytes_read;
+            status_t result = vfs_read(vma->file, virt, PAGE_SIZE, file_offset, &bytes_read);
+            if (FAILED(result)) {
+                memset(virt, 0, PAGE_SIZE);
+            } else if (bytes_read < PAGE_SIZE) {
+                memset((char*)virt + bytes_read, 0, PAGE_SIZE - bytes_read);
+            }
+            
+            unmap_temp_page(virt);
+            
+            /* Map with appropriate permissions */
+            uint64_t pte_flags = PTE_PRESENT | PTE_USER;
+            if (vma->prot & PROT_WRITE) pte_flags |= PTE_WRITABLE;
+            if (!(vma->prot & PROT_EXEC)) pte_flags |= PTE_NX;
+            
+            map_page(current->mm->pgd, page_addr, phys, pte_flags);
+            file_faults++;
+        }
+    } else if (error_code & PAGE_FAULT_WRITE) {
+        /* Copy-on-write fault */
+        pte_t* pte = get_pte(current->mm->pgd, page_addr);
+        if (pte && (*pte & PTE_COW)) {
+            paddr_t old_phys = *pte & PTE_ADDR_MASK;
+            
+            /* Check reference count */
+            if (pmm_get_ref_count(old_phys) > 1) {
+                /* Need to copy */
+                paddr_t new_phys = pmm_alloc_page();
+                if (!new_phys) {
+                    spin_unlock(&page_fault_lock);
+                    send_signal(current, SIGKILL);
+                    return STATUS_NO_MEMORY;
+                }
+                
+                /* Copy page content */
+                void* src = map_temp_page(old_phys);
+                void* dst = map_temp_page(new_phys);
+                memcpy(dst, src, PAGE_SIZE);
+                unmap_temp_page(src);
+                unmap_temp_page(dst);
+                
+                /* Update PTE */
+                *pte = new_phys | ((*pte & ~PTE_ADDR_MASK) & ~PTE_COW) | PTE_WRITABLE;
+                
+                /* Decrease reference count of old page */
+                pmm_dec_ref_count(old_phys);
+                
+                /* Flush TLB */
+                flush_tlb_page(page_addr);
+                
+                cow_faults++;
+            } else {
+                /* Last reference - just make writable */
+                *pte = (*pte & ~PTE_COW) | PTE_WRITABLE;
+                flush_tlb_page(page_addr);
+            }
+        }
+    }
+    
+    spin_unlock(&page_fault_lock);
+    return STATUS_OK;
+}
+
+/* ============================================================================
+ * PAGE CACHE IMPLEMENTATION
+ * ============================================================================ */
+
+#define PAGE_CACHE_SIZE 8192
+#define PAGE_CACHE_HASH_SIZE 1024
+
+typedef struct page_cache_entry {
+    struct file* file;
+    uint64_t offset;
+    paddr_t phys_addr;
+    uint32_t ref_count;
+    uint32_t flags;
+    uint64_t access_time;
+    struct page_cache_entry* hash_next;
+    struct page_cache_entry* lru_next;
+    struct page_cache_entry* lru_prev;
+} page_cache_entry_t;
+
+#define PCE_DIRTY       0x1
+#define PCE_LOCKED      0x2
+#define PCE_UPTODATE    0x4
+#define PCE_WRITEBACK   0x8
+
+static page_cache_entry_t page_cache[PAGE_CACHE_SIZE];
+static page_cache_entry_t* page_cache_hash[PAGE_CACHE_HASH_SIZE];
+static page_cache_entry_t* lru_head = NULL;
+static page_cache_entry_t* lru_tail = NULL;
+static spinlock_t page_cache_lock = 0;
+static uint32_t page_cache_used = 0;
+
+static uint32_t page_cache_hash_func(struct file* file, uint64_t offset) {
+    uintptr_t file_hash = (uintptr_t)file >> 4;
+    uint64_t offset_hash = offset >> PAGE_SHIFT;
+    return (file_hash ^ offset_hash) % PAGE_CACHE_HASH_SIZE;
+}
+
+static page_cache_entry_t* page_cache_lookup(struct file* file, uint64_t offset) {
+    uint32_t hash = page_cache_hash_func(file, offset);
+    page_cache_entry_t* entry = page_cache_hash[hash];
+    
+    while (entry) {
+        if (entry->file == file && entry->offset == offset) {
+            return entry;
+        }
+        entry = entry->hash_next;
+    }
+    
+    return NULL;
+}
+
+static void page_cache_lru_add(page_cache_entry_t* entry) {
+    entry->lru_next = lru_head;
+    entry->lru_prev = NULL;
+    
+    if (lru_head) {
+        lru_head->lru_prev = entry;
+    } else {
+        lru_tail = entry;
+    }
+    
+    lru_head = entry;
+    entry->access_time = get_timestamp();
+}
+
+static void page_cache_lru_remove(page_cache_entry_t* entry) {
+    if (entry->lru_prev) {
+        entry->lru_prev->lru_next = entry->lru_next;
+    } else {
+        lru_head = entry->lru_next;
+    }
+    
+    if (entry->lru_next) {
+        entry->lru_next->lru_prev = entry->lru_prev;
+    } else {
+        lru_tail = entry->lru_prev;
+    }
+}
+
+static page_cache_entry_t* page_cache_alloc_entry(void) {
+    /* Find free entry or evict LRU */
+    for (uint32_t i = 0; i < PAGE_CACHE_SIZE; i++) {
+        if (page_cache[i].ref_count == 0) {
+            return &page_cache[i];
+        }
+    }
+    
+    /* Evict LRU entry */
+    page_cache_entry_t* victim = lru_tail;
+    if (victim && victim->ref_count == 0) {
+        if (victim->flags & PCE_DIRTY) {
+            /* Write back dirty page */
+            page_cache_writeback(victim);
+        }
+        
+        /* Remove from hash table */
+        uint32_t hash = page_cache_hash_func(victim->file, victim->offset);
+        page_cache_entry_t** entry_ptr = &page_cache_hash[hash];
+        while (*entry_ptr && *entry_ptr != victim) {
+            entry_ptr = &(*entry_ptr)->hash_next;
+        }
+        if (*entry_ptr) {
+            *entry_ptr = victim->hash_next;
+        }
+        
+        /* Remove from LRU */
+        page_cache_lru_remove(victim);
+        
+        /* Free physical page */
+        pmm_free_page(victim->phys_addr);
+        
+        /* Clear entry */
+        memset(victim, 0, sizeof(*victim));
+        return victim;
+    }
+    
+    return NULL;
+}
+
+page_cache_entry_t* page_cache_get_page(struct file* file, uint64_t offset) {
+    spin_lock(&page_cache_lock);
+    
+    offset &= ~(PAGE_SIZE - 1);  /* Align to page boundary */
+    
+    /* Look up in cache first */
+    page_cache_entry_t* entry = page_cache_lookup(file, offset);
+    if (entry) {
+        entry->ref_count++;
+        page_cache_lru_remove(entry);
+        page_cache_lru_add(entry);
+        spin_unlock(&page_cache_lock);
+        return entry;
+    }
+    
+    /* Allocate new entry */
+    entry = page_cache_alloc_entry();
+    if (!entry) {
+        spin_unlock(&page_cache_lock);
+        return NULL;
+    }
+    
+    /* Allocate physical page */
+    paddr_t phys = pmm_alloc_page();
+    if (!phys) {
+        spin_unlock(&page_cache_lock);
+        return NULL;
+    }
+    
+    /* Initialize entry */
+    entry->file = file;
+    entry->offset = offset;
+    entry->phys_addr = phys;
+    entry->ref_count = 1;
+    entry->flags = 0;
+    
+    /* Add to hash table */
+    uint32_t hash = page_cache_hash_func(file, offset);
+    entry->hash_next = page_cache_hash[hash];
+    page_cache_hash[hash] = entry;
+    
+    /* Add to LRU */
+    page_cache_lru_add(entry);
+    
+    page_cache_used++;
+    spin_unlock(&page_cache_lock);
+    
+    /* Read page from file */
+    void* page_virt = map_temp_page(phys);
+    size_t bytes_read;
+    status_t result = vfs_read(file, page_virt, PAGE_SIZE, offset, &bytes_read);
+    
+    if (SUCCEEDED(result)) {
+        if (bytes_read < PAGE_SIZE) {
+            memset((char*)page_virt + bytes_read, 0, PAGE_SIZE - bytes_read);
+        }
+        entry->flags |= PCE_UPTODATE;
+    } else {
+        memset(page_virt, 0, PAGE_SIZE);
+    }
+    
+    unmap_temp_page(page_virt);
+    
+    return entry;
+}
+
+void page_cache_put_page(page_cache_entry_t* entry) {
+    if (!entry) return;
+    
+    spin_lock(&page_cache_lock);
+    entry->ref_count--;
+    spin_unlock(&page_cache_lock);
+}
+
+/* ============================================================================
+ * SLAB ALLOCATOR WITH POISONING
+ * ============================================================================ */
+
+#define SLAB_POISON_BYTE    0xA5
+#define SLAB_FREE_POISON    0x6B
+#define SLAB_REDZONE_SIZE   8
+#define SLAB_REDZONE_BYTE   0xCC
+
+typedef struct slab_cache {
+    char name[32];
+    size_t object_size;
+    size_t align;
+    uint32_t flags;
+    
+    /* Constructor/destructor */
+    void (*ctor)(void* obj);
+    void (*dtor)(void* obj);
+    
+    /* Statistics */
+    uint64_t alloc_count;
+    uint64_t free_count;
+    uint64_t active_objects;
+    uint64_t total_objects;
+    
+    /* Slab list */
+    struct slab* partial_slabs;
+    struct slab* full_slabs;
+    struct slab* free_slabs;
+    
+    spinlock_t lock;
+    struct slab_cache* next;
+} slab_cache_t;
+
+typedef struct slab {
+    void* start_addr;
+    uint32_t object_count;
+    uint32_t free_count;
+    void* freelist;
+    slab_cache_t* cache;
+    struct slab* next;
+} slab_t;
+
+#define SLAB_POISON         0x1
+#define SLAB_RED_ZONE       0x2
+#define SLAB_PANIC          0x4
+#define SLAB_DEBUG          0x8
+
+static slab_cache_t* slab_caches = NULL;
+static spinlock_t slab_lock = 0;
+
+/* Predefined caches for common sizes */
+static slab_cache_t* kmem_cache_8;
+static slab_cache_t* kmem_cache_16;
+static slab_cache_t* kmem_cache_32;
+static slab_cache_t* kmem_cache_64;
+static slab_cache_t* kmem_cache_128;
+static slab_cache_t* kmem_cache_256;
+static slab_cache_t* kmem_cache_512;
+static slab_cache_t* kmem_cache_1024;
+static slab_cache_t* kmem_cache_2048;
+static slab_cache_t* kmem_cache_4096;
+
+static void slab_poison_object(slab_cache_t* cache, void* obj, uint8_t poison_byte) {
+    if (!(cache->flags & SLAB_POISON)) return;
+    
+    memset(obj, poison_byte, cache->object_size);
+    
+    if (cache->flags & SLAB_RED_ZONE) {
+        /* Add red zones before and after object */
+        uint8_t* redzone_start = (uint8_t*)obj - SLAB_REDZONE_SIZE;
+        uint8_t* redzone_end = (uint8_t*)obj + cache->object_size;
+        
+        memset(redzone_start, SLAB_REDZONE_BYTE, SLAB_REDZONE_SIZE);
+        memset(redzone_end, SLAB_REDZONE_BYTE, SLAB_REDZONE_SIZE);
+    }
+}
+
+static bool slab_check_poison(slab_cache_t* cache, void* obj, uint8_t expected_byte) {
+    if (!(cache->flags & SLAB_POISON)) return true;
+    
+    uint8_t* bytes = (uint8_t*)obj;
+    for (size_t i = 0; i < cache->object_size; i++) {
+        if (bytes[i] != expected_byte) {
+            kprintf("SLAB CORRUPTION: Cache %s, object %p, offset %zu: expected 0x%02x, got 0x%02x\n",
+                    cache->name, obj, i, expected_byte, bytes[i]);
+            if (cache->flags & SLAB_PANIC) {
+                panic("Slab corruption detected");
+            }
+            return false;
+        }
+    }
+    
+    if (cache->flags & SLAB_RED_ZONE) {
+        /* Check red zones */
+        uint8_t* redzone_start = (uint8_t*)obj - SLAB_REDZONE_SIZE;
+        uint8_t* redzone_end = (uint8_t*)obj + cache->object_size;
+        
+        for (int i = 0; i < SLAB_REDZONE_SIZE; i++) {
+            if (redzone_start[i] != SLAB_REDZONE_BYTE || redzone_end[i] != SLAB_REDZONE_BYTE) {
+                kprintf("SLAB REDZONE CORRUPTION: Cache %s, object %p\n", cache->name, obj);
+                if (cache->flags & SLAB_PANIC) {
+                    panic("Slab redzone corruption");
+                }
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+slab_cache_t* slab_cache_create(const char* name, size_t size, size_t align, uint32_t flags,
+                               void (*ctor)(void*), void (*dtor)(void*)) {
+    slab_cache_t* cache = kmalloc(sizeof(slab_cache_t));
+    if (!cache) return NULL;
+    
+    memset(cache, 0, sizeof(*cache));
+    strncpy(cache->name, name, sizeof(cache->name) - 1);
+    cache->object_size = size;
+    cache->align = align ? align : sizeof(void*);
+    cache->flags = flags;
+    cache->ctor = ctor;
+    cache->dtor = dtor;
+    
+    /* Add red zone space if enabled */
+    if (flags & SLAB_RED_ZONE) {
+        cache->object_size += 2 * SLAB_REDZONE_SIZE;
+    }
+    
+    /* Align object size */
+    cache->object_size = (cache->object_size + cache->align - 1) & ~(cache->align - 1);
+    
+    spin_lock(&slab_lock);
+    cache->next = slab_caches;
+    slab_caches = cache;
+    spin_unlock(&slab_lock);
+    
+    return cache;
+}
+
+void* slab_cache_alloc(slab_cache_t* cache) {
+    if (!cache) return NULL;
+    
+    spin_lock(&cache->lock);
+    
+    slab_t* slab = cache->partial_slabs;
+    if (!slab) {
+        slab = cache->free_slabs;
+        if (slab) {
+            /* Move from free to partial */
+            cache->free_slabs = slab->next;
+            slab->next = cache->partial_slabs;
+            cache->partial_slabs = slab;
+        } else {
+            /* Allocate new slab */
+            slab = slab_create(cache);
+            if (!slab) {
+                spin_unlock(&cache->lock);
+                return NULL;
+            }
+        }
+    }
+    
+    /* Allocate object from slab */
+    void* obj = slab->freelist;
+    if (!obj) {
+        spin_unlock(&cache->lock);
+        return NULL;
+    }
+    
+    slab->freelist = *(void**)obj;
+    slab->free_count--;
+    
+    /* Check if slab is now full */
+    if (slab->free_count == 0) {
+        /* Move to full list */
+        cache->partial_slabs = slab->next;
+        slab->next = cache->full_slabs;
+        cache->full_slabs = slab;
+    }
+    
+    cache->alloc_count++;
+    cache->active_objects++;
+    
+    spin_unlock(&cache->lock);
+    
+    /* Check for use-after-free */
+    if (!slab_check_poison(cache, obj, SLAB_FREE_POISON)) {
+        kprintf("USE-AFTER-FREE detected in cache %s\n", cache->name);
+    }
+    
+    /* Initialize object */
+    if (cache->flags & SLAB_POISON) {
+        slab_poison_object(cache, obj, SLAB_POISON_BYTE);
+    }
+    
+    if (cache->ctor) {
+        cache->ctor(obj);
+    }
+    
+    return obj;
+}
+
+void slab_cache_free(slab_cache_t* cache, void* obj) {
+    if (!cache || !obj) return;
+    
+    /* Call destructor */
+    if (cache->dtor) {
+        cache->dtor(obj);
+    }
+    
+    /* Poison object on free */
+    if (cache->flags & SLAB_POISON) {
+        slab_poison_object(cache, obj, SLAB_FREE_POISON);
+    }
+    
+    spin_lock(&cache->lock);
+    
+    /* Find slab containing object */
+    slab_t* slab = find_slab_for_object(cache, obj);
+    if (!slab) {
+        kprintf("INVALID FREE: Object %p not found in cache %s\n", obj, cache->name);
+        if (cache->flags & SLAB_PANIC) {
+            panic("Invalid slab free");
+        }
+        spin_unlock(&cache->lock);
+        return;
+    }
+    
+    /* Add to freelist */
+    *(void**)obj = slab->freelist;
+    slab->freelist = obj;
+    slab->free_count++;
+    
+    cache->free_count++;
+    cache->active_objects--;
+    
+    /* Move slab between lists as needed */
+    if (slab->free_count == 1) {
+        /* Was full, now partial */
+        /* Remove from full list, add to partial */
+    } else if (slab->free_count == slab->object_count) {
+        /* Now empty - move to free list or destroy */
+    }
+    
+    spin_unlock(&cache->lock);
+}
+
+/* Initialize slab allocator */
+void slab_init(void) {
+    /* Create caches for common sizes */
+    kmem_cache_8 = slab_cache_create("kmem-8", 8, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_16 = slab_cache_create("kmem-16", 16, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_32 = slab_cache_create("kmem-32", 32, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_64 = slab_cache_create("kmem-64", 64, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_128 = slab_cache_create("kmem-128", 128, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_256 = slab_cache_create("kmem-256", 256, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_512 = slab_cache_create("kmem-512", 512, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_1024 = slab_cache_create("kmem-1024", 1024, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_2048 = slab_cache_create("kmem-2048", 2048, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+    kmem_cache_4096 = slab_cache_create("kmem-4096", 4096, 8, SLAB_POISON | SLAB_RED_ZONE, NULL, NULL);
+}
+
+/* General purpose allocator using slab caches */
+void* kmalloc(size_t size) {
+    slab_cache_t* cache;
+    
+    if (size <= 8) cache = kmem_cache_8;
+    else if (size <= 16) cache = kmem_cache_16;
+    else if (size <= 32) cache = kmem_cache_32;
+    else if (size <= 64) cache = kmem_cache_64;
+    else if (size <= 128) cache = kmem_cache_128;
+    else if (size <= 256) cache = kmem_cache_256;
+    else if (size <= 512) cache = kmem_cache_512;
+    else if (size <= 1024) cache = kmem_cache_1024;
+    else if (size <= 2048) cache = kmem_cache_2048;
+    else if (size <= 4096) cache = kmem_cache_4096;
+    else {
+        /* Large allocation - use page allocator */
+        size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+        paddr_t phys = pmm_alloc_pages(pages);
+        return phys ? (void*)PHYS_TO_VIRT(phys) : NULL;
+    }
+    
+    return slab_cache_alloc(cache);
+}
+
+void kfree(void* ptr) {
+    if (!ptr) return;
+    
+    /* Determine which cache this came from */
+    slab_cache_t* cache = find_cache_for_pointer(ptr);
+    if (cache) {
+        slab_cache_free(cache, ptr);
+    } else {
+        /* Large allocation - free pages */
+        /* Would need to track allocation size */
+        kprintf("WARNING: kfree of large allocation not fully implemented\n");
+    }
+}
+
+/* ============================================================================
+ * MEMORY PROTECTION AND W^X ENFORCEMENT
+ * ============================================================================ */
+
+#define WX_ENFORCE_STRICT   0x1
+#define WX_ENFORCE_WARN     0x2
+
+static uint32_t wx_enforcement_mode = WX_ENFORCE_STRICT;
+static uint64_t wx_violations = 0;
+
+status_t enforce_wx_protection(void) {
+    /* Scan all process memory mappings */
+    process_t* proc = process_current();
+    if (!proc) return STATUS_ERROR;
+    
+    vma_t* vma = proc->mm->vma_list;
+    while (vma) {
+        /* Check for W^X violations */
+        if ((vma->prot & PROT_WRITE) && (vma->prot & PROT_EXEC)) {
+            wx_violations++;
+            
+            if (wx_enforcement_mode & WX_ENFORCE_STRICT) {
+                kprintf("W^X VIOLATION: VMA %p-%p has both WRITE and EXEC\n",
+                        (void*)vma->start, (void*)vma->end);
+                send_signal(proc, SIGSEGV);
+                return STATUS_ERROR;
+            } else if (wx_enforcement_mode & WX_ENFORCE_WARN) {
+                kprintf("W^X WARNING: VMA %p-%p has both WRITE and EXEC\n",
+                        (void*)vma->start, (void*)vma->end);
+            }
+        }
+        
+        vma = vma->next;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Initialize memory management */
+status_t memory_init(void) {
+    /* Initialize slab allocator */
+    slab_init();
+    
+    /* Initialize page cache */
+    memset(page_cache, 0, sizeof(page_cache));
+    memset(page_cache_hash, 0, sizeof(page_cache_hash));
+    
+    /* Set up page fault handler */
+    register_interrupt_handler(14, (interrupt_handler_t)page_fault_handler);
+    
+    kprintf("Memory management initialized\n");
+    kprintf("- Demand paging: enabled\n");
+    kprintf("- Page cache: %d entries\n", PAGE_CACHE_SIZE);
+    kprintf("- Slab allocator: enabled with poisoning\n");
+    kprintf("- W^X enforcement: %s\n", 
+            wx_enforcement_mode & WX_ENFORCE_STRICT ? "strict" : "warnings");
+    
+    return STATUS_OK;
+}
+
+/* Memory statistics */
+void memory_print_stats(void) {
+    kprintf("MEMORY STATISTICS\n");
+    kprintf("=================\n");
+    kprintf("Page faults: %llu\n", page_fault_count);
+    kprintf("  COW faults: %llu\n", cow_faults);
+    kprintf("  Demand zero: %llu\n", demand_zero_faults);
+    kprintf("  File faults: %llu\n", file_faults);
+    kprintf("Page cache used: %u/%u entries\n", page_cache_used, PAGE_CACHE_SIZE);
+    kprintf("W^X violations: %llu\n", wx_violations);
+    
+    /* Slab statistics */
+    spin_lock(&slab_lock);
+    slab_cache_t* cache = slab_caches;
+    while (cache) {
+        kprintf("Slab cache %s: %llu allocs, %llu frees, %llu active\n",
+                cache->name, cache->alloc_count, cache->free_count, cache->active_objects);
+        cache = cache->next;
+    }
+    spin_unlock(&slab_lock);
+}

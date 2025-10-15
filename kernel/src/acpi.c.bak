@@ -1,0 +1,55 @@
+#include "acpi.h"
+#include "kernel.h"
+
+/* HAL memory mapping to access ACPI physical tables */
+extern void* hal_early_map_physical(phys_addr_t pa, size_t size);
+
+static const acpi_rsdp_t* g_rsdp = NULL;
+static const acpi_madt_t* g_madt = NULL;
+static const acpi_fadt_t* g_fadt = NULL;
+
+static u8 acpi_checksum(const void* p, size_t len) {
+    const u8* b = (const u8*)p;
+    u8 sum = 0;
+    for (size_t i=0;i<len;i++) sum = (u8)(sum + b[i]);
+    return sum;
+}
+
+static const acpi_sdt_hdr_t* acpi_find_sdt(const acpi_sdt_hdr_t* xsdt, const char sig[4]) {
+    if (!xsdt) return NULL;
+    u32 entries = (xsdt->length - sizeof(acpi_sdt_hdr_t)) / 8;
+    const u64* ptrs = (const u64*)((const u8*)xsdt + sizeof(acpi_sdt_hdr_t));
+    for (u32 i=0;i<entries;i++) {
+        const acpi_sdt_hdr_t* h = (const acpi_sdt_hdr_t*)hal_early_map_physical((phys_addr_t)ptrs[i], sizeof(acpi_sdt_hdr_t));
+        if (h && h->signature[0]==sig[0] && h->signature[1]==sig[1] && h->signature[2]==sig[2] && h->signature[3]==sig[3]) {
+            size_t len = h->length;
+            const acpi_sdt_hdr_t* full = (const acpi_sdt_hdr_t*)hal_early_map_physical((phys_addr_t)ptrs[i], len);
+            if (acpi_checksum(full, len)==0) return full;
+        }
+    }
+    return NULL;
+}
+
+void acpi_init(const boot_info_t* bi) {
+    if (!bi || !bi->rsdp_phys) return;
+    g_rsdp = (const acpi_rsdp_t*)hal_early_map_physical(bi->rsdp_phys, sizeof(acpi_rsdp_t));
+    if (!g_rsdp) return;
+    if (acpi_checksum(g_rsdp, (g_rsdp->revision<2)?20:36) != 0) return;
+
+    const acpi_sdt_hdr_t* xsdt = NULL;
+    if (g_rsdp->revision >= 2 && g_rsdp->xsdt_address) {
+        xsdt = (const acpi_sdt_hdr_t*)hal_early_map_physical((phys_addr_t)g_rsdp->xsdt_address, sizeof(acpi_sdt_hdr_t));
+        if (xsdt) xsdt = (const acpi_sdt_hdr_t*)hal_early_map_physical((phys_addr_t)g_rsdp->xsdt_address, xsdt->length);
+    } else if (g_rsdp->rsdt_address) {
+        xsdt = (const acpi_sdt_hdr_t*)hal_early_map_physical((phys_addr_t)g_rsdp->rsdt_address, sizeof(acpi_sdt_hdr_t));
+        if (xsdt) xsdt = (const acpi_sdt_hdr_t*)hal_early_map_physical((phys_addr_t)g_rsdp->rsdt_address, xsdt->length);
+    }
+
+    if (!xsdt) return;
+
+    g_madt = (const acpi_madt_t*)acpi_find_sdt(xsdt, "APIC");
+    g_fadt = (const acpi_fadt_t*)acpi_find_sdt(xsdt, "FACP");
+}
+
+const acpi_madt_t* acpi_get_madt(void) { return g_madt; }
+const acpi_fadt_t* acpi_get_fadt(void) { return g_fadt; }

@@ -1,0 +1,577 @@
+/*
+ * smp_scheduler.c - LimitlessOS SMP-aware Scheduler
+ * 
+ * Advanced multi-processor scheduler with per-CPU runqueues,
+ * load balancing, and fairness guarantees (CFS-inspired).
+ */
+
+#include "kernel.h"
+#include "scheduler.h"
+#include "process.h"
+#include "interrupt.h"
+#include "vmm.h"
+#include "percpu.h"
+#include "signal.h"
+
+#define SMP_MAX_CPUS            64
+#define SCHED_LATENCY_NS        (6 * 1000 * 1000)    /* 6ms */
+#define MIN_GRANULARITY_NS      (750 * 1000)         /* 0.75ms */
+#define WAKEUP_GRANULARITY_NS   (1 * 1000 * 1000)    /* 1ms */
+#define MIGRATION_COST_NS       (500 * 1000)         /* 0.5ms */
+#define LOAD_BALANCE_INTERVAL   (10 * 1000 * 1000)   /* 10ms */
+
+/* Priority to weight mapping (same as Linux CFS) */
+static const u32 prio_to_weight[40] = {
+    /* -20 */ 88761, 71755, 56483, 46273, 36291,
+    /* -15 */ 29154, 23254, 18705, 14949, 11916,
+    /* -10 */ 9548,  7620,  6100,  4904,  3906,
+    /*  -5 */ 3121,  2501,  1991,  1586,  1277,
+    /*   0 */ 1024,  820,   655,   526,   423,
+    /*   5 */ 335,   272,   215,   172,   137,
+    /*  10 */ 110,   87,    70,    56,    45,
+    /*  15 */ 36,    29,    23,    18,    15,
+};
+
+/* Per-CPU runqueue */
+typedef struct smp_runqueue {
+    spinlock_t lock;
+    
+    /* Red-black tree for runnable tasks ordered by vruntime */
+    struct rb_root tasks_timeline;
+    struct rb_node* rb_leftmost;    /* Leftmost node (earliest vruntime) */
+    
+    /* Currently running task */
+    thread_t* curr;
+    thread_t* next;
+    thread_t* last;
+    thread_t* skip;
+    
+    /* Load tracking */
+    u64 load_weight;                /* Total weight of runnable tasks */
+    u32 nr_running;                 /* Number of runnable tasks */
+    u64 min_vruntime;               /* Minimum vruntime */
+    
+    /* Load balancing */
+    u64 next_balance;               /* Next load balance time */
+    u32 idle_stamp;                 /* When CPU went idle */
+    
+    /* Per-CPU scheduler statistics */
+    u64 clock;                      /* Per-CPU scheduler clock */
+    u64 clock_task;                 /* Clock for task accounting */
+    u64 exec_clock;                 /* Execution clock */
+    
+    /* Migration */
+    struct list_head migration_queue;
+    thread_t* migration_thread;
+    
+} smp_runqueue_t;
+
+/* SMP scheduler state */
+typedef struct smp_scheduler {
+    bool initialized;
+    bool smp_enabled;
+    u32 cpu_count;
+    u64 sched_clock_running;
+    
+    /* Per-CPU runqueues */
+    smp_runqueue_t runqueues[SMP_MAX_CPUS];
+    
+    /* Load balancing */
+    u64 last_load_update;
+    bool load_balance_active;
+    
+} smp_scheduler_t;
+
+static smp_scheduler_t g_smp_sched = {0};
+
+/* Red-black tree operations for timeline */
+static void rb_insert_timeline(smp_runqueue_t* rq, thread_t* thread);
+static void rb_erase_timeline(smp_runqueue_t* rq, thread_t* thread);
+static thread_t* rb_first_timeline(smp_runqueue_t* rq);
+
+/* Load balancing */
+static void load_balance(u32 cpu);
+static u32 find_busiest_cpu(u32 this_cpu);
+static void migrate_task(thread_t* thread, u32 target_cpu);
+
+/* Scheduler clock */
+static u64 sched_clock(void);
+static void update_rq_clock(smp_runqueue_t* rq);
+
+/* Initialize SMP scheduler */
+int smp_scheduler_init(void) {
+    if (g_smp_sched.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing SMP-aware scheduler\n");
+    
+    /* Get CPU count from HAL */
+    g_smp_sched.cpu_count = percpu_cpu_count();
+    g_smp_sched.smp_enabled = (g_smp_sched.cpu_count > 1);
+    
+    printf("Detected %u CPUs, SMP %s\n", 
+           g_smp_sched.cpu_count, g_smp_sched.smp_enabled ? "enabled" : "disabled");
+    
+    /* Initialize per-CPU runqueues */
+    for (u32 cpu = 0; cpu < g_smp_sched.cpu_count; cpu++) {
+        smp_runqueue_t* rq = &g_smp_sched.runqueues[cpu];
+        memset(rq, 0, sizeof(smp_runqueue_t));
+        
+        spinlock_init(&rq->lock);
+        rq->tasks_timeline = RB_ROOT;
+        rq->rb_leftmost = NULL;
+        rq->min_vruntime = 0;
+        rq->clock = sched_clock();
+        rq->clock_task = rq->clock;
+        
+        /* Initialize migration queue */
+        INIT_LIST_HEAD(&rq->migration_queue);
+    }
+    
+    g_smp_sched.initialized = true;
+    g_smp_sched.sched_clock_running = 1;
+    
+    printf("SMP scheduler initialized for %u CPUs\n", g_smp_sched.cpu_count);
+    return 0;
+}
+
+/* Get current CPU runqueue */
+static inline smp_runqueue_t* cpu_rq(u32 cpu) {
+    return &g_smp_sched.runqueues[cpu];
+}
+
+static inline smp_runqueue_t* this_rq(void) {
+    return cpu_rq(percpu_current_id());
+}
+
+/* Calculate task weight from nice value */
+static u32 calc_task_weight(thread_t* thread) {
+    int nice = thread->priority - THREAD_PRIO_NORMAL;
+    if (nice < -20) nice = -20;
+    if (nice > 19) nice = 19;
+    return prio_to_weight[nice + 20];
+}
+
+/* Update task's vruntime */
+static void update_curr(smp_runqueue_t* rq) {
+    thread_t* curr = rq->curr;
+    if (!curr) return;
+    
+    u64 now = sched_clock();
+    u64 delta_exec = now - curr->exec_start;
+    
+    if (unlikely(!delta_exec)) return;
+    
+    curr->exec_start = now;
+    curr->sum_exec_runtime += delta_exec;
+    
+    /* Update vruntime based on task weight (fairness) */
+    u32 weight = calc_task_weight(curr);
+    u64 delta_fair = delta_exec * 1024 / weight;  /* Scale by weight */
+    
+    curr->vruntime += delta_fair;
+    
+    /* Update runqueue min_vruntime */
+    if (rq->rb_leftmost) {
+        thread_t* leftmost = rb_entry(rq->rb_leftmost, thread_t, run_node);
+        rq->min_vruntime = max(rq->min_vruntime, leftmost->vruntime);
+    } else {
+        rq->min_vruntime = curr->vruntime;
+    }
+    
+    /* Check if preemption is needed */
+    if (rq->rb_leftmost) {
+        thread_t* leftmost = rb_entry(rq->rb_leftmost, thread_t, run_node);
+        s64 delta = curr->vruntime - leftmost->vruntime;
+        
+        if (delta > WAKEUP_GRANULARITY_NS) {
+            curr->need_resched = 1;
+        }
+    }
+}
+
+/* Add task to red-black tree timeline */
+static void rb_insert_timeline(smp_runqueue_t* rq, thread_t* thread) {
+    struct rb_node** link = &rq->tasks_timeline.rb_node;
+    struct rb_node* parent = NULL;
+    thread_t* entry;
+    bool leftmost = true;
+    
+    /* Find insertion point */
+    while (*link) {
+        parent = *link;
+        entry = rb_entry(parent, thread_t, run_node);
+        
+        if (thread->vruntime < entry->vruntime) {
+            link = &parent->rb_left;
+        } else {
+            link = &parent->rb_right;
+            leftmost = false;
+        }
+    }
+    
+    /* Insert and rebalance tree */
+    rb_link_node(&thread->run_node, parent, link);
+    rb_insert_color(&thread->run_node, &rq->tasks_timeline);
+    
+    /* Update leftmost */
+    if (leftmost) {
+        rq->rb_leftmost = &thread->run_node;
+    }
+    
+    /* Update runqueue stats */
+    rq->nr_running++;
+    rq->load_weight += calc_task_weight(thread);
+    thread->on_rq = 1;
+}
+
+/* Remove task from red-black tree */
+static void rb_erase_timeline(smp_runqueue_t* rq, thread_t* thread) {
+    if (!thread->on_rq) return;
+    
+    /* Update leftmost if needed */
+    if (rq->rb_leftmost == &thread->run_node) {
+        rq->rb_leftmost = rb_next(&thread->run_node);
+    }
+    
+    rb_erase(&thread->run_node, &rq->tasks_timeline);
+    RB_CLEAR_NODE(&thread->run_node);
+    
+    /* Update runqueue stats */
+    rq->nr_running--;
+    rq->load_weight -= calc_task_weight(thread);
+    thread->on_rq = 0;
+}
+
+/* Get first (leftmost) task from timeline */
+static thread_t* rb_first_timeline(smp_runqueue_t* rq) {
+    if (!rq->rb_leftmost) return NULL;
+    return rb_entry(rq->rb_leftmost, thread_t, run_node);
+}
+
+/* Enqueue task on runqueue */
+void smp_enqueue_task(thread_t* thread, u32 cpu) {
+    smp_runqueue_t* rq = cpu_rq(cpu);
+    
+    spin_lock(&rq->lock);
+    
+    /* Set vruntime for new tasks */
+    if (!thread->on_rq) {
+        u64 vruntime = rq->min_vruntime;
+        
+        /* Place new task slightly behind to avoid starvation */
+        if (thread->state == THREAD_NEW) {
+            vruntime += WAKEUP_GRANULARITY_NS;
+        }
+        
+        thread->vruntime = max(thread->vruntime, vruntime);
+    }
+    
+    rb_insert_timeline(rq, thread);
+    thread->cpu = cpu;
+    
+    spin_unlock(&rq->lock);
+}
+
+/* Dequeue task from runqueue */
+void smp_dequeue_task(thread_t* thread) {
+    u32 cpu = thread->cpu;
+    smp_runqueue_t* rq = cpu_rq(cpu);
+    
+    spin_lock(&rq->lock);
+    rb_erase_timeline(rq, thread);
+    spin_unlock(&rq->lock);
+}
+
+/* Pick next task to run */
+static thread_t* pick_next_task(smp_runqueue_t* rq) {
+    thread_t* next = rb_first_timeline(rq);
+    
+    if (next) {
+        next->exec_start = sched_clock();
+    }
+    
+    return next;
+}
+
+/* Main scheduler - pick next task and switch */
+void smp_schedule(void) {
+    u32 cpu = percpu_current_id();
+    smp_runqueue_t* rq = cpu_rq(cpu);
+    thread_t* prev = rq->curr;
+    thread_t* next;
+    
+    spin_lock(&rq->lock);
+    
+    update_rq_clock(rq);
+    
+    /* Update current task */
+    if (prev) {
+        update_curr(rq);
+        
+        /* Requeue if still runnable */
+        if (prev->state == THREAD_RUNNING) {
+            prev->state = THREAD_RUNNABLE;
+            /* Task stays on runqueue */
+        } else if (prev->state != THREAD_RUNNABLE) {
+            /* Remove from runqueue if not runnable */
+            rb_erase_timeline(rq, prev);
+        }
+    }
+    
+    /* Pick next task */
+    next = pick_next_task(rq);
+    
+    if (next) {
+        next->state = THREAD_RUNNING;
+        rq->curr = next;
+    } else {
+        /* No runnable tasks - run idle */
+        rq->curr = NULL;
+    }
+    
+    spin_unlock(&rq->lock);
+    
+    /* Context switch if needed */
+    if (next != prev) {
+        if (next) {
+            /* Switch to next task */
+            /* TODO: Implement architecture-specific context switch */
+            g_percpu_sched[cpu].context_switch++;
+        } else {
+            /* Switch to idle */
+            /* TODO: Implement idle task switch */
+        }
+    }
+    
+    /* Load balancing */
+    u64 now = sched_clock();
+    if (g_smp_sched.smp_enabled && now >= rq->next_balance) {
+        rq->next_balance = now + LOAD_BALANCE_INTERVAL;
+        load_balance(cpu);
+    }
+}
+
+/* Scheduler tick - called from timer interrupt */
+void smp_scheduler_tick(void) {
+    u32 cpu = percpu_current_id();
+    smp_runqueue_t* rq = cpu_rq(cpu);
+    
+    spin_lock(&rq->lock);
+    
+    update_rq_clock(rq);
+    update_curr(rq);
+    
+    g_percpu_sched[cpu].ticks++;
+    
+    spin_unlock(&rq->lock);
+    
+    /* Check if preemption needed */
+    if (rq->curr && rq->curr->need_resched) {
+        rq->curr->need_resched = 0;
+        /* Trigger reschedule */
+        smp_schedule();
+    }
+}
+
+/* Wake up sleeping task */
+void smp_wakeup_task(thread_t* thread) {
+    if (thread->state != THREAD_SLEEPING && thread->state != THREAD_BLOCKED) {
+        return;
+    }
+    
+    thread->state = THREAD_RUNNABLE;
+    
+    /* Find best CPU for this task */
+    u32 target_cpu = thread->cpu;  /* Try same CPU first */
+    
+    if (g_smp_sched.smp_enabled) {
+        /* Simple load balancing - find least loaded CPU */
+        u32 min_load = g_smp_sched.runqueues[target_cpu].nr_running;
+        
+        for (u32 cpu = 0; cpu < g_smp_sched.cpu_count; cpu++) {
+            u32 load = g_smp_sched.runqueues[cpu].nr_running;
+            if (load < min_load) {
+                min_load = load;
+                target_cpu = cpu;
+            }
+        }
+    }
+    
+    smp_enqueue_task(thread, target_cpu);
+}
+
+/* Load balancing */
+static void load_balance(u32 this_cpu) {
+    smp_runqueue_t* this_rq = cpu_rq(this_cpu);
+    u32 busiest_cpu = find_busiest_cpu(this_cpu);
+    
+    if (busiest_cpu >= g_smp_sched.cpu_count) {
+        return;  /* No imbalance found */
+    }
+    
+    smp_runqueue_t* busiest_rq = cpu_rq(busiest_cpu);
+    
+    /* Check if migration is worth it */
+    if (busiest_rq->nr_running <= this_rq->nr_running + 1) {
+        return;
+    }
+    
+    /* Try to migrate one task */
+    spin_lock(&busiest_rq->lock);
+    
+    thread_t* task = rb_first_timeline(busiest_rq);
+    if (task && task != busiest_rq->curr) {
+        rb_erase_timeline(busiest_rq, task);
+        spin_unlock(&busiest_rq->lock);
+        
+        /* Migrate to this CPU */
+        migrate_task(task, this_cpu);
+    } else {
+        spin_unlock(&busiest_rq->lock);
+    }
+}
+
+/* Find the busiest CPU */
+static u32 find_busiest_cpu(u32 this_cpu) {
+    u32 busiest_cpu = g_smp_sched.cpu_count;  /* Invalid CPU */
+    u32 max_load = 0;
+    u32 this_load = g_smp_sched.runqueues[this_cpu].nr_running;
+    
+    for (u32 cpu = 0; cpu < g_smp_sched.cpu_count; cpu++) {
+        if (cpu == this_cpu) continue;
+        
+        u32 load = g_smp_sched.runqueues[cpu].nr_running;
+        
+        /* Only consider if significantly more loaded */
+        if (load > max_load && load > this_load + 1) {
+            max_load = load;
+            busiest_cpu = cpu;
+        }
+    }
+    
+    return busiest_cpu;
+}
+
+/* Migrate task to target CPU */
+static void migrate_task(thread_t* task, u32 target_cpu) {
+    task->cpu = target_cpu;
+    smp_enqueue_task(task, target_cpu);
+}
+
+/* Scheduler clock */
+static u64 sched_clock(void) {
+    /* TODO: Use high-resolution timer */
+    return timer_get_ticks() * 1000000;  /* Convert to nanoseconds */
+}
+
+/* Update runqueue clock */
+static void update_rq_clock(smp_runqueue_t* rq) {
+    rq->clock = sched_clock();
+    rq->clock_task = rq->clock;
+}
+
+/* Create kernel thread on specific CPU */
+int smp_create_kthread(thread_t** out_thread, void (*entry)(void*), void* arg,
+                      void* stack_base, size_t stack_size, u32 target_cpu) {
+    
+    if (!out_thread || !entry || target_cpu >= g_smp_sched.cpu_count) {
+        return -1;
+    }
+    
+    /* Allocate thread structure */
+    thread_t* thread = (thread_t*)vmm_kmalloc(sizeof(thread_t), 64);
+    if (!thread) return -1;
+    
+    memset(thread, 0, sizeof(thread_t));
+    
+    /* Initialize thread */
+    thread->tid = __sync_fetch_and_add(&g_next_tid, 1);
+    thread->pid = 0;  /* Kernel thread */
+    thread->cpu = target_cpu;
+    thread->priority = THREAD_PRIO_NORMAL;
+    thread->state = THREAD_NEW;
+    
+    /* Initialize scheduling fields */
+    thread->vruntime = 0;
+    thread->exec_start = 0;
+    thread->sum_exec_runtime = 0;
+    thread->need_resched = 0;
+    thread->on_rq = 0;
+    
+    RB_CLEAR_NODE(&thread->run_node);
+    
+    /* TODO: Set up architecture-specific context */
+    thread->kstack_base = stack_base;
+    thread->kstack_size = stack_size;
+    thread->entry_arg = arg;
+    
+    *out_thread = thread;
+    
+    /* Enqueue on target CPU */
+    thread->state = THREAD_RUNNABLE;
+    smp_enqueue_task(thread, target_cpu);
+    
+    return 0;
+}
+
+/* Get scheduler statistics */
+void smp_get_scheduler_stats(u32* total_threads, u32* total_load, u64* total_switches) {
+    u32 threads = 0;
+    u32 load = 0;
+    u64 switches = 0;
+    
+    for (u32 cpu = 0; cpu < g_smp_sched.cpu_count; cpu++) {
+        threads += g_smp_sched.runqueues[cpu].nr_running;
+        load += g_smp_sched.runqueues[cpu].load_weight;
+        switches += g_percpu_sched[cpu].context_switch;
+    }
+    
+    if (total_threads) *total_threads = threads;
+    if (total_load) *total_load = load;
+    if (total_switches) *total_switches = switches;
+}
+
+/* CPU affinity support */
+int smp_set_task_affinity(thread_t* thread, u32 cpu_mask) {
+    /* TODO: Implement CPU affinity */
+    (void)thread;
+    (void)cpu_mask;
+    return 0;
+}
+
+/* NUMA-aware scheduling */
+int smp_set_numa_policy(thread_t* thread, u32 numa_node) {
+    /* TODO: Implement NUMA-aware scheduling */
+    (void)thread;
+    (void)numa_node;
+    return 0;
+}
+
+/* Real-time priority support */
+int smp_set_rt_priority(thread_t* thread, u32 rt_priority) {
+    /* TODO: Implement real-time scheduling */
+    (void)thread;
+    (void)rt_priority;
+    return 0;
+}
+
+/* Debugging and introspection */
+void smp_dump_runqueue_stats(void) {
+    printf("SMP Scheduler Statistics:\n");
+    printf("CPUs: %u (SMP %s)\n", g_smp_sched.cpu_count, 
+           g_smp_sched.smp_enabled ? "enabled" : "disabled");
+    
+    for (u32 cpu = 0; cpu < g_smp_sched.cpu_count; cpu++) {
+        smp_runqueue_t* rq = &g_smp_sched.runqueues[cpu];
+        
+        printf("CPU %u: %u tasks, load %lu, min_vruntime %lu\n",
+               cpu, rq->nr_running, rq->load_weight, rq->min_vruntime);
+        
+        if (rq->curr) {
+            printf("  Current: TID %u (vruntime %lu)\n",
+                   rq->curr->tid, rq->curr->vruntime);
+        }
+    }
+}

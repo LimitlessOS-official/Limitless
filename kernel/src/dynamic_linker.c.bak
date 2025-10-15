@@ -1,0 +1,435 @@
+/**
+ * Enhanced Dynamic Linker for LimitlessOS
+ * Implements PLT/GOT lazy binding, symbol resolution, and shared library management
+ */
+
+#include "kernel.h"
+#include "vmm.h"
+#include "elf_loader.h"
+#include "log.h"
+
+/* Dynamic linker constants */
+#define MAX_SHARED_LIBS     64
+#define MAX_SYMBOLS         4096
+#define PLT_ENTRY_SIZE      16
+#define GOT_ENTRY_SIZE      8
+
+/* PLT/GOT structures */
+typedef struct plt_entry {
+    uint8_t  jmp_instruction[6];   /* jmpq *GOT_ENTRY(%rip) */
+    uint8_t  push_instruction[5];  /* pushq $index */
+    uint8_t  jmp_plt0[5];         /* jmpq PLT[0] */
+} __attribute__((packed)) plt_entry_t;
+
+typedef struct got_entry {
+    uint64_t address;             /* Target function address or PLT resolver */
+} got_entry_t;
+
+/* Symbol cache for fast lookup */
+typedef struct symbol_cache_entry {
+    uint32_t hash;
+    const char* name;
+    uint64_t address;
+    uint16_t lib_index;
+    uint8_t  type;
+    uint8_t  flags;
+} symbol_cache_entry_t;
+
+/* Shared library descriptor */
+typedef struct shared_library {
+    char name[256];
+    uint64_t base_address;
+    uint64_t size;
+    const Elf64_Ehdr* elf_header;
+    const Elf64_Sym* dynsym;
+    const char* dynstr;
+    size_t dynsym_count;
+    size_t dynstr_size;
+    got_entry_t* got_table;
+    plt_entry_t* plt_table;
+    uint32_t got_count;
+    uint32_t plt_count;
+    uint8_t loaded;
+    uint8_t initialized;
+} shared_library_t;
+
+/* Dynamic linker state */
+typedef struct dynamic_linker_state {
+    shared_library_t libraries[MAX_SHARED_LIBS];
+    symbol_cache_entry_t symbol_cache[MAX_SYMBOLS];
+    uint32_t lib_count;
+    uint32_t symbol_count;
+    uint64_t plt_resolver_addr;
+    vmm_aspace_t* current_aspace;
+} dynamic_linker_state_t;
+
+static dynamic_linker_state_t g_dynlink_state = {0};
+
+/* Hash function for symbol names (djb2) */
+static uint32_t symbol_hash(const char* str) {
+    uint32_t hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash;
+}
+
+/* PLT resolver - called when lazy binding resolves a symbol */
+uint64_t plt_resolver(uint64_t lib_index, uint64_t symbol_index) {
+    if (lib_index >= g_dynlink_state.lib_count) {
+        KLOG_ERROR("dynlink", "Invalid library index %llu in PLT resolver", lib_index);
+        return 0;
+    }
+    
+    shared_library_t* lib = &g_dynlink_state.libraries[lib_index];
+    if (symbol_index >= lib->dynsym_count) {
+        KLOG_ERROR("dynlink", "Invalid symbol index %llu in PLT resolver", symbol_index);
+        return 0;
+    }
+    
+    const Elf64_Sym* symbol = &lib->dynsym[symbol_index];
+    const char* symbol_name = lib->dynstr + symbol->st_name;
+    
+    KLOG_DEBUG("dynlink", "Resolving symbol %s", symbol_name);
+    
+    /* Search for symbol in all loaded libraries */
+    uint64_t resolved_addr = dynlink_resolve_symbol(symbol_name);
+    if (resolved_addr == 0) {
+        KLOG_ERROR("dynlink", "Failed to resolve symbol %s", symbol_name);
+        return 0;
+    }
+    
+    /* Update GOT entry for lazy binding */
+    if (symbol_index < lib->got_count) {
+        lib->got_table[symbol_index].address = resolved_addr;
+    }
+    
+    return resolved_addr;
+}
+
+/* Initialize dynamic linker */
+int dynlink_init(vmm_aspace_t* aspace) {
+    if (!aspace) return K_EINVAL;
+    
+    k_memset(&g_dynlink_state, 0, sizeof(g_dynlink_state));
+    g_dynlink_state.current_aspace = aspace;
+    
+    /* Set up PLT resolver */
+    g_dynlink_state.plt_resolver_addr = (uint64_t)plt_resolver;
+    
+    KLOG_INFO("dynlink", "Dynamic linker initialized");
+    return 0;
+}
+
+/* Load shared library */
+int dynlink_load_library(const char* path, uint64_t* base_addr) {
+    if (!path || !base_addr) return K_EINVAL;
+    
+    if (g_dynlink_state.lib_count >= MAX_SHARED_LIBS) {
+        KLOG_ERROR("dynlink", "Maximum shared libraries exceeded");
+        return K_ENOMEM;
+    }
+    
+    /* Check if already loaded */
+    for (uint32_t i = 0; i < g_dynlink_state.lib_count; i++) {
+        if (k_strcmp(g_dynlink_state.libraries[i].name, path) == 0) {
+            *base_addr = g_dynlink_state.libraries[i].base_address;
+            return 0;  /* Already loaded */
+        }
+    }
+    
+    shared_library_t* lib = &g_dynlink_state.libraries[g_dynlink_state.lib_count];
+    k_memset(lib, 0, sizeof(shared_library_t));
+    k_strncpy(lib->name, path, sizeof(lib->name) - 1);
+    
+    /* Load ELF using existing loader */
+    elf_load_result_t load_result;
+    int ret = elf_load_into_aspace(g_dynlink_state.current_aspace, path, 0, &load_result);
+    if (ret != ELF_OK) {
+        KLOG_ERROR("dynlink", "Failed to load library %s: %d", path, ret);
+        return ret;
+    }
+    
+    lib->base_address = load_result.image_base;
+    lib->size = load_result.image_size;
+    lib->loaded = 1;
+    
+    *base_addr = lib->base_address;
+    g_dynlink_state.lib_count++;
+    
+    KLOG_INFO("dynlink", "Loaded library %s at 0x%llx", path, lib->base_address);
+    return 0;
+}
+
+/* Create PLT and GOT tables for a library */
+int dynlink_create_plt_got(shared_library_t* lib, const Elf64_Rela* relocations, size_t reloc_count) {
+    if (!lib || !relocations) return K_EINVAL;
+    
+    /* Count PLT entries needed */
+    uint32_t plt_count = 0;
+    for (size_t i = 0; i < reloc_count; i++) {
+        if (ELF64_R_TYPE(relocations[i].r_info) == R_X86_64_JUMP_SLOT) {
+            plt_count++;
+        }
+    }
+    
+    if (plt_count == 0) {
+        return 0;  /* No PLT needed */
+    }
+    
+    /* Allocate PLT and GOT tables */
+    size_t plt_size = plt_count * sizeof(plt_entry_t);
+    size_t got_size = plt_count * sizeof(got_entry_t);
+    
+    lib->plt_table = (plt_entry_t*)vmm_kmalloc(plt_size, PAGE_SIZE);
+    lib->got_table = (got_entry_t*)vmm_kmalloc(got_size, PAGE_SIZE);
+    
+    if (!lib->plt_table || !lib->got_table) {
+        if (lib->plt_table) vmm_kfree(lib->plt_table, plt_size);
+        if (lib->got_table) vmm_kfree(lib->got_table, got_size);
+        return K_ENOMEM;
+    }
+    
+    lib->plt_count = plt_count;
+    lib->got_count = plt_count;
+    
+    /* Initialize PLT entries */
+    uint32_t plt_index = 0;
+    uint32_t lib_index = lib - g_dynlink_state.libraries;
+    
+    for (size_t i = 0; i < reloc_count; i++) {
+        if (ELF64_R_TYPE(relocations[i].r_info) != R_X86_64_JUMP_SLOT) {
+            continue;
+        }
+        
+        uint32_t symbol_index = ELF64_R_SYM(relocations[i].r_info);
+        plt_entry_t* plt_entry = &lib->plt_table[plt_index];
+        got_entry_t* got_entry = &lib->got_table[plt_index];
+        
+        /* Set GOT entry to point to PLT resolver initially */
+        got_entry->address = g_dynlink_state.plt_resolver_addr;
+        
+        /* Create PLT entry */
+        /* jmpq *GOT_ENTRY(%rip) */
+        plt_entry->jmp_instruction[0] = 0xFF;  /* jmpq opcode */
+        plt_entry->jmp_instruction[1] = 0x25;  /* ModR/M byte for RIP-relative */
+        *(uint32_t*)&plt_entry->jmp_instruction[2] = 
+            (uint32_t)((uint64_t)got_entry - (uint64_t)plt_entry - 6);
+        
+        /* pushq $symbol_index */
+        plt_entry->push_instruction[0] = 0x68;  /* pushq immediate */
+        *(uint32_t*)&plt_entry->push_instruction[1] = symbol_index;
+        
+        /* jmpq PLT[0] (resolver) */
+        plt_entry->jmp_plt0[0] = 0xE9;  /* jmpq relative */
+        *(uint32_t*)&plt_entry->jmp_plt0[1] = 
+            (uint32_t)(g_dynlink_state.plt_resolver_addr - 
+                      (uint64_t)&plt_entry->jmp_plt0[5]);
+        
+        plt_index++;
+    }
+    
+    KLOG_INFO("dynlink", "Created PLT (%u entries) and GOT for %s", plt_count, lib->name);
+    return 0;
+}
+
+/* Resolve symbol by name */
+uint64_t dynlink_resolve_symbol(const char* name) {
+    if (!name) return 0;
+    
+    uint32_t hash = symbol_hash(name);
+    
+    /* Check symbol cache first */
+    for (uint32_t i = 0; i < g_dynlink_state.symbol_count; i++) {
+        symbol_cache_entry_t* entry = &g_dynlink_state.symbol_cache[i];
+        if (entry->hash == hash && k_strcmp(entry->name, name) == 0) {
+            return entry->address;
+        }
+    }
+    
+    /* Search all loaded libraries */
+    for (uint32_t lib_idx = 0; lib_idx < g_dynlink_state.lib_count; lib_idx++) {
+        shared_library_t* lib = &g_dynlink_state.libraries[lib_idx];
+        if (!lib->loaded || !lib->dynsym || !lib->dynstr) continue;
+        
+        /* Linear search through symbols (could be optimized with hash tables) */
+        for (size_t sym_idx = 0; sym_idx < lib->dynsym_count; sym_idx++) {
+            const Elf64_Sym* symbol = &lib->dynsym[sym_idx];
+            
+            if (symbol->st_name >= lib->dynstr_size) continue;
+            if (symbol->st_shndx == 0) continue;  /* Undefined symbol */
+            
+            const char* sym_name = lib->dynstr + symbol->st_name;
+            if (k_strcmp(sym_name, name) == 0) {
+                uint64_t address = lib->base_address + symbol->st_value;
+                
+                /* Add to cache */
+                if (g_dynlink_state.symbol_count < MAX_SYMBOLS) {
+                    symbol_cache_entry_t* cache_entry = 
+                        &g_dynlink_state.symbol_cache[g_dynlink_state.symbol_count++];
+                    cache_entry->hash = hash;
+                    cache_entry->name = sym_name;  /* Points to loaded library string */
+                    cache_entry->address = address;
+                    cache_entry->lib_index = lib_idx;
+                    cache_entry->type = ELF64_ST_TYPE(symbol->st_info);
+                    cache_entry->flags = 0;
+                }
+                
+                return address;
+            }
+        }
+    }
+    
+    return 0;  /* Symbol not found */
+}
+
+/* Apply relocations with PLT/GOT support */
+int dynlink_apply_relocations(shared_library_t* lib, const Elf64_Rela* relocations, size_t count) {
+    if (!lib || !relocations) return K_EINVAL;
+    
+    uint32_t applied = 0;
+    
+    for (size_t i = 0; i < count; i++) {
+        const Elf64_Rela* reloc = &relocations[i];
+        uint32_t type = ELF64_R_TYPE(reloc->r_info);
+        uint32_t symbol_index = ELF64_R_SYM(reloc->r_info);
+        uint64_t* target = (uint64_t*)(lib->base_address + reloc->r_offset);
+        
+        switch (type) {
+            case R_X86_64_RELATIVE:
+                *target = lib->base_address + reloc->r_addend;
+                applied++;
+                break;
+                
+            case R_X86_64_GLOB_DAT: {
+                if (symbol_index < lib->dynsym_count) {
+                    const Elf64_Sym* symbol = &lib->dynsym[symbol_index];
+                    const char* sym_name = lib->dynstr + symbol->st_name;
+                    
+                    uint64_t sym_addr = dynlink_resolve_symbol(sym_name);
+                    if (sym_addr != 0) {
+                        *target = sym_addr;
+                        applied++;
+                    } else {
+                        KLOG_WARN("dynlink", "Unresolved GLOB_DAT symbol: %s", sym_name);
+                    }
+                }
+                break;
+            }
+            
+            case R_X86_64_JUMP_SLOT: {
+                /* For lazy binding, point to PLT entry initially */
+                if (symbol_index < lib->plt_count) {
+                    *target = (uint64_t)&lib->plt_table[symbol_index];
+                    applied++;
+                } else {
+                    /* Immediate resolution fallback */
+                    if (symbol_index < lib->dynsym_count) {
+                        const Elf64_Sym* symbol = &lib->dynsym[symbol_index];
+                        const char* sym_name = lib->dynstr + symbol->st_name;
+                        
+                        uint64_t sym_addr = dynlink_resolve_symbol(sym_name);
+                        if (sym_addr != 0) {
+                            *target = sym_addr;
+                            applied++;
+                        } else {
+                            KLOG_WARN("dynlink", "Unresolved JUMP_SLOT symbol: %s", sym_name);
+                        }
+                    }
+                }
+                break;
+            }
+            
+            case R_X86_64_64: {
+                if (symbol_index < lib->dynsym_count) {
+                    const Elf64_Sym* symbol = &lib->dynsym[symbol_index];
+                    uint64_t sym_addr;
+                    
+                    if (symbol->st_shndx != 0) {
+                        /* Defined in this library */
+                        sym_addr = lib->base_address + symbol->st_value;
+                    } else {
+                        /* External symbol */
+                        const char* sym_name = lib->dynstr + symbol->st_name;
+                        sym_addr = dynlink_resolve_symbol(sym_name);
+                    }
+                    
+                    if (sym_addr != 0) {
+                        *target = sym_addr + reloc->r_addend;
+                        applied++;
+                    }
+                }
+                break;
+            }
+            
+            default:
+                KLOG_WARN("dynlink", "Unsupported relocation type: %u", type);
+                break;
+        }
+    }
+    
+    KLOG_INFO("dynlink", "Applied %u/%zu relocations for %s", applied, count, lib->name);
+    return applied;
+}
+
+/* Initialize library constructors */
+int dynlink_run_constructors(shared_library_t* lib) {
+    if (!lib || lib->initialized) return 0;
+    
+    /* TODO: Find and run DT_INIT and DT_INIT_ARRAY functions */
+    KLOG_DEBUG("dynlink", "Running constructors for %s (stub)", lib->name);
+    
+    lib->initialized = 1;
+    return 0;
+}
+
+/* Get library by name */
+shared_library_t* dynlink_get_library(const char* name) {
+    if (!name) return NULL;
+    
+    for (uint32_t i = 0; i < g_dynlink_state.lib_count; i++) {
+        if (k_strcmp(g_dynlink_state.libraries[i].name, name) == 0) {
+            return &g_dynlink_state.libraries[i];
+        }
+    }
+    
+    return NULL;
+}
+
+/* Unload library */
+int dynlink_unload_library(const char* name) {
+    shared_library_t* lib = dynlink_get_library(name);
+    if (!lib) return K_ENOENT;
+    
+    /* Free PLT/GOT tables */
+    if (lib->plt_table) {
+        vmm_kfree(lib->plt_table, lib->plt_count * sizeof(plt_entry_t));
+    }
+    if (lib->got_table) {
+        vmm_kfree(lib->got_table, lib->got_count * sizeof(got_entry_t));
+    }
+    
+    /* Remove from symbol cache */
+    uint32_t lib_index = lib - g_dynlink_state.libraries;
+    for (uint32_t i = 0; i < g_dynlink_state.symbol_count; i++) {
+        if (g_dynlink_state.symbol_cache[i].lib_index == lib_index) {
+            /* Move last entry to this position */
+            g_dynlink_state.symbol_cache[i] = 
+                g_dynlink_state.symbol_cache[--g_dynlink_state.symbol_count];
+            i--;  /* Check this position again */
+        }
+    }
+    
+    /* Clear library entry */
+    k_memset(lib, 0, sizeof(shared_library_t));
+    
+    KLOG_INFO("dynlink", "Unloaded library %s", name);
+    return 0;
+}
+
+/* Get dynamic linker statistics */
+void dynlink_get_stats(uint32_t* lib_count, uint32_t* symbol_count) {
+    if (lib_count) *lib_count = g_dynlink_state.lib_count;
+    if (symbol_count) *symbol_count = g_dynlink_state.symbol_count;
+}

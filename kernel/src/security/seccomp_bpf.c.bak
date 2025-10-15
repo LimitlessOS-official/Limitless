@@ -1,0 +1,750 @@
+/*
+ * seccomp_bpf.c - LimitlessOS System Call Filtering with seccomp-BPF
+ * 
+ * Advanced system call filtering using Berkeley Packet Filter (BPF) for
+ * fine-grained security control and sandboxing capabilities.
+ */
+
+#include "kernel.h"
+#include "syscall.h"
+#include "process.h"
+#include "vmm.h"
+#include "security.h"
+
+#define SECCOMP_MAX_FILTERS    1024
+#define SECCOMP_MAX_PROGRAM_LEN 4096
+#define SECCOMP_MAX_DATA       256
+
+/* seccomp modes */
+#define SECCOMP_MODE_DISABLED  0
+#define SECCOMP_MODE_STRICT    1
+#define SECCOMP_MODE_FILTER    2
+
+/* seccomp return values */
+#define SECCOMP_RET_KILL       0x00000000U  /* Kill the process */
+#define SECCOMP_RET_TRAP       0x00030000U  /* Disallow and force a SIGSYS */
+#define SECCOMP_RET_ERRNO      0x00050000U  /* Return errno */
+#define SECCOMP_RET_TRACE      0x7ff00000U  /* Pass to a tracer */
+#define SECCOMP_RET_ALLOW      0x7fff0000U  /* Allow */
+
+/* BPF instruction structure */
+typedef struct bpf_insn {
+    uint16_t code;                  /* Instruction opcode */
+    uint8_t jt;                     /* Jump true */
+    uint8_t jf;                     /* Jump false */
+    uint32_t k;                     /* Generic multiuse field */
+} bpf_insn_t;
+
+/* BPF opcodes */
+#define BPF_LD          0x00        /* Load */
+#define BPF_LDX         0x01        /* Load indexed */
+#define BPF_ST          0x02        /* Store */
+#define BPF_STX         0x03        /* Store indexed */
+#define BPF_ALU         0x04        /* Arithmetic */
+#define BPF_JMP         0x05        /* Jump */
+#define BPF_RET         0x06        /* Return */
+#define BPF_MISC        0x07        /* Miscellaneous */
+
+/* BPF addressing modes */
+#define BPF_IMM         0x00        /* Immediate */
+#define BPF_ABS         0x20        /* Absolute */
+#define BPF_IND         0x40        /* Indirect */
+#define BPF_MEM         0x60        /* Memory */
+#define BPF_LEN         0x80        /* Length */
+#define BPF_MSH         0xa0        /* Most significant half */
+
+/* BPF ALU operations */
+#define BPF_ADD         0x00        /* Add */
+#define BPF_SUB         0x10        /* Subtract */
+#define BPF_MUL         0x20        /* Multiply */
+#define BPF_DIV         0x30        /* Divide */
+#define BPF_OR          0x40        /* Bitwise OR */
+#define BPF_AND         0x50        /* Bitwise AND */
+#define BPF_LSH         0x60        /* Left shift */
+#define BPF_RSH         0x70        /* Right shift */
+#define BPF_NEG         0x80        /* Negate */
+#define BPF_MOD         0x90        /* Modulo */
+#define BPF_XOR         0xa0        /* Bitwise XOR */
+
+/* BPF jump operations */
+#define BPF_JA          0x00        /* Jump always */
+#define BPF_JEQ         0x10        /* Jump equal */
+#define BPF_JGT         0x20        /* Jump greater than */
+#define BPF_JGE         0x30        /* Jump greater or equal */
+#define BPF_JSET        0x40        /* Jump if bit set */
+
+/* System call data structure for BPF */
+typedef struct seccomp_data {
+    uint32_t nr;                    /* System call number */
+    uint32_t arch;                  /* Architecture */
+    uint64_t instruction_pointer;   /* CPU instruction pointer */
+    uint64_t args[6];               /* System call arguments */
+} seccomp_data_t;
+
+/* BPF program */
+typedef struct bpf_program {
+    uint32_t len;                   /* Number of instructions */
+    bpf_insn_t* insns;              /* Program instructions */
+    
+    /* Metadata */
+    uint32_t id;                    /* Program ID */
+    pid_t owner_pid;                /* Owner process ID */
+    uint64_t created;               /* Creation timestamp */
+    
+    /* Statistics */
+    atomic64_t executions;          /* Number of executions */
+    atomic64_t allows;              /* Allow decisions */
+    atomic64_t denies;              /* Deny decisions */
+    atomic64_t errors;              /* BPF errors */
+    
+    atomic_t refcount;              /* Reference count */
+    
+    struct list_head list;          /* Global program list */
+    
+} bpf_program_t;
+
+/* BPF execution context */
+typedef struct bpf_context {
+    const seccomp_data_t* data;     /* System call data */
+    uint32_t mem[16];               /* BPF memory */
+    uint32_t A;                     /* Accumulator */
+    uint32_t X;                     /* Index register */
+    
+    /* Execution tracking */
+    uint32_t pc;                    /* Program counter */
+    uint32_t max_insns;             /* Maximum instructions */
+    uint32_t executed_insns;        /* Executed instructions */
+    
+} bpf_context_t;
+
+/* Process seccomp state */
+typedef struct process_seccomp {
+    uint32_t mode;                  /* seccomp mode */
+    bpf_program_t* filter;          /* BPF filter program */
+    
+    /* Filter chain */
+    struct list_head filters;       /* Multiple filters */
+    uint32_t filter_count;          /* Number of filters */
+    
+    /* Statistics */
+    atomic64_t syscalls_filtered;   /* Filtered system calls */
+    atomic64_t syscalls_allowed;    /* Allowed system calls */
+    atomic64_t syscalls_denied;     /* Denied system calls */
+    
+    spinlock_t lock;
+    
+} process_seccomp_t;
+
+/* Global seccomp state */
+static struct {
+    bool initialized;
+    
+    /* Program management */
+    struct list_head programs;      /* All BPF programs */
+    spinlock_t programs_lock;
+    uint32_t next_program_id;
+    
+    /* Statistics */
+    atomic32_t total_programs;
+    atomic64_t total_executions;
+    atomic64_t total_allows;
+    atomic64_t total_denies;
+    atomic64_t total_errors;
+    
+} g_seccomp = {0};
+
+/* Function prototypes */
+static uint32_t bpf_execute(bpf_program_t* prog, const seccomp_data_t* data);
+static int bpf_validate_program(const bpf_insn_t* insns, uint32_t len);
+static bpf_program_t* bpf_create_program(const bpf_insn_t* insns, uint32_t len);
+static void bpf_destroy_program(bpf_program_t* prog);
+static uint32_t seccomp_apply_filters(process_t* proc, const seccomp_data_t* data);
+static int seccomp_install_filter(process_t* proc, const bpf_insn_t* insns, uint32_t len);
+
+/* Initialize seccomp subsystem */
+int seccomp_init(void) {
+    if (g_seccomp.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing seccomp-BPF subsystem\n");
+    
+    memset(&g_seccomp, 0, sizeof(g_seccomp));
+    
+    INIT_LIST_HEAD(&g_seccomp.programs);
+    spinlock_init(&g_seccomp.programs_lock);
+    g_seccomp.next_program_id = 1;
+    
+    g_seccomp.initialized = true;
+    
+    printf("seccomp-BPF subsystem initialized\n");
+    return 0;
+}
+
+/* Initialize process seccomp state */
+int seccomp_init_process(process_t* proc) {
+    if (!proc) {
+        return -EINVAL;
+    }
+    
+    process_seccomp_t* seccomp = (process_seccomp_t*)vmm_kmalloc(sizeof(process_seccomp_t), 32);
+    if (!seccomp) {
+        return -ENOMEM;
+    }
+    
+    memset(seccomp, 0, sizeof(process_seccomp_t));
+    
+    seccomp->mode = SECCOMP_MODE_DISABLED;
+    INIT_LIST_HEAD(&seccomp->filters);
+    spinlock_init(&seccomp->lock);
+    
+    proc->seccomp = seccomp;
+    
+    return 0;
+}
+
+/* Validate BPF program */
+static int bpf_validate_program(const bpf_insn_t* insns, uint32_t len) {
+    if (!insns || len == 0 || len > SECCOMP_MAX_PROGRAM_LEN) {
+        return -EINVAL;
+    }
+    
+    /* Basic validation */
+    for (uint32_t i = 0; i < len; i++) {
+        const bpf_insn_t* insn = &insns[i];
+        uint8_t class = insn->code & 0x07;
+        uint8_t op = insn->code & 0xf0;
+        
+        /* Validate instruction class */
+        switch (class) {
+            case BPF_LD:
+            case BPF_LDX:
+                /* Load instructions */
+                if ((insn->code & 0xe0) == BPF_ABS) {
+                    /* Absolute load - check bounds */
+                    if (insn->k >= sizeof(seccomp_data_t)) {
+                        return -EINVAL;
+                    }
+                }
+                break;
+                
+            case BPF_ST:
+            case BPF_STX:
+                /* Store instructions - check memory index */
+                if (insn->k >= 16) {
+                    return -EINVAL;
+                }
+                break;
+                
+            case BPF_ALU:
+                /* ALU instructions */
+                if (op == BPF_DIV || op == BPF_MOD) {
+                    /* Division by zero check */
+                    if ((insn->code & 0x18) == BPF_IMM && insn->k == 0) {
+                        return -EINVAL;
+                    }
+                }
+                break;
+                
+            case BPF_JMP:
+                /* Jump instructions - check targets */
+                if (op == BPF_JA) {
+                    if (i + 1 + insn->k >= len) {
+                        return -EINVAL;
+                    }
+                } else {
+                    if (i + 1 + insn->jt >= len || i + 1 + insn->jf >= len) {
+                        return -EINVAL;
+                    }
+                }
+                break;
+                
+            case BPF_RET:
+                /* Return instruction - validate return value */
+                if ((insn->code & 0x18) == BPF_IMM) {
+                    uint32_t ret = insn->k;
+                    uint32_t action = ret & 0xffff0000U;
+                    
+                    switch (action) {
+                        case SECCOMP_RET_KILL:
+                        case SECCOMP_RET_TRAP:
+                        case SECCOMP_RET_ERRNO:
+                        case SECCOMP_RET_TRACE:
+                        case SECCOMP_RET_ALLOW:
+                            break;
+                        default:
+                            return -EINVAL;
+                    }
+                }
+                break;
+                
+            case BPF_MISC:
+                /* Miscellaneous instructions */
+                break;
+                
+            default:
+                return -EINVAL;
+        }
+    }
+    
+    /* Check that program ends with return */
+    if ((insns[len - 1].code & 0x07) != BPF_RET) {
+        return -EINVAL;
+    }
+    
+    return 0;
+}
+
+/* Create BPF program */
+static bpf_program_t* bpf_create_program(const bpf_insn_t* insns, uint32_t len) {
+    int result = bpf_validate_program(insns, len);
+    if (result != 0) {
+        return NULL;
+    }
+    
+    bpf_program_t* prog = (bpf_program_t*)vmm_kmalloc(sizeof(bpf_program_t), 32);
+    if (!prog) {
+        return NULL;
+    }
+    
+    memset(prog, 0, sizeof(bpf_program_t));
+    
+    /* Copy instructions */
+    prog->insns = (bpf_insn_t*)vmm_kmalloc(len * sizeof(bpf_insn_t), 32);
+    if (!prog->insns) {
+        vmm_kfree(prog, sizeof(bpf_program_t));
+        return NULL;
+    }
+    
+    memcpy(prog->insns, insns, len * sizeof(bpf_insn_t));
+    prog->len = len;
+    prog->id = g_seccomp.next_program_id++;
+    prog->owner_pid = current_process ? current_process->pid : 0;
+    prog->created = timer_get_ticks();
+    atomic_set(&prog->refcount, 1);
+    
+    /* Add to global program list */
+    spin_lock(&g_seccomp.programs_lock);
+    list_add(&prog->list, &g_seccomp.programs);
+    atomic32_inc(&g_seccomp.total_programs);
+    spin_unlock(&g_seccomp.programs_lock);
+    
+    printf("seccomp: Created BPF program %u (%u instructions)\n", prog->id, len);
+    
+    return prog;
+}
+
+/* Destroy BPF program */
+static void bpf_destroy_program(bpf_program_t* prog) {
+    if (!prog) {
+        return;
+    }
+    
+    if (atomic_dec_and_test(&prog->refcount)) {
+        spin_lock(&g_seccomp.programs_lock);
+        list_del(&prog->list);
+        atomic32_dec(&g_seccomp.total_programs);
+        spin_unlock(&g_seccomp.programs_lock);
+        
+        if (prog->insns) {
+            vmm_kfree(prog->insns, prog->len * sizeof(bpf_insn_t));
+        }
+        
+        vmm_kfree(prog, sizeof(bpf_program_t));
+    }
+}
+
+/* Execute BPF program */
+static uint32_t bpf_execute(bpf_program_t* prog, const seccomp_data_t* data) {
+    if (!prog || !prog->insns || !data) {
+        return SECCOMP_RET_KILL;
+    }
+    
+    bpf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    
+    ctx.data = data;
+    ctx.max_insns = prog->len * 32; /* Prevent infinite loops */
+    
+    atomic64_inc(&prog->executions);
+    atomic64_inc(&g_seccomp.total_executions);
+    
+    /* Execute BPF program */
+    while (ctx.pc < prog->len && ctx.executed_insns < ctx.max_insns) {
+        const bpf_insn_t* insn = &prog->insns[ctx.pc];
+        uint8_t class = insn->code & 0x07;
+        uint8_t op = insn->code & 0xf0;
+        uint8_t src = insn->code & 0x18;
+        
+        ctx.executed_insns++;
+        
+        switch (class) {
+            case BPF_LD:
+                /* Load instructions */
+                if ((insn->code & 0xe0) == BPF_ABS) {
+                    /* Load from packet data */
+                    const uint8_t* packet_data = (const uint8_t*)data;
+                    uint32_t offset = insn->k;
+                    
+                    if (offset + 4 <= sizeof(seccomp_data_t)) {
+                        ctx.A = *((uint32_t*)(packet_data + offset));
+                    } else {
+                        ctx.A = 0;
+                    }
+                } else if ((insn->code & 0xe0) == BPF_IND) {
+                    /* Load indexed */
+                    const uint8_t* packet_data = (const uint8_t*)data;
+                    uint32_t offset = ctx.X + insn->k;
+                    
+                    if (offset + 4 <= sizeof(seccomp_data_t)) {
+                        ctx.A = *((uint32_t*)(packet_data + offset));
+                    } else {
+                        ctx.A = 0;
+                    }
+                } else if (src == BPF_IMM) {
+                    ctx.A = insn->k;
+                } else if (src == BPF_MEM) {
+                    if (insn->k < 16) {
+                        ctx.A = ctx.mem[insn->k];
+                    }
+                } else if ((insn->code & 0xe0) == BPF_LEN) {
+                    ctx.A = sizeof(seccomp_data_t);
+                }
+                break;
+                
+            case BPF_LDX:
+                /* Load X register */
+                if (src == BPF_IMM) {
+                    ctx.X = insn->k;
+                } else if (src == BPF_MEM) {
+                    if (insn->k < 16) {
+                        ctx.X = ctx.mem[insn->k];
+                    }
+                } else if ((insn->code & 0xe0) == BPF_LEN) {
+                    ctx.X = sizeof(seccomp_data_t);
+                }
+                break;
+                
+            case BPF_ST:
+                /* Store A register */
+                if (insn->k < 16) {
+                    ctx.mem[insn->k] = ctx.A;
+                }
+                break;
+                
+            case BPF_STX:
+                /* Store X register */
+                if (insn->k < 16) {
+                    ctx.mem[insn->k] = ctx.X;
+                }
+                break;
+                
+            case BPF_ALU:
+                /* ALU operations */
+                {
+                    uint32_t operand = (src == BPF_IMM) ? insn->k : ctx.X;
+                    
+                    switch (op) {
+                        case BPF_ADD:
+                            ctx.A += operand;
+                            break;
+                        case BPF_SUB:
+                            ctx.A -= operand;
+                            break;
+                        case BPF_MUL:
+                            ctx.A *= operand;
+                            break;
+                        case BPF_DIV:
+                            if (operand != 0) {
+                                ctx.A /= operand;
+                            } else {
+                                /* Division by zero */
+                                atomic64_inc(&prog->errors);
+                                atomic64_inc(&g_seccomp.total_errors);
+                                return SECCOMP_RET_KILL;
+                            }
+                            break;
+                        case BPF_OR:
+                            ctx.A |= operand;
+                            break;
+                        case BPF_AND:
+                            ctx.A &= operand;
+                            break;
+                        case BPF_LSH:
+                            ctx.A <<= operand;
+                            break;
+                        case BPF_RSH:
+                            ctx.A >>= operand;
+                            break;
+                        case BPF_NEG:
+                            ctx.A = -ctx.A;
+                            break;
+                        case BPF_MOD:
+                            if (operand != 0) {
+                                ctx.A %= operand;
+                            } else {
+                                /* Modulo by zero */
+                                atomic64_inc(&prog->errors);
+                                atomic64_inc(&g_seccomp.total_errors);
+                                return SECCOMP_RET_KILL;
+                            }
+                            break;
+                        case BPF_XOR:
+                            ctx.A ^= operand;
+                            break;
+                    }
+                }
+                break;
+                
+            case BPF_JMP:
+                /* Jump instructions */
+                {
+                    bool take_jump = false;
+                    uint32_t operand = (src == BPF_IMM) ? insn->k : ctx.X;
+                    
+                    switch (op) {
+                        case BPF_JA:
+                            take_jump = true;
+                            break;
+                        case BPF_JEQ:
+                            take_jump = (ctx.A == operand);
+                            break;
+                        case BPF_JGT:
+                            take_jump = (ctx.A > operand);
+                            break;
+                        case BPF_JGE:
+                            take_jump = (ctx.A >= operand);
+                            break;
+                        case BPF_JSET:
+                            take_jump = !!(ctx.A & operand);
+                            break;
+                    }
+                    
+                    if (op == BPF_JA) {
+                        ctx.pc += insn->k;
+                    } else if (take_jump) {
+                        ctx.pc += insn->jt;
+                    } else {
+                        ctx.pc += insn->jf;
+                    }
+                    continue; /* Don't increment PC */
+                }
+                break;
+                
+            case BPF_RET:
+                /* Return instruction */
+                {
+                    uint32_t ret_val = (src == BPF_IMM) ? insn->k : ctx.A;
+                    uint32_t action = ret_val & 0xffff0000U;
+                    
+                    if (action == SECCOMP_RET_ALLOW) {
+                        atomic64_inc(&prog->allows);
+                        atomic64_inc(&g_seccomp.total_allows);
+                    } else {
+                        atomic64_inc(&prog->denies);
+                        atomic64_inc(&g_seccomp.total_denies);
+                    }
+                    
+                    return ret_val;
+                }
+                
+            case BPF_MISC:
+                /* Miscellaneous instructions */
+                if ((insn->code & 0x18) == 0x00) { /* TAX */
+                    ctx.X = ctx.A;
+                } else if ((insn->code & 0x18) == 0x08) { /* TXA */
+                    ctx.A = ctx.X;
+                }
+                break;
+        }
+        
+        ctx.pc++;
+    }
+    
+    /* Program ended without return - kill process */
+    atomic64_inc(&prog->errors);
+    atomic64_inc(&g_seccomp.total_errors);
+    return SECCOMP_RET_KILL;
+}
+
+/* Apply seccomp filters */
+static uint32_t seccomp_apply_filters(process_t* proc, const seccomp_data_t* data) {
+    if (!proc || !proc->seccomp) {
+        return SECCOMP_RET_ALLOW;
+    }
+    
+    process_seccomp_t* seccomp = proc->seccomp;
+    
+    if (seccomp->mode == SECCOMP_MODE_DISABLED) {
+        return SECCOMP_RET_ALLOW;
+    }
+    
+    if (seccomp->mode == SECCOMP_MODE_STRICT) {
+        /* Strict mode - only allow read, write, exit, sigreturn */
+        switch (data->nr) {
+            case SYS_read:
+            case SYS_write:
+            case SYS_exit:
+            case SYS_rt_sigreturn:
+                return SECCOMP_RET_ALLOW;
+            default:
+                return SECCOMP_RET_KILL;
+        }
+    }
+    
+    if (seccomp->mode == SECCOMP_MODE_FILTER) {
+        atomic64_inc(&seccomp->syscalls_filtered);
+        
+        /* Apply BPF filter */
+        if (seccomp->filter) {
+            uint32_t result = bpf_execute(seccomp->filter, data);
+            
+            if ((result & 0xffff0000U) == SECCOMP_RET_ALLOW) {
+                atomic64_inc(&seccomp->syscalls_allowed);
+            } else {
+                atomic64_inc(&seccomp->syscalls_denied);
+            }
+            
+            return result;
+        }
+    }
+    
+    return SECCOMP_RET_ALLOW;
+}
+
+/* Install seccomp filter */
+static int seccomp_install_filter(process_t* proc, const bpf_insn_t* insns, uint32_t len) {
+    if (!proc || !proc->seccomp || !insns) {
+        return -EINVAL;
+    }
+    
+    bpf_program_t* prog = bpf_create_program(insns, len);
+    if (!prog) {
+        return -EINVAL;
+    }
+    
+    process_seccomp_t* seccomp = proc->seccomp;
+    
+    spin_lock(&seccomp->lock);
+    
+    /* Replace existing filter */
+    if (seccomp->filter) {
+        bpf_destroy_program(seccomp->filter);
+    }
+    
+    seccomp->filter = prog;
+    seccomp->mode = SECCOMP_MODE_FILTER;
+    
+    spin_unlock(&seccomp->lock);
+    
+    printf("seccomp: Installed filter for process %d\n", proc->pid);
+    
+    return 0;
+}
+
+/* System call entry point for seccomp filtering */
+uint32_t seccomp_filter_syscall(uint32_t syscall_nr, uint64_t arg1, uint64_t arg2, 
+                                uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    
+    if (!current_process || !current_process->seccomp) {
+        return SECCOMP_RET_ALLOW;
+    }
+    
+    /* Prepare seccomp data */
+    seccomp_data_t data;
+    memset(&data, 0, sizeof(data));
+    
+    data.nr = syscall_nr;
+    data.arch = 0x3e; /* x86_64 */
+    data.instruction_pointer = 0; /* Would get from CPU context */
+    data.args[0] = arg1;
+    data.args[1] = arg2;
+    data.args[2] = arg3;
+    data.args[3] = arg4;
+    data.args[4] = arg5;
+    data.args[5] = arg6;
+    
+    return seccomp_apply_filters(current_process, &data);
+}
+
+/* seccomp system call */
+long sys_seccomp(unsigned int operation, unsigned int flags, void* args) {
+    switch (operation) {
+        case 0: /* SECCOMP_SET_MODE_STRICT */
+            if (!current_process || !current_process->seccomp) {
+                return -EINVAL;
+            }
+            current_process->seccomp->mode = SECCOMP_MODE_STRICT;
+            printf("seccomp: Process %d enabled strict mode\n", current_process->pid);
+            return 0;
+            
+        case 1: /* SECCOMP_SET_MODE_FILTER */
+            {
+                if (!current_process || !current_process->seccomp || !args) {
+                    return -EINVAL;
+                }
+                
+                struct sock_fprog {
+                    uint16_t len;
+                    bpf_insn_t* filter;
+                } *fprog = (struct sock_fprog*)args;
+                
+                if (fprog->len == 0 || fprog->len > SECCOMP_MAX_PROGRAM_LEN || !fprog->filter) {
+                    return -EINVAL;
+                }
+                
+                /* Copy filter from userspace */
+                bpf_insn_t* kernel_filter = (bpf_insn_t*)vmm_kmalloc(fprog->len * sizeof(bpf_insn_t), 32);
+                if (!kernel_filter) {
+                    return -ENOMEM;
+                }
+                
+                /* TODO: Copy from userspace with proper validation */
+                memcpy(kernel_filter, fprog->filter, fprog->len * sizeof(bpf_insn_t));
+                
+                int result = seccomp_install_filter(current_process, kernel_filter, fprog->len);
+                
+                vmm_kfree(kernel_filter, fprog->len * sizeof(bpf_insn_t));
+                
+                return result;
+            }
+            
+        case 2: /* SECCOMP_GET_ACTION_AVAIL */
+            /* Return available actions */
+            return 0;
+            
+        default:
+            return -EINVAL;
+    }
+}
+
+/* Get seccomp statistics */
+void seccomp_get_stats(struct seccomp_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct seccomp_stats));
+    
+    stats->total_programs = atomic32_read(&g_seccomp.total_programs);
+    stats->total_executions = atomic64_read(&g_seccomp.total_executions);
+    stats->total_allows = atomic64_read(&g_seccomp.total_allows);
+    stats->total_denies = atomic64_read(&g_seccomp.total_denies);
+    stats->total_errors = atomic64_read(&g_seccomp.total_errors);
+    
+    /* Count processes using seccomp */
+    /* This would iterate through process list */
+    stats->processes_with_seccomp = 0;
+}
+
+/* Debug output */
+void seccomp_dump_stats(void) {
+    struct seccomp_stats stats;
+    seccomp_get_stats(&stats);
+    
+    printf("seccomp-BPF Statistics:\n");
+    printf("  BPF programs: %u\n", stats.total_programs);
+    printf("  Executions: %lu\n", stats.total_executions);
+    printf("  Allows: %lu\n", stats.total_allows);
+    printf("  Denies: %lu\n", stats.total_denies);
+    printf("  Errors: %lu\n", stats.total_errors);
+    printf("  Processes with seccomp: %u\n", stats.processes_with_seccomp);
+}

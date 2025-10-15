@@ -1,0 +1,258 @@
+/**
+ * Architecture-specific signal handling functions for x86_64
+ * Provides low-level signal frame management and context switching
+ */
+
+#include "arch.h"
+#include "signal.h"
+#include "kernel.h"
+#include "log.h"
+
+/* Signal restorer trampoline in user space */
+extern void signal_restorer_trampoline(void);
+
+/* Get current user stack pointer from saved context */
+uint64_t arch_get_user_stack_pointer(void) {
+    process_t* current = process_current();
+    if (!current || !current->context) return 0;
+    
+    /* Return saved RSP from interrupt context */
+    return current->context->rsp;
+}
+
+/* Save current user context to signal frame */
+void arch_save_user_context(signal_frame_t* frame) {
+    process_t* current = process_current();
+    if (!current || !current->context || !frame) return;
+    
+    /* Save general-purpose registers */
+    frame->rdi = current->context->rdi;
+    frame->rsi = current->context->rsi;
+    frame->rdx = current->context->rdx;
+    frame->rcx = current->context->rcx;
+    frame->r8 = current->context->r8;
+    frame->r9 = current->context->r9;
+    frame->rax = current->context->rax;
+    frame->rbx = current->context->rbx;
+    frame->rbp = current->context->rbp;
+    frame->r10 = current->context->r10;
+    frame->r11 = current->context->r11;
+    frame->r12 = current->context->r12;
+    frame->r13 = current->context->r13;
+    frame->r14 = current->context->r14;
+    frame->r15 = current->context->r15;
+    
+    /* Save instruction pointer and stack pointer */
+    frame->rip = current->context->rip;
+    frame->rsp = current->context->rsp;
+    frame->rflags = current->context->rflags;
+    
+    KLOG_DEBUG("signal", "Saved user context: RIP=0x%lx, RSP=0x%lx", frame->rip, frame->rsp);
+}
+
+/* Restore user context from signal frame */
+void arch_restore_user_context(signal_frame_t* frame) {
+    process_t* current = process_current();
+    if (!current || !current->context || !frame) return;
+    
+    /* Restore general-purpose registers */
+    current->context->rdi = frame->rdi;
+    current->context->rsi = frame->rsi;
+    current->context->rdx = frame->rdx;
+    current->context->rcx = frame->rcx;
+    current->context->r8 = frame->r8;
+    current->context->r9 = frame->r9;
+    current->context->rax = frame->rax;
+    current->context->rbx = frame->rbx;
+    current->context->rbp = frame->rbp;
+    current->context->r10 = frame->r10;
+    current->context->r11 = frame->r11;
+    current->context->r12 = frame->r12;
+    current->context->r13 = frame->r13;
+    current->context->r14 = frame->r14;
+    current->context->r15 = frame->r15;
+    
+    /* Restore instruction pointer and stack pointer */
+    current->context->rip = frame->rip;
+    current->context->rsp = frame->rsp;
+    current->context->rflags = frame->rflags;
+    
+    KLOG_DEBUG("signal", "Restored user context: RIP=0x%lx, RSP=0x%lx", frame->rip, frame->rsp);
+}
+
+/* Set up user context for signal handler execution */
+void arch_set_user_context(uint64_t rip, uint64_t rsp, uint64_t rdi, uint64_t rsi, uint64_t rdx) {
+    process_t* current = process_current();
+    if (!current || !current->context) return;
+    
+    /* Set up registers for signal handler call */
+    current->context->rip = rip;  /* Handler address */
+    current->context->rsp = rsp;  /* Signal stack */
+    current->context->rdi = rdi;  /* First argument */
+    current->context->rsi = rsi;  /* Second argument */
+    current->context->rdx = rdx;  /* Third argument */
+    
+    /* Clear other registers for security */
+    current->context->rax = 0;
+    current->context->rbx = 0;
+    current->context->rcx = 0;
+    current->context->r8 = 0;
+    current->context->r9 = 0;
+    current->context->r10 = 0;
+    current->context->r11 = 0;
+    
+    /* Set up proper user mode flags */
+    current->context->rflags = (current->context->rflags & ~0x3F7FD5) | 0x202;
+    
+    KLOG_DEBUG("signal", "Set signal handler context: RIP=0x%lx, RSP=0x%lx, RDI=0x%lx", rip, rsp, rdi);
+}
+
+/* Get address of signal restorer function */
+uint64_t arch_get_signal_restorer(void) {
+    /* Return address of the signal restorer trampoline */
+    return (uint64_t)signal_restorer_trampoline;
+}
+
+/* Assembly trampoline for signal return - this will be copied to user space */
+__asm__(
+    ".text\n"
+    ".globl signal_restorer_trampoline\n"
+    ".type signal_restorer_trampoline, @function\n"
+    "signal_restorer_trampoline:\n"
+    "    movq $15, %rax\n"          /* SYS_rt_sigreturn syscall number */
+    "    syscall\n"                 /* Call kernel to restore context */
+    "    ud2\n"                     /* Should never reach here */
+    ".size signal_restorer_trampoline, .-signal_restorer_trampoline\n"
+);
+
+/* Install signal handling into process */
+int arch_setup_signal_handling(process_t* proc) {
+    if (!proc || !proc->as) return K_EINVAL;
+    
+    /* Allocate page for signal restorer in user space */
+    void* user_page = vmm_alloc_user_page(proc->as, VM_PROT_READ | VM_PROT_EXEC);
+    if (!user_page) {
+        KLOG_ERROR("signal", "Failed to allocate signal restorer page");
+        return K_ENOMEM;
+    }
+    
+    /* Copy signal restorer trampoline to user space */
+    int ret = hal_arch_copy_to_aspace(proc->as, (uint64_t)user_page, 
+                                     signal_restorer_trampoline, 4096);
+    if (ret != 0) {
+        KLOG_ERROR("signal", "Failed to copy signal restorer to user space");
+        vmm_free_user_page(proc->as, user_page);
+        return ret;
+    }
+    
+    KLOG_DEBUG("signal", "Installed signal restorer at %p for process %d", user_page, proc->pid);
+    return 0;
+}
+
+/* Handle page faults in signal frames */
+int arch_handle_signal_fault(process_t* proc, uint64_t fault_addr, uint32_t error_code) {
+    if (!proc || !proc->sigstate) return 0;
+    
+    signal_state_t* sigstate = proc->sigstate;
+    
+    /* Check if fault occurred in signal frame area */
+    if (sigstate->signal_frame && 
+        fault_addr >= (uint64_t)sigstate->signal_frame &&
+        fault_addr < (uint64_t)sigstate->signal_frame + sizeof(signal_frame_t)) {
+        
+        KLOG_WARNING("signal", "Page fault in signal frame at 0x%lx, terminating process %d", 
+                    fault_addr, proc->pid);
+        
+        /* Send SIGSEGV to process */
+        siginfo_t info;
+        k_memset(&info, 0, sizeof(info));
+        info.si_signo = SIGSEGV;
+        info.si_code = 1; /* SEGV_MAPERR */
+        info.si_addr = (void*)fault_addr;
+        
+        signal_send(proc, SIGSEGV, &info);
+        return 1; /* Handled */
+    }
+    
+    return 0; /* Not handled */
+}
+
+/* Get signal number from exception */
+int arch_exception_to_signal(uint32_t exception_code) {
+    switch (exception_code) {
+        case 0:  /* Divide by zero */
+            return SIGFPE;
+        case 1:  /* Debug */
+            return SIGTRAP;
+        case 3:  /* Breakpoint */
+            return SIGTRAP;
+        case 4:  /* Overflow */
+            return SIGFPE;
+        case 5:  /* Bound range exceeded */
+            return SIGSEGV;
+        case 6:  /* Invalid opcode */
+            return SIGILL;
+        case 7:  /* Device not available */
+            return SIGFPE;
+        case 8:  /* Double fault */
+            return SIGKILL;
+        case 10: /* Invalid TSS */
+            return SIGSEGV;
+        case 11: /* Segment not present */
+            return SIGSEGV;
+        case 12: /* Stack segment fault */
+            return SIGSEGV;
+        case 13: /* General protection fault */
+            return SIGSEGV;
+        case 14: /* Page fault */
+            return SIGSEGV;
+        case 16: /* Floating point error */
+            return SIGFPE;
+        case 17: /* Alignment check */
+            return SIGBUS;
+        case 18: /* Machine check */
+            return SIGKILL;
+        case 19: /* SIMD floating point */
+            return SIGFPE;
+        default:
+            return SIGKILL;
+    }
+}
+
+/* Send signal from exception handler */
+void arch_send_exception_signal(uint32_t exception_code, uint64_t fault_addr) {
+    process_t* current = process_current();
+    if (!current) return;
+    
+    int signo = arch_exception_to_signal(exception_code);
+    
+    siginfo_t info;
+    k_memset(&info, 0, sizeof(info));
+    info.si_signo = signo;
+    info.si_errno = 0;
+    info.si_addr = (void*)fault_addr;
+    
+    /* Set appropriate signal code */
+    switch (signo) {
+        case SIGFPE:
+            info.si_code = 1; /* FPE_INTDIV */
+            break;
+        case SIGSEGV:
+            info.si_code = (exception_code == 14) ? 2 : 1; /* SEGV_ACCERR or SEGV_MAPERR */
+            break;
+        case SIGILL:
+            info.si_code = 1; /* ILL_ILLOPC */
+            break;
+        case SIGBUS:
+            info.si_code = 1; /* BUS_ADRALN */
+            break;
+        case SIGTRAP:
+            info.si_code = 1; /* TRAP_BRKPT */
+            break;
+    }
+    
+    KLOG_WARNING("signal", "Sending signal %d to process %d for exception %d at 0x%lx", 
+                signo, current->pid, exception_code, fault_addr);
+    
+    signal_send(current, signo, &info);
+}

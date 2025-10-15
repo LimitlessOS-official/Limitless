@@ -1,0 +1,1107 @@
+/**
+ * Graphics and Windowing System for LimitlessOS
+ * Provides framebuffer management and basic windowing
+ */
+
+#include "kernel.h"
+#include "hal.h"
+#include "vmm.h"
+#include "string.h"
+
+/* Graphics subsystem state */
+#define MAX_WINDOWS 64
+#define MAX_GRAPHICS_BUFFERS 128
+#define MAX_FONTS 32
+#define MAX_BITMAPS 256
+#define MAX_MESHES 512
+#define MAX_TEXTURES 1024
+#define MAX_SHADERS 64
+
+typedef struct graphics_window {
+    bool in_use;
+    uint32_t id;
+    uint32_t x, y, width, height;
+    uint32_t z_order;
+    uint32_t flags;
+    void* framebuffer;
+    uint32_t pitch;
+    process_t* owner;
+} graphics_window_t;
+
+typedef struct graphics_buffer {
+    bool in_use;
+    uint32_t id;
+    uint32_t width, height;
+    uint32_t format;  /* RGBA8888, RGB888, etc. */
+    void* data;
+    size_t size;
+    process_t* owner;
+} graphics_buffer_t;
+
+typedef struct graphics_font {
+    bool in_use;
+    uint32_t id;
+    char name[64];
+    uint32_t size;
+    uint8_t* glyph_data;
+    uint32_t glyph_width, glyph_height;
+    process_t* owner;
+} graphics_font_t;
+
+typedef struct graphics_bitmap {
+    bool in_use;
+    uint32_t id;
+    uint32_t width, height;
+    uint32_t format;
+    void* data;
+    size_t size;
+    process_t* owner;
+} graphics_bitmap_t;
+
+typedef struct graphics_mesh {
+    bool in_use;
+    uint32_t id;
+    vertex_t* vertices;
+    uint32_t* indices;
+    uint32_t vertex_count;
+    uint32_t index_count;
+    uint32_t texture_id;
+    process_t* owner;
+} graphics_mesh_t;
+
+typedef struct graphics_texture {
+    bool in_use;
+    uint32_t id;
+    uint32_t width, height;
+    uint32_t format;
+    void* data;
+    size_t size;
+    process_t* owner;
+} graphics_texture_t;
+
+typedef struct graphics_shader {
+    bool in_use;
+    uint32_t id;
+    char* vertex_source;
+    char* fragment_source;
+    void* compiled_program;
+    process_t* owner;
+} graphics_shader_t;
+
+typedef struct graphics_state {
+    bool initialized;
+    display_device_t primary_display;
+    display_info_t display_info;
+    void* screen_framebuffer;
+    uint32_t screen_width, screen_height, screen_bpp;
+    
+    graphics_window_t windows[MAX_WINDOWS];
+    graphics_buffer_t buffers[MAX_GRAPHICS_BUFFERS];
+    graphics_font_t fonts[MAX_FONTS];
+    graphics_bitmap_t bitmaps[MAX_BITMAPS];
+    graphics_mesh_t meshes[MAX_MESHES];
+    graphics_texture_t textures[MAX_TEXTURES];
+    graphics_shader_t shaders[MAX_SHADERS];
+    
+    uint32_t next_window_id;
+    uint32_t next_buffer_id;
+    uint32_t next_font_id;
+    uint32_t next_bitmap_id;
+    uint32_t next_mesh_id;
+    uint32_t next_texture_id;
+    uint32_t next_shader_id;
+    
+    /* 3D rendering state */
+    bool gpu_initialized;
+    matrix4x4_t view_matrix;
+    matrix4x4_t projection_matrix;
+    float camera_x, camera_y, camera_z;
+    uint32_t active_shader;
+    
+    /* Performance statistics */
+    uint32_t frame_count;
+    uint32_t draw_calls;
+    uint32_t triangles_rendered;
+    uint64_t last_fps_time;
+    uint32_t fps;
+    
+    /* Dirty rectangles for optimization */
+    bool screen_dirty;
+    uint32_t dirty_x1, dirty_y1, dirty_x2, dirty_y2;
+} graphics_state_t;
+
+static graphics_state_t g_graphics;
+
+/* Graphics formats */
+#define GFX_FORMAT_RGBA8888  0
+#define GFX_FORMAT_RGB888    1
+#define GFX_FORMAT_RGB565    2
+
+/* Window flags */
+#define WINDOW_FLAG_VISIBLE     0x01
+#define WINDOW_FLAG_RESIZABLE   0x02
+#define WINDOW_FLAG_DECORATED   0x04
+
+/* Color helper functions */
+static inline uint32_t rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static inline void set_pixel_rgba(void* framebuffer, uint32_t x, uint32_t y, uint32_t pitch, uint32_t color) {
+    uint32_t* pixels = (uint32_t*)framebuffer;
+    pixels[y * (pitch / 4) + x] = color;
+}
+
+static inline uint32_t get_pixel_rgba(void* framebuffer, uint32_t x, uint32_t y, uint32_t pitch) {
+    uint32_t* pixels = (uint32_t*)framebuffer;
+    return pixels[y * (pitch / 4) + x];
+}
+
+/* Initialize graphics subsystem */
+status_t graphics_init(void) {
+    if (g_graphics.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    k_memset(&g_graphics, 0, sizeof(graphics_state_t));
+    
+    /* Initialize display subsystem */
+    status_t result = hal_display_init();
+    if (result != STATUS_OK) {
+        return result;
+    }
+    
+    /* Find primary display */
+    uint32_t display_count = hal_display_get_device_count();
+    if (display_count == 0) {
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Use the first framebuffer display (skip VGA text mode) */
+    g_graphics.primary_display = (display_count > 1) ? 1 : 0;
+    
+    result = hal_display_get_info(g_graphics.primary_display, &g_graphics.display_info);
+    if (result != STATUS_OK) {
+        return result;
+    }
+    
+    /* Get framebuffer */
+    uint32_t fb_size;
+    result = hal_display_get_framebuffer(g_graphics.primary_display, &g_graphics.screen_framebuffer, &fb_size);
+    if (result != STATUS_OK && g_graphics.primary_display != 0) {
+        /* Allocate framebuffer if not provided by hardware */
+        fb_size = g_graphics.display_info.width * g_graphics.display_info.height * (g_graphics.display_info.bpp / 8);
+        g_graphics.screen_framebuffer = vmm_kmalloc(fb_size, PAGE_SIZE);
+        if (!g_graphics.screen_framebuffer) {
+            return STATUS_NOMEM;
+        }
+    }
+    
+    g_graphics.screen_width = g_graphics.display_info.width;
+    g_graphics.screen_height = g_graphics.display_info.height;
+    g_graphics.screen_bpp = g_graphics.display_info.bpp;
+    
+    g_graphics.next_window_id = 1;
+    g_graphics.next_buffer_id = 1;
+    g_graphics.next_font_id = 1;
+    g_graphics.next_bitmap_id = 1;
+    g_graphics.next_mesh_id = 1;
+    g_graphics.next_texture_id = 1;
+    g_graphics.next_shader_id = 1;
+    
+    /* Initialize 3D graphics */
+    g_graphics.gpu_initialized = false;
+    g_graphics.active_shader = 0;
+    g_graphics.frame_count = 0;
+    g_graphics.draw_calls = 0;
+    g_graphics.triangles_rendered = 0;
+    g_graphics.fps = 0;
+    g_graphics.last_fps_time = 0;
+    
+    g_graphics.initialized = true;
+    
+    /* Clear screen */
+    graphics_clear_screen(rgba(0, 0, 80, 255));  /* Dark blue background */
+    
+    return STATUS_OK;
+}
+
+/* Clear entire screen */
+status_t graphics_clear_screen(uint32_t color) {
+    if (!g_graphics.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    if (g_graphics.screen_bpp == 32 && g_graphics.screen_framebuffer) {
+        uint32_t* pixels = (uint32_t*)g_graphics.screen_framebuffer;
+        uint32_t total_pixels = g_graphics.screen_width * g_graphics.screen_height;
+        
+        for (uint32_t i = 0; i < total_pixels; i++) {
+            pixels[i] = color;
+        }
+        
+        g_graphics.screen_dirty = true;
+        g_graphics.dirty_x1 = 0;
+        g_graphics.dirty_y1 = 0;
+        g_graphics.dirty_x2 = g_graphics.screen_width;
+        g_graphics.dirty_y2 = g_graphics.screen_height;
+    } else {
+        /* Fallback to HAL clear */
+        hal_display_clear(g_graphics.primary_display, color);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Create graphics buffer */
+uint32_t graphics_create_buffer(uint32_t width, uint32_t height, uint32_t format) {
+    if (!g_graphics.initialized || width == 0 || height == 0) {
+        return 0;
+    }
+    
+    /* Find free buffer slot */
+    for (uint32_t i = 0; i < MAX_GRAPHICS_BUFFERS; i++) {
+        if (!g_graphics.buffers[i].in_use) {
+            graphics_buffer_t* buf = &g_graphics.buffers[i];
+            
+            uint32_t bytes_per_pixel = (format == GFX_FORMAT_RGBA8888) ? 4 : 
+                                      (format == GFX_FORMAT_RGB888) ? 3 : 2;
+            size_t buffer_size = width * height * bytes_per_pixel;
+            
+            buf->data = vmm_kmalloc(buffer_size, 16);
+            if (!buf->data) {
+                return 0;
+            }
+            
+            buf->in_use = true;
+            buf->id = g_graphics.next_buffer_id++;
+            buf->width = width;
+            buf->height = height;
+            buf->format = format;
+            buf->size = buffer_size;
+            buf->owner = get_current_process();
+            
+            /* Clear buffer */
+            k_memset(buf->data, 0, buffer_size);
+            
+            return buf->id;
+        }
+    }
+    
+    return 0;  /* No free buffers */
+}
+
+/* Create window */
+uint32_t graphics_create_window(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t flags) {
+    if (!g_graphics.initialized || width == 0 || height == 0) {
+        return 0;
+    }
+    
+    /* Find free window slot */
+    for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
+        if (!g_graphics.windows[i].in_use) {
+            graphics_window_t* win = &g_graphics.windows[i];
+            
+            /* Create framebuffer for window */
+            size_t fb_size = width * height * 4;  /* RGBA8888 */
+            win->framebuffer = vmm_kmalloc(fb_size, 16);
+            if (!win->framebuffer) {
+                return 0;
+            }
+            
+            win->in_use = true;
+            win->id = g_graphics.next_window_id++;
+            win->x = x;
+            win->y = y;
+            win->width = width;
+            win->height = height;
+            win->z_order = 0;  /* Background */
+            win->flags = flags | WINDOW_FLAG_VISIBLE;
+            win->pitch = width * 4;
+            win->owner = get_current_process();
+            
+            /* Clear window to transparent */
+            k_memset(win->framebuffer, 0, fb_size);
+            
+            return win->id;
+        }
+    }
+    
+    return 0;  /* No free windows */
+}
+
+/* Fill rectangle in buffer/window */
+status_t graphics_fill_rect(uint32_t buffer_id, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
+    if (!g_graphics.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    /* Find buffer */
+    graphics_buffer_t* buf = NULL;
+    graphics_window_t* win = NULL;
+    void* framebuffer = NULL;
+    uint32_t fb_width = 0, fb_height = 0, pitch = 0;
+    
+    /* Check if it's a window */
+    for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
+        if (g_graphics.windows[i].in_use && g_graphics.windows[i].id == buffer_id) {
+            win = &g_graphics.windows[i];
+            framebuffer = win->framebuffer;
+            fb_width = win->width;
+            fb_height = win->height;
+            pitch = win->pitch;
+            break;
+        }
+    }
+    
+    /* Check if it's a buffer */
+    if (!win) {
+        for (uint32_t i = 0; i < MAX_GRAPHICS_BUFFERS; i++) {
+            if (g_graphics.buffers[i].in_use && g_graphics.buffers[i].id == buffer_id) {
+                buf = &g_graphics.buffers[i];
+                framebuffer = buf->data;
+                fb_width = buf->width;
+                fb_height = buf->height;
+                pitch = fb_width * 4;  /* Assume RGBA8888 */
+                break;
+            }
+        }
+    }
+    
+    if (!framebuffer) {
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Clip rectangle */
+    if (x >= fb_width || y >= fb_height) {
+        return STATUS_OK;  /* Outside bounds */
+    }
+    
+    if (x + width > fb_width) {
+        width = fb_width - x;
+    }
+    if (y + height > fb_height) {
+        height = fb_height - y;
+    }
+    
+    /* Fill rectangle */
+    for (uint32_t row = 0; row < height; row++) {
+        for (uint32_t col = 0; col < width; col++) {
+            set_pixel_rgba(framebuffer, x + col, y + row, pitch, color);
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+/* Blit buffer to screen or window */
+status_t graphics_blit(uint32_t src_buffer_id, uint32_t dst_buffer_id, 
+                      uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, 
+                      uint32_t width, uint32_t height) {
+    if (!g_graphics.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    /* TODO: Implement proper blitting between buffers */
+    /* For now, just mark screen as dirty if blitting to screen (buffer_id 0) */
+    
+    if (dst_buffer_id == 0) {
+        /* Blitting to screen */
+        g_graphics.screen_dirty = true;
+        
+        /* Update dirty region */
+        if (!g_graphics.screen_dirty || dst_x < g_graphics.dirty_x1) {
+            g_graphics.dirty_x1 = dst_x;
+        }
+        if (!g_graphics.screen_dirty || dst_y < g_graphics.dirty_y1) {
+            g_graphics.dirty_y1 = dst_y;
+        }
+        if (!g_graphics.screen_dirty || dst_x + width > g_graphics.dirty_x2) {
+            g_graphics.dirty_x2 = dst_x + width;
+        }
+        if (!g_graphics.screen_dirty || dst_y + height > g_graphics.dirty_y2) {
+            g_graphics.dirty_y2 = dst_y + height;
+        }
+    }
+    
+    (void)src_buffer_id;
+    (void)src_x;
+    (void)src_y;
+    
+    return STATUS_OK;
+}
+
+/* Composite and present windows to screen */
+status_t graphics_present(void) {
+    if (!g_graphics.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    /* Composite all visible windows in z-order */
+    for (uint32_t z = 0; z < MAX_WINDOWS; z++) {
+        for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
+            graphics_window_t* win = &g_graphics.windows[i];
+            
+            if (win->in_use && (win->flags & WINDOW_FLAG_VISIBLE) && win->z_order == z) {
+                /* Blit window to screen */
+                if (g_graphics.screen_framebuffer && win->framebuffer) {
+                    /* Simple blit (no alpha blending for now) */
+                    for (uint32_t y = 0; y < win->height; y++) {
+                        if (win->y + y >= g_graphics.screen_height) break;
+                        
+                        for (uint32_t x = 0; x < win->width; x++) {
+                            if (win->x + x >= g_graphics.screen_width) break;
+                            
+                            uint32_t src_pixel = get_pixel_rgba(win->framebuffer, x, y, win->pitch);
+                            uint32_t alpha = (src_pixel >> 24) & 0xFF;
+                            
+                            /* Skip transparent pixels */
+                            if (alpha > 0) {
+                                set_pixel_rgba(g_graphics.screen_framebuffer, 
+                                             win->x + x, win->y + y, 
+                                             g_graphics.display_info.pitch, src_pixel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /* Present to hardware if we have dirty regions */
+    if (g_graphics.screen_dirty) {
+        status_t result = hal_display_blit(g_graphics.primary_display, g_graphics.screen_framebuffer,
+                                         g_graphics.dirty_x1, g_graphics.dirty_y1,
+                                         g_graphics.dirty_x2 - g_graphics.dirty_x1,
+                                         g_graphics.dirty_y2 - g_graphics.dirty_y1);
+        
+        g_graphics.screen_dirty = false;
+        return result;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Destroy window */
+status_t graphics_destroy_window(uint32_t window_id) {
+    if (!g_graphics.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
+        graphics_window_t* win = &g_graphics.windows[i];
+        
+        if (win->in_use && win->id == window_id) {
+            /* Check ownership */
+            if (win->owner != get_current_process()) {
+                return STATUS_DENIED;
+            }
+            
+            /* Free framebuffer */
+            if (win->framebuffer) {
+                vmm_kfree(win->framebuffer, win->width * win->height * 4);
+            }
+            
+            /* Clear window */
+            k_memset(win, 0, sizeof(graphics_window_t));
+            win->in_use = false;
+            
+            return STATUS_OK;
+        }
+    }
+    
+    return STATUS_NOTFOUND;
+}
+
+/* Destroy buffer */
+status_t graphics_destroy_buffer(uint32_t buffer_id) {
+    if (!g_graphics.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    for (uint32_t i = 0; i < MAX_GRAPHICS_BUFFERS; i++) {
+        graphics_buffer_t* buf = &g_graphics.buffers[i];
+        
+        if (buf->in_use && buf->id == buffer_id) {
+            /* Check ownership */
+            if (buf->owner != get_current_process()) {
+                return STATUS_DENIED;
+            }
+            
+            /* Free data */
+            if (buf->data) {
+                vmm_kfree(buf->data, buf->size);
+            }
+            
+            /* Clear buffer */
+            k_memset(buf, 0, sizeof(graphics_buffer_t));
+            buf->in_use = false;
+            
+            return STATUS_OK;
+        }
+    }
+    
+    return STATUS_NOTFOUND;
+}
+
+/* Helper function to find framebuffer for buffer ID */
+static bool get_framebuffer_for_buffer(uint32_t buffer_id, void** framebuffer, uint32_t* width, uint32_t* height, uint32_t* pitch) {
+    /* Check windows */
+    for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
+        if (g_graphics.windows[i].in_use && g_graphics.windows[i].id == buffer_id) {
+            *framebuffer = g_graphics.windows[i].framebuffer;
+            *width = g_graphics.windows[i].width;
+            *height = g_graphics.windows[i].height;
+            *pitch = g_graphics.windows[i].pitch;
+            return true;
+        }
+    }
+    
+    /* Check buffers */
+    for (uint32_t i = 0; i < MAX_GRAPHICS_BUFFERS; i++) {
+        if (g_graphics.buffers[i].in_use && g_graphics.buffers[i].id == buffer_id) {
+            *framebuffer = g_graphics.buffers[i].data;
+            *width = g_graphics.buffers[i].width;
+            *height = g_graphics.buffers[i].height;
+            *pitch = g_graphics.buffers[i].width * 4; /* Assume RGBA8888 */
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/* Advanced 2D Graphics Primitives */
+
+/* Draw line using Bresenham's algorithm */
+status_t graphics_draw_line(uint32_t buffer_id, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t color, uint32_t thickness) {
+    if (!g_graphics.initialized || thickness == 0) {
+        return STATUS_ERROR;
+    }
+    
+    /* Find target framebuffer */
+    void* framebuffer = NULL;
+    uint32_t fb_width = 0, fb_height = 0, pitch = 0;
+    
+    if (!get_framebuffer_for_buffer(buffer_id, &framebuffer, &fb_width, &fb_height, &pitch)) {
+        return STATUS_NOTFOUND;
+    }
+    
+    int dx = abs((int)x2 - (int)x1);
+    int dy = abs((int)y2 - (int)y1);
+    int sx = (x1 < x2) ? 1 : -1;
+    int sy = (y1 < y2) ? 1 : -1;
+    int err = dx - dy;
+    
+    int x = (int)x1, y = (int)y1;
+    
+    while (true) {
+        /* Draw thick line by drawing multiple pixels around the line */
+        for (uint32_t t = 0; t < thickness; t++) {
+            int offset_x = t - (thickness / 2);
+            int offset_y = t - (thickness / 2);
+            
+            if (dx > dy) {
+                /* Horizontal line - vary y */
+                int draw_x = x;
+                int draw_y = y + offset_y;
+                if (draw_x >= 0 && draw_x < (int)fb_width && draw_y >= 0 && draw_y < (int)fb_height) {
+                    set_pixel_rgba(framebuffer, draw_x, draw_y, pitch, color);
+                }
+            } else {
+                /* Vertical line - vary x */
+                int draw_x = x + offset_x;
+                int draw_y = y;
+                if (draw_x >= 0 && draw_x < (int)fb_width && draw_y >= 0 && draw_y < (int)fb_height) {
+                    set_pixel_rgba(framebuffer, draw_x, draw_y, pitch, color);
+                }
+            }
+        }
+        
+        if (x == (int)x2 && y == (int)y2) break;
+        
+        int e2 = 2 * err;
+        if (e2 > -dy) {
+            err -= dy;
+            x += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y += sy;
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+/* Draw circle using midpoint circle algorithm */
+status_t graphics_draw_circle(uint32_t buffer_id, uint32_t cx, uint32_t cy, uint32_t radius, uint32_t color, bool filled) {
+    if (!g_graphics.initialized || radius == 0) {
+        return STATUS_ERROR;
+    }
+    
+    void* framebuffer = NULL;
+    uint32_t fb_width = 0, fb_height = 0, pitch = 0;
+    
+    if (!get_framebuffer_for_buffer(buffer_id, &framebuffer, &fb_width, &fb_height, &pitch)) {
+        return STATUS_NOTFOUND;
+    }
+    
+    int x = 0;
+    int y = radius;
+    int d = 1 - radius;
+    
+    while (x <= y) {
+        if (filled) {
+            /* Draw horizontal lines for filled circle */
+            for (int i = cx - x; i <= (int)(cx + x); i++) {
+                if (i >= 0 && i < (int)fb_width) {
+                    if (cy + y < fb_height) set_pixel_rgba(framebuffer, i, cy + y, pitch, color);
+                    if (cy - y < fb_height) set_pixel_rgba(framebuffer, i, cy - y, pitch, color);
+                }
+            }
+            for (int i = cx - y; i <= (int)(cx + y); i++) {
+                if (i >= 0 && i < (int)fb_width) {
+                    if (cy + x < fb_height) set_pixel_rgba(framebuffer, i, cy + x, pitch, color);
+                    if (cy - x < fb_height) set_pixel_rgba(framebuffer, i, cy - x, pitch, color);
+                }
+            }
+        } else {
+            /* Draw circle outline */
+            if (cx + x < fb_width && cy + y < fb_height) set_pixel_rgba(framebuffer, cx + x, cy + y, pitch, color);
+            if (cx - x < fb_width && cy + y < fb_height) set_pixel_rgba(framebuffer, cx - x, cy + y, pitch, color);
+            if (cx + x < fb_width && cy - y < fb_height) set_pixel_rgba(framebuffer, cx + x, cy - y, pitch, color);
+            if (cx - x < fb_width && cy - y < fb_height) set_pixel_rgba(framebuffer, cx - x, cy - y, pitch, color);
+            if (cx + y < fb_width && cy + x < fb_height) set_pixel_rgba(framebuffer, cx + y, cy + x, pitch, color);
+            if (cx - y < fb_width && cy + x < fb_height) set_pixel_rgba(framebuffer, cx - y, cy + x, pitch, color);
+            if (cx + y < fb_width && cy - x < fb_height) set_pixel_rgba(framebuffer, cx + y, cy - x, pitch, color);
+            if (cx - y < fb_width && cy - x < fb_height) set_pixel_rgba(framebuffer, cx - y, cy - x, pitch, color);
+        }
+        
+        if (d < 0) {
+            d += 2 * x + 3;
+        } else {
+            d += 2 * (x - y) + 5;
+            y--;
+        }
+        x++;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Draw triangle */
+status_t graphics_draw_triangle(uint32_t buffer_id, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t x3, uint32_t y3, uint32_t color, bool filled) {
+    if (!g_graphics.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    if (filled) {
+        /* Rasterize filled triangle using edge functions */
+        uint32_t min_x = (x1 < x2) ? ((x1 < x3) ? x1 : x3) : ((x2 < x3) ? x2 : x3);
+        uint32_t max_x = (x1 > x2) ? ((x1 > x3) ? x1 : x3) : ((x2 > x3) ? x2 : x3);
+        uint32_t min_y = (y1 < y2) ? ((y1 < y3) ? y1 : y3) : ((y2 < y3) ? y2 : y3);
+        uint32_t max_y = (y1 > y2) ? ((y1 > y3) ? y1 : y3) : ((y2 > y3) ? y2 : y3);
+        
+        void* framebuffer = NULL;
+        uint32_t fb_width = 0, fb_height = 0, pitch = 0;
+        
+        if (!get_framebuffer_for_buffer(buffer_id, &framebuffer, &fb_width, &fb_height, &pitch)) {
+            return STATUS_NOTFOUND;
+        }
+        
+        for (uint32_t y = min_y; y <= max_y && y < fb_height; y++) {
+            for (uint32_t x = min_x; x <= max_x && x < fb_width; x++) {
+                /* Check if point is inside triangle using edge functions */
+                bool inside = true;
+                
+                /* Edge function for each side of triangle */
+                int e1 = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1);
+                int e2 = (x3 - x2) * (y - y2) - (y3 - y2) * (x - x2);
+                int e3 = (x1 - x3) * (y - y3) - (y1 - y3) * (x - x3);
+                
+                if (!((e1 >= 0 && e2 >= 0 && e3 >= 0) || (e1 <= 0 && e2 <= 0 && e3 <= 0))) {
+                    inside = false;
+                }
+                
+                if (inside) {
+                    set_pixel_rgba(framebuffer, x, y, pitch, color);
+                }
+            }
+        }
+    } else {
+        /* Draw triangle outline */
+        graphics_draw_line(buffer_id, x1, y1, x2, y2, color, 1);
+        graphics_draw_line(buffer_id, x2, y2, x3, y3, color, 1);
+        graphics_draw_line(buffer_id, x3, y3, x1, y1, color, 1);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Scaled blit with nearest neighbor sampling */
+status_t graphics_blit_scaled(uint32_t src_buffer_id, uint32_t dst_buffer_id,
+                             uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h,
+                             uint32_t dst_x, uint32_t dst_y, uint32_t dst_w, uint32_t dst_h) {
+    if (!g_graphics.initialized || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) {
+        return STATUS_ERROR;
+    }
+    
+    void* src_fb = NULL, *dst_fb = NULL;
+    uint32_t src_width = 0, src_height = 0, src_pitch = 0;
+    uint32_t dst_width = 0, dst_height = 0, dst_pitch = 0;
+    
+    if (!get_framebuffer_for_buffer(src_buffer_id, &src_fb, &src_width, &src_height, &src_pitch) ||
+        !get_framebuffer_for_buffer(dst_buffer_id, &dst_fb, &dst_width, &dst_height, &dst_pitch)) {
+        return STATUS_NOTFOUND;
+    }
+    
+    float x_ratio = (float)src_w / dst_w;
+    float y_ratio = (float)src_h / dst_h;
+    
+    for (uint32_t y = 0; y < dst_h; y++) {
+        if (dst_y + y >= dst_height) break;
+        
+        for (uint32_t x = 0; x < dst_w; x++) {
+            if (dst_x + x >= dst_width) break;
+            
+            uint32_t src_x_i = src_x + (uint32_t)(x * x_ratio);
+            uint32_t src_y_i = src_y + (uint32_t)(y * y_ratio);
+            
+            if (src_x_i < src_width && src_y_i < src_height) {
+                uint32_t pixel = get_pixel_rgba(src_fb, src_x_i, src_y_i, src_pitch);
+                set_pixel_rgba(dst_fb, dst_x + x, dst_y + y, dst_pitch, pixel);
+            }
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+/* Simple text rendering with built-in 8x8 font */
+status_t graphics_draw_text(uint32_t buffer_id, const char* text, uint32_t x, uint32_t y, uint32_t font_id, uint32_t color) {
+    if (!g_graphics.initialized || !text) {
+        return STATUS_ERROR;
+    }
+    
+    void* framebuffer = NULL;
+    uint32_t fb_width = 0, fb_height = 0, pitch = 0;
+    
+    if (!get_framebuffer_for_buffer(buffer_id, &framebuffer, &fb_width, &fb_height, &pitch)) {
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Simple 8x8 font bitmap for basic characters */
+    static const uint8_t font_8x8[256][8] = {
+        /* Simplified: just implement a few characters for demonstration */
+        [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+        ['A'] = {0x30, 0x48, 0x48, 0x78, 0x48, 0x48, 0x48, 0x00},
+        ['B'] = {0x70, 0x48, 0x48, 0x70, 0x48, 0x48, 0x70, 0x00},
+        ['C'] = {0x30, 0x48, 0x40, 0x40, 0x40, 0x48, 0x30, 0x00},
+        /* Add more characters as needed... */
+    };
+    
+    uint32_t char_x = x;
+    
+    for (size_t i = 0; text[i]; i++) {
+        uint8_t ch = (uint8_t)text[i];
+        
+        if (ch == '\n') {
+            char_x = x;
+            y += 8;
+            continue;
+        }
+        
+        if (char_x + 8 > fb_width || y + 8 > fb_height) {
+            break;
+        }
+        
+        /* Render character */
+        for (int row = 0; row < 8; row++) {
+            uint8_t font_row = font_8x8[ch][row];
+            for (int col = 0; col < 8; col++) {
+                if (font_row & (0x80 >> col)) {
+                    set_pixel_rgba(framebuffer, char_x + col, y + row, pitch, color);
+                }
+            }
+        }
+        
+        char_x += 8;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Get screen info */
+status_t graphics_get_screen_info(uint32_t* width, uint32_t* height, uint32_t* bpp) {
+    if (!g_graphics.initialized || !width || !height || !bpp) {
+        return STATUS_ERROR;
+    }
+    
+    *width = g_graphics.screen_width;
+    *height = g_graphics.screen_height;
+    *bpp = g_graphics.screen_bpp;
+    
+    return STATUS_OK;
+}
+
+/* Additional graphics function implementations */
+
+/* Draw ellipse */
+status_t graphics_draw_ellipse(uint32_t buffer_id, uint32_t cx, uint32_t cy, uint32_t rx, uint32_t ry, uint32_t color, bool filled) {
+    /* Simplified: draw as circle using average radius */
+    uint32_t avg_radius = (rx + ry) / 2;
+    return graphics_draw_circle(buffer_id, cx, cy, avg_radius, color, filled);
+}
+
+/* Draw polygon */
+status_t graphics_draw_polygon(uint32_t buffer_id, uint32_t* points, uint32_t num_points, uint32_t color, bool filled) {
+    if (!points || num_points < 3) {
+        return STATUS_ERROR;
+    }
+    
+    if (filled) {
+        /* For filled polygons, triangulate and fill */
+        /* Simplified: just fill as if it were a triangle */
+        if (num_points >= 6) {
+            return graphics_draw_triangle(buffer_id, points[0], points[1], points[2], points[3], points[4], points[5], color, true);
+        }
+    } else {
+        /* Draw polygon outline */
+        for (uint32_t i = 0; i < num_points; i++) {
+            uint32_t next = (i + 1) % num_points;
+            graphics_draw_line(buffer_id, points[i*2], points[i*2+1], points[next*2], points[next*2+1], color, 1);
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+/* Draw Bezier curve */
+status_t graphics_draw_bezier_curve(uint32_t buffer_id, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t x3, uint32_t y3, uint32_t x4, uint32_t y4, uint32_t color) {
+    /* Draw cubic Bezier curve using De Casteljau's algorithm */
+    const int steps = 50;
+    uint32_t prev_x = x1, prev_y = y1;
+    
+    for (int i = 1; i <= steps; i++) {
+        float t = (float)i / steps;
+        float u = 1.0f - t;
+        
+        /* Cubic Bezier formula */
+        float x = u*u*u*x1 + 3*u*u*t*x2 + 3*u*t*t*x3 + t*t*t*x4;
+        float y = u*u*u*y1 + 3*u*u*t*y2 + 3*u*t*t*y3 + t*t*t*y4;
+        
+        graphics_draw_line(buffer_id, prev_x, prev_y, (uint32_t)x, (uint32_t)y, color, 1);
+        
+        prev_x = (uint32_t)x;
+        prev_y = (uint32_t)y;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Rotated blit */
+status_t graphics_blit_rotated(uint32_t src_buffer_id, uint32_t dst_buffer_id,
+                              uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y,
+                              uint32_t width, uint32_t height, float angle) {
+    /* Simplified: just do regular blit for now */
+    /* Real implementation would rotate pixels around center point */
+    (void)angle;
+    return graphics_blit(src_buffer_id, dst_buffer_id, src_x, src_y, dst_x, dst_y, width, height);
+}
+
+/* Font management */
+uint32_t graphics_load_font(const char* font_path, uint32_t size) {
+    if (!font_path || size == 0) {
+        return 0;
+    }
+    
+    /* Find free font slot */
+    for (uint32_t i = 0; i < MAX_FONTS; i++) {
+        if (!g_graphics.fonts[i].in_use) {
+            graphics_font_t* font = &g_graphics.fonts[i];
+            
+            font->in_use = true;
+            font->id = g_graphics.next_font_id++;
+            font->size = size;
+            font->glyph_width = 8;
+            font->glyph_height = size;
+            font->owner = get_current_process();
+            
+            /* Copy font name */
+            for (int j = 0; j < 63 && font_path[j]; j++) {
+                font->name[j] = font_path[j];
+            }
+            font->name[63] = 0;
+            
+            /* Allocate glyph data (simplified) */
+            font->glyph_data = (uint8_t*)vmm_kmalloc(256 * 8, 16);
+            if (!font->glyph_data) {
+                font->in_use = false;
+                return 0;
+            }
+            
+            return font->id;
+        }
+    }
+    
+    return 0;
+}
+
+status_t graphics_unload_font(uint32_t font_id) {
+    for (uint32_t i = 0; i < MAX_FONTS; i++) {
+        if (g_graphics.fonts[i].in_use && g_graphics.fonts[i].id == font_id) {
+            graphics_font_t* font = &g_graphics.fonts[i];
+            
+            if (font->glyph_data) {
+                vmm_kfree(font->glyph_data, 256 * 8);
+            }
+            
+            k_memset(font, 0, sizeof(graphics_font_t));
+            return STATUS_OK;
+        }
+    }
+    
+    return STATUS_NOTFOUND;
+}
+
+status_t graphics_measure_text(const char* text, uint32_t font_id, uint32_t* width, uint32_t* height) {
+    if (!text || !width || !height) {
+        return STATUS_ERROR;
+    }
+    
+    /* Find font */
+    graphics_font_t* font = NULL;
+    for (uint32_t i = 0; i < MAX_FONTS; i++) {
+        if (g_graphics.fonts[i].in_use && g_graphics.fonts[i].id == font_id) {
+            font = &g_graphics.fonts[i];
+            break;
+        }
+    }
+    
+    if (!font) {
+        /* Use default 8x8 font */
+        *width = strlen(text) * 8;
+        *height = 8;
+    } else {
+        *width = strlen(text) * font->glyph_width;
+        *height = font->glyph_height;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Bitmap management */
+uint32_t graphics_load_bitmap(const char* image_path) {
+    if (!image_path) {
+        return 0;
+    }
+    
+    /* Find free bitmap slot */
+    for (uint32_t i = 0; i < MAX_BITMAPS; i++) {
+        if (!g_graphics.bitmaps[i].in_use) {
+            graphics_bitmap_t* bitmap = &g_graphics.bitmaps[i];
+            
+            bitmap->in_use = true;
+            bitmap->id = g_graphics.next_bitmap_id++;
+            bitmap->width = 64;   /* Placeholder dimensions */
+            bitmap->height = 64;
+            bitmap->format = GFX_FORMAT_RGBA8888;
+            bitmap->size = 64 * 64 * 4;
+            bitmap->owner = get_current_process();
+            
+            /* Allocate bitmap data */
+            bitmap->data = vmm_kmalloc(bitmap->size, 16);
+            if (!bitmap->data) {
+                bitmap->in_use = false;
+                return 0;
+            }
+            
+            /* Initialize with placeholder pattern */
+            uint32_t* pixels = (uint32_t*)bitmap->data;
+            for (uint32_t y = 0; y < 64; y++) {
+                for (uint32_t x = 0; x < 64; x++) {
+                    pixels[y * 64 + x] = ((x + y) & 1) ? 0xFFFFFFFF : 0xFF000000;
+                }
+            }
+            
+            return bitmap->id;
+        }
+    }
+    
+    return 0;
+}
+
+status_t graphics_draw_bitmap(uint32_t buffer_id, uint32_t bitmap_id, uint32_t x, uint32_t y) {
+    /* Find bitmap */
+    graphics_bitmap_t* bitmap = NULL;
+    for (uint32_t i = 0; i < MAX_BITMAPS; i++) {
+        if (g_graphics.bitmaps[i].in_use && g_graphics.bitmaps[i].id == bitmap_id) {
+            bitmap = &g_graphics.bitmaps[i];
+            break;
+        }
+    }
+    
+    if (!bitmap) {
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Get destination framebuffer */
+    void* framebuffer = NULL;
+    uint32_t fb_width = 0, fb_height = 0, pitch = 0;
+    
+    if (!get_framebuffer_for_buffer(buffer_id, &framebuffer, &fb_width, &fb_height, &pitch)) {
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Blit bitmap to framebuffer */
+    uint32_t* src_pixels = (uint32_t*)bitmap->data;
+    
+    for (uint32_t row = 0; row < bitmap->height; row++) {
+        if (y + row >= fb_height) break;
+        
+        for (uint32_t col = 0; col < bitmap->width; col++) {
+            if (x + col >= fb_width) break;
+            
+            uint32_t pixel = src_pixels[row * bitmap->width + col];
+            set_pixel_rgba(framebuffer, x + col, y + row, pitch, pixel);
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+status_t graphics_draw_bitmap_scaled(uint32_t buffer_id, uint32_t bitmap_id, uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    /* Find bitmap */
+    graphics_bitmap_t* bitmap = NULL;
+    for (uint32_t i = 0; i < MAX_BITMAPS; i++) {
+        if (g_graphics.bitmaps[i].in_use && g_graphics.bitmaps[i].id == bitmap_id) {
+            bitmap = &g_graphics.bitmaps[i];
+            break;
+        }
+    }
+    
+    if (!bitmap) {
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Use scaled blit - simplified approach */
+    return graphics_blit_scaled(bitmap_id, buffer_id, 0, 0, bitmap->width, bitmap->height, x, y, width, height);
+}
+
+status_t graphics_unload_bitmap(uint32_t bitmap_id) {
+    for (uint32_t i = 0; i < MAX_BITMAPS; i++) {
+        if (g_graphics.bitmaps[i].in_use && g_graphics.bitmaps[i].id == bitmap_id) {
+            graphics_bitmap_t* bitmap = &g_graphics.bitmaps[i];
+            
+            if (bitmap->data) {
+                vmm_kfree(bitmap->data, bitmap->size);
+            }
+            
+            k_memset(bitmap, 0, sizeof(graphics_bitmap_t));
+            return STATUS_OK;
+        }
+    }
+    
+    return STATUS_NOTFOUND;
+}

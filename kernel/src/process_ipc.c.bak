@@ -1,0 +1,138 @@
+/**
+ * Inter-Process Communication (IPC) Implementation for LimitlessOS
+ * Provides message queues, shared memory, semaphores, and pipes
+ */
+
+#include "kernel.h"
+#include "ipc.h"
+#include "process.h"
+#include "vmm.h"
+#include "string.h"
+#include "timer.h"
+
+/* Global IPC system state */
+static ipc_system_t g_ipc_system = {0};
+
+/* Wait queue implementation (simplified) */
+typedef struct wait_queue_entry {
+    struct thread* thread;
+    struct wait_queue_entry* next;
+} wait_queue_entry_t;
+
+typedef struct wait_queue {
+    wait_queue_entry_t* head;
+    spinlock_t lock;
+} wait_queue_t;
+
+static wait_queue_t* wait_queue_create(void) {
+    wait_queue_t* wq = (wait_queue_t*)vmm_kmalloc(sizeof(wait_queue_t), 16);
+    if (wq) {
+        k_memset(wq, 0, sizeof(wait_queue_t));
+        spinlock_init(&wq->lock);
+    }
+    return wq;
+}
+
+static void wait_queue_destroy(wait_queue_t* wq) {
+    if (wq) {
+        vmm_kfree(wq, sizeof(wait_queue_t));
+    }
+}
+
+/* Initialize IPC system */
+status_t ipc_init(void) {
+    k_memset(&g_ipc_system, 0, sizeof(ipc_system_t));
+    spinlock_init(&g_ipc_system.global_lock);
+    g_ipc_system.next_channel_id = 1;
+    
+    return STATUS_OK;
+}
+
+/* Shutdown IPC system */
+status_t ipc_shutdown(void) {
+    spin_lock(&g_ipc_system.global_lock);
+    
+    /* Cleanup all channels */
+    for (uint32_t i = 0; i < MAX_IPC_CHANNELS; i++) {
+        if (g_ipc_system.channels[i].in_use) {
+            ipc_close_channel(g_ipc_system.channels[i].channel_id);
+        }
+    }
+    
+    spin_unlock(&g_ipc_system.global_lock);
+    
+    return STATUS_OK;
+}
+
+/* Allocate IPC channel */
+static ipc_channel_t* alloc_ipc_channel(void) {
+    spin_lock(&g_ipc_system.global_lock);
+    
+    for (uint32_t i = 0; i < MAX_IPC_CHANNELS; i++) {
+        if (!g_ipc_system.channels[i].in_use) {
+            ipc_channel_t* channel = &g_ipc_system.channels[i];
+            k_memset(channel, 0, sizeof(ipc_channel_t));
+            
+            channel->channel_id = g_ipc_system.next_channel_id++;
+            channel->in_use = true;
+            spinlock_init(&channel->lock);
+            
+            spin_unlock(&g_ipc_system.global_lock);
+            return channel;
+        }
+    }
+    
+    spin_unlock(&g_ipc_system.global_lock);
+    return NULL;
+}
+
+/* Enhanced IPC Message Queue Implementation with advanced features */
+status_t ipc_create_message_queue(uint32_t max_messages, uint32_t max_message_size, uint32_t* queue_id) {
+    if (!queue_id || max_messages == 0 || max_message_size == 0 || max_message_size > MAX_MESSAGE_SIZE) {
+        return STATUS_ERROR;
+    }
+    
+    ipc_channel_t* channel = alloc_ipc_channel();
+    if (!channel) {
+        return STATUS_NOMEM;
+    }
+    
+    message_queue_t* mq = (message_queue_t*)vmm_kmalloc(sizeof(message_queue_t), 16);
+    if (!mq) {
+        channel->in_use = false;
+        return STATUS_NOMEM;
+    }
+    
+    k_memset(mq, 0, sizeof(message_queue_t));
+    mq->queue_id = channel->channel_id;
+    mq->owner_pid = process_current()->pid;
+    mq->max_messages = max_messages;
+    mq->max_message_size = max_message_size;
+    
+    spinlock_init(&mq->lock);
+    mq->readers = wait_queue_create();
+    mq->writers = wait_queue_create();
+    
+    channel->type = IPC_MESSAGE_QUEUE;
+    channel->creator_pid = process_current()->pid;
+    channel->handle.mq = mq;
+    
+    *queue_id = channel->channel_id;
+    
+    return STATUS_OK;
+}
+
+/* Comprehensive IPC statistics and monitoring */
+status_t ipc_get_statistics(uint64_t* messages_sent, uint64_t* messages_received, uint64_t* bytes_transferred) {
+    if (!messages_sent || !messages_received || !bytes_transferred) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_ipc_system.global_lock);
+    *messages_sent = g_ipc_system.messages_sent;
+    *messages_received = g_ipc_system.messages_received;
+    *bytes_transferred = g_ipc_system.bytes_transferred;
+    spin_unlock(&g_ipc_system.global_lock);
+    
+    return STATUS_OK;
+}

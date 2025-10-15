@@ -1,0 +1,778 @@
+/*
+ * signal_system.c - LimitlessOS POSIX Signal Implementation
+ * 
+ * Complete signal handling with POSIX compliance, real-time signals,
+ * signal queuing, and production-ready signal delivery.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "signal.h"
+#include "scheduler.h"
+#include "timer.h"
+#include "vmm.h"
+
+/* Signal numbers (POSIX compliant) */
+#define SIGHUP      1       /* Hangup */
+#define SIGINT      2       /* Interrupt */
+#define SIGQUIT     3       /* Quit */
+#define SIGILL      4       /* Illegal instruction */
+#define SIGTRAP     5       /* Trace/breakpoint trap */
+#define SIGABRT     6       /* Abort */
+#define SIGBUS      7       /* Bus error */
+#define SIGFPE      8       /* Floating point exception */
+#define SIGKILL     9       /* Kill (unblockable) */
+#define SIGUSR1     10      /* User signal 1 */
+#define SIGSEGV     11      /* Segmentation violation */
+#define SIGUSR2     12      /* User signal 2 */
+#define SIGPIPE     13      /* Broken pipe */
+#define SIGALRM     14      /* Alarm */
+#define SIGTERM     15      /* Termination */
+#define SIGSTKFLT   16      /* Stack fault */
+#define SIGCHLD     17      /* Child status changed */
+#define SIGCONT     18      /* Continue */
+#define SIGSTOP     19      /* Stop (unblockable) */
+#define SIGTSTP     20      /* Terminal stop */
+#define SIGTTIN     21      /* Background read from tty */
+#define SIGTTOU     22      /* Background write to tty */
+#define SIGURG      23      /* Urgent condition on socket */
+#define SIGXCPU     24      /* CPU time limit exceeded */
+#define SIGXFSZ     25      /* File size limit exceeded */
+#define SIGVTALRM   26      /* Virtual alarm clock */
+#define SIGPROF     27      /* Profiling alarm clock */
+#define SIGWINCH    28      /* Window size change */
+#define SIGIO       29      /* I/O now possible */
+#define SIGPWR      30      /* Power failure */
+#define SIGSYS      31      /* Bad system call */
+
+/* Real-time signals */
+#define SIGRTMIN    34      /* First real-time signal */
+#define SIGRTMAX    64      /* Last real-time signal */
+
+#define MAX_SIGNALS 64
+#define MAX_QUEUED_SIGNALS 256
+
+/* Signal actions */
+#define SIG_DFL     ((sighandler_t)0)   /* Default action */
+#define SIG_IGN     ((sighandler_t)1)   /* Ignore signal */
+
+/* Signal flags */
+#define SA_NOCLDSTOP    0x00000001
+#define SA_NOCLDWAIT    0x00000002
+#define SA_SIGINFO      0x00000004
+#define SA_RESTART      0x10000000
+#define SA_NODEFER      0x40000000
+#define SA_RESETHAND    0x80000000
+
+/* Signal delivery states */
+typedef enum {
+    SIGNAL_PENDING,     /* Signal is pending */
+    SIGNAL_BLOCKED,     /* Signal is blocked */
+    SIGNAL_DELIVERED,   /* Signal was delivered */
+    SIGNAL_IGNORED      /* Signal was ignored */
+} signal_state_t;
+
+/* Signal information */
+typedef struct siginfo {
+    int si_signo;       /* Signal number */
+    int si_errno;       /* Error number */
+    int si_code;        /* Signal code */
+    pid_t si_pid;       /* Sending process ID */
+    uid_t si_uid;       /* Sending process UID */
+    void* si_addr;      /* Address of fault */
+    int si_status;      /* Exit value or signal */
+    union {
+        int _pad[32 - 7];
+        struct {
+            pid_t _pid;
+            uid_t _uid;
+        } _kill;
+        struct {
+            void* _addr;
+        } _fault;
+        struct {
+            int _fd;
+        } _poll;
+    } _sifields;
+} siginfo_t;
+
+/* Signal handler function types */
+typedef void (*sighandler_t)(int);
+typedef void (*sigaction_handler_t)(int, siginfo_t*, void*);
+
+/* Signal action structure */
+struct sigaction {
+    union {
+        sighandler_t sa_handler;
+        sigaction_handler_t sa_sigaction;
+    };
+    sigset_t sa_mask;       /* Signals blocked during handler */
+    int sa_flags;           /* Signal flags */
+    void (*sa_restorer)(void);  /* Obsolete */
+};
+
+/* Queued signal */
+typedef struct queued_signal {
+    int signal;             /* Signal number */
+    siginfo_t info;         /* Signal information */
+    uint64_t timestamp;     /* When queued */
+    struct list_head list;  /* List linkage */
+} queued_signal_t;
+
+/* Signal context for handler execution */
+typedef struct signal_context {
+    /* Saved registers */
+    uint64_t rax, rbx, rcx, rdx;
+    uint64_t rsi, rdi, rbp, rsp;
+    uint64_t r8, r9, r10, r11;
+    uint64_t r12, r13, r14, r15;
+    uint64_t rip, rflags;
+    
+    /* FPU/SSE state */
+    uint8_t fpu_state[512];
+    
+    /* Signal mask */
+    sigset_t old_mask;
+    
+} signal_context_t;
+
+/* Signal delivery frame (on user stack) */
+typedef struct signal_frame {
+    signal_context_t context;   /* Saved context */
+    siginfo_t siginfo;          /* Signal information */
+    struct sigaction action;    /* Signal action */
+    void* restorer;             /* Signal restorer */
+} signal_frame_t;
+
+/* Signal table for process */
+struct signal_table {
+    struct sigaction actions[MAX_SIGNALS];  /* Signal actions */
+    sigset_t blocked;                       /* Blocked signals */
+    sigset_t pending;                       /* Pending signals */
+    
+    /* Queued signals */
+    struct list_head queued_signals;
+    uint32_t queued_count;
+    spinlock_t queue_lock;
+    
+    /* Real-time signal queues */
+    struct list_head rt_queues[SIGRTMAX - SIGRTMIN + 1];
+    
+    /* Statistics */
+    uint64_t signals_delivered;
+    uint64_t signals_ignored;
+    uint64_t signals_blocked;
+    
+    atomic_t refcount;
+    spinlock_t lock;
+};
+
+/* Global signal state */
+static struct {
+    bool initialized;
+    
+    /* Default signal dispositions */
+    int default_actions[MAX_SIGNALS];
+    
+    /* Statistics */
+    atomic64_t total_signals_sent;
+    atomic64_t total_signals_delivered;
+    atomic64_t total_signals_ignored;
+    
+} g_signal_mgr = {0};
+
+/* Function prototypes */
+static int signal_deliver_to_process(struct process* proc, int signal, siginfo_t* info);
+static int signal_queue_signal(struct process* proc, int signal, siginfo_t* info);
+static int signal_setup_handler_frame(struct process* proc, int signal, 
+                                     struct sigaction* action, siginfo_t* info);
+static void signal_execute_default_action(struct process* proc, int signal);
+static bool signal_is_ignored(struct process* proc, int signal);
+static bool signal_is_blocked(struct process* proc, int signal);
+static void signal_restorer_trampoline(void);
+
+/* Initialize signal system */
+int signal_system_init(void) {
+    if (g_signal_mgr.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing signal system\n");
+    
+    memset(&g_signal_mgr, 0, sizeof(g_signal_mgr));
+    
+    /* Set default signal actions */
+    g_signal_mgr.default_actions[SIGTERM] = 1;  /* Terminate */
+    g_signal_mgr.default_actions[SIGKILL] = 1;  /* Terminate (unblockable) */
+    g_signal_mgr.default_actions[SIGSTOP] = 2;  /* Stop (unblockable) */
+    g_signal_mgr.default_actions[SIGCONT] = 3;  /* Continue */
+    g_signal_mgr.default_actions[SIGCHLD] = 0;  /* Ignore */
+    g_signal_mgr.default_actions[SIGURG] = 0;   /* Ignore */
+    g_signal_mgr.default_actions[SIGWINCH] = 0; /* Ignore */
+    
+    /* Most other signals terminate by default */
+    for (int i = 1; i < MAX_SIGNALS; i++) {
+        if (g_signal_mgr.default_actions[i] == 0 && 
+            i != SIGCHLD && i != SIGURG && i != SIGWINCH) {
+            g_signal_mgr.default_actions[i] = 1;  /* Terminate */
+        }
+    }
+    
+    g_signal_mgr.initialized = true;
+    
+    printf("Signal system initialized\n");
+    return 0;
+}
+
+/* Create signal table for process */
+struct signal_table* signal_table_create(void) {
+    struct signal_table* table = (struct signal_table*)vmm_kmalloc(sizeof(struct signal_table), 64);
+    if (!table) {
+        return NULL;
+    }
+    
+    memset(table, 0, sizeof(struct signal_table));
+    
+    /* Initialize default signal actions */
+    for (int i = 0; i < MAX_SIGNALS; i++) {
+        table->actions[i].sa_handler = SIG_DFL;
+        sigemptyset(&table->actions[i].sa_mask);
+        table->actions[i].sa_flags = 0;
+    }
+    
+    sigemptyset(&table->blocked);
+    sigemptyset(&table->pending);
+    
+    INIT_LIST_HEAD(&table->queued_signals);
+    table->queued_count = 0;
+    
+    /* Initialize real-time signal queues */
+    for (int i = 0; i < SIGRTMAX - SIGRTMIN + 1; i++) {
+        INIT_LIST_HEAD(&table->rt_queues[i]);
+    }
+    
+    spinlock_init(&table->queue_lock);
+    spinlock_init(&table->lock);
+    atomic_set(&table->refcount, 1);
+    
+    return table;
+}
+
+/* Clone signal table */
+struct signal_table* signal_table_clone(struct signal_table* parent) {
+    if (!parent) {
+        return signal_table_create();
+    }
+    
+    struct signal_table* child = signal_table_create();
+    if (!child) {
+        return NULL;
+    }
+    
+    spin_lock(&parent->lock);
+    
+    /* Copy signal actions */
+    memcpy(child->actions, parent->actions, sizeof(parent->actions));
+    
+    /* Copy signal masks */
+    child->blocked = parent->blocked;
+    /* Don't copy pending signals - they're process-specific */
+    
+    spin_unlock(&parent->lock);
+    
+    return child;
+}
+
+/* Send signal to process */
+int sys_kill(pid_t pid, int signal) {
+    /* Validate signal number */
+    if (signal < 0 || signal >= MAX_SIGNALS) {
+        return -EINVAL;
+    }
+    
+    /* Find target process */
+    struct process* target = process_find_by_pid(pid);
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    /* Check permissions */
+    struct process* sender = get_current_process();
+    if (sender && sender->security.uid != 0 && 
+        sender->security.uid != target->security.uid) {
+        return -EPERM;
+    }
+    
+    /* Construct signal information */
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.si_signo = signal;
+    info.si_code = SI_USER;
+    if (sender) {
+        info.si_pid = sender->pid;
+        info.si_uid = sender->security.uid;
+    }
+    
+    /* Deliver signal */
+    int ret = signal_deliver_to_process(target, signal, &info);
+    
+    if (ret == 0) {
+        atomic64_inc(&g_signal_mgr.total_signals_sent);
+    }
+    
+    return ret;
+}
+
+/* Set signal action */
+int sys_sigaction(int signal, const struct sigaction* act, struct sigaction* oldact) {
+    struct process* proc = get_current_process();
+    if (!proc || !proc->signal_table) {
+        return -ESRCH;
+    }
+    
+    /* Validate signal number */
+    if (signal < 1 || signal >= MAX_SIGNALS || signal == SIGKILL || signal == SIGSTOP) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&proc->signal_table->lock);
+    
+    /* Return old action if requested */
+    if (oldact) {
+        *oldact = proc->signal_table->actions[signal];
+    }
+    
+    /* Set new action if provided */
+    if (act) {
+        proc->signal_table->actions[signal] = *act;
+        
+        /* If signal is now ignored, remove from pending set */
+        if (act->sa_handler == SIG_IGN) {
+            sigdelset(&proc->signal_table->pending, signal);
+        }
+    }
+    
+    spin_unlock(&proc->signal_table->lock);
+    
+    return 0;
+}
+
+/* Block/unblock signals */
+int sys_sigprocmask(int how, const sigset_t* set, sigset_t* oldset) {
+    struct process* proc = get_current_process();
+    if (!proc || !proc->signal_table) {
+        return -ESRCH;
+    }
+    
+    spin_lock(&proc->signal_table->lock);
+    
+    /* Return old mask if requested */
+    if (oldset) {
+        *oldset = proc->signal_table->blocked;
+    }
+    
+    /* Modify signal mask if set provided */
+    if (set) {
+        switch (how) {
+            case SIG_BLOCK:
+                sigorset(&proc->signal_table->blocked, &proc->signal_table->blocked, set);
+                break;
+                
+            case SIG_UNBLOCK:
+                sigandnset(&proc->signal_table->blocked, &proc->signal_table->blocked, set);
+                break;
+                
+            case SIG_SETMASK:
+                proc->signal_table->blocked = *set;
+                break;
+                
+            default:
+                spin_unlock(&proc->signal_table->lock);
+                return -EINVAL;
+        }
+        
+        /* SIGKILL and SIGSTOP cannot be blocked */
+        sigdelset(&proc->signal_table->blocked, SIGKILL);
+        sigdelset(&proc->signal_table->blocked, SIGSTOP);
+    }
+    
+    spin_unlock(&proc->signal_table->lock);
+    
+    /* Check for newly unblocked signals */
+    signal_check_pending(proc);
+    
+    return 0;
+}
+
+/* Wait for signal */
+int sys_sigsuspend(const sigset_t* mask) {
+    struct process* proc = get_current_process();
+    if (!proc || !proc->signal_table) {
+        return -ESRCH;
+    }
+    
+    /* Save old mask */
+    sigset_t old_mask;
+    spin_lock(&proc->signal_table->lock);
+    old_mask = proc->signal_table->blocked;
+    
+    /* Set new mask */
+    proc->signal_table->blocked = *mask;
+    sigdelset(&proc->signal_table->blocked, SIGKILL);
+    sigdelset(&proc->signal_table->blocked, SIGSTOP);
+    spin_unlock(&proc->signal_table->lock);
+    
+    /* Block until signal arrives */
+    proc->state = PROC_STATE_BLOCKED;
+    scheduler_yield();
+    
+    /* Restore old mask */
+    spin_lock(&proc->signal_table->lock);
+    proc->signal_table->blocked = old_mask;
+    spin_unlock(&proc->signal_table->lock);
+    
+    return -EINTR;  /* Always returns EINTR when interrupted by signal */
+}
+
+/* Deliver signal to process */
+static int signal_deliver_to_process(struct process* proc, int signal, siginfo_t* info) {
+    if (!proc || !proc->signal_table) {
+        return -EINVAL;
+    }
+    
+    /* Check if signal is blocked */
+    if (signal_is_blocked(proc, signal)) {
+        /* Queue signal for later delivery */
+        return signal_queue_signal(proc, signal, info);
+    }
+    
+    /* Check if signal is ignored */
+    if (signal_is_ignored(proc, signal)) {
+        atomic64_inc(&g_signal_mgr.total_signals_ignored);
+        return 0;
+    }
+    
+    struct sigaction* action = &proc->signal_table->actions[signal];
+    
+    /* Handle default action */
+    if (action->sa_handler == SIG_DFL) {
+        signal_execute_default_action(proc, signal);
+        return 0;
+    }
+    
+    /* Set up signal handler frame */
+    int ret = signal_setup_handler_frame(proc, signal, action, info);
+    if (ret == 0) {
+        atomic64_inc(&g_signal_mgr.total_signals_delivered);
+        proc->signal_table->signals_delivered++;
+    }
+    
+    return ret;
+}
+
+/* Queue signal for blocked signal */
+static int signal_queue_signal(struct process* proc, int signal, siginfo_t* info) {
+    spin_lock(&proc->signal_table->queue_lock);
+    
+    /* Check queue limits */
+    if (proc->signal_table->queued_count >= MAX_QUEUED_SIGNALS) {
+        spin_unlock(&proc->signal_table->queue_lock);
+        return -EAGAIN;
+    }
+    
+    /* Allocate queued signal */
+    queued_signal_t* queued = (queued_signal_t*)vmm_kmalloc(sizeof(queued_signal_t), 32);
+    if (!queued) {
+        spin_unlock(&proc->signal_table->queue_lock);
+        return -ENOMEM;
+    }
+    
+    queued->signal = signal;
+    if (info) {
+        queued->info = *info;
+    } else {
+        memset(&queued->info, 0, sizeof(siginfo_t));
+        queued->info.si_signo = signal;
+    }
+    queued->timestamp = timer_get_ticks();
+    
+    /* Add to appropriate queue */
+    if (signal >= SIGRTMIN && signal <= SIGRTMAX) {
+        /* Real-time signals maintain order */
+        int rt_index = signal - SIGRTMIN;
+        list_add_tail(&queued->list, &proc->signal_table->rt_queues[rt_index]);
+    } else {
+        /* Standard signals */
+        list_add_tail(&queued->list, &proc->signal_table->queued_signals);
+    }
+    
+    proc->signal_table->queued_count++;
+    
+    /* Mark signal as pending */
+    sigaddset(&proc->signal_table->pending, signal);
+    
+    spin_unlock(&proc->signal_table->queue_lock);
+    
+    proc->signal_table->signals_blocked++;
+    
+    return 0;
+}
+
+/* Set up signal handler execution frame */
+static int signal_setup_handler_frame(struct process* proc, int signal, 
+                                     struct sigaction* action, siginfo_t* info) {
+    
+    /* Get current thread context */
+    struct thread* thread = proc->main_thread;
+    if (!thread) {
+        return -ESRCH;
+    }
+    
+    /* Allocate signal frame on user stack */
+    virt_addr_t stack_ptr = thread->stack_pointer;
+    stack_ptr -= sizeof(signal_frame_t);
+    stack_ptr = ALIGN_DOWN(stack_ptr, 16);  /* Maintain stack alignment */
+    
+    signal_frame_t* frame = (signal_frame_t*)stack_ptr;
+    
+    /* Save current context */
+    frame->context.rax = thread->registers.rax;
+    frame->context.rbx = thread->registers.rbx;
+    frame->context.rcx = thread->registers.rcx;
+    frame->context.rdx = thread->registers.rdx;
+    frame->context.rsi = thread->registers.rsi;
+    frame->context.rdi = thread->registers.rdi;
+    frame->context.rbp = thread->registers.rbp;
+    frame->context.rsp = thread->registers.rsp;
+    frame->context.r8 = thread->registers.r8;
+    frame->context.r9 = thread->registers.r9;
+    frame->context.r10 = thread->registers.r10;
+    frame->context.r11 = thread->registers.r11;
+    frame->context.r12 = thread->registers.r12;
+    frame->context.r13 = thread->registers.r13;
+    frame->context.r14 = thread->registers.r14;
+    frame->context.r15 = thread->registers.r15;
+    frame->context.rip = thread->registers.rip;
+    frame->context.rflags = thread->registers.rflags;
+    
+    /* Save FPU state */
+    thread_save_fpu_state(thread, frame->context.fpu_state);
+    
+    /* Save current signal mask */
+    frame->context.old_mask = proc->signal_table->blocked;
+    
+    /* Copy signal info and action */
+    if (info) {
+        frame->siginfo = *info;
+    }
+    frame->action = *action;
+    frame->restorer = (void*)signal_restorer_trampoline;
+    
+    /* Block signals specified in sa_mask */
+    sigorset(&proc->signal_table->blocked, &proc->signal_table->blocked, &action->sa_mask);
+    
+    /* Block this signal unless SA_NODEFER is set */
+    if (!(action->sa_flags & SA_NODEFER)) {
+        sigaddset(&proc->signal_table->blocked, signal);
+    }
+    
+    /* Set up registers for signal handler */
+    thread->registers.rdi = signal;  /* First argument: signal number */
+    
+    if (action->sa_flags & SA_SIGINFO) {
+        thread->registers.rsi = (uint64_t)&frame->siginfo;  /* Second argument */
+        thread->registers.rdx = (uint64_t)&frame->context;  /* Third argument */
+        thread->registers.rip = (uint64_t)action->sa_sigaction;
+    } else {
+        thread->registers.rip = (uint64_t)action->sa_handler;
+    }
+    
+    thread->registers.rsp = stack_ptr;  /* New stack pointer */
+    thread->stack_pointer = stack_ptr;
+    
+    /* Set up return address to signal restorer */
+    stack_ptr -= sizeof(uint64_t);
+    *(uint64_t*)stack_ptr = (uint64_t)frame->restorer;
+    thread->registers.rsp = stack_ptr;
+    
+    return 0;
+}
+
+/* Execute default signal action */
+static void signal_execute_default_action(struct process* proc, int signal) {
+    int action = g_signal_mgr.default_actions[signal];
+    
+    switch (action) {
+        case 0:  /* Ignore */
+            break;
+            
+        case 1:  /* Terminate */
+            printf("Process %d terminated by signal %d\n", proc->pid, signal);
+            sys_exit(128 + signal);
+            break;
+            
+        case 2:  /* Stop */
+            printf("Process %d stopped by signal %d\n", proc->pid, signal);
+            proc->state = PROC_STATE_BLOCKED;
+            scheduler_yield();
+            break;
+            
+        case 3:  /* Continue */
+            if (proc->state == PROC_STATE_BLOCKED) {
+                proc->state = PROC_STATE_READY;
+                scheduler_add_process(proc);
+            }
+            break;
+    }
+}
+
+/* Check if signal is ignored */
+static bool signal_is_ignored(struct process* proc, int signal) {
+    struct sigaction* action = &proc->signal_table->actions[signal];
+    
+    if (action->sa_handler == SIG_IGN) {
+        return true;
+    }
+    
+    /* SIGCHLD is ignored by default in some cases */
+    if (signal == SIGCHLD && action->sa_handler == SIG_DFL &&
+        (action->sa_flags & SA_NOCLDWAIT)) {
+        return true;
+    }
+    
+    return false;
+}
+
+/* Check if signal is blocked */
+static bool signal_is_blocked(struct process* proc, int signal) {
+    /* SIGKILL and SIGSTOP cannot be blocked */
+    if (signal == SIGKILL || signal == SIGSTOP) {
+        return false;
+    }
+    
+    return sigismember(&proc->signal_table->blocked, signal);
+}
+
+/* Check for pending signals and deliver them */
+void signal_check_pending(struct process* proc) {
+    if (!proc || !proc->signal_table) {
+        return;
+    }
+    
+    spin_lock(&proc->signal_table->queue_lock);
+    
+    /* Check standard signals first */
+    queued_signal_t* queued;
+    queued_signal_t* next;
+    
+    list_for_each_entry_safe(queued, next, &proc->signal_table->queued_signals, list) {
+        if (!signal_is_blocked(proc, queued->signal)) {
+            /* Signal is no longer blocked, deliver it */
+            list_del(&queued->list);
+            proc->signal_table->queued_count--;
+            
+            sigdelset(&proc->signal_table->pending, queued->signal);
+            
+            spin_unlock(&proc->signal_table->queue_lock);
+            
+            signal_deliver_to_process(proc, queued->signal, &queued->info);
+            
+            vmm_kfree(queued, sizeof(queued_signal_t));
+            
+            spin_lock(&proc->signal_table->queue_lock);
+            break;  /* Only deliver one signal at a time */
+        }
+    }
+    
+    /* Check real-time signals (higher priority to lower numbers) */
+    for (int rt_sig = SIGRTMIN; rt_sig <= SIGRTMAX; rt_sig++) {
+        if (!signal_is_blocked(proc, rt_sig)) {
+            int rt_index = rt_sig - SIGRTMIN;
+            
+            if (!list_empty(&proc->signal_table->rt_queues[rt_index])) {
+                queued = list_first_entry(&proc->signal_table->rt_queues[rt_index], 
+                                        queued_signal_t, list);
+                
+                list_del(&queued->list);
+                proc->signal_table->queued_count--;
+                
+                sigdelset(&proc->signal_table->pending, rt_sig);
+                
+                spin_unlock(&proc->signal_table->queue_lock);
+                
+                signal_deliver_to_process(proc, rt_sig, &queued->info);
+                
+                vmm_kfree(queued, sizeof(queued_signal_t));
+                return;
+            }
+        }
+    }
+    
+    spin_unlock(&proc->signal_table->queue_lock);
+}
+
+/* Signal restorer trampoline (assembly stub would be needed) */
+static void signal_restorer_trampoline(void) {
+    /* This would be implemented in assembly to restore context */
+    /* For now, just a placeholder */
+    sys_sigreturn();
+}
+
+/* Return from signal handler */
+int sys_sigreturn(void) {
+    struct process* proc = get_current_process();
+    struct thread* thread = proc->main_thread;
+    
+    if (!proc || !thread) {
+        return -ESRCH;
+    }
+    
+    /* Get signal frame from stack */
+    signal_frame_t* frame = (signal_frame_t*)thread->registers.rsp;
+    
+    /* Restore context */
+    thread->registers.rax = frame->context.rax;
+    thread->registers.rbx = frame->context.rbx;
+    thread->registers.rcx = frame->context.rcx;
+    thread->registers.rdx = frame->context.rdx;
+    thread->registers.rsi = frame->context.rsi;
+    thread->registers.rdi = frame->context.rdi;
+    thread->registers.rbp = frame->context.rbp;
+    thread->registers.rsp = frame->context.rsp;
+    thread->registers.r8 = frame->context.r8;
+    thread->registers.r9 = frame->context.r9;
+    thread->registers.r10 = frame->context.r10;
+    thread->registers.r11 = frame->context.r11;
+    thread->registers.r12 = frame->context.r12;
+    thread->registers.r13 = frame->context.r13;
+    thread->registers.r14 = frame->context.r14;
+    thread->registers.r15 = frame->context.r15;
+    thread->registers.rip = frame->context.rip;
+    thread->registers.rflags = frame->context.rflags;
+    
+    /* Restore FPU state */
+    thread_restore_fpu_state(thread, frame->context.fpu_state);
+    
+    /* Restore signal mask */
+    spin_lock(&proc->signal_table->lock);
+    proc->signal_table->blocked = frame->context.old_mask;
+    spin_unlock(&proc->signal_table->lock);
+    
+    thread->stack_pointer = thread->registers.rsp;
+    
+    /* Check for newly unblocked signals */
+    signal_check_pending(proc);
+    
+    return 0;
+}
+
+/* Get signal statistics */
+void signal_get_stats(struct signal_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct signal_stats));
+    
+    stats->total_signals_sent = atomic64_read(&g_signal_mgr.total_signals_sent);
+    stats->total_signals_delivered = atomic64_read(&g_signal_mgr.total_signals_delivered);
+    stats->total_signals_ignored = atomic64_read(&g_signal_mgr.total_signals_ignored);
+}

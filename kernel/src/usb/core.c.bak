@@ -1,0 +1,21 @@
+#include "usb.h"
+#include "input.h"
+#include "kernel.h"
+
+void usb_init(void) {
+    /* Initialize USB subsystems */
+    usb_hid_init();
+    usb_hub_init();
+    
+    kprintf("USB core initialized\n");
+}
+
+void usb_hid_kbd_input(u8 keycode, int pressed) {
+    key_event_t ke = { .scancode = keycode, .unicode = 0, .pressed = pressed ? 1 : 0 };
+    input_push_key(&ke);
+}
+
+void usb_hid_mouse_input(int dx, int dy, u8 buttons) {
+    mouse_event_t me = { .dx = dx, .dy = dy, .buttons = buttons };
+    input_push_mouse(&me);
+}

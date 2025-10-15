@@ -1,0 +1,4 @@
+#include "lock_instrument.h"
+#ifdef CONFIG_LOCK_INSTRUMENT
+lock_stats_t g_lock_stats = {0};
+#endif

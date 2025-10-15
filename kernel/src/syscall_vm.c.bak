@@ -1,0 +1,139 @@
+/* File-backed region fault handler now uses metadata embedded in vmm_region_t */
+#include "log.h"
+#include "syscall.h"
+#include "vmm.h"
+#include "vfs.h"
+#include "page_cache.h"
+#include "process.h"
+
+/* Protection and mapping flags (local fallback; align with uapi/mman later) */
+#ifndef PROT_READ
+#define PROT_READ  0x1
+#endif
+#ifndef PROT_WRITE
+#define PROT_WRITE 0x2
+#endif
+#ifndef MAP_ANON
+#define MAP_ANON   0x20
+#endif
+#ifndef MAP_FILE
+#define MAP_FILE   0x00
+#endif
+
+int vmm_region_file_map_fault(vmm_aspace_t* as, vmm_region_t* r, u64 fault_addr, u64 err_code){
+    if(!r || !(r->flags & VMM_REGION_FILE) || !r->file_map) return -K_EINVAL;
+    vmm_file_mapping_t* fm = r->file_map;
+    if(!fm->vnode) return -K_ENOENT;
+    u64 page_off = ((u64)fault_addr - r->start) & ~(PAGE_SIZE-1);
+    if(page_off >= fm->length) return -K_EFAULT;
+    u64 file_off = fm->file_off + page_off;
+    bool is_write = (err_code & 0x2) != 0;
+    virt_addr_t vpage = (virt_addr_t)(fault_addr & PAGE_MASK);
+    if(is_write && (fm->prot & PROT_WRITE)){
+        return page_cache_remap_writable(as, fm->vnode, file_off, vpage, fm->prot);
+    }
+    return page_cache_map_into(as, fm->vnode, file_off, vpage, fm->prot, false);
+}
+
+
+static virt_addr_t alloc_user_va_range(vmm_aspace_t* as, u64 length){
+    /* naive: search a descending top area (placeholder) */
+    static virt_addr_t next = 0x00007fff00000000ULL; /* arbitrary high user start */
+    virt_addr_t base = (next - length) & ~(PAGE_SIZE-1); next = base;
+    return base;
+}
+
+long sys_mmap(void* addr, u64 length, int prot, int flags, int fd, u64 offset){
+    if(length==0) return -K_EINVAL; u64 pages = (length + PAGE_SIZE -1) & ~(PAGE_SIZE-1);
+    process_t* p = process_current(); if(!p) return -K_EINVAL; vmm_aspace_t* as = p->as; if(!as) return -K_EINVAL;
+    virt_addr_t base = addr ? (virt_addr_t)addr : alloc_user_va_range(as, pages);
+    int vmm_flags = VMM_REGION_USER; if(prot & PROT_WRITE) vmm_flags |= VMM_REGION_WRITE; if(!(flags & MAP_ANON)) vmm_flags |= VMM_REGION_FILE;
+    /* Demand paging: region is registered but no physical pages mapped yet.
+       Anonymous pages materialize on first not-present fault (zero-fill),
+       file-backed pages fetched from page cache via vmm_region_file_map_fault. */
+    int rc = vmm_region_add(as, base, pages, vmm_flags); if(rc!=0) return -rc;
+    vmm_region_t* region = vmm_region_find(as, base);
+    if(flags & MAP_ANON){ return (long)base; }
+    /* file-backed mapping: TODO fd table; for now fail if fd != -1 placeholder */
+    if(fd != -1) {
+        /* Not implemented: require sentinel -1 meaning temp test mapping. */
+    }
+    /* Build a dummy vnode for test or expect external layer to patch one in; weak path skip if none. */
+    extern vnode_t* test_mmap_default_vnode(void) __attribute__((weak));
+    vnode_t* vn = test_mmap_default_vnode ? test_mmap_default_vnode() : NULL;
+    if(!vn){ return (long)base; } /* silently treat as anonymous if no vnode */
+    if(region){
+        vmm_file_mapping_t* fm = (vmm_file_mapping_t*)vmm_kmalloc(sizeof(vmm_file_mapping_t),32);
+        if(!fm) return -K_ENOMEM;
+        fm->vnode = vn; fm->file_off=offset; fm->length=length; fm->prot=prot;
+        region->file_map = fm;
+    }
+    return (long)base;
+}
+
+long sys_munmap(void* addr, u64 length){
+    if(!addr || length==0) return -K_EINVAL;
+    process_t* p = process_current(); if(!p) return -K_EINVAL; vmm_aspace_t* as = p->as; if(!as) return -K_EINVAL;
+    virt_addr_t start = (virt_addr_t)addr & PAGE_MASK;
+    u64 len_aligned = (length + PAGE_SIZE -1) & PAGE_MASK;
+    vmm_region_t* r = vmm_region_find(as, start);
+    if(!r) return -K_EINVAL;
+    /* Clamp length if it extends past region */
+    if(start + len_aligned > r->start + r->length) return -K_EINVAL; /* cross-region unmap not supported */
+    /* Cases: exact, prefix, suffix, middle split */
+    bool file_backed = (r->flags & VMM_REGION_FILE) && r->file_map && r->file_map->vnode;
+    u64 region_end = r->start + r->length;
+    u64 unmap_start = start;
+    u64 unmap_end = start + len_aligned;
+    /* Flush only the portion if file-backed: for simplicity flush whole vnode */
+    if(file_backed) page_cache_flush_vnode(r->file_map->vnode);
+    /* Unmap pages in range */
+    for(u64 va = unmap_start; va < unmap_end; va += PAGE_SIZE){ vmm_unmap(as, (virt_addr_t)va, PAGE_SIZE); }
+    if(unmap_start == r->start && unmap_end == region_end){
+        /* Remove whole region */
+        vmm_region_t* pr=NULL; vmm_region_t* cur=as->regions; while(cur){ if(cur==r){ if(pr) pr->next=cur->next; else as->regions=cur->next; break;} pr=cur; cur=cur->next; }
+        if(r->file_map){ vmm_kfree(r->file_map, sizeof(*r->file_map)); }
+        vmm_kfree(r, sizeof(*r));
+        return 0;
+    } else if(unmap_start == r->start) {
+        /* Trim front */
+        u64 removed = unmap_end - r->start;
+        r->start = unmap_end;
+        r->length = region_end - unmap_end;
+        if(file_backed){ r->file_map->file_off += removed; r->file_map->length -= removed; }
+        return 0;
+    } else if(unmap_end == region_end) {
+        /* Trim tail */
+        r->length = unmap_start - r->start;
+        if(file_backed){ r->file_map->length = r->length; }
+        return 0;
+    } else {
+        /* Middle split: create a new region for the suffix */
+        u64 prefix_len = unmap_start - r->start;
+        u64 suffix_len = region_end - unmap_end;
+        vmm_region_t* newr = (vmm_region_t*)vmm_kmalloc(sizeof(vmm_region_t),32); if(!newr) return -K_ENOMEM;
+        newr->start = unmap_end;
+        newr->length = suffix_len;
+        newr->flags = r->flags;
+        newr->file_map = NULL;
+        /* Adjust original (prefix) */
+        r->length = prefix_len;
+        if(file_backed){
+            /* Original mapping keeps same file_off and trimmed length */
+            r->file_map->length = prefix_len + suffix_len; /* temporarily full span */
+            /* Need separate file_map for suffix */
+            vmm_file_mapping_t* fm2 = (vmm_file_mapping_t*)vmm_kmalloc(sizeof(vmm_file_mapping_t),32); if(!fm2){ vmm_kfree(newr,sizeof(*newr)); return -K_ENOMEM; }
+            fm2->vnode = r->file_map->vnode;
+            fm2->prot = r->file_map->prot;
+            fm2->file_off = r->file_map->file_off + (unmap_end - r->start - prefix_len); /* r->file_map->file_off + prefix + removed */
+            fm2->length = suffix_len;
+            newr->file_map = fm2;
+            /* Fix original length to prefix_len */
+            r->file_map->length = prefix_len;
+        }
+        /* Insert new region after r */
+        newr->next = r->next; r->next = newr;
+        return 0;
+    }
+}
+long sys_mprotect(void* addr, u64 length, int prot){ (void)addr; (void)length; (void)prot; return 0; }

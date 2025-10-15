@@ -1,0 +1,13 @@
+
+# LimitlessOS Optimized Build
+
+all:
+	@echo "🚀 Building LimitlessOS Optimized Edition..."
+	@$(MAKE) -f Makefile CFLAGS="-O3 -march=native -flto" LDFLAGS="-O3 -flto"
+
+help:
+	@echo "LimitlessOS Optimized Build System"
+	@echo "------------------------"
+	@echo "make all         - Build the entire OS (optimized)"
+	@echo "make help        - Show this help message"
+	@exit 0

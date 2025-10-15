@@ -1,0 +1,146 @@
+#include "net/dhcp.h"
+#include "net/net.h"
+
+#pragma pack(push,1)
+typedef struct {
+    u8  op, htype, hlen, hops;
+    u32 xid; u16 secs; u16 flags;
+    u32 ciaddr, yiaddr, siaddr, giaddr;
+    u8  chaddr[16];
+    u8  sname[64];
+    u8  file[128];
+    u32 magic;
+    u8  options[312];
+} dhcp_msg_t;
+#pragma pack(pop)
+
+#define BOOTREQUEST 1
+#define BOOTREPLY   2
+
+#define DHCP_MAGIC 0x63825363
+
+#define DHCP_OPT_MSGTYPE 53
+#define DHCP_OPT_REQIP   50
+#define DHCP_OPT_SERVER  54
+#define DHCP_OPT_PARAM   55
+#define DHCP_OPT_LEASE   51
+#define DHCP_OPT_SUBNET  1
+#define DHCP_OPT_ROUTER  3
+#define DHCP_OPT_DNS     6
+#define DHCP_OPT_END     255
+
+#define DHCPDISCOVER 1
+#define DHCPOFFER    2
+#define DHCPREQUEST  3
+#define DHCPACK      5
+
+#define DHCP_CLIENT_PORT 68
+#define DHCP_SERVER_PORT 67
+
+static u32 rand32(void) {
+    static u32 s=0x12345678; s = s*1103515245 + 12345; return s;
+}
+
+static int build_discover(dhcp_msg_t* m, const u8 mac[6], u32 xid) {
+    k_memset(m, 0, sizeof(*m));
+    m->op = BOOTREQUEST; m->htype=1; m->hlen=6; m->xid = xid; m->magic = DHCP_MAGIC;
+    k_memcpy(m->chaddr, mac, 6);
+    u8* o = m->options; u32 i=0;
+    o[i++]=DHCP_OPT_MSGTYPE; o[i++]=1; o[i++]=DHCPDISCOVER;
+    o[i++]=DHCP_OPT_PARAM;  o[i++]=3; o[i++]=DHCP_OPT_SUBNET; o[i++]=DHCP_OPT_ROUTER; o[i++]=DHCP_OPT_DNS;
+    o[i++]=DHCP_OPT_END;
+    return (int)(sizeof(dhcp_msg_t));
+}
+
+static int build_request(dhcp_msg_t* m, const u8 mac[6], u32 xid, u32 req_ip, u32 server_ip) {
+    k_memset(m, 0, sizeof(*m));
+    m->op = BOOTREQUEST; m->htype=1; m->hlen=6; m->xid = xid; m->magic = DHCP_MAGIC;
+    k_memcpy(m->chaddr, mac, 6);
+    u8* o = m->options; u32 i=0;
+    o[i++]=DHCP_OPT_MSGTYPE; o[i++]=1; o[i++]=DHCPREQUEST;
+    o[i++]=DHCP_OPT_REQIP;  o[i++]=4; *(u32*)(o+i) = req_ip; i+=4;
+    o[i++]=DHCP_OPT_SERVER; o[i++]=4; *(u32*)(o+i) = server_ip; i+=4;
+    o[i++]=DHCP_OPT_END;
+    return (int)(sizeof(dhcp_msg_t));
+}
+
+static int parse_offer(const dhcp_msg_t* m, u32* yiaddr, u32* server_ip, u32* subnet, u32* router) {
+    if (m->op != BOOTREPLY || m->magic != DHCP_MAGIC) return K_EINVAL;
+    *yiaddr = m->yiaddr; *server_ip = 0; *subnet = 0; *router = 0;
+    const u8* o = m->options; u32 i=0; int mt=0;
+    while (i < sizeof(m->options)) {
+        u8 code = o[i++]; if (code == DHCP_OPT_END) break; if (code==0) continue; u8 len = o[i++];
+        if (code == DHCP_OPT_MSGTYPE && len==1) mt = o[i];
+        else if (code == DHCP_OPT_SERVER && len==4) *server_ip = *(u32*)(o+i);
+        else if (code == DHCP_OPT_SUBNET && len==4) *subnet = *(u32*)(o+i);
+        else if (code == DHCP_OPT_ROUTER && len>=4) *router = *(u32*)(o+i);
+        i += len;
+    }
+    return (mt == DHCPOFFER) ? 0 : K_EINVAL;
+}
+
+static int parse_ack(const dhcp_msg_t* m, u32* yiaddr, u32* subnet, u32* router) {
+    if (m->op != BOOTREPLY || m->magic != DHCP_MAGIC) return K_EINVAL;
+    *yiaddr = m->yiaddr; *subnet=0; *router=0;
+    const u8* o = m->options; u32 i=0; int mt=0;
+    while (i < sizeof(m->options)) {
+        u8 code = o[i++]; if (code == DHCP_OPT_END) break; if (code==0) continue; u8 len = o[i++];
+        if (code == DHCP_OPT_MSGTYPE && len==1) mt = o[i];
+        else if (code == DHCP_OPT_SUBNET && len==4) *subnet = *(u32*)(o+i);
+        else if (code == DHCP_OPT_ROUTER && len>=4) *router = *(u32*)(o+i);
+        i += len;
+    }
+    return (mt == DHCPACK) ? 0 : K_EINVAL;
+}
+
+int dhcpv4_acquire(net_if_t* nif, u32* out_ip_be, u32* out_netmask_be, u32* out_gw_be, u32 timeout_ms) {
+    if (!nif) return K_EINVAL;
+    int sid = udp_socket_open();
+    if (sid < 0) return sid;
+    u32 xid = rand32();
+
+    /* Broadcast DISCOVER */
+    dhcp_msg_t msg; int mlen = build_discover(&msg, nif->mac, xid);
+    u32 bcast = net_htonl(0xFFFFFFFFu);
+    int rc = udp_sendto(sid, &msg, (u32)mlen, bcast, net_htons(DHCP_SERVER_PORT));
+    if (rc < 0) return rc;
+
+    /* Wait OFFER */
+    u64 start = timer_get_ticks(); u64 freq = timer_get_freq_hz();
+    dhcp_msg_t offer;
+    for (;;) {
+        u32 ip=0; u16 port=0; int n = udp_recvfrom(sid, &offer, sizeof(offer), &ip, &port);
+        if (n > 0) {
+            u32 yi, srv, sn, gw;
+            if (parse_offer(&offer, &yi, &srv, &sn, &gw)==0) {
+                /* Send REQUEST */
+                dhcp_msg_t req; int rlen = build_request(&req, nif->mac, xid, yi, srv);
+                udp_sendto(sid, &req, (u32)rlen, bcast, net_htons(DHCP_SERVER_PORT));
+                /* Wait ACK */
+                for (;;) {
+                    dhcp_msg_t ack; int n2 = udp_recvfrom(sid, &ack, sizeof(ack), &ip, &port);
+                    if (n2 > 0) {
+                        u32 yi2, sn2, gw2;
+                        if (parse_ack(&ack, &yi2, &sn2, &gw2)==0) {
+                            if (out_ip_be) *out_ip_be = yi2;
+                            if (out_netmask_be) *out_netmask_be = sn2 ? sn2 : net_htonl(0xFFFFFF00);
+                            if (out_gw_be) *out_gw_be = gw2;
+                            net_if_config_static(nif, yi2, sn2 ? sn2 : net_htonl(0xFFFFFF00), gw2);
+                            return 0;
+                        }
+                    }
+                    if (timeout_ms) {
+                        u64 elapsed = ((timer_get_ticks()-start)*1000)/(freq?freq:1000);
+                        if (elapsed > timeout_ms) return K_ETIMEDOUT;
+                    }
+                    net_pump();
+                }
+            }
+        }
+        if (timeout_ms) {
+            u64 elapsed = ((timer_get_ticks()-start)*1000)/(freq?freq:1000);
+            if (elapsed > timeout_ms) return K_ETIMEDOUT;
+        }
+        net_pump();
+    }
+}

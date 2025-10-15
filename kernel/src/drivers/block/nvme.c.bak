@@ -1,0 +1,37 @@
+#include "block.h"
+#include "pci.h"
+#include "kernel.h"
+#include "nvme.h"
+
+typedef struct { pci_device_t pci; } nvme_ctrl_t;
+
+static int nvme_read(block_dev_t* dev, blk_io_t* io) { (void)dev; (void)io; return K_ENOTSUP; }
+static int nvme_write(block_dev_t* dev, const blk_io_t* io) { (void)dev; (void)io; return K_ENOTSUP; }
+static u32 nvme_sector_size(block_dev_t* dev) { (void)dev; return 512; }
+static u64 nvme_capacity(block_dev_t* dev) { (void)dev; return 0; }
+static void nvme_flush(block_dev_t* dev) { (void)dev; }
+
+static void nvme_probe_cb(const pci_device_t* dev, void* user) {
+    (void)user;
+    /* NVMe class: 0x01, subclass 0x08 (NVM), prog-if 0x02 */
+    if (dev->class_code == 0x01 && dev->subclass == 0x08) {
+        kprintf("NVMe controller %02x:%02x.%x (vid=%04x did=%04x)\n",
+            dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);
+
+        static block_dev_t nvmed;
+        k_memset(&nvmed, 0, sizeof(nvmed));
+        k_strlcpy(nvmed.name, "nvme0n1", sizeof(nvmed.name));
+        nvmed.ops.read = nvme_read;
+        nvmed.ops.write = nvme_write;
+        nvmed.ops.sector_size = nvme_sector_size;
+        nvmed.ops.capacity_sectors = nvme_capacity;
+        nvmed.ops.flush = nvme_flush;
+        nvmed.sector_sz = 512;
+        nvmed.sectors = 0;
+        block_register(&nvmed);
+    }
+}
+
+void nvme_init(void) {
+    pci_enumerate(nvme_probe_cb, NULL);
+}

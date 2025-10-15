@@ -1,0 +1,591 @@
+/*
+ * Advanced Signal Management System
+ * Production-quality POSIX signal handling with real-time signals
+ */
+
+#include "kernel.h"
+#include "hal.h"
+
+/* Status codes and logging macros */
+#define KLOG_INFO(subsys, fmt, ...) kprintf("[INFO:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_DEBUG(subsys, fmt, ...) kprintf("[DEBUG:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_WARN(subsys, fmt, ...) kprintf("[WARN:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_ERROR(subsys, fmt, ...) kprintf("[ERROR:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+
+/* Process state definitions */
+#define PROCESS_ZOMBIE      4
+#define PROCESS_STOPPED     5
+
+/* Signal set type */
+typedef uint64_t sigset_t;
+
+/* Process type stub */
+typedef struct process {
+    uint32_t pid;
+    uint32_t state;
+    void* signal_state;
+} process_t;
+
+/* Signal numbers (POSIX standard) */
+#define SIGHUP    1   /* Hangup */
+#define SIGINT    2   /* Interrupt */
+#define SIGQUIT   3   /* Quit */
+#define SIGILL    4   /* Illegal instruction */
+#define SIGTRAP   5   /* Trace/breakpoint trap */
+#define SIGABRT   6   /* Aborted */
+#define SIGBUS    7   /* Bus error */
+#define SIGFPE    8   /* Floating point exception */
+#define SIGKILL   9   /* Kill (cannot be caught) */
+#define SIGUSR1   10  /* User-defined signal 1 */
+#define SIGSEGV   11  /* Segmentation violation */
+#define SIGUSR2   12  /* User-defined signal 2 */
+#define SIGPIPE   13  /* Broken pipe */
+#define SIGALRM   14  /* Alarm clock */
+#define SIGTERM   15  /* Termination */
+#define SIGSTKFLT 16  /* Stack fault */
+#define SIGCHLD   17  /* Child status changed */
+#define SIGCONT   18  /* Continue */
+#define SIGSTOP   19  /* Stop (cannot be caught) */
+#define SIGTSTP   20  /* Keyboard stop */
+#define SIGTTIN   21  /* Background read from tty */
+#define SIGTTOU   22  /* Background write to tty */
+#define SIGURG    23  /* Urgent data on socket */
+#define SIGXCPU   24  /* CPU limit exceeded */
+#define SIGXFSZ   25  /* File size limit exceeded */
+#define SIGVTALRM 26  /* Virtual alarm clock */
+#define SIGPROF   27  /* Profiling alarm clock */
+#define SIGWINCH  28  /* Window size changed */
+#define SIGPOLL   29  /* Pollable event occurred */
+#define SIGPWR    30  /* Power failure restart */
+#define SIGSYS    31  /* Bad system call */
+
+/* Real-time signals */
+#define SIGRTMIN  32
+#define SIGRTMAX  63
+#define NSIG      64
+
+/* Signal actions */
+#define SIG_DFL   ((void (*)(int))0)   /* Default action */
+#define SIG_IGN   ((void (*)(int))1)   /* Ignore signal */
+#define SIG_ERR   ((void (*)(int))-1)  /* Error return */
+
+/* Signal flags */
+#define SA_NOCLDSTOP  1     /* Don't receive SIGCHLD when children stop */
+#define SA_NOCLDWAIT  2     /* Don't create zombies on child death */
+#define SA_SIGINFO    4     /* Invoke signal-catching function with three arguments */
+#define SA_ONSTACK    8     /* Use signal stack by sigaltstack(2) */
+#define SA_RESTART    16    /* Restart functions if interrupted by handler */
+#define SA_NODEFER    32    /* Don't automatically block the signal when its handler is being executed */
+#define SA_RESETHAND  64    /* Reset to SIG_DFL on entry to handler */
+
+/* Signal information */
+typedef struct {
+    int si_signo;      /* Signal number */
+    int si_errno;      /* An errno value */
+    int si_code;       /* Signal code */
+    pid_t si_pid;      /* Sending process ID */
+    uid_t si_uid;      /* Real user ID of sending process */
+    void* si_addr;     /* Memory location which caused fault */
+    int si_status;     /* Exit value or signal */
+    long si_band;      /* Band event for SIGPOLL */
+    union {
+        int si_int;    /* POSIX.1b signal */
+        void* si_ptr;  /* POSIX.1b signal */
+    } si_value;
+} siginfo_t;
+
+/* Signal action structure */
+typedef struct {
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t*, void*);
+    };
+    sigset_t sa_mask;
+    int sa_flags;
+    void (*sa_restorer)(void);
+} sigaction_t;
+
+/* Signal set operations */
+typedef uint64_t sigset_t;
+
+#define sigemptyset(set) (*(set) = 0)
+#define sigfillset(set) (*(set) = ~0ULL)
+#define sigaddset(set, signum) (*(set) |= (1ULL << ((signum) - 1)))
+#define sigdelset(set, signum) (*(set) &= ~(1ULL << ((signum) - 1)))
+#define sigismember(set, signum) ((*(set) & (1ULL << ((signum) - 1))) != 0)
+
+/* Per-process signal state */
+typedef struct signal_state {
+    sigaction_t actions[NSIG];      /* Signal actions */
+    sigset_t pending;               /* Pending signals */
+    sigset_t blocked;               /* Blocked signals */
+    siginfo_t pending_info[NSIG];   /* Signal information */
+    void* alt_stack_base;           /* Alternative signal stack */
+    size_t alt_stack_size;          /* Alternative stack size */
+    bool alt_stack_enabled;         /* Using alternative stack */
+} signal_state_t;
+
+/* Default signal dispositions */
+static const struct {
+    int signal;
+    const char* name;
+    bool terminate;   /* Default action terminates process */
+    bool core_dump;   /* Default action creates core dump */
+    bool ignore;      /* Default action ignores signal */
+    bool stop;        /* Default action stops process */
+} signal_defaults[] = {
+    {SIGHUP,    "SIGHUP",    true,  false, false, false},
+    {SIGINT,    "SIGINT",    true,  false, false, false},
+    {SIGQUIT,   "SIGQUIT",   true,  true,  false, false},
+    {SIGILL,    "SIGILL",    true,  true,  false, false},
+    {SIGTRAP,   "SIGTRAP",   true,  true,  false, false},
+    {SIGABRT,   "SIGABRT",   true,  true,  false, false},
+    {SIGBUS,    "SIGBUS",    true,  true,  false, false},
+    {SIGFPE,    "SIGFPE",    true,  true,  false, false},
+    {SIGKILL,   "SIGKILL",   true,  false, false, false},
+    {SIGUSR1,   "SIGUSR1",   true,  false, false, false},
+    {SIGSEGV,   "SIGSEGV",   true,  true,  false, false},
+    {SIGUSR2,   "SIGUSR2",   true,  false, false, false},
+    {SIGPIPE,   "SIGPIPE",   true,  false, false, false},
+    {SIGALRM,   "SIGALRM",   true,  false, false, false},
+    {SIGTERM,   "SIGTERM",   true,  false, false, false},
+    {SIGSTKFLT, "SIGSTKFLT", true,  false, false, false},
+    {SIGCHLD,   "SIGCHLD",   false, false, true,  false},
+    {SIGCONT,   "SIGCONT",   false, false, false, false},
+    {SIGSTOP,   "SIGSTOP",   false, false, false, true},
+    {SIGTSTP,   "SIGTSTP",   false, false, false, true},
+    {SIGTTIN,   "SIGTTIN",   false, false, false, true},
+    {SIGTTOU,   "SIGTTOU",   false, false, false, true},
+    {SIGURG,    "SIGURG",    false, false, true,  false},
+    {SIGXCPU,   "SIGXCPU",   true,  true,  false, false},
+    {SIGXFSZ,   "SIGXFSZ",   true,  true,  false, false},
+    {SIGVTALRM, "SIGVTALRM", true,  false, false, false},
+    {SIGPROF,   "SIGPROF",   true,  false, false, false},
+    {SIGWINCH,  "SIGWINCH",  false, false, true,  false},
+    {SIGPOLL,   "SIGPOLL",   true,  false, false, false},
+    {SIGPWR,    "SIGPWR",    true,  false, false, false},
+    {SIGSYS,    "SIGSYS",    true,  true,  false, false},
+    {0, NULL, false, false, false, false}
+};
+
+/* Global signal system state */
+static volatile uint32_t signal_lock = 0;
+
+/* Get signal name */
+static const char* signal_get_name(int signum) {
+    for (int i = 0; signal_defaults[i].name; i++) {
+        if (signal_defaults[i].signal == signum) {
+            return signal_defaults[i].name;
+        }
+    }
+    
+    if (signum >= SIGRTMIN && signum <= SIGRTMAX) {
+        static char rtname[16];
+        snprintf(rtname, sizeof(rtname), "SIGRT%d", signum - SIGRTMIN);
+        return rtname;
+    }
+    
+    return "UNKNOWN";
+}
+
+/* Initialize signal state for process */
+status_t signal_init_process(process_t* process) {
+    if (!process) return STATUS_INVALID;
+    
+    signal_state_t* sig_state = (signal_state_t*)kalloc(sizeof(signal_state_t));
+    if (!sig_state) return STATUS_NOMEM;
+    
+    memset(sig_state, 0, sizeof(*sig_state));
+    
+    /* Initialize default signal actions */
+    for (int i = 1; i < NSIG; i++) {
+        sig_state->actions[i].sa_handler = SIG_DFL;
+        sigemptyset(&sig_state->actions[i].sa_mask);
+        sig_state->actions[i].sa_flags = 0;
+    }
+    
+    /* Set up uncatchable signals */
+    sig_state->actions[SIGKILL].sa_handler = SIG_DFL;
+    sig_state->actions[SIGSTOP].sa_handler = SIG_DFL;
+    
+    sigemptyset(&sig_state->pending);
+    sigemptyset(&sig_state->blocked);
+    
+    process->signal_state = sig_state;
+    
+    KLOG_DEBUG("SIGNAL", "Initialized signal state for process %d", process->pid);
+    return STATUS_OK;
+}
+
+/* Clean up signal state for process */
+void signal_cleanup_process(process_t* process) {
+    if (!process || !process->signal_state) return;
+    
+    signal_state_t* sig_state = (signal_state_t*)process->signal_state;
+    
+    if (sig_state->alt_stack_base) {
+        kfree(sig_state->alt_stack_base);
+    }
+    
+    kfree(sig_state);
+    process->signal_state = NULL;
+    
+    KLOG_DEBUG("SIGNAL", "Cleaned up signal state for process %d", process->pid);
+}
+
+/* Send signal to process */
+status_t signal_send(process_t* target, int signum, siginfo_t* info) {
+    if (!target || signum < 1 || signum >= NSIG) {
+        return STATUS_INVALID;
+    }
+    
+    signal_state_t* sig_state = (signal_state_t*)target->signal_state;
+    if (!sig_state) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&signal_lock, 1);
+    
+    /* Check if signal is blocked */
+    if (sigismember(&sig_state->blocked, signum)) {
+        /* Add to pending signals */
+        sigaddset(&sig_state->pending, signum);
+        if (info) {
+            sig_state->pending_info[signum] = *info;
+        } else {
+            memset(&sig_state->pending_info[signum], 0, sizeof(siginfo_t));
+            sig_state->pending_info[signum].si_signo = signum;
+        }
+        
+        KLOG_DEBUG("SIGNAL", "Signal %d (%s) blocked for process %d",
+                   signum, signal_get_name(signum), target->pid);
+        
+        __sync_lock_release(&signal_lock);
+        return STATUS_OK;
+    }
+    
+    /* Handle uncatchable signals immediately */
+    if (signum == SIGKILL || signum == SIGSTOP) {
+        if (signum == SIGKILL) {
+            KLOG_INFO("SIGNAL", "SIGKILL sent to process %d", target->pid);
+            /* Terminate process immediately */
+            target->state = PROCESS_ZOMBIE;
+            target->exit_code = 128 + signum;
+        } else {
+            KLOG_INFO("SIGNAL", "SIGSTOP sent to process %d", target->pid);
+            /* Stop process */
+            target->state = PROCESS_STOPPED;
+        }
+        
+        __sync_lock_release(&signal_lock);
+        return STATUS_OK;
+    }
+    
+    /* Check signal action */
+    sigaction_t* action = &sig_state->actions[signum];
+    
+    if (action->sa_handler == SIG_IGN) {
+        /* Signal ignored */
+        KLOG_DEBUG("SIGNAL", "Signal %d (%s) ignored by process %d",
+                   signum, signal_get_name(signum), target->pid);
+    } else if (action->sa_handler == SIG_DFL) {
+        /* Default action */
+        bool handled = false;
+        
+        for (int i = 0; signal_defaults[i].name; i++) {
+            if (signal_defaults[i].signal == signum) {
+                if (signal_defaults[i].terminate) {
+                    KLOG_INFO("SIGNAL", "Process %d terminated by signal %d (%s)",
+                              target->pid, signum, signal_get_name(signum));
+                    target->state = PROCESS_ZOMBIE;
+                    target->exit_code = 128 + signum;
+                } else if (signal_defaults[i].stop) {
+                    KLOG_INFO("SIGNAL", "Process %d stopped by signal %d (%s)",
+                              target->pid, signum, signal_get_name(signum));
+                    target->state = PROCESS_STOPPED;
+                } else if (signal_defaults[i].ignore) {
+                    KLOG_DEBUG("SIGNAL", "Signal %d (%s) ignored (default) by process %d",
+                               signum, signal_get_name(signum), target->pid);
+                }
+                handled = true;
+                break;
+            }
+        }
+        
+        if (!handled) {
+            /* Real-time signals default to termination */
+            if (signum >= SIGRTMIN && signum <= SIGRTMAX) {
+                KLOG_INFO("SIGNAL", "Process %d terminated by real-time signal %d",
+                          target->pid, signum);
+                target->state = PROCESS_ZOMBIE;
+                target->exit_code = 128 + signum;
+            }
+        }
+    } else {
+        /* Custom handler - add to pending for delivery */
+        sigaddset(&sig_state->pending, signum);
+        if (info) {
+            sig_state->pending_info[signum] = *info;
+        } else {
+            memset(&sig_state->pending_info[signum], 0, sizeof(siginfo_t));
+            sig_state->pending_info[signum].si_signo = signum;
+        }
+        
+        KLOG_DEBUG("SIGNAL", "Signal %d (%s) queued for custom handler in process %d",
+                   signum, signal_get_name(signum), target->pid);
+    }
+    
+    __sync_lock_release(&signal_lock);
+    return STATUS_OK;
+}
+
+/* Deliver pending signals to current process */
+void signal_deliver_pending(process_t* process) {
+    if (!process || !process->signal_state) return;
+    
+    signal_state_t* sig_state = (signal_state_t*)process->signal_state;
+    
+    __sync_lock_test_and_set(&signal_lock, 1);
+    
+    /* Find highest priority pending signal */
+    for (int signum = 1; signum < NSIG; signum++) {
+        if (sigismember(&sig_state->pending, signum) && 
+            !sigismember(&sig_state->blocked, signum)) {
+            
+            /* Remove from pending */
+            sigdelset(&sig_state->pending, signum);
+            
+            sigaction_t* action = &sig_state->actions[signum];
+            siginfo_t* info = &sig_state->pending_info[signum];
+            
+            __sync_lock_release(&signal_lock);
+            
+            /* Deliver signal */
+            if (action->sa_flags & SA_SIGINFO) {
+                /* Extended signal handler */
+                if (action->sa_sigaction) {
+                    KLOG_DEBUG("SIGNAL", "Delivering signal %d (%s) with siginfo to process %d",
+                               signum, signal_get_name(signum), process->pid);
+                    
+                    /* TODO: Set up signal stack and call handler */
+                    /* This would involve switching to user mode and calling the handler */
+                    action->sa_sigaction(signum, info, NULL);
+                }
+            } else {
+                /* Standard signal handler */
+                if (action->sa_handler && action->sa_handler != SIG_DFL && action->sa_handler != SIG_IGN) {
+                    KLOG_DEBUG("SIGNAL", "Delivering signal %d (%s) to process %d",
+                               signum, signal_get_name(signum), process->pid);
+                    
+                    /* TODO: Set up signal stack and call handler */
+                    /* This would involve switching to user mode and calling the handler */
+                    action->sa_handler(signum);
+                }
+            }
+            
+            /* Reset handler if SA_RESETHAND is set */
+            if (action->sa_flags & SA_RESETHAND) {
+                action->sa_handler = SIG_DFL;
+            }
+            
+            return;
+        }
+    }
+    
+    __sync_lock_release(&signal_lock);
+}
+
+/* Set signal action */
+status_t signal_action(process_t* process, int signum, const sigaction_t* act, sigaction_t* oldact) {
+    if (!process || signum < 1 || signum >= NSIG) {
+        return STATUS_INVALID;
+    }
+    
+    /* Cannot change SIGKILL or SIGSTOP */
+    if (signum == SIGKILL || signum == SIGSTOP) {
+        return STATUS_INVALID;
+    }
+    
+    signal_state_t* sig_state = (signal_state_t*)process->signal_state;
+    if (!sig_state) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&signal_lock, 1);
+    
+    if (oldact) {
+        *oldact = sig_state->actions[signum];
+    }
+    
+    if (act) {
+        sig_state->actions[signum] = *act;
+        KLOG_DEBUG("SIGNAL", "Set signal action for %d (%s) in process %d",
+                   signum, signal_get_name(signum), process->pid);
+    }
+    
+    __sync_lock_release(&signal_lock);
+    return STATUS_OK;
+}
+
+/* Set signal mask */
+status_t signal_procmask(process_t* process, int how, const sigset_t* set, sigset_t* oldset) {
+    if (!process) return STATUS_INVALID;
+    
+    signal_state_t* sig_state = (signal_state_t*)process->signal_state;
+    if (!sig_state) return STATUS_INVALID;
+    
+    __sync_lock_test_and_set(&signal_lock, 1);
+    
+    if (oldset) {
+        *oldset = sig_state->blocked;
+    }
+    
+    if (set) {
+        sigset_t new_mask = *set;
+        
+        /* Cannot block SIGKILL or SIGSTOP */
+        sigdelset(&new_mask, SIGKILL);
+        sigdelset(&new_mask, SIGSTOP);
+        
+        switch (how) {
+            case SIG_BLOCK:
+                sig_state->blocked |= new_mask;
+                break;
+            case SIG_UNBLOCK:
+                sig_state->blocked &= ~new_mask;
+                break;
+            case SIG_SETMASK:
+                sig_state->blocked = new_mask;
+                break;
+            default:
+                __sync_lock_release(&signal_lock);
+                return STATUS_INVALID;
+        }
+        
+        KLOG_DEBUG("SIGNAL", "Updated signal mask for process %d", process->pid);
+    }
+    
+    __sync_lock_release(&signal_lock);
+    
+    /* Check for newly unblocked signals */
+    if (set && (how == SIG_UNBLOCK || how == SIG_SETMASK)) {
+        signal_deliver_pending(process);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Wait for signal */
+status_t signal_wait(process_t* process, const sigset_t* set, siginfo_t* info) {
+    if (!process || !set) return STATUS_INVALID;
+    
+    signal_state_t* sig_state = (signal_state_t*)process->signal_state;
+    if (!sig_state) return STATUS_INVALID;
+    
+    __sync_lock_test_and_set(&signal_lock, 1);
+    
+    /* Check if any requested signals are already pending */
+    for (int signum = 1; signum < NSIG; signum++) {
+        if (sigismember(set, signum) && sigismember(&sig_state->pending, signum)) {
+            /* Remove from pending */
+            sigdelset(&sig_state->pending, signum);
+            
+            if (info) {
+                *info = sig_state->pending_info[signum];
+            }
+            
+            __sync_lock_release(&signal_lock);
+            return signum;
+        }
+    }
+    
+    __sync_lock_release(&signal_lock);
+    
+    /* No signals pending - would need to block process here */
+    /* TODO: Implement process blocking/wakeup mechanism */
+    
+    return STATUS_WOULD_BLOCK;
+}
+
+/* Kill process with signal */
+status_t signal_kill(pid_t pid, int signum) {
+    /* Find process by PID */
+    process_t* target = process_find_by_pid(pid);
+    if (!target) {
+        return STATUS_NOT_FOUND;
+    }
+    
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.si_signo = signum;
+    info.si_code = SI_USER;
+    info.si_pid = 0; /* TODO: Get current process PID */
+    info.si_uid = 0; /* TODO: Get current user ID */
+    
+    return signal_send(target, signum, &info);
+}
+
+/* Generate signal for current process */
+status_t signal_raise(process_t* process, int signum) {
+    return signal_kill(process->pid, signum);
+}
+
+/* Set up alternative signal stack */
+status_t signal_altstack(process_t* process, const stack_t* ss, stack_t* oss) {
+    if (!process) return STATUS_INVALID;
+    
+    signal_state_t* sig_state = (signal_state_t*)process->signal_state;
+    if (!sig_state) return STATUS_INVALID;
+    
+    __sync_lock_test_and_set(&signal_lock, 1);
+    
+    if (oss) {
+        oss->ss_sp = sig_state->alt_stack_base;
+        oss->ss_size = sig_state->alt_stack_size;
+        oss->ss_flags = sig_state->alt_stack_enabled ? 0 : SS_DISABLE;
+    }
+    
+    if (ss) {
+        if (ss->ss_flags & SS_DISABLE) {
+            sig_state->alt_stack_enabled = false;
+        } else {
+            sig_state->alt_stack_base = ss->ss_sp;
+            sig_state->alt_stack_size = ss->ss_size;
+            sig_state->alt_stack_enabled = true;
+        }
+        
+        KLOG_DEBUG("SIGNAL", "Set alternative signal stack for process %d", process->pid);
+    }
+    
+    __sync_lock_release(&signal_lock);
+    return STATUS_OK;
+}
+
+/* Initialize signal subsystem */
+status_t signal_init(void) {
+    KLOG_INFO("SIGNAL", "Initializing signal management subsystem");
+    
+    /* Signal system is ready */
+    KLOG_INFO("SIGNAL", "Signal subsystem initialized with %d signals", NSIG - 1);
+    return STATUS_OK;
+}
+
+/* Print signal information */
+void signal_print_info(process_t* process) {
+    if (!process || !process->signal_state) return;
+    
+    signal_state_t* sig_state = (signal_state_t*)process->signal_state;
+    
+    kprintf("Signal state for process %d:\n", process->pid);
+    kprintf("  Blocked signals: 0x%016llx\n", sig_state->blocked);
+    kprintf("  Pending signals: 0x%016llx\n", sig_state->pending);
+    
+    /* Show custom handlers */
+    kprintf("  Custom handlers:\n");
+    for (int i = 1; i < NSIG; i++) {
+        if (sig_state->actions[i].sa_handler != SIG_DFL && 
+            sig_state->actions[i].sa_handler != SIG_IGN) {
+            kprintf("    %s: %p\n", signal_get_name(i), sig_state->actions[i].sa_handler);
+        }
+    }
+}

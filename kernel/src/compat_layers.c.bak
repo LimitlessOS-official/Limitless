@@ -1,0 +1,324 @@
+/*
+ * Application Compatibility Layers
+ * POSIX, Linux ABI, and Windows persona support
+ */
+
+#include "kernel.h"
+
+/* Compatibility layer types */
+typedef enum {
+    COMPAT_NATIVE = 0,    /* Native LimitlessOS */
+    COMPAT_POSIX,         /* POSIX compatibility */
+    COMPAT_LINUX,         /* Linux ABI compatibility */
+    COMPAT_WINDOWS,       /* Windows persona */
+    COMPAT_MACOS          /* macOS persona */
+} compat_layer_t;
+
+/* Process compatibility information */
+typedef struct process_compat {
+    compat_layer_t layer;
+    u32 abi_version;
+    char emulation_name[32];
+    void* layer_data;
+    struct process_compat* next;
+} process_compat_t;
+
+/* Global compatibility state */
+static process_compat_t* g_compat_processes = NULL;
+static u32 g_posix_processes = 0;
+static u32 g_linux_processes = 0;
+static u32 g_windows_processes = 0;
+static u32 g_macos_processes = 0;
+
+/* POSIX Compatibility Layer */
+typedef struct posix_context {
+    char working_dir[256];
+    u32 uid;
+    u32 gid;
+    u32 umask;
+    char* environment[64];
+    u32 env_count;
+} posix_context_t;
+
+/* Linux ABI Compatibility */
+typedef struct linux_context {
+    u32 kernel_version;      /* Emulated kernel version */
+    char hostname[64];
+    char domainname[64];
+    u32 personality;         /* Linux personality flags */
+    void* vsyscall_page;     /* Virtual syscall page */
+} linux_context_t;
+
+/* Windows Persona */
+typedef struct windows_context {
+    char computer_name[64];
+    char username[64];
+    u32 windows_version;     /* Emulated Windows version */
+    char system_root[256];   /* %SystemRoot% path */
+    char program_files[256]; /* %ProgramFiles% path */
+    void* registry_root;     /* Registry emulation */
+} windows_context_t;
+
+/* macOS Persona */
+typedef struct macos_context {
+    char computer_name[64];
+    char username[64];
+    u32 darwin_version;      /* Emulated Darwin version */
+    char home_dir[256];      /* Home directory */
+    void* frameworks;        /* Framework emulation */
+} macos_context_t;
+
+/* Create POSIX compatibility context */
+static posix_context_t* create_posix_context(void) {
+    posix_context_t* ctx = (posix_context_t*)kalloc(sizeof(posix_context_t));
+    if (!ctx) return NULL;
+    
+    strcpy(ctx->working_dir, "/");
+    ctx->uid = 1000;
+    ctx->gid = 1000;
+    ctx->umask = 0022;
+    ctx->env_count = 0;
+    
+    /* Add basic environment variables */
+    ctx->environment[ctx->env_count++] = "PATH=/bin:/usr/bin";
+    ctx->environment[ctx->env_count++] = "HOME=/home/user";
+    ctx->environment[ctx->env_count++] = "SHELL=/bin/sh";
+    ctx->environment[ctx->env_count++] = "USER=user";
+    
+    return ctx;
+}
+
+/* Create Linux compatibility context */
+static linux_context_t* create_linux_context(void) {
+    linux_context_t* ctx = (linux_context_t*)kalloc(sizeof(linux_context_t));
+    if (!ctx) return NULL;
+    
+    ctx->kernel_version = 0x051000;  /* Emulate Linux 5.16.0 */
+    strcpy(ctx->hostname, "limitlessos");
+    strcpy(ctx->domainname, "local");
+    ctx->personality = 0;  /* Default personality */
+    ctx->vsyscall_page = NULL;
+    
+    return ctx;
+}
+
+/* Create Windows compatibility context */
+static windows_context_t* create_windows_context(void) {
+    windows_context_t* ctx = (windows_context_t*)kalloc(sizeof(windows_context_t));
+    if (!ctx) return NULL;
+    
+    strcpy(ctx->computer_name, "LIMITLESSOS-PC");
+    strcpy(ctx->username, "User");
+    ctx->windows_version = 0x0A000A28;  /* Windows 10 build 2600 */
+    strcpy(ctx->system_root, "C:\\Windows");
+    strcpy(ctx->program_files, "C:\\Program Files");
+    ctx->registry_root = NULL;
+    
+    return ctx;
+}
+
+/* Create macOS compatibility context */
+static macos_context_t* create_macos_context(void) {
+    macos_context_t* ctx = (macos_context_t*)kalloc(sizeof(macos_context_t));
+    if (!ctx) return NULL;
+    
+    strcpy(ctx->computer_name, "LimitlessOS-Mac");
+    strcpy(ctx->username, "user");
+    ctx->darwin_version = 0x150600;  /* Darwin 21.6.0 (macOS 12.0) */
+    strcpy(ctx->home_dir, "/Users/user");
+    ctx->frameworks = NULL;
+    
+    return ctx;
+}
+
+/* Add compatibility layer to process */
+int compat_add_layer(u32 process_id, compat_layer_t layer) {
+    process_compat_t* compat = (process_compat_t*)kalloc(sizeof(process_compat_t));
+    if (!compat) return -1;
+    
+    compat->layer = layer;
+    compat->abi_version = 1;
+    
+    switch (layer) {
+        case COMPAT_POSIX:
+            strcpy(compat->emulation_name, "POSIX.1-2017");
+            compat->layer_data = create_posix_context();
+            g_posix_processes++;
+            break;
+            
+        case COMPAT_LINUX:
+            strcpy(compat->emulation_name, "Linux ABI 5.16");
+            compat->layer_data = create_linux_context();
+            g_linux_processes++;
+            break;
+            
+        case COMPAT_WINDOWS:
+            strcpy(compat->emulation_name, "Windows 10 Persona");
+            compat->layer_data = create_windows_context();
+            g_windows_processes++;
+            break;
+            
+        case COMPAT_MACOS:
+            strcpy(compat->emulation_name, "macOS Monterey Persona");
+            compat->layer_data = create_macos_context();
+            g_macos_processes++;
+            break;
+            
+        default:
+            strcpy(compat->emulation_name, "Native LimitlessOS");
+            compat->layer_data = NULL;
+            break;
+    }
+    
+    /* Add to global list */
+    compat->next = g_compat_processes;
+    g_compat_processes = compat;
+    
+    return 0;
+}
+
+/* Translate system call for compatibility layer */
+long compat_translate_syscall(u32 process_id, compat_layer_t layer, 
+                             long syscall_num, long arg1, long arg2, long arg3, 
+                             long arg4, long arg5, long arg6) {
+    switch (layer) {
+        case COMPAT_POSIX:
+            /* POSIX system calls are mostly direct translations */
+            return syscall_dispatch(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+            
+        case COMPAT_LINUX:
+            /* Linux system call translation */
+            switch (syscall_num) {
+                case 0:   /* sys_read -> SYS_READ */
+                    return syscall_dispatch(3, arg1, arg2, arg3, arg4, arg5, arg6);
+                case 1:   /* sys_write -> SYS_WRITE */
+                    return syscall_dispatch(4, arg1, arg2, arg3, arg4, arg5, arg6);
+                case 2:   /* sys_open -> SYS_OPEN */
+                    return syscall_dispatch(5, arg1, arg2, arg3, arg4, arg5, arg6);
+                case 3:   /* sys_close -> SYS_CLOSE */
+                    return syscall_dispatch(6, arg1, arg2, arg3, arg4, arg5, arg6);
+                case 39:  /* sys_getpid -> SYS_GETPID */
+                    return syscall_dispatch(20, arg1, arg2, arg3, arg4, arg5, arg6);
+                default:
+                    return syscall_dispatch(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+            }
+            
+        case COMPAT_WINDOWS:
+            /* Windows API translation to POSIX system calls */
+            /* This would be much more complex in a real implementation */
+            return -1;  /* Not implemented for simplicity */
+            
+        case COMPAT_MACOS:
+            /* macOS system call translation */
+            /* Darwin syscalls are similar to BSD, mostly direct translation */
+            return syscall_dispatch(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+            
+        default:
+            return syscall_dispatch(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+    }
+}
+
+/* Get environment variable (POSIX) */
+const char* compat_getenv(u32 process_id, const char* name) {
+    /* Find process compatibility context */
+    process_compat_t* compat = g_compat_processes;
+    while (compat) {
+        /* In real implementation would match by process_id */
+        if (compat->layer == COMPAT_POSIX && compat->layer_data) {
+            posix_context_t* ctx = (posix_context_t*)compat->layer_data;
+            
+            /* Search environment variables */
+            for (u32 i = 0; i < ctx->env_count; i++) {
+                char* env_var = ctx->environment[i];
+                char* equals = strchr(env_var, '=');
+                if (equals) {
+                    u32 name_len = equals - env_var;
+                    if (strlen(name) == name_len && 
+                        strncmp(env_var, name, name_len) == 0) {
+                        return equals + 1;
+                    }
+                }
+            }
+        }
+        compat = compat->next;
+    }
+    
+    return NULL;
+}
+
+/* Set environment variable (POSIX) */
+int compat_setenv(u32 process_id, const char* name, const char* value) {
+    (void)process_id; (void)name; (void)value;
+    /* Would implement environment variable setting */
+    return 0;
+}
+
+/* Windows Registry emulation */
+long compat_windows_registry_query(const char* key, const char* value, void* data, u32* size) {
+    (void)key; (void)value; (void)data; (void)size;
+    /* Would implement registry emulation */
+    return -1;  /* Key not found */
+}
+
+/* Windows API emulation */
+void* compat_windows_load_library(const char* library_name) {
+    (void)library_name;
+    /* Would implement Windows DLL loading emulation */
+    return NULL;
+}
+
+void* compat_windows_get_proc_address(void* library, const char* proc_name) {
+    (void)library; (void)proc_name;
+    /* Would implement Windows API function resolution */
+    return NULL;
+}
+
+/* macOS Framework emulation */
+void* compat_macos_load_framework(const char* framework_name) {
+    (void)framework_name;
+    /* Would implement macOS Framework loading */
+    return NULL;
+}
+
+/* Initialize compatibility layers */
+void compat_init(void) {
+    /* Initialize compatibility layer subsystem */
+    g_compat_processes = NULL;
+    
+    /* Create default POSIX environment for init process */
+    compat_add_layer(1, COMPAT_POSIX);
+}
+
+/* Get compatibility statistics */
+void compat_get_stats(u32* posix_count, u32* linux_count, u32* windows_count, u32* macos_count) {
+    if (posix_count) *posix_count = g_posix_processes;
+    if (linux_count) *linux_count = g_linux_processes;
+    if (windows_count) *windows_count = g_windows_processes;
+    if (macos_count) *macos_count = g_macos_processes;
+}
+
+/* List available compatibility layers */
+void compat_list_layers(void) {
+    /* In real implementation would print available layers */
+    /* Available layers:
+     * - Native LimitlessOS
+     * - POSIX.1-2017 compatibility
+     * - Linux ABI 5.16 compatibility
+     * - Windows 10 persona
+     * - macOS Monterey persona
+     */
+}
+
+/* Check if layer is supported */
+bool compat_is_layer_supported(compat_layer_t layer) {
+    switch (layer) {
+        case COMPAT_NATIVE:
+        case COMPAT_POSIX:
+        case COMPAT_LINUX:
+        case COMPAT_WINDOWS:
+        case COMPAT_MACOS:
+            return true;
+        default:
+            return false;
+    }
+}

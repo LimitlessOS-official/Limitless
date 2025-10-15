@@ -1,0 +1,18 @@
+#include "net/filter.h"
+
+static nf_verdict_t g_policy_in = NF_DROP;
+static nf_verdict_t g_policy_out = NF_DROP;
+
+void nf_init(void){ g_policy_in = NF_DROP; g_policy_out = NF_DROP; }
+void nf_set_default_policy(uint8_t dir, nf_verdict_t v){ if(dir==0) g_policy_in=v; else g_policy_out=v; }
+
+
+
+/* Optional external rule engine provided by fw_syscalls */
+extern int fw_apply_rules(const nf_packet_t* p, nf_verdict_t* out) __attribute__((weak));
+
+nf_verdict_t nf_check(const nf_packet_t* p){
+    if(!p) return NF_DROP;
+    if (fw_apply_rules){ nf_verdict_t v; if (fw_apply_rules(p, &v)) return v; }
+    return p->direction==0 ? g_policy_in : g_policy_out;
+}

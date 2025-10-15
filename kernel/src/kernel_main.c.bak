@@ -1,0 +1,217 @@
+/*
+ * LimitlessOS Kernel Entry Point
+ * Complete bootable kernel with all enterprise subsystems
+ */
+
+#include "kernel_types.h"
+#include "multiboot2.h"
+
+/* Enterprise subsystem headers */
+extern int enterprise_smp_init(void);
+extern int enterprise_iommu_init(void);
+extern int enterprise_hal_init(void);
+extern int enterprise_storage_init(void);
+extern int enterprise_network_init(void);
+extern int enterprise_multimedia_init(void);
+extern int enterprise_virtualization_init(void);
+extern int enterprise_security_init(void);
+
+/* GUI subsystem headers */
+extern int gui_compositor_init(void);
+extern int gui_applications_init(void);
+
+/* Hardware detection and initialization */
+extern void hardware_detect_and_init(void);
+
+/* Memory management */
+extern void memory_init(struct multiboot_info* mbi);
+
+/* Display management */
+static void early_console_init(void) {
+    /* Initialize basic VGA text mode for early boot messages */
+    uint16_t* video_memory = (uint16_t*)0xB8000;
+    static int cursor_pos = 0;
+    
+    /* Clear screen with black background, light gray text */
+    for (int i = 0; i < 80 * 25; i++) {
+        video_memory[i] = (0x07 << 8) | ' ';
+    }
+    cursor_pos = 0;
+}
+
+static void early_print(const char* message) {
+    uint16_t* video_memory = (uint16_t*)0xB8000;
+    static int cursor_pos = 0;
+    
+    while (*message) {
+        if (*message == '\n') {
+            cursor_pos = ((cursor_pos / 80) + 1) * 80;
+        } else {
+            video_memory[cursor_pos] = (0x07 << 8) | *message;
+            cursor_pos++;
+        }
+        
+        if (cursor_pos >= 80 * 25) {
+            cursor_pos = 0; /* Wrap around */
+        }
+        message++;
+    }
+}
+
+/* Hardware abstraction layer initialization */
+static int hardware_init(void) {
+    early_print("Initializing Hardware Abstraction Layer...\n");
+    
+    /* Basic hardware detection */
+    hardware_detect_and_init();
+    
+    /* Initialize enterprise HAL */
+    if (enterprise_hal_init() != 0) {
+        early_print("ERROR: HAL initialization failed\n");
+        return -1;
+    }
+    
+    early_print("Hardware initialization complete\n");
+    return 0;
+}
+
+/* Enterprise subsystem initialization */
+static int enterprise_init(void) {
+    early_print("Initializing Enterprise Subsystems...\n");
+    
+    /* SMP (Symmetric Multiprocessing) */
+    early_print("  Starting SMP subsystem...\n");
+    if (enterprise_smp_init() != 0) {
+        early_print("  WARNING: SMP initialization failed\n");
+    }
+    
+    /* IOMMU (Input-Output Memory Management Unit) */
+    early_print("  Starting IOMMU subsystem...\n");
+    if (enterprise_iommu_init() != 0) {
+        early_print("  WARNING: IOMMU initialization failed\n");
+    }
+    
+    /* Storage subsystem */
+    early_print("  Starting Storage subsystem...\n");
+    if (enterprise_storage_init() != 0) {
+        early_print("  WARNING: Storage initialization failed\n");
+    }
+    
+    /* Network subsystem */
+    early_print("  Starting Network subsystem...\n");
+    if (enterprise_network_init() != 0) {
+        early_print("  WARNING: Network initialization failed\n");
+    }
+    
+    /* Multimedia subsystem */
+    early_print("  Starting Multimedia subsystem...\n");
+    if (enterprise_multimedia_init() != 0) {
+        early_print("  WARNING: Multimedia initialization failed\n");
+    }
+    
+    /* Virtualization subsystem */
+    early_print("  Starting Virtualization subsystem...\n");
+    if (enterprise_virtualization_init() != 0) {
+        early_print("  WARNING: Virtualization initialization failed\n");
+    }
+    
+    /* Security subsystem */
+    early_print("  Starting Security subsystem...\n");
+    if (enterprise_security_init() != 0) {
+        early_print("  ERROR: Security initialization failed\n");
+        return -1;
+    }
+    
+    early_print("Enterprise subsystems initialized\n");
+    return 0;
+}
+
+/* GUI subsystem initialization */
+static int gui_init(void) {
+    early_print("Initializing Desktop Environment...\n");
+    
+    /* Initialize compositor (window manager) */
+    early_print("  Starting GUI Compositor...\n");
+    if (gui_compositor_init() != 0) {
+        early_print("  WARNING: Compositor initialization failed\n");
+        return -1;
+    }
+    
+    /* Initialize desktop applications */
+    early_print("  Starting Desktop Applications...\n");
+    if (gui_applications_init() != 0) {
+        early_print("  WARNING: Applications initialization failed\n");
+    }
+    
+    early_print("Desktop Environment ready\n");
+    return 0;
+}
+
+/* Main kernel entry point called by multiboot loader */
+void kernel_main(uint32_t magic, struct multiboot_info* mbi) {
+    /* Verify we were booted by a multiboot2-compliant loader */
+    if (magic != 0x36d76289) {
+        /* Cannot print error - no console available yet */
+        while (1) { asm volatile("hlt"); }
+    }
+    
+    /* Initialize early console for boot messages */
+    early_console_init();
+    
+    early_print("LimitlessOS Enterprise Kernel v1.0.0\n");
+    early_print("Military-grade operating system with GUI desktop\n");
+    early_print("=====================================\n\n");
+    
+    /* Initialize memory management */
+    early_print("Initializing Memory Management...\n");
+    memory_init(mbi);
+    
+    /* Initialize hardware */
+    if (hardware_init() != 0) {
+        early_print("FATAL: Hardware initialization failed\n");
+        goto kernel_panic;
+    }
+    
+    /* Initialize enterprise subsystems */
+    if (enterprise_init() != 0) {
+        early_print("FATAL: Enterprise subsystem initialization failed\n");
+        goto kernel_panic;
+    }
+    
+    /* Initialize GUI desktop environment */
+    if (gui_init() != 0) {
+        early_print("WARNING: GUI initialization failed - continuing in text mode\n");
+    }
+    
+    early_print("\n=====================================\n");
+    early_print("LimitlessOS boot complete!\n");
+    early_print("Enterprise features: ACTIVE\n");
+    early_print("Desktop environment: READY\n");
+    early_print("System ready for use\n");
+    
+    /* Enter main kernel loop */
+    while (1) {
+        asm volatile("hlt"); /* Halt until next interrupt */
+    }
+
+kernel_panic:
+    early_print("\n*** KERNEL PANIC ***\n");
+    early_print("System halted due to critical error\n");
+    while (1) {
+        asm volatile("hlt");
+    }
+}
+
+/* Assembly entry point from multiboot.S */
+void _start(void) {
+    /* This will be called from assembly code */
+    /* Stack is already set up by bootloader */
+    
+    /* Get multiboot information from registers */
+    uint32_t magic, mbi_addr;
+    asm volatile("mov %%eax, %0" : "=r" (magic));
+    asm volatile("mov %%ebx, %0" : "=r" (mbi_addr));
+    
+    /* Call main kernel initialization */
+    kernel_main(magic, (struct multiboot_info*)mbi_addr);
+}

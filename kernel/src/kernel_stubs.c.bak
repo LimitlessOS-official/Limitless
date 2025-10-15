@@ -1,0 +1,161 @@
+/*
+ * LimitlessOS Kernel Stubs
+ * Minimal implementations for P1/P2 frameworks
+ */
+
+#include "kernel.h"
+
+/* Console output */
+void kprintf(const char* format, ...) {
+    /* Simple stub - in real kernel this would be formatted output */
+}
+
+void klog_printf(const char* format, ...) {
+    /* Logging stub */
+}
+
+/* Real Memory Management - Forward declarations */
+extern void* vmm_kmalloc(size_t size, size_t align);
+extern void vmm_kfree(void* ptr);
+
+/* Memory management using real implementations */
+void* kalloc(size_t size) {
+    return vmm_kmalloc(size, 16); /* 16-byte alignment */
+}
+
+void kfree(void* ptr) {
+    vmm_kfree(ptr);
+}
+
+/* Logging stubs */
+void KLOG_ERROR(const char* subsystem, const char* format, ...) {
+    (void)subsystem; (void)format; /* Stub logging */
+}
+
+/* HAL timer stubs */
+void hal_timer_set_periodic(uint32_t hz) {
+    (void)hz; /* Timer stub */
+}
+
+void hal_cpu_halt(void) {
+    __asm__ volatile ("hlt"); /* Simple CPU halt */
+}
+
+/* Signal management stub */
+void signal_deliver_pending(void* process) {
+    (void)process; /* Signal stub */
+}
+
+/* CPU management stubs */
+uint32_t hal_cpu_id(void) {
+    return 0; /* Always CPU 0 for now */
+}
+
+/* String functions */
+size_t strlen(const char* str) {
+    size_t len = 0;
+    while (str[len]) len++;
+    return len;
+}
+
+int strcmp(const char* s1, const char* s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(unsigned char*)s1 - *(unsigned char*)s2;
+}
+
+char* strcpy(char* dest, const char* src) {
+    char* orig = dest;
+    while ((*dest++ = *src++));
+    return orig;
+}
+
+char* strncpy(char* dest, const char* src, size_t n) {
+    size_t i;
+    for (i = 0; i < n && src[i] != '\0'; i++) {
+        dest[i] = src[i];
+    }
+    for (; i < n; i++) {
+        dest[i] = '\0';
+    }
+    return dest;
+}
+
+void* memcpy(void* dest, const void* src, size_t n) {
+    char* d = dest;
+    const char* s = src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
+int k_snprintf(char* buf, size_t size, const char* format, ...) {
+    /* Simple stub */
+    if (size > 0) buf[0] = '\0';
+    return 0;
+}
+
+/* PCI stubs */
+status_t pci_enumerate(void) {
+    return STATUS_OK;
+}
+
+uint32_t hal_pci_cfg_read32(uint32_t bus, uint32_t device, uint32_t function, uint32_t offset) {
+    (void)bus; (void)device; (void)function; (void)offset;
+    return 0;
+}
+
+/* Crypto algorithm stubs */
+status_t crypto_register_rsa(void) { return STATUS_OK; }
+status_t crypto_register_hmac(void) { return STATUS_OK; }
+status_t crypto_register_ecdsa(void) { return STATUS_OK; }
+status_t crypto_register_chacha20(void) { return STATUS_OK; }
+
+/* Container system stubs */
+status_t container_destroy_namespaces(void* container) { (void)container; return STATUS_OK; }
+status_t container_destroy_cgroup(void* container) { (void)container; return STATUS_OK; }
+status_t container_apply_security(void* container) { (void)container; return STATUS_OK; }
+status_t vfs_mkdir(const char* path, uint16_t mode) { (void)path; (void)mode; return STATUS_OK; }
+status_t container_mount_overlay_fs(void* container) { (void)container; return STATUS_OK; }
+status_t vfs_bind_mount(const char* src, const char* dst) { (void)src; (void)dst; return STATUS_OK; }
+status_t container_apply_resource_limits(void* container) { (void)container; return STATUS_OK; }
+status_t container_setup_network(void* container) { (void)container; return STATUS_OK; }
+status_t container_kill_all_processes(void* container) { (void)container; return STATUS_OK; }
+
+/* Process management stubs */
+void* process_create_advanced(void) { return NULL; }
+status_t process_set_namespaces(void* process, void* namespaces) { (void)process; (void)namespaces; return STATUS_OK; }
+status_t process_destroy(void* process) { (void)process; return STATUS_OK; }
+status_t process_chroot(void* process, const char* path) { (void)process; (void)path; return STATUS_OK; }
+status_t process_set_cwd(void* process, const char* path) { (void)process; (void)path; return STATUS_OK; }
+status_t process_set_env(void* process, const char* env) { (void)process; (void)env; return STATUS_OK; }
+status_t process_exec(void* process, const char* path, char* const argv[]) { (void)process; (void)path; (void)argv; return STATUS_OK; }
+status_t process_terminate(void* process) { (void)process; return STATUS_OK; }
+/* scheduler_yield() now implemented in scheduler_fixed.c */
+
+/* Additional string functions */
+int snprintf(char* buf, size_t size, const char* format, ...) {
+    if (size > 0) buf[0] = '\0';
+    return 0;
+}
+
+void* memset(void* s, int c, size_t n) {
+    unsigned char* p = s;
+    while (n--) *p++ = c;
+    return s;
+}
+
+char* strchr(const char* str, int ch) {
+    while (*str && *str != ch) str++;
+    return *str == ch ? (char*)str : NULL;
+}
+
+int strncmp(const char* s1, const char* s2, size_t n) {
+    while (n && *s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+        n--;
+    }
+    return n ? (*(unsigned char*)s1 - *(unsigned char*)s2) : 0;
+}

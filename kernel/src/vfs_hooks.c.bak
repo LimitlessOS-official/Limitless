@@ -1,0 +1,56 @@
+/* VFS & Security Hook Framework */
+#include "vfs.h"
+#include "log.h"
+
+#define VFS_HOOK_MAX 16
+static vfs_open_hook_t   g_open_hooks[VFS_HOOK_MAX];
+static vfs_create_hook_t g_create_hooks[VFS_HOOK_MAX];
+static vfs_unlink_hook_t g_unlink_hooks[VFS_HOOK_MAX];
+
+static security_exec_hook_t   g_exec_hooks[VFS_HOOK_MAX];
+static security_open_hook_t   g_sec_open_hooks[VFS_HOOK_MAX];
+static security_socket_hook_t g_socket_hooks[VFS_HOOK_MAX];
+
+static vfs_sec_hook_stats_t g_stats;
+
+static int hook_add_void(void** arr, void* fn){
+    for(int i=0;i<VFS_HOOK_MAX;i++){ if(!arr[i]){ arr[i]=fn; return 0;} if(arr[i]==fn) return 0; }
+    return K_ENOSPC;
+}
+
+int vfs_register_open_hook(vfs_open_hook_t fn){ return hook_add_void((void**)g_open_hooks,(void*)fn);} 
+int vfs_register_create_hook(vfs_create_hook_t fn){ return hook_add_void((void**)g_create_hooks,(void*)fn);} 
+int vfs_register_unlink_hook(vfs_unlink_hook_t fn){ return hook_add_void((void**)g_unlink_hooks,(void*)fn);} 
+
+int security_register_exec_hook(security_exec_hook_t fn){ return hook_add_void((void**)g_exec_hooks,(void*)fn);} 
+int security_register_open_hook(security_open_hook_t fn){ return hook_add_void((void**)g_sec_open_hooks,(void*)fn);} 
+int security_register_socket_hook(security_socket_hook_t fn){ return hook_add_void((void**)g_socket_hooks,(void*)fn);} 
+
+/* Invocation helpers (internal; exposed via weak symbols if needed) */
+int __security_exec_check(const char* path, const char* const argv[]){
+    g_stats.exec_checks++;
+    for(int i=0;i<VFS_HOOK_MAX;i++){ if(g_exec_hooks[i]){ int rc=g_exec_hooks[i](path,argv); if(rc!=0){ g_stats.exec_denied++; return rc; } }}
+    return 0;
+}
+int __security_open_check(const char* path, int flags){
+    g_stats.open_checks++;
+    for(int i=0;i<VFS_HOOK_MAX;i++){ if(g_sec_open_hooks[i]){ int rc=g_sec_open_hooks[i](path,flags); if(rc!=0){ g_stats.open_denied++; return rc; } }}
+    return 0;
+}
+int __security_socket_check(int d,int t,int p){
+    g_stats.socket_checks++;
+    for(int i=0;i<VFS_HOOK_MAX;i++){ if(g_socket_hooks[i]){ int rc=g_socket_hooks[i](d,t,p); if(rc!=0){ g_stats.socket_denied++; return rc; } }}
+    return 0;
+}
+
+void __vfs_emit_open_event(const char* path,int flags,int rc){ g_stats.open_events++; vfs_open_event_t ev={path,flags,rc}; for(int i=0;i<VFS_HOOK_MAX;i++){ if(g_open_hooks[i]) g_open_hooks[i](&ev);} }
+void __vfs_emit_create_event(const char* path,u32 mode,int rc){ g_stats.create_events++; vfs_create_event_t ev={path,mode,rc}; for(int i=0;i<VFS_HOOK_MAX;i++){ if(g_create_hooks[i]) g_create_hooks[i](&ev);} }
+void __vfs_emit_unlink_event(const char* path,int rc){ g_stats.unlink_events++; vfs_unlink_event_t ev={path,rc}; for(int i=0;i<VFS_HOOK_MAX;i++){ if(g_unlink_hooks[i]) g_unlink_hooks[i](&ev);} }
+
+const vfs_sec_hook_stats_t* vfs_sec_get_hook_stats(void){
+    /* snapshot registration counts each time */
+    g_stats.open_hooks=0; g_stats.create_hooks=0; g_stats.unlink_hooks=0;
+    g_stats.exec_hooks=0; g_stats.sec_open_hooks=0; g_stats.socket_sec_hooks=0;
+    for(int i=0;i<VFS_HOOK_MAX;i++){ if(g_open_hooks[i]) g_stats.open_hooks++; if(g_create_hooks[i]) g_stats.create_hooks++; if(g_unlink_hooks[i]) g_stats.unlink_hooks++; if(g_exec_hooks[i]) g_stats.exec_hooks++; if(g_sec_open_hooks[i]) g_stats.sec_open_hooks++; if(g_socket_hooks[i]) g_stats.socket_sec_hooks++; }
+    return &g_stats; }
+void vfs_sec_reset_hook_stats(void){ u32 oh=g_stats.open_hooks, ch=g_stats.create_hooks, uh=g_stats.unlink_hooks, eh=g_stats.exec_hooks, soh=g_stats.sec_open_hooks, sh=g_stats.socket_sec_hooks; k_memset(&g_stats,0,sizeof(g_stats)); g_stats.open_hooks=oh; g_stats.create_hooks=ch; g_stats.unlink_hooks=uh; g_stats.exec_hooks=eh; g_stats.sec_open_hooks=soh; g_stats.socket_sec_hooks=sh; }

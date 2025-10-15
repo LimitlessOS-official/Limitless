@@ -1,0 +1,721 @@
+/*
+ * netfilter.c - LimitlessOS Network Packet Filtering System
+ * 
+ * Advanced packet filtering with iptables-compatible interface,
+ * connection tracking, NAT, and network security features.
+ */
+
+#include "kernel.h"
+#include "net/ip.h"
+#include "net/tcp.h"
+#include "net/udp.h"
+#include "net/icmp.h"
+#include "vmm.h"
+#include "timer.h"
+
+#define MAX_FILTER_RULES        8192
+#define MAX_CONNECTIONS         65536
+#define MAX_NAT_ENTRIES         4096
+#define CONNECTION_TIMEOUT      (300 * 1000)  /* 5 minutes */
+#define TCP_TIMEOUT             (3600 * 1000) /* 1 hour */
+#define UDP_TIMEOUT             (30 * 1000)   /* 30 seconds */
+
+/* Filter verdicts */
+#define NF_DROP                 0
+#define NF_ACCEPT               1
+#define NF_STOLEN               2
+#define NF_QUEUE                3
+#define NF_REPEAT               4
+#define NF_RETURN               5
+
+/* Filter hooks */
+#define NF_INET_PRE_ROUTING     0
+#define NF_INET_LOCAL_IN        1
+#define NF_INET_FORWARD         2
+#define NF_INET_LOCAL_OUT       3
+#define NF_INET_POST_ROUTING    4
+#define NF_INET_NUMHOOKS        5
+
+/* Filter tables */
+#define NF_TABLE_FILTER         0
+#define NF_TABLE_NAT            1
+#define NF_TABLE_MANGLE         2
+#define NF_TABLE_RAW            3
+#define NF_TABLE_SECURITY       4
+#define NF_TABLE_MAX            5
+
+/* Connection states */
+#define NF_CONNTRACK_NEW        0x01
+#define NF_CONNTRACK_ESTABLISHED 0x02
+#define NF_CONNTRACK_RELATED    0x04
+#define NF_CONNTRACK_INVALID    0x08
+
+/* Filter rule structure */
+typedef struct netfilter_rule {
+    uint32_t id;                    /* Rule ID */
+    uint32_t priority;              /* Rule priority */
+    uint8_t table;                  /* Target table */
+    uint8_t hook;                   /* Hook point */
+    
+    /* Match criteria */
+    uint32_t src_ip;                /* Source IP */
+    uint32_t src_mask;              /* Source netmask */
+    uint32_t dst_ip;                /* Destination IP */
+    uint32_t dst_mask;              /* Destination netmask */
+    
+    uint16_t src_port_min;          /* Source port range */
+    uint16_t src_port_max;
+    uint16_t dst_port_min;          /* Destination port range */
+    uint16_t dst_port_max;
+    
+    uint8_t protocol;               /* IP protocol */
+    uint8_t tcp_flags;              /* TCP flags to match */
+    uint8_t tcp_flags_mask;         /* TCP flags mask */
+    
+    uint32_t conntrack_state;       /* Connection tracking state */
+    
+    /* Action */
+    uint8_t action;                 /* Action to take */
+    uint32_t target_chain;          /* Target chain for JUMP */
+    
+    /* Counters */
+    uint64_t packets;               /* Packets matched */
+    uint64_t bytes;                 /* Bytes matched */
+    
+    /* Timing */
+    uint64_t created;               /* Rule creation time */
+    uint64_t last_match;            /* Last match time */
+    
+    struct list_head list;          /* List linkage */
+    
+} netfilter_rule_t;
+
+/* Connection tracking entry */
+typedef struct conntrack_entry {
+    uint32_t hash;                  /* Hash value */
+    
+    /* Connection tuple */
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t protocol;
+    
+    /* Connection state */
+    uint8_t state;                  /* Connection state */
+    uint8_t tcp_state;              /* TCP state */
+    
+    /* Timing */
+    uint64_t created;               /* Connection creation time */
+    uint64_t last_seen;             /* Last packet time */
+    uint64_t timeout;               /* Connection timeout */
+    
+    /* Counters */
+    uint64_t packets_orig;          /* Original direction packets */
+    uint64_t bytes_orig;            /* Original direction bytes */
+    uint64_t packets_reply;         /* Reply direction packets */
+    uint64_t bytes_reply;           /* Reply direction bytes */
+    
+    /* NAT information */
+    uint32_t nat_src_ip;            /* NAT source IP */
+    uint32_t nat_dst_ip;            /* NAT destination IP */
+    uint16_t nat_src_port;          /* NAT source port */
+    uint16_t nat_dst_port;          /* NAT destination port */
+    
+    struct list_head list;          /* Hash table list */
+    struct list_head global_list;   /* Global list */
+    
+} conntrack_entry_t;
+
+/* NAT rule structure */
+typedef struct nat_rule {
+    uint32_t id;                    /* NAT rule ID */
+    
+    /* Match criteria */
+    uint32_t src_ip;
+    uint32_t src_mask;
+    uint32_t dst_ip;
+    uint32_t dst_mask;
+    uint16_t src_port_min;
+    uint16_t src_port_max;
+    uint16_t dst_port_min;
+    uint16_t dst_port_max;
+    uint8_t protocol;
+    
+    /* NAT action */
+    uint8_t nat_type;               /* SNAT or DNAT */
+    uint32_t nat_ip_min;            /* NAT IP range */
+    uint32_t nat_ip_max;
+    uint16_t nat_port_min;          /* NAT port range */
+    uint16_t nat_port_max;
+    
+    /* Statistics */
+    uint64_t packets;
+    uint64_t bytes;
+    
+    struct list_head list;
+    
+} nat_rule_t;
+
+/* Packet context */
+typedef struct packet_context {
+    void* packet;                   /* Network packet */
+    size_t packet_len;              /* Packet length */
+    
+    /* Parsed headers */
+    struct iphdr* ip_hdr;           /* IP header */
+    struct tcphdr* tcp_hdr;         /* TCP header */
+    struct udphdr* udp_hdr;         /* UDP header */
+    struct icmphdr* icmp_hdr;       /* ICMP header */
+    
+    /* Packet info */
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t protocol;
+    
+    /* Connection tracking */
+    conntrack_entry_t* conntrack;
+    uint8_t conntrack_state;
+    
+    /* Hook info */
+    uint8_t hook;
+    uint8_t table;
+    
+} packet_context_t;
+
+/* Global netfilter state */
+static struct {
+    bool initialized;
+    
+    /* Filter rules */
+    struct list_head rules[NF_TABLE_MAX][NF_INET_NUMHOOKS];
+    spinlock_t rules_lock;
+    uint32_t next_rule_id;
+    
+    /* Connection tracking */
+    struct list_head conntrack_hash[1024];
+    struct list_head conntrack_global;
+    spinlock_t conntrack_lock;
+    uint32_t conntrack_count;
+    
+    /* NAT rules */
+    struct list_head nat_rules;
+    spinlock_t nat_lock;
+    uint32_t next_nat_id;
+    
+    /* Cleanup timer */
+    struct timer cleanup_timer;
+    
+    /* Statistics */
+    atomic64_t packets_total;
+    atomic64_t packets_dropped;
+    atomic64_t packets_accepted;
+    atomic64_t connections_created;
+    atomic64_t connections_destroyed;
+    atomic64_t nat_translations;
+    
+} g_netfilter = {0};
+
+/* Function prototypes */
+static int netfilter_process_packet(packet_context_t* ctx);
+static int netfilter_match_rule(netfilter_rule_t* rule, packet_context_t* ctx);
+static conntrack_entry_t* conntrack_find_or_create(packet_context_t* ctx);
+static void conntrack_update(conntrack_entry_t* ct, packet_context_t* ctx);
+static uint32_t conntrack_hash_func(uint32_t src_ip, uint32_t dst_ip, 
+                                   uint16_t src_port, uint16_t dst_port, uint8_t protocol);
+static void netfilter_cleanup_connections(void* data);
+static int netfilter_apply_nat(packet_context_t* ctx, nat_rule_t* nat_rule);
+
+/* Initialize netfilter system */
+int netfilter_init(void) {
+    if (g_netfilter.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing netfilter system\n");
+    
+    memset(&g_netfilter, 0, sizeof(g_netfilter));
+    
+    /* Initialize rule lists */
+    for (int table = 0; table < NF_TABLE_MAX; table++) {
+        for (int hook = 0; hook < NF_INET_NUMHOOKS; hook++) {
+            INIT_LIST_HEAD(&g_netfilter.rules[table][hook]);
+        }
+    }
+    
+    /* Initialize connection tracking */
+    for (int i = 0; i < 1024; i++) {
+        INIT_LIST_HEAD(&g_netfilter.conntrack_hash[i]);
+    }
+    INIT_LIST_HEAD(&g_netfilter.conntrack_global);
+    INIT_LIST_HEAD(&g_netfilter.nat_rules);
+    
+    /* Initialize locks */
+    spinlock_init(&g_netfilter.rules_lock);
+    spinlock_init(&g_netfilter.conntrack_lock);
+    spinlock_init(&g_netfilter.nat_lock);
+    
+    /* Initialize cleanup timer */
+    timer_init(&g_netfilter.cleanup_timer, netfilter_cleanup_connections, NULL);
+    timer_schedule(&g_netfilter.cleanup_timer, 30000); /* 30 seconds */
+    
+    g_netfilter.next_rule_id = 1;
+    g_netfilter.next_nat_id = 1;
+    
+    g_netfilter.initialized = true;
+    
+    printf("Netfilter system initialized\n");
+    return 0;
+}
+
+/* Main packet filtering entry point */
+int netfilter_filter_packet(void* packet, size_t len, uint8_t hook) {
+    if (!g_netfilter.initialized || !packet || len == 0) {
+        return NF_ACCEPT;
+    }
+    
+    atomic64_inc(&g_netfilter.packets_total);
+    
+    /* Create packet context */
+    packet_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    
+    ctx.packet = packet;
+    ctx.packet_len = len;
+    ctx.hook = hook;
+    
+    /* Parse IP header */
+    struct iphdr* ip_hdr = (struct iphdr*)packet;
+    if (len < sizeof(struct iphdr) || ip_hdr->version != 4) {
+        return NF_DROP;
+    }
+    
+    ctx.ip_hdr = ip_hdr;
+    ctx.src_ip = ntohl(ip_hdr->saddr);
+    ctx.dst_ip = ntohl(ip_hdr->daddr);
+    ctx.protocol = ip_hdr->protocol;
+    
+    /* Parse transport layer headers */
+    void* transport_hdr = (char*)packet + (ip_hdr->ihl * 4);
+    size_t transport_len = len - (ip_hdr->ihl * 4);
+    
+    switch (ctx.protocol) {
+        case IPPROTO_TCP:
+            if (transport_len >= sizeof(struct tcphdr)) {
+                ctx.tcp_hdr = (struct tcphdr*)transport_hdr;
+                ctx.src_port = ntohs(ctx.tcp_hdr->source);
+                ctx.dst_port = ntohs(ctx.tcp_hdr->dest);
+            }
+            break;
+            
+        case IPPROTO_UDP:
+            if (transport_len >= sizeof(struct udphdr)) {
+                ctx.udp_hdr = (struct udphdr*)transport_hdr;
+                ctx.src_port = ntohs(ctx.udp_hdr->source);
+                ctx.dst_port = ntohs(ctx.udp_hdr->dest);
+            }
+            break;
+            
+        case IPPROTO_ICMP:
+            if (transport_len >= sizeof(struct icmphdr)) {
+                ctx.icmp_hdr = (struct icmphdr*)transport_hdr;
+            }
+            break;
+    }
+    
+    /* Connection tracking */
+    if (ctx.protocol == IPPROTO_TCP || ctx.protocol == IPPROTO_UDP) {
+        ctx.conntrack = conntrack_find_or_create(&ctx);
+        if (ctx.conntrack) {
+            conntrack_update(ctx.conntrack, &ctx);
+        }
+    }
+    
+    /* Process through filter tables */
+    int verdict = netfilter_process_packet(&ctx);
+    
+    /* Update statistics */
+    if (verdict == NF_ACCEPT) {
+        atomic64_inc(&g_netfilter.packets_accepted);
+    } else if (verdict == NF_DROP) {
+        atomic64_inc(&g_netfilter.packets_dropped);
+    }
+    
+    return verdict;
+}
+
+/* Process packet through filter rules */
+static int netfilter_process_packet(packet_context_t* ctx) {
+    /* Process filter table first */
+    ctx->table = NF_TABLE_FILTER;
+    
+    spin_lock(&g_netfilter.rules_lock);
+    
+    netfilter_rule_t* rule;
+    list_for_each_entry(rule, &g_netfilter.rules[ctx->table][ctx->hook], list) {
+        if (netfilter_match_rule(rule, ctx)) {
+            /* Update rule statistics */
+            rule->packets++;
+            rule->bytes += ctx->packet_len;
+            rule->last_match = timer_get_ticks();
+            
+            spin_unlock(&g_netfilter.rules_lock);
+            
+            /* Apply action */
+            switch (rule->action) {
+                case NF_DROP:
+                    return NF_DROP;
+                case NF_ACCEPT:
+                    return NF_ACCEPT;
+                case NF_RETURN:
+                    break; /* Continue processing */
+                default:
+                    break;
+            }
+        }
+    }
+    
+    spin_unlock(&g_netfilter.rules_lock);
+    
+    /* Default policy: ACCEPT */
+    return NF_ACCEPT;
+}
+
+/* Match rule against packet */
+static int netfilter_match_rule(netfilter_rule_t* rule, packet_context_t* ctx) {
+    /* Check IP addresses */
+    if (rule->src_mask && (ctx->src_ip & rule->src_mask) != (rule->src_ip & rule->src_mask)) {
+        return 0;
+    }
+    
+    if (rule->dst_mask && (ctx->dst_ip & rule->dst_mask) != (rule->dst_ip & rule->dst_mask)) {
+        return 0;
+    }
+    
+    /* Check protocol */
+    if (rule->protocol && rule->protocol != ctx->protocol) {
+        return 0;
+    }
+    
+    /* Check ports */
+    if (rule->src_port_min && (ctx->src_port < rule->src_port_min || ctx->src_port > rule->src_port_max)) {
+        return 0;
+    }
+    
+    if (rule->dst_port_min && (ctx->dst_port < rule->dst_port_min || ctx->dst_port > rule->dst_port_max)) {
+        return 0;
+    }
+    
+    /* Check TCP flags */
+    if (rule->tcp_flags_mask && ctx->tcp_hdr) {
+        uint8_t flags = ((uint8_t*)ctx->tcp_hdr)[13]; /* TCP flags byte */
+        if ((flags & rule->tcp_flags_mask) != rule->tcp_flags) {
+            return 0;
+        }
+    }
+    
+    /* Check connection tracking state */
+    if (rule->conntrack_state && ctx->conntrack) {
+        if (!(rule->conntrack_state & ctx->conntrack_state)) {
+            return 0;
+        }
+    }
+    
+    return 1; /* Rule matches */
+}
+
+/* Find or create connection tracking entry */
+static conntrack_entry_t* conntrack_find_or_create(packet_context_t* ctx) {
+    uint32_t hash = conntrack_hash_func(ctx->src_ip, ctx->dst_ip, 
+                                       ctx->src_port, ctx->dst_port, ctx->protocol);
+    uint32_t bucket = hash % 1024;
+    
+    spin_lock(&g_netfilter.conntrack_lock);
+    
+    /* Look for existing connection */
+    conntrack_entry_t* ct;
+    list_for_each_entry(ct, &g_netfilter.conntrack_hash[bucket], list) {
+        if (ct->hash == hash &&
+            ct->src_ip == ctx->src_ip && ct->dst_ip == ctx->dst_ip &&
+            ct->src_port == ctx->src_port && ct->dst_port == ctx->dst_port &&
+            ct->protocol == ctx->protocol) {
+            
+            spin_unlock(&g_netfilter.conntrack_lock);
+            return ct;
+        }
+        
+        /* Check reverse direction */
+        if (ct->hash == hash &&
+            ct->src_ip == ctx->dst_ip && ct->dst_ip == ctx->src_ip &&
+            ct->src_port == ctx->dst_port && ct->dst_port == ctx->src_port &&
+            ct->protocol == ctx->protocol) {
+            
+            spin_unlock(&g_netfilter.conntrack_lock);
+            return ct;
+        }
+    }
+    
+    /* Create new connection if we have space */
+    if (g_netfilter.conntrack_count >= MAX_CONNECTIONS) {
+        spin_unlock(&g_netfilter.conntrack_lock);
+        return NULL;
+    }
+    
+    ct = (conntrack_entry_t*)vmm_kmalloc(sizeof(conntrack_entry_t), 32);
+    if (!ct) {
+        spin_unlock(&g_netfilter.conntrack_lock);
+        return NULL;
+    }
+    
+    memset(ct, 0, sizeof(conntrack_entry_t));
+    
+    /* Initialize connection */
+    ct->hash = hash;
+    ct->src_ip = ctx->src_ip;
+    ct->dst_ip = ctx->dst_ip;
+    ct->src_port = ctx->src_port;
+    ct->dst_port = ctx->dst_port;
+    ct->protocol = ctx->protocol;
+    ct->state = NF_CONNTRACK_NEW;
+    ct->created = timer_get_ticks();
+    ct->last_seen = ct->created;
+    
+    /* Set timeout based on protocol */
+    if (ctx->protocol == IPPROTO_TCP) {
+        ct->timeout = TCP_TIMEOUT;
+    } else if (ctx->protocol == IPPROTO_UDP) {
+        ct->timeout = UDP_TIMEOUT;
+    } else {
+        ct->timeout = CONNECTION_TIMEOUT;
+    }
+    
+    /* Add to hash table and global list */
+    list_add(&ct->list, &g_netfilter.conntrack_hash[bucket]);
+    list_add(&ct->global_list, &g_netfilter.conntrack_global);
+    g_netfilter.conntrack_count++;
+    
+    atomic64_inc(&g_netfilter.connections_created);
+    
+    spin_unlock(&g_netfilter.conntrack_lock);
+    
+    ctx->conntrack_state = NF_CONNTRACK_NEW;
+    
+    return ct;
+}
+
+/* Update connection tracking entry */
+static void conntrack_update(conntrack_entry_t* ct, packet_context_t* ctx) {
+    ct->last_seen = timer_get_ticks();
+    
+    /* Update packet counters */
+    bool original_direction = (ct->src_ip == ctx->src_ip && ct->dst_ip == ctx->dst_ip);
+    
+    if (original_direction) {
+        ct->packets_orig++;
+        ct->bytes_orig += ctx->packet_len;
+    } else {
+        ct->packets_reply++;
+        ct->bytes_reply += ctx->packet_len;
+    }
+    
+    /* Update connection state */
+    if (ct->state == NF_CONNTRACK_NEW && !original_direction) {
+        ct->state = NF_CONNTRACK_ESTABLISHED;
+        ctx->conntrack_state = NF_CONNTRACK_ESTABLISHED;
+    } else if (ct->state == NF_CONNTRACK_ESTABLISHED) {
+        ctx->conntrack_state = NF_CONNTRACK_ESTABLISHED;
+    } else {
+        ctx->conntrack_state = ct->state;
+    }
+    
+    /* Update TCP state */
+    if (ctx->protocol == IPPROTO_TCP && ctx->tcp_hdr) {
+        uint8_t flags = ((uint8_t*)ctx->tcp_hdr)[13];
+        
+        if (flags & TCP_FLAG_RST) {
+            ct->tcp_state = TCP_CLOSE;
+        } else if (flags & TCP_FLAG_FIN) {
+            if (ct->tcp_state == TCP_ESTABLISHED) {
+                ct->tcp_state = TCP_FIN_WAIT1;
+            }
+        } else if (flags & TCP_FLAG_SYN) {
+            if (ct->tcp_state == 0) {
+                ct->tcp_state = TCP_SYN_SENT;
+            }
+        }
+    }
+}
+
+/* Hash function for connection tracking */
+static uint32_t conntrack_hash_func(uint32_t src_ip, uint32_t dst_ip, 
+                                   uint16_t src_port, uint16_t dst_port, uint8_t protocol) {
+    uint32_t hash = src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ dst_port ^ protocol;
+    hash ^= hash >> 16;
+    hash ^= hash >> 8;
+    return hash;
+}
+
+/* Add filter rule */
+int netfilter_add_rule(uint8_t table, uint8_t hook, uint32_t priority,
+                      uint32_t src_ip, uint32_t src_mask,
+                      uint32_t dst_ip, uint32_t dst_mask,
+                      uint16_t src_port_min, uint16_t src_port_max,
+                      uint16_t dst_port_min, uint16_t dst_port_max,
+                      uint8_t protocol, uint8_t action) {
+    
+    if (table >= NF_TABLE_MAX || hook >= NF_INET_NUMHOOKS) {
+        return -EINVAL;
+    }
+    
+    netfilter_rule_t* rule = (netfilter_rule_t*)vmm_kmalloc(sizeof(netfilter_rule_t), 32);
+    if (!rule) {
+        return -ENOMEM;
+    }
+    
+    memset(rule, 0, sizeof(netfilter_rule_t));
+    
+    rule->id = g_netfilter.next_rule_id++;
+    rule->priority = priority;
+    rule->table = table;
+    rule->hook = hook;
+    rule->src_ip = src_ip;
+    rule->src_mask = src_mask;
+    rule->dst_ip = dst_ip;
+    rule->dst_mask = dst_mask;
+    rule->src_port_min = src_port_min;
+    rule->src_port_max = src_port_max;
+    rule->dst_port_min = dst_port_min;
+    rule->dst_port_max = dst_port_max;
+    rule->protocol = protocol;
+    rule->action = action;
+    rule->created = timer_get_ticks();
+    
+    /* Insert rule in priority order */
+    spin_lock(&g_netfilter.rules_lock);
+    
+    netfilter_rule_t* pos;
+    list_for_each_entry(pos, &g_netfilter.rules[table][hook], list) {
+        if (rule->priority < pos->priority) {
+            list_add_tail(&rule->list, &pos->list);
+            spin_unlock(&g_netfilter.rules_lock);
+            return rule->id;
+        }
+    }
+    
+    /* Add to end if highest priority */
+    list_add_tail(&rule->list, &g_netfilter.rules[table][hook]);
+    
+    spin_unlock(&g_netfilter.rules_lock);
+    
+    printf("Added netfilter rule %u: %u.%u.%u.%u -> %u.%u.%u.%u, action=%u\n",
+           rule->id,
+           (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF,
+           (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF,
+           action);
+    
+    return rule->id;
+}
+
+/* Remove filter rule */
+int netfilter_remove_rule(uint32_t rule_id) {
+    spin_lock(&g_netfilter.rules_lock);
+    
+    for (int table = 0; table < NF_TABLE_MAX; table++) {
+        for (int hook = 0; hook < NF_INET_NUMHOOKS; hook++) {
+            netfilter_rule_t* rule;
+            netfilter_rule_t* tmp;
+            
+            list_for_each_entry_safe(rule, tmp, &g_netfilter.rules[table][hook], list) {
+                if (rule->id == rule_id) {
+                    list_del(&rule->list);
+                    spin_unlock(&g_netfilter.rules_lock);
+                    
+                    vmm_kfree(rule, sizeof(netfilter_rule_t));
+                    return 0;
+                }
+            }
+        }
+    }
+    
+    spin_unlock(&g_netfilter.rules_lock);
+    return -ENOENT;
+}
+
+/* Connection cleanup timer */
+static void netfilter_cleanup_connections(void* data) {
+    UNUSED(data);
+    
+    uint64_t now = timer_get_ticks();
+    
+    spin_lock(&g_netfilter.conntrack_lock);
+    
+    conntrack_entry_t* ct;
+    conntrack_entry_t* tmp;
+    
+    list_for_each_entry_safe(ct, tmp, &g_netfilter.conntrack_global, global_list) {
+        /* Check if connection has timed out */
+        if (now - ct->last_seen > ct->timeout) {
+            /* Remove from hash table and global list */
+            list_del(&ct->list);
+            list_del(&ct->global_list);
+            g_netfilter.conntrack_count--;
+            
+            vmm_kfree(ct, sizeof(conntrack_entry_t));
+            
+            atomic64_inc(&g_netfilter.connections_destroyed);
+        }
+    }
+    
+    spin_unlock(&g_netfilter.conntrack_lock);
+    
+    /* Reschedule timer */
+    timer_schedule(&g_netfilter.cleanup_timer, 30000);
+}
+
+/* Get netfilter statistics */
+void netfilter_get_stats(struct netfilter_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct netfilter_stats));
+    
+    stats->packets_total = atomic64_read(&g_netfilter.packets_total);
+    stats->packets_dropped = atomic64_read(&g_netfilter.packets_dropped);
+    stats->packets_accepted = atomic64_read(&g_netfilter.packets_accepted);
+    stats->connections_created = atomic64_read(&g_netfilter.connections_created);
+    stats->connections_destroyed = atomic64_read(&g_netfilter.connections_destroyed);
+    stats->nat_translations = atomic64_read(&g_netfilter.nat_translations);
+    
+    stats->active_connections = g_netfilter.conntrack_count;
+    
+    /* Count rules */
+    spin_lock(&g_netfilter.rules_lock);
+    for (int table = 0; table < NF_TABLE_MAX; table++) {
+        for (int hook = 0; hook < NF_INET_NUMHOOKS; hook++) {
+            netfilter_rule_t* rule;
+            list_for_each_entry(rule, &g_netfilter.rules[table][hook], list) {
+                stats->total_rules++;
+            }
+        }
+    }
+    spin_unlock(&g_netfilter.rules_lock);
+}
+
+/* Debug output */
+void netfilter_dump_stats(void) {
+    struct netfilter_stats stats;
+    netfilter_get_stats(&stats);
+    
+    printf("Netfilter Statistics:\n");
+    printf("  Total packets: %lu\n", stats.packets_total);
+    printf("  Packets accepted: %lu\n", stats.packets_accepted);
+    printf("  Packets dropped: %lu\n", stats.packets_dropped);
+    printf("  Drop rate: %.2f%%\n", 
+           stats.packets_total > 0 ? (stats.packets_dropped * 100.0) / stats.packets_total : 0.0);
+    printf("  Active connections: %u\n", stats.active_connections);
+    printf("  Connections created: %lu\n", stats.connections_created);
+    printf("  Connections destroyed: %lu\n", stats.connections_destroyed);
+    printf("  NAT translations: %lu\n", stats.nat_translations);
+    printf("  Total rules: %u\n", stats.total_rules);
+}

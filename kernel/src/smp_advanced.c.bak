@@ -1,0 +1,883 @@
+/*
+ * LimitlessOS Advanced SMP Support
+ * Production-ready multi-core CPU management with AI optimization
+ * Supports up to 1024 CPUs with NUMA-awareness and power management
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "kernel/include/smp.h"
+#include "kernel/include/scheduler.h"
+#include "kernel/include/apic.h"
+#include "kernel/include/topology.h"
+#include "kernel/include/power_management.h"
+#include "kernel/include/ai_scheduler.h"
+
+// Maximum supported CPUs
+#define MAX_CPUS 1024
+
+// Global SMP management structure
+struct smp_manager smp_mgr;
+struct cpu_topology cpu_topo;
+struct scheduler_data scheduler;
+struct ai_scheduler_engine ai_sched;
+
+// Per-CPU data structure
+struct per_cpu_data {
+    int cpu_id;                         // Logical CPU ID
+    int apic_id;                        // APIC ID
+    int physical_id;                    // Physical CPU package ID
+    int core_id;                        // CPU core ID within package
+    int thread_id;                      // Hardware thread ID within core
+    
+    // CPU state and control
+    enum cpu_state {
+        CPU_STATE_OFFLINE = 0,
+        CPU_STATE_ONLINE,
+        CPU_STATE_IDLE,
+        CPU_STATE_RUNNING,
+        CPU_STATE_HOTPLUG_PREPARE,
+        CPU_STATE_DEAD
+    } state;
+    
+    // Scheduling data
+    struct rq runqueue;                 // CPU runqueue
+    struct task_struct *curr;           // Current running task
+    struct task_struct *idle;           // Idle task
+    struct task_struct *stop;           // Stop task for CPU hotplug
+    
+    // Load balancing
+    unsigned long load_weight;          // CPU load weight
+    unsigned long cpu_capacity;         // CPU processing capacity
+    unsigned long cpu_capacity_orig;    // Original CPU capacity
+    
+    // Statistics and monitoring
+    struct cpu_stats {
+        uint64_t context_switches;      // Context switches count
+        uint64_t interrupts_handled;    // Interrupts handled
+        uint64_t idle_time;            // Total idle time
+        uint64_t busy_time;            // Total busy time
+        uint64_t iowait_time;          // I/O wait time
+        uint64_t irq_time;             // IRQ processing time
+        uint64_t softirq_time;         // SoftIRQ processing time
+        uint64_t steal_time;           // Stolen time (virtualization)
+        uint64_t guest_time;           // Guest time (virtualization)
+    } stats;
+    
+    // Power management
+    struct cpu_power_state {
+        int current_freq;              // Current CPU frequency
+        int min_freq;                  // Minimum CPU frequency
+        int max_freq;                  // Maximum CPU frequency
+        int target_freq;               // Target CPU frequency
+        int c_state;                   // Current C-state
+        int max_c_state;              // Maximum available C-state
+        bool frequency_scaling;        // Frequency scaling enabled
+        bool idle_governor_active;     // Idle governor active
+    } power;
+    
+    // Cache topology
+    struct cpu_cache_info {
+        int l1d_size;                  // L1 data cache size
+        int l1i_size;                  // L1 instruction cache size
+        int l2_size;                   // L2 cache size
+        int l3_size;                   // L3 cache size (shared)
+        int cache_line_size;           // Cache line size
+        bool l1d_coherent;             // L1D cache coherency
+        bool l2_inclusive;             // L2 cache inclusivity
+        bool l3_shared;                // L3 cache sharing
+    } cache;
+    
+    // NUMA node information
+    int numa_node;                     // NUMA node ID
+    cpumask_t numa_cpus;              // CPUs in same NUMA node
+    
+    // AI optimization data
+    struct ai_cpu_profile {
+        float workload_prediction;     // Predicted workload
+        float performance_score;       // Performance score
+        float efficiency_rating;       // Energy efficiency rating
+        uint64_t prediction_accuracy;  // AI prediction accuracy
+        bool ai_governor_active;       // AI governor active
+    } ai_profile;
+    
+    // Thermal management
+    struct cpu_thermal_state {
+        int current_temp;              // Current temperature (°C)
+        int critical_temp;             // Critical temperature
+        int passive_temp;              // Passive cooling temperature
+        bool thermal_throttling;       // Thermal throttling active
+        int throttle_level;            // Throttling level (0-100%)
+    } thermal;
+    
+    // Interrupt handling
+    struct cpu_irq_data {
+        unsigned long *irq_stack;      // IRQ stack
+        unsigned long irq_stack_size;  // IRQ stack size
+        int irq_count;                // Active IRQ count
+        spinlock_t irq_lock;          // IRQ lock
+    } irq_data;
+    
+    // Performance counters
+    struct cpu_perf_counters {
+        uint64_t cycles;              // CPU cycles
+        uint64_t instructions;        // Instructions retired
+        uint64_t cache_references;    // Cache references
+        uint64_t cache_misses;        // Cache misses
+        uint64_t branch_instructions; // Branch instructions
+        uint64_t branch_misses;       // Branch misses
+        uint64_t page_faults;         // Page faults
+        uint64_t context_switches;    // Context switches
+    } perf;
+    
+    // Synchronization
+    raw_spinlock_t lock;              // CPU data lock
+    
+    // Architecture-specific data
+    void *arch_data;                  // Architecture-specific CPU data
+} __aligned(SMP_CACHE_BYTES);
+
+// Per-CPU data array
+static DEFINE_PER_CPU_ALIGNED(struct per_cpu_data, cpu_data);
+
+// CPU topology and configuration
+struct cpu_topology {
+    int nr_cpus;                      // Total number of CPUs
+    int nr_cores;                     // Total number of cores
+    int nr_packages;                  // Total number of packages
+    int nr_threads_per_core;          // Threads per core
+    int nr_cores_per_package;         // Cores per package
+    
+    // CPU masks
+    cpumask_t online_cpus;            // Online CPUs
+    cpumask_t possible_cpus;          // Possible CPUs
+    cpumask_t present_cpus;           // Present CPUs
+    cpumask_t active_cpus;            // Active CPUs
+    
+    // NUMA topology
+    int nr_numa_nodes;                // Number of NUMA nodes
+    cpumask_t numa_node_cpus[MAX_NUMNODES]; // CPUs per NUMA node
+    int cpu_to_node[MAX_CPUS];        // CPU to NUMA node mapping
+    
+    // Cache topology
+    cpumask_t llc_shared_cpus[MAX_CPUS]; // Last-level cache shared CPUs
+    int cache_levels;                 // Number of cache levels
+    
+    // Power domains
+    int nr_power_domains;             // Number of power domains
+    cpumask_t power_domain_cpus[MAX_POWER_DOMAINS];
+    
+    bool initialized;                 // Topology initialized
+};
+
+// SMP operations structure
+struct smp_ops {
+    void (*smp_prepare_boot_cpu)(void);
+    void (*smp_prepare_cpus)(unsigned int max_cpus);
+    void (*smp_cpus_done)(unsigned int max_cpus);
+    
+    void (*smp_send_stop)(void);
+    void (*smp_send_reschedule)(int cpu);
+    
+    int (*cpu_up)(unsigned int cpu, struct task_struct *tidle);
+    int (*cpu_down)(unsigned int cpu);
+    int (*cpu_disable)(void);
+    void (*cpu_die)(unsigned int cpu);
+    void (*play_dead)(void);
+    
+    void (*send_call_func_ipi)(const struct cpumask *mask);
+    void (*send_call_func_single_ipi)(int cpu);
+};
+
+static struct smp_ops smp_ops;
+
+// CPU runqueue structure (per-CPU scheduling data)
+struct rq {
+    raw_spinlock_t lock;              // Runqueue lock
+    
+    unsigned int nr_running;          // Number of runnable tasks
+    unsigned long cpu_load[CPU_LOAD_IDX_MAX]; // CPU load averages
+    unsigned long last_load_update_tick; // Last load update
+    
+    // Completely Fair Scheduler (CFS)
+    struct cfs_rq cfs;               // CFS runqueue
+    struct rt_rq rt;                 // Real-time runqueue
+    struct dl_rq dl;                 // Deadline runqueue
+    struct stop_rq stop;             // Stop task runqueue
+    
+    // Load balancing
+    struct sched_domain *sd;         // Scheduling domain
+    unsigned long next_balance;      // Next load balancing time
+    struct callback_head balance_callback; // Load balance callback
+    
+    // Current task
+    struct task_struct *curr;        // Currently running task
+    struct task_struct *idle;        // Idle task
+    struct task_struct *stop;        // Stop task
+    
+    // Scheduler statistics
+    struct rq_stats {
+        unsigned long yld_count;     // Yield count
+        unsigned long sched_count;   // Schedule count
+        unsigned long sched_goidle;  // Schedule to idle count
+        unsigned long ttwu_count;    // Try to wake up count
+        unsigned long ttwu_local;    // Try to wake up local count
+    } stats;
+    
+    // CPU capacity and utilization
+    unsigned long cpu_capacity;      // CPU capacity
+    unsigned long cpu_capacity_orig; // Original CPU capacity
+    struct util_est util_est;        // Utilization estimation
+    
+    // Power management
+    unsigned long max_idle_balance_cost; // Maximum idle balance cost
+    u64 next_update_time;           // Next capacity update time
+    
+    // AI optimization
+    struct ai_rq_data {
+        float predicted_load;        // AI-predicted load
+        float efficiency_score;      // Efficiency score
+        unsigned long migration_cost; // Migration cost estimate
+        bool ai_balancing_active;    // AI load balancing active
+    } ai_data;
+    
+    // Architecture-specific data
+    void *arch_rq_data;             // Architecture-specific runqueue data
+    
+    int cpu;                        // CPU ID
+    int online;                     // CPU online status
+    
+    struct list_head leaf_cfs_rq_list; // Leaf CFS runqueue list
+    struct task_group *tg;          // Task group
+    
+    atomic_t nr_iowait;             // Number of tasks waiting for I/O
+    
+#ifdef CONFIG_SMP
+    struct root_domain *rd;         // Root domain for load balancing
+    struct sched_domain *sd;        // Scheduling domain
+    
+    unsigned long cpu_capacity;     // CPU processing capacity
+    unsigned long cpu_capacity_orig; // Original CPU capacity
+    
+    struct callback_head *balance_callback; // Balance callback
+    
+    unsigned char idle_balance;     // Idle balancing flag
+    unsigned long misfit_task_load; // Misfit task load
+    
+    int active_balance;             // Active balancing flag
+    int push_cpu;                   // Push CPU for active balancing
+    struct cpu_stop_work active_balance_work; // Active balance work
+    
+    struct mm_struct *prev_mm;      // Previous memory management
+    
+    unsigned int avg_idle;          // Average idle time
+    u64 max_idle_balance_cost;      // Maximum idle balance cost
+    
+    call_single_data_t wake_csd;    // Wake CSD
+    struct cpuidle_state *idle_state; // Idle state
+#endif
+};
+
+// Scheduler domains for hierarchical load balancing
+struct sched_domain {
+    struct sched_domain *parent;     // Parent scheduling domain
+    struct sched_domain *child;      // Child scheduling domain
+    struct sched_group *groups;      // Scheduling groups
+    unsigned long min_interval;     // Minimum balancing interval
+    unsigned long max_interval;     // Maximum balancing interval
+    unsigned int busy_factor;       // Busy balancing factor
+    unsigned int imbalance_pct;     // Imbalance percentage threshold
+    unsigned int cache_nice_tries;  // Cache-nice tries
+    unsigned int busy_idx;          // Busy load index
+    unsigned int idle_idx;          // Idle load index
+    unsigned int newidle_idx;       // New idle load index
+    unsigned int wake_idx;          // Wake load index
+    unsigned int forkexec_idx;      // Fork/exec load index
+    unsigned int flags;             // Domain flags
+    int level;                      // Domain level
+    
+    unsigned long last_balance;     // Last balance timestamp
+    unsigned int balance_interval;  // Current balance interval
+    unsigned int nr_balance_failed; // Number of failed balances
+    
+    u64 max_newidle_lb_cost;       // Maximum new idle load balance cost
+    unsigned long next_decay_max_lb_cost; // Next decay time
+    
+    cpumask_var_t span;            // CPUs spanned by this domain
+    
+    const char *name;              // Domain name
+};
+
+// SMP initialization functions
+
+// Initialize SMP subsystem
+int __init smp_init(void) {
+    int ret;
+    
+    pr_info("Initializing LimitlessOS SMP subsystem\n");
+    
+    // Initialize SMP manager
+    memset(&smp_mgr, 0, sizeof(smp_mgr));
+    smp_mgr.max_cpus = MAX_CPUS;
+    
+    // Detect CPU topology
+    ret = detect_cpu_topology();
+    if (ret) {
+        pr_err("Failed to detect CPU topology: %d\n", ret);
+        return ret;
+    }
+    
+    // Initialize per-CPU data
+    ret = init_per_cpu_data();
+    if (ret) {
+        pr_err("Failed to initialize per-CPU data: %d\n", ret);
+        return ret;
+    }
+    
+    // Initialize APIC for SMP
+    ret = apic_smp_init();
+    if (ret) {
+        pr_err("Failed to initialize APIC for SMP: %d\n", ret);
+        return ret;
+    }
+    
+    // Initialize scheduler
+    ret = scheduler_init();
+    if (ret) {
+        pr_err("Failed to initialize scheduler: %d\n", ret);
+        return ret;
+    }
+    
+    // Initialize AI scheduler if enabled
+    if (CONFIG_LIMITLESS_AI) {
+        ret = ai_scheduler_init(&ai_sched);
+        if (ret) {
+            pr_warn("AI scheduler initialization failed, continuing without AI\n");
+            smp_mgr.ai_enabled = false;
+        } else {
+            smp_mgr.ai_enabled = true;
+            pr_info("AI-enhanced scheduler enabled\n");
+        }
+    }
+    
+    // Initialize power management
+    ret = cpu_power_management_init();
+    if (ret) {
+        pr_warn("CPU power management initialization failed\n");
+        smp_mgr.power_mgmt_enabled = false;
+    } else {
+        smp_mgr.power_mgmt_enabled = true;
+        pr_info("CPU power management enabled\n");
+    }
+    
+    pr_info("SMP subsystem initialized: %d CPUs, %d cores, %d packages\n",
+            cpu_topo.nr_cpus, cpu_topo.nr_cores, cpu_topo.nr_packages);
+    
+    return 0;
+}
+
+// Detect and initialize CPU topology
+static int detect_cpu_topology(void) {
+    int cpu, max_cpu_id = 0;
+    
+    // Initialize topology structure
+    memset(&cpu_topo, 0, sizeof(cpu_topo));
+    
+    // Scan all possible CPUs
+    for_each_possible_cpu(cpu) {
+        struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+        
+        // Initialize basic CPU information
+        cpu_data->cpu_id = cpu;
+        cpu_data->state = CPU_STATE_OFFLINE;
+        
+        // Read CPU topology from CPUID or ACPI
+        detect_cpu_info(cpu, cpu_data);
+        
+        // Update global topology counters
+        cpu_topo.nr_cpus++;
+        if (cpu > max_cpu_id)
+            max_cpu_id = cpu;
+        
+        // Set CPU in possible mask
+        cpumask_set_cpu(cpu, &cpu_topo.possible_cpus);
+        
+        // Map CPU to NUMA node
+        cpu_topo.cpu_to_node[cpu] = cpu_data->numa_node;
+        if (cpu_data->numa_node >= 0) {
+            cpumask_set_cpu(cpu, &cpu_topo.numa_node_cpus[cpu_data->numa_node]);
+            if (cpu_data->numa_node >= cpu_topo.nr_numa_nodes)
+                cpu_topo.nr_numa_nodes = cpu_data->numa_node + 1;
+        }
+    }
+    
+    // Calculate topology metrics
+    calculate_topology_metrics();
+    
+    // Build scheduling domains
+    build_sched_domains();
+    
+    cpu_topo.initialized = true;
+    return 0;
+}
+
+// Detect individual CPU information
+static void detect_cpu_info(int cpu, struct per_cpu_data *cpu_data) {
+    uint32_t eax, ebx, ecx, edx;
+    
+    // Get basic CPU information
+    cpuid(0x1, &eax, &ebx, &ecx, &edx);
+    cpu_data->apic_id = (ebx >> 24) & 0xFF;
+    
+    // Get topology information
+    if (boot_cpu_has(X86_FEATURE_TOPOEXT)) {
+        // AMD topology extensions
+        cpuid_count(0x8000001E, 0, &eax, &ebx, &ecx, &edx);
+        cpu_data->thread_id = eax & 0xFF;
+        cpu_data->core_id = (ebx >> 8) & 0xFF;
+        cpu_data->physical_id = (ecx >> 8) & 0xFF;
+    } else if (boot_cpu_has(X86_FEATURE_XTOPOLOGY)) {
+        // Intel extended topology
+        detect_intel_topology(cpu, cpu_data);
+    } else {
+        // Legacy topology detection
+        detect_legacy_topology(cpu, cpu_data);
+    }
+    
+    // Detect cache information
+    detect_cache_topology(cpu, cpu_data);
+    
+    // Detect NUMA node
+    cpu_data->numa_node = numa_cpu_node(cpu);
+    
+    // Initialize CPU capacity
+    cpu_data->cpu_capacity = SCHED_CAPACITY_SCALE;
+    cpu_data->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
+    
+    // Detect power management capabilities
+    detect_power_capabilities(cpu, cpu_data);
+    
+    // Initialize thermal management
+    init_thermal_management(cpu, cpu_data);
+}
+
+// Initialize per-CPU data structures
+static int init_per_cpu_data(void) {
+    int cpu;
+    
+    for_each_possible_cpu(cpu) {
+        struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+        
+        // Initialize locks
+        raw_spin_lock_init(&cpu_data->lock);
+        raw_spin_lock_init(&cpu_data->runqueue.lock);
+        spin_lock_init(&cpu_data->irq_data.irq_lock);
+        
+        // Initialize runqueue
+        init_cpu_runqueue(cpu, &cpu_data->runqueue);
+        
+        // Initialize statistics
+        memset(&cpu_data->stats, 0, sizeof(cpu_data->stats));
+        memset(&cpu_data->perf, 0, sizeof(cpu_data->perf));
+        
+        // Initialize AI profile
+        if (smp_mgr.ai_enabled) {
+            init_ai_cpu_profile(cpu, &cpu_data->ai_profile);
+        }
+        
+        // Allocate IRQ stack
+        cpu_data->irq_data.irq_stack_size = THREAD_SIZE;
+        cpu_data->irq_data.irq_stack = 
+            (unsigned long *)__get_free_pages(GFP_KERNEL, THREAD_SIZE_ORDER);
+        if (!cpu_data->irq_data.irq_stack) {
+            pr_err("Failed to allocate IRQ stack for CPU %d\n", cpu);
+            return -ENOMEM;
+        }
+    }
+    
+    return 0;
+}
+
+// Initialize CPU runqueue
+static void init_cpu_runqueue(int cpu, struct rq *rq) {
+    memset(rq, 0, sizeof(*rq));
+    
+    rq->cpu = cpu;
+    rq->online = 0;
+    
+    // Initialize CFS runqueue
+    init_cfs_rq(&rq->cfs);
+    
+    // Initialize RT runqueue
+    init_rt_rq(&rq->rt);
+    
+    // Initialize deadline runqueue
+    init_dl_rq(&rq->dl);
+    
+    // Initialize statistics
+    memset(&rq->stats, 0, sizeof(rq->stats));
+    
+    // Initialize load tracking
+    for (int i = 0; i < CPU_LOAD_IDX_MAX; i++) {
+        rq->cpu_load[i] = 0;
+    }
+    
+    rq->last_load_update_tick = jiffies;
+    rq->next_balance = jiffies;
+    
+    // Initialize AI data
+    if (smp_mgr.ai_enabled) {
+        rq->ai_data.predicted_load = 0.0f;
+        rq->ai_data.efficiency_score = 1.0f;
+        rq->ai_data.migration_cost = 0;
+        rq->ai_data.ai_balancing_active = false;
+    }
+}
+
+// CPU hotplug support
+int cpu_up(unsigned int cpu) {
+    struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+    int ret;
+    
+    if (cpu_online(cpu))
+        return -EINVAL;
+    
+    pr_info("Bringing CPU %d online\n", cpu);
+    
+    cpu_data->state = CPU_STATE_HOTPLUG_PREPARE;
+    
+    // Notify CPU hotplug callbacks
+    ret = cpuhp_up_callbacks(cpu, CPUHP_AP_ONLINE_DYN, 
+                            CPUHP_AP_ACTIVE, NULL, true);
+    if (ret)
+        goto out_notify;
+    
+    // Wake up CPU
+    ret = wake_up_secondary_cpu(cpu);
+    if (ret)
+        goto out_notify;
+    
+    // Wait for CPU to come online
+    ret = wait_for_cpu_online(cpu, 10000); // 10 second timeout
+    if (ret)
+        goto out_notify;
+    
+    // Update CPU topology
+    cpumask_set_cpu(cpu, &cpu_topo.online_cpus);
+    cpumask_set_cpu(cpu, &cpu_topo.active_cpus);
+    
+    cpu_data->state = CPU_STATE_ONLINE;
+    
+    // AI learning from CPU hotplug
+    if (smp_mgr.ai_enabled) {
+        ai_learn_from_cpu_hotplug(cpu, true);
+    }
+    
+    pr_info("CPU %d is now online\n", cpu);
+    return 0;
+    
+out_notify:
+    cpu_data->state = CPU_STATE_OFFLINE;
+    pr_err("Failed to bring CPU %d online: %d\n", cpu, ret);
+    return ret;
+}
+
+int cpu_down(unsigned int cpu) {
+    struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+    int ret;
+    
+    if (!cpu_online(cpu) || cpu == 0) // Don't allow taking down CPU 0
+        return -EINVAL;
+    
+    pr_info("Taking CPU %d offline\n", cpu);
+    
+    // Migrate tasks away from this CPU
+    ret = migrate_tasks_from_cpu(cpu);
+    if (ret)
+        return ret;
+    
+    // Stop CPU
+    ret = stop_machine_cpuslocked(take_cpu_down, &cpu, cpumask_of(cpu));
+    if (ret)
+        return ret;
+    
+    // Update CPU topology
+    cpumask_clear_cpu(cpu, &cpu_topo.online_cpus);
+    cpumask_clear_cpu(cpu, &cpu_topo.active_cpus);
+    
+    cpu_data->state = CPU_STATE_OFFLINE;
+    
+    // AI learning from CPU hotplug
+    if (smp_mgr.ai_enabled) {
+        ai_learn_from_cpu_hotplug(cpu, false);
+    }
+    
+    pr_info("CPU %d is now offline\n", cpu);
+    return 0;
+}
+
+// Load balancing with AI optimization
+void load_balance_tick(struct rq *this_rq, enum cpu_idle_type idle) {
+    unsigned long interval;
+    struct sched_domain *sd;
+    int this_cpu = this_rq->cpu;
+    
+    for_each_domain(this_cpu, sd) {
+        if (!(sd->flags & SD_LOAD_BALANCE))
+            continue;
+        
+        interval = get_sd_balance_interval(sd, idle);
+        
+        if (time_after_eq(jiffies, sd->last_balance + interval)) {
+            if (load_balance(this_cpu, this_rq, sd, idle, NULL)) {
+                // Balance failed, increase interval
+                if (sd->balance_interval < sd->max_interval)
+                    sd->balance_interval *= 2;
+            } else {
+                // Balance succeeded, reset interval
+                sd->balance_interval = sd->min_interval;
+            }
+        }
+    }
+    
+    // AI-guided load balancing
+    if (smp_mgr.ai_enabled) {
+        ai_guided_load_balance(this_rq, idle);
+    }
+}
+
+// AI-guided load balancing
+static void ai_guided_load_balance(struct rq *this_rq, enum cpu_idle_type idle) {
+    struct ai_scheduler_engine *ai = &ai_sched;
+    int this_cpu = this_rq->cpu;
+    
+    if (!ai->enabled)
+        return;
+    
+    // Predict optimal load distribution
+    struct ai_load_prediction prediction = ai_predict_optimal_load(ai, this_cpu);
+    
+    // Check if current distribution matches prediction
+    if (abs(this_rq->ai_data.predicted_load - prediction.target_load) > 
+        prediction.threshold) {
+        
+        // Find best migration candidates
+        struct task_struct *migrate_task = 
+            ai_find_migration_candidate(this_rq, &prediction);
+        
+        if (migrate_task) {
+            int target_cpu = ai_find_target_cpu(migrate_task, &prediction);
+            
+            if (target_cpu >= 0 && target_cpu != this_cpu) {
+                // Perform AI-guided migration
+                if (migrate_task_to_cpu(migrate_task, target_cpu)) {
+                    ai->successful_migrations++;
+                } else {
+                    ai->failed_migrations++;
+                }
+            }
+        }
+    }
+    
+    // Update AI statistics
+    ai->balance_attempts++;
+    if (this_rq->nr_running <= prediction.target_load + prediction.threshold &&
+        this_rq->nr_running >= prediction.target_load - prediction.threshold) {
+        ai->successful_predictions++;
+    }
+}
+
+// CPU frequency scaling with AI optimization
+void cpufreq_scale_cpu(int cpu, unsigned int target_freq) {
+    struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+    
+    if (!smp_mgr.power_mgmt_enabled)
+        return;
+    
+    // AI-guided frequency scaling
+    if (smp_mgr.ai_enabled) {
+        target_freq = ai_optimize_cpu_frequency(cpu, target_freq);
+    }
+    
+    // Thermal throttling check
+    if (cpu_data->thermal.thermal_throttling) {
+        unsigned int max_freq = cpu_data->power.max_freq * 
+                               (100 - cpu_data->thermal.throttle_level) / 100;
+        if (target_freq > max_freq)
+            target_freq = max_freq;
+    }
+    
+    // Apply frequency change
+    if (target_freq != cpu_data->power.current_freq) {
+        arch_set_cpu_frequency(cpu, target_freq);
+        cpu_data->power.current_freq = target_freq;
+        
+        // Update CPU capacity based on frequency
+        update_cpu_capacity(cpu, target_freq);
+    }
+}
+
+// Update CPU capacity based on frequency and microarchitecture
+static void update_cpu_capacity(int cpu, unsigned int freq) {
+    struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+    struct rq *rq = &cpu_data->runqueue;
+    unsigned long capacity;
+    
+    // Calculate capacity based on frequency ratio
+    capacity = (cpu_data->cpu_capacity_orig * freq) / cpu_data->power.max_freq;
+    
+    // Apply thermal throttling
+    if (cpu_data->thermal.thermal_throttling) {
+        capacity = capacity * (100 - cpu_data->thermal.throttle_level) / 100;
+    }
+    
+    // Apply AI efficiency scaling
+    if (smp_mgr.ai_enabled) {
+        capacity = capacity * cpu_data->ai_profile.efficiency_rating;
+    }
+    
+    // Update runqueue capacity
+    rq->cpu_capacity = capacity;
+    
+    // Trigger load balancing if capacity changed significantly
+    if (abs((long)(capacity - cpu_data->cpu_capacity)) > 
+        (cpu_data->cpu_capacity >> 4)) {
+        cpu_data->cpu_capacity = capacity;
+        trigger_load_balance(rq);
+    }
+}
+
+// Performance monitoring and statistics
+void update_cpu_stats(int cpu) {
+    struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+    struct rq *rq = &cpu_data->runqueue;
+    u64 now = sched_clock_cpu(cpu);
+    static u64 last_update[MAX_CPUS];
+    u64 delta = now - last_update[cpu];
+    
+    if (delta < 1000000) // Update at most once per millisecond
+        return;
+    
+    last_update[cpu] = now;
+    
+    // Update basic statistics
+    cpu_data->stats.context_switches = rq->stats.sched_count;
+    
+    // Update utilization
+    update_cpu_utilization(cpu, delta);
+    
+    // Update power statistics
+    if (smp_mgr.power_mgmt_enabled) {
+        update_power_statistics(cpu, delta);
+    }
+    
+    // Update AI profile
+    if (smp_mgr.ai_enabled) {
+        update_ai_cpu_profile(cpu, &cpu_data->ai_profile);
+    }
+    
+    // Update thermal statistics
+    update_thermal_statistics(cpu);
+}
+
+// SMP IPI (Inter-Processor Interrupt) functions
+void smp_send_reschedule(int cpu) {
+    if (likely(cpu_online(cpu))) {
+        native_send_call_func_single_ipi(cpu);
+    }
+}
+
+void smp_send_stop(void) {
+    unsigned long timeout;
+    
+    if (num_online_cpus() > 1) {
+        cpumask_t mask;
+        
+        cpumask_copy(&mask, cpu_online_mask);
+        cpumask_clear_cpu(smp_processor_id(), &mask);
+        
+        if (!cpumask_empty(&mask))
+            apic->send_IPI_mask(&mask, REBOOT_VECTOR);
+    }
+    
+    // Wait for CPUs to stop
+    timeout = USEC_PER_SEC;
+    while (num_online_cpus() > 1 && timeout--)
+        udelay(1);
+}
+
+// CPU idle management with AI optimization
+void cpu_idle_loop(void) {
+    int cpu = smp_processor_id();
+    struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+    
+    while (1) {
+        tick_nohz_idle_enter();
+        
+        while (!need_resched()) {
+            // AI-guided idle state selection
+            int target_state = 0;
+            
+            if (smp_mgr.ai_enabled) {
+                target_state = ai_select_idle_state(cpu);
+            } else {
+                target_state = cpuidle_select(drv, dev);
+            }
+            
+            // Enter idle state
+            if (target_state > 0) {
+                cpu_data->power.c_state = target_state;
+                arch_cpu_idle_enter(target_state);
+                
+                // Update idle statistics
+                cpu_data->stats.idle_time += 
+                    measure_idle_duration(target_state);
+                
+                arch_cpu_idle_exit(target_state);
+                cpu_data->power.c_state = 0;
+            } else {
+                arch_cpu_idle();
+            }
+        }
+        
+        tick_nohz_idle_exit();
+        schedule_preempt_disabled();
+    }
+}
+
+// SMP cleanup on shutdown
+void smp_cleanup(void) {
+    int cpu;
+    
+    pr_info("Shutting down SMP subsystem\n");
+    
+    // Stop all CPUs except boot CPU
+    for_each_online_cpu(cpu) {
+        if (cpu != 0) {
+            cpu_down(cpu);
+        }
+    }
+    
+    // Cleanup AI scheduler
+    if (smp_mgr.ai_enabled) {
+        ai_scheduler_cleanup(&ai_sched);
+    }
+    
+    // Cleanup power management
+    if (smp_mgr.power_mgmt_enabled) {
+        cpu_power_management_cleanup();
+    }
+    
+    // Free per-CPU data
+    for_each_possible_cpu(cpu) {
+        struct per_cpu_data *cpu_data = &per_cpu(cpu_data, cpu);
+        
+        if (cpu_data->irq_data.irq_stack) {
+            free_pages((unsigned long)cpu_data->irq_data.irq_stack,
+                      THREAD_SIZE_ORDER);
+        }
+    }
+    
+    pr_info("SMP subsystem shutdown complete\n");
+}

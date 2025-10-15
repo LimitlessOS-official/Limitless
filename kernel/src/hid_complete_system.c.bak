@@ -1,0 +1,1070 @@
+/*
+ * LimitlessOS Complete HID (Human Interface Device) Support
+ * Production-ready HID subsystem with keyboard, mouse, touchscreen, gamepad support
+ * Includes gesture recognition, AI input prediction, and accessibility features
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "kernel/include/hid.h"
+#include "kernel/include/input.h"
+#include "kernel/include/usb.h"
+#include "kernel/include/bluetooth.h"
+#include "kernel/include/ai_input.h"
+
+// HID device types
+typedef enum {
+    HID_TYPE_KEYBOARD = 0,
+    HID_TYPE_MOUSE,
+    HID_TYPE_TOUCHSCREEN,
+    HID_TYPE_TOUCHPAD,
+    HID_TYPE_GAMEPAD,
+    HID_TYPE_JOYSTICK,
+    HID_TYPE_STYLUS,
+    HID_TYPE_DIGITIZER,
+    HID_TYPE_SENSOR,
+    HID_TYPE_AUDIO_CONTROLS,
+    HID_TYPE_SYSTEM_CONTROLS,
+    HID_TYPE_GENERIC
+} hid_device_type_t;
+
+// Complete HID device structure
+struct hid_device {
+    struct limitless_device dev;       // Base device structure
+    
+    // HID identification
+    struct hid_id {
+        uint16_t vendor_id;            // Vendor ID
+        uint16_t product_id;           // Product ID
+        uint16_t version;              // Device version
+        uint32_t usage_page;           // HID usage page
+        uint32_t usage;                // HID usage
+        hid_device_type_t type;        // Device type
+        char manufacturer[64];         // Manufacturer string
+        char product[128];             // Product string
+        char serial[64];               // Serial number
+    } id;
+    
+    // HID descriptors and reports
+    struct hid_descriptors {
+        uint8_t *hid_descriptor;       // HID descriptor
+        size_t hid_desc_size;          // HID descriptor size
+        uint8_t *report_descriptor;    // Report descriptor
+        size_t report_desc_size;       // Report descriptor size
+        
+        // Report information
+        struct hid_report_info {
+            uint8_t report_id;         // Report ID
+            uint16_t report_size;      // Report size in bits
+            uint16_t report_count;     // Number of reports
+            enum hid_report_type {
+                HID_INPUT_REPORT = 1,
+                HID_OUTPUT_REPORT,
+                HID_FEATURE_REPORT
+            } type;
+            uint32_t usage_page;       // Usage page
+            uint32_t usage;            // Usage
+            bool has_report_id;        // Report has ID field
+        } reports[32];
+        int num_reports;               // Number of reports
+        
+        // Collections
+        struct hid_collection {
+            uint32_t usage_page;       // Collection usage page
+            uint32_t usage;            // Collection usage
+            enum hid_collection_type {
+                HID_COLLECTION_PHYSICAL = 0,
+                HID_COLLECTION_APPLICATION,
+                HID_COLLECTION_LOGICAL,
+                HID_COLLECTION_REPORT,
+                HID_COLLECTION_NAMED_ARRAY,
+                HID_COLLECTION_USAGE_SWITCH,
+                HID_COLLECTION_USAGE_MODIFIER
+            } type;
+            int parent;                // Parent collection index
+        } collections[16];
+        int num_collections;           // Number of collections
+    } descriptors;
+    
+    // Input/Output buffers
+    struct hid_buffers {
+        uint8_t *input_buffer;         // Input report buffer
+        uint8_t *output_buffer;        // Output report buffer
+        uint8_t *feature_buffer;       // Feature report buffer
+        size_t input_buffer_size;      // Input buffer size
+        size_t output_buffer_size;     // Output buffer size
+        size_t feature_buffer_size;    // Feature buffer size
+        
+        struct circular_buffer *event_buffer; // Event circular buffer
+        spinlock_t buffer_lock;        // Buffer protection lock
+    } buffers;
+    
+    // Connection and interface
+    struct hid_connection {
+        enum hid_connection_type {
+            HID_CONN_USB = 0,
+            HID_CONN_BLUETOOTH,
+            HID_CONN_I2C,
+            HID_CONN_SPI,
+            HID_CONN_VIRTUAL
+        } type;
+        
+        union {
+            struct {
+                struct usb_device *udev; // USB device
+                struct usb_interface *intf; // USB interface
+                struct usb_endpoint_descriptor *in_ep; // Input endpoint
+                struct usb_endpoint_descriptor *out_ep; // Output endpoint
+                struct urb *input_urb;   // Input URB
+                struct urb *output_urb;  // Output URB
+            } usb;
+            
+            struct {
+                struct bluetooth_device *bdev; // Bluetooth device
+                uint16_t interrupt_cid;  // Interrupt channel ID
+                uint16_t control_cid;    // Control channel ID
+                bool connected;          // Connection status
+                uint8_t battery_level;   // Battery level (0-100)
+            } bluetooth;
+            
+            struct {
+                struct i2c_client *client; // I2C client
+                int irq_gpio;            // IRQ GPIO pin
+                bool polling_mode;       // Polling mode enabled
+            } i2c;
+        } conn;
+        
+        bool connected;                // Device connected
+        uint64_t connect_time;         // Connection timestamp
+        uint32_t packets_sent;         // Packets sent count
+        uint32_t packets_received;     // Packets received count
+        uint32_t error_count;          // Error count
+    } connection;
+    
+    // Device-specific data
+    union {
+        // Keyboard data
+        struct keyboard_data {
+            uint8_t led_state;         // LED state (Caps, Num, Scroll)
+            uint8_t modifier_state;    // Modifier key state
+            uint8_t pressed_keys[16];  // Currently pressed keys
+            int num_pressed;           // Number of pressed keys
+            bool repeat_enabled;       // Key repeat enabled
+            int repeat_delay;          // Key repeat delay (ms)
+            int repeat_rate;           // Key repeat rate (Hz)
+            
+            // Keyboard layout
+            struct keyboard_layout {
+                char name[32];         // Layout name
+                uint16_t *keymap;      // Key mapping table
+                uint16_t *shift_map;   // Shift key mapping
+                uint16_t *altgr_map;   // AltGr key mapping
+                bool loaded;           // Layout loaded
+            } layout;
+            
+            // Advanced features
+            bool fn_keys_support;      // Function keys support
+            bool multimedia_keys;      // Multimedia keys support
+            bool programmable_keys;    // Programmable keys support
+            int macro_keys;            // Number of macro keys
+        } keyboard;
+        
+        // Mouse data
+        struct mouse_data {
+            int16_t x, y;              // Current position
+            int16_t wheel_x, wheel_y;  // Wheel position
+            uint8_t button_state;      // Button state
+            int num_buttons;           // Number of buttons
+            
+            // Mouse settings
+            struct mouse_settings {
+                int sensitivity;       // Mouse sensitivity (1-100)
+                int acceleration;      // Mouse acceleration (0-10)
+                bool left_handed;      // Left-handed mode
+                int double_click_time; // Double-click time (ms)
+                int scroll_lines;      // Scroll lines per wheel step
+                bool natural_scrolling; // Natural scrolling direction
+            } settings;
+            
+            // Advanced features
+            bool high_precision;       // High precision mode
+            int polling_rate;          // Polling rate (Hz)
+            int max_dpi;               // Maximum DPI
+            int current_dpi;           // Current DPI
+            bool dpi_switching;        // DPI switching support
+            int profile_count;         // Number of profiles
+        } mouse;
+        
+        // Touchscreen/Touchpad data
+        struct touch_data {
+            struct touch_point {
+                uint16_t id;           // Touch point ID
+                uint16_t x, y;         // Position
+                uint16_t pressure;     // Pressure (0-65535)
+                uint16_t size_major;   // Major axis size
+                uint16_t size_minor;   // Minor axis size
+                int16_t orientation;   // Orientation (-180 to 180)
+                bool active;           // Touch point active
+            } points[10];              // Support up to 10 touch points
+            int active_points;         // Number of active points
+            
+            // Touch capabilities
+            struct touch_caps {
+                uint16_t max_x, max_y; // Maximum coordinates
+                uint16_t resolution_x; // X resolution (units per mm)
+                uint16_t resolution_y; // Y resolution (units per mm)
+                bool pressure_support; // Pressure sensitivity
+                bool size_support;     // Contact size support
+                bool orientation_support; // Orientation support
+                int max_contacts;      // Maximum simultaneous contacts
+            } caps;
+            
+            // Gesture recognition
+            struct gesture_data {
+                bool gesture_enabled;  // Gesture recognition enabled
+                struct gesture_state {
+                    enum gesture_type {
+                        GESTURE_TAP = 0,
+                        GESTURE_DOUBLE_TAP,
+                        GESTURE_LONG_PRESS,
+                        GESTURE_SWIPE_LEFT,
+                        GESTURE_SWIPE_RIGHT,
+                        GESTURE_SWIPE_UP,
+                        GESTURE_SWIPE_DOWN,
+                        GESTURE_PINCH_IN,
+                        GESTURE_PINCH_OUT,
+                        GESTURE_ROTATE,
+                        GESTURE_THREE_FINGER_TAP,
+                        GESTURE_FOUR_FINGER_TAP
+                    } type;
+                    float confidence;  // Gesture confidence (0.0-1.0)
+                    uint64_t start_time; // Gesture start time
+                    uint64_t end_time; // Gesture end time
+                    bool recognized;   // Gesture recognized
+                } current_gesture;
+                
+                // Palm rejection
+                bool palm_rejection;   // Palm rejection enabled
+                uint16_t palm_threshold; // Palm detection threshold
+            } gestures;
+        } touch;
+        
+        // Gamepad data
+        struct gamepad_data {
+            // Analog sticks
+            struct analog_stick {
+                int16_t x, y;          // Stick position (-32768 to 32767)
+                uint16_t deadzone;     // Deadzone radius
+                bool pressed;          // Stick button pressed
+            } left_stick, right_stick;
+            
+            // Triggers
+            struct trigger {
+                uint16_t value;        // Trigger value (0-65535)
+                uint16_t deadzone;     // Trigger deadzone
+            } left_trigger, right_trigger;
+            
+            // D-Pad
+            struct dpad {
+                bool up, down, left, right; // D-Pad directions
+            } dpad;
+            
+            // Buttons
+            uint32_t button_state;     // Button state bitfield
+            int num_buttons;           // Number of buttons
+            
+            // Gamepad features
+            struct gamepad_features {
+                bool rumble_support;   // Rumble/vibration support
+                bool led_support;      // LED support
+                bool gyroscope;        // Gyroscope sensor
+                bool accelerometer;    // Accelerometer sensor
+                bool touchpad;         // Built-in touchpad
+                bool audio_jack;       // Audio jack support
+                bool wireless;         // Wireless connectivity
+                uint8_t battery_level; // Battery level (0-100)
+            } features;
+            
+            // Rumble control
+            struct rumble_control {
+                uint16_t left_motor;   // Left motor intensity (0-65535)
+                uint16_t right_motor;  // Right motor intensity (0-65535)
+                uint32_t duration;     // Rumble duration (ms)
+                bool enabled;          // Rumble enabled
+            } rumble;
+        } gamepad;
+    } device_data;
+    
+    // AI input prediction and optimization
+    struct ai_input_profile {
+        bool ai_enabled;               // AI input processing enabled
+        
+        // Usage prediction
+        struct usage_prediction {
+            float typing_speed_wpm;    // Predicted typing speed (WPM)
+            float click_frequency;     // Click frequency (clicks/sec)
+            enum input_pattern {
+                PATTERN_GAMING = 0,
+                PATTERN_PRODUCTIVITY,
+                PATTERN_CREATIVE,
+                PATTERN_CASUAL
+            } predicted_pattern;
+            float confidence;          // Prediction confidence
+        } prediction;
+        
+        // Adaptive optimization
+        struct adaptive_settings {
+            bool auto_sensitivity;     // Auto sensitivity adjustment
+            bool predictive_cursor;    // Predictive cursor movement
+            bool smart_acceleration;   // Smart acceleration
+            bool gesture_prediction;   // Gesture prediction
+            bool error_correction;     // Input error correction
+        } adaptive;
+        
+        // Learning data
+        struct input_learning {
+            uint64_t total_inputs;     // Total input events
+            uint64_t error_corrections; // Number of corrections made
+            float accuracy_score;      // Input accuracy (0.0-1.0)
+            uint64_t session_start;    // Current session start time
+            struct input_statistics {
+                uint64_t keystrokes;   // Total keystrokes
+                uint64_t mouse_clicks; // Total mouse clicks
+                uint64_t mouse_distance; // Total mouse distance (pixels)
+                uint64_t touch_events; // Total touch events
+                float average_speed;   // Average input speed
+            } stats;
+        } learning;
+    } ai_profile;
+    
+    // Accessibility features
+    struct accessibility {
+        bool enabled;                  // Accessibility features enabled
+        
+        struct sticky_keys {
+            bool enabled;              // Sticky keys enabled
+            bool locked;               // Modifier locked
+            uint8_t modifier_mask;     // Active modifiers
+        } sticky_keys;
+        
+        struct filter_keys {
+            bool enabled;              // Filter keys enabled
+            uint16_t repeat_delay;     // Repeat delay (ms)
+            uint16_t accept_delay;     // Key accept delay (ms)
+        } filter_keys;
+        
+        struct toggle_keys {
+            bool enabled;              // Toggle keys enabled
+            bool caps_lock_sound;      // Caps lock sound
+            bool num_lock_sound;       // Num lock sound
+            bool scroll_lock_sound;    // Scroll lock sound
+        } toggle_keys;
+        
+        struct mouse_keys {
+            bool enabled;              // Mouse keys enabled
+            int acceleration;          // Mouse acceleration
+            int max_speed;             // Maximum speed
+            int delay;                 // Initial delay
+        } mouse_keys;
+        
+        struct high_contrast {
+            bool enabled;              // High contrast mode
+            int contrast_level;        // Contrast level (1-10)
+        } high_contrast;
+        
+        struct magnifier {
+            bool enabled;              // Screen magnifier
+            float zoom_level;          // Zoom level (1.0-16.0)
+            bool follow_cursor;        // Follow cursor
+            bool follow_keyboard;      // Follow keyboard focus
+        } magnifier;
+    } accessibility;
+    
+    // Power management
+    struct hid_power_management {
+        bool runtime_suspend;          // Runtime suspend enabled
+        uint32_t idle_timeout;         // Idle timeout (ms)
+        uint32_t suspend_delay;        // Suspend delay (ms)
+        bool remote_wakeup;            // Remote wakeup capability
+        uint8_t power_state;           // Current power state
+        
+        // Battery information (for wireless devices)
+        struct battery_info {
+            bool has_battery;          // Device has battery
+            uint8_t level;             // Battery level (0-100)
+            enum battery_status {
+                BATTERY_UNKNOWN = 0,
+                BATTERY_CHARGING,
+                BATTERY_DISCHARGING,
+                BATTERY_NOT_CHARGING,
+                BATTERY_FULL
+            } status;
+            uint32_t time_remaining;   // Time remaining (minutes)
+            bool low_battery_warning;  // Low battery warning active
+        } battery;
+    } power_mgmt;
+    
+    // Security features
+    struct hid_security {
+        bool secure_input;             // Secure input mode
+        bool encryption_enabled;       // Communication encryption
+        uint8_t authentication_key[32]; // Authentication key
+        bool trusted_device;           // Device is trusted
+        bool biometric_auth;           // Biometric authentication
+        
+        // Input validation
+        struct input_validation {
+            bool validate_reports;     // Validate HID reports
+            bool rate_limiting;        // Input rate limiting
+            uint32_t max_input_rate;   // Maximum input rate (events/sec)
+            bool suspicious_activity;  // Suspicious activity detected
+        } validation;
+    } security;
+    
+    // HID operations
+    struct hid_ops {
+        int (*start)(struct hid_device *hid);
+        int (*stop)(struct hid_device *hid);
+        int (*open)(struct hid_device *hid);
+        int (*close)(struct hid_device *hid);
+        int (*get_report)(struct hid_device *hid, uint8_t report_type,
+                         uint8_t report_id, uint8_t *buffer, size_t size);
+        int (*set_report)(struct hid_device *hid, uint8_t report_type,
+                         uint8_t report_id, const uint8_t *buffer, size_t size);
+        int (*raw_request)(struct hid_device *hid, uint8_t report_id,
+                          uint8_t *buffer, size_t size, uint8_t report_type,
+                          int request_type);
+        int (*output_report)(struct hid_device *hid, const uint8_t *buffer,
+                           size_t size);
+        void (*process_report)(struct hid_device *hid, uint8_t *buffer,
+                             size_t size);
+    } *ops;
+    
+    // Event handling
+    struct input_dev *input_device;   // Input device
+    struct work_struct input_work;     // Input work queue
+    struct timer_list repeat_timer;    // Key repeat timer
+    
+    // Statistics and monitoring
+    struct hid_statistics {
+        uint64_t input_reports;        // Input reports processed
+        uint64_t output_reports;       // Output reports sent
+        uint64_t feature_reports;      // Feature reports
+        uint64_t parse_errors;         // Parse errors
+        uint64_t transmission_errors;  // Transmission errors
+        uint64_t last_activity;        // Last activity timestamp
+        uint32_t active_time;          // Total active time (seconds)
+    } stats;
+    
+    unsigned long flags;               // HID device flags
+    atomic_t open_count;               // Open reference count
+    
+    void *driver_data;                 // Driver private data
+};
+
+// HID Controller structure
+struct hid_controller {
+    bool enabled;                      // HID controller enabled
+    struct list_head devices;          // HID devices list
+    struct mutex devices_mutex;        // Devices list mutex
+    int device_count;                  // Number of HID devices
+    
+    // Input subsystem integration
+    struct input_handler handlers[HID_TYPE_GENERIC + 1]; // Input handlers
+    
+    // AI input optimization
+    struct ai_input_optimizer {
+        bool enabled;                  // AI optimization enabled
+        struct neural_network *prediction_model; // Input prediction model
+        struct user_behavior_profile *user_profile; // User behavior profile
+        float optimization_efficiency; // Optimization efficiency
+        uint64_t predictions_made;     // Predictions made
+        uint64_t predictions_correct;  // Correct predictions
+    } ai_optimizer;
+    
+    // Gesture recognition engine
+    struct gesture_engine {
+        bool enabled;                  // Gesture recognition enabled
+        struct gesture_classifier *classifier; // Gesture classifier
+        struct gesture_template *templates; // Gesture templates
+        int num_templates;             // Number of templates
+        float recognition_threshold;   // Recognition threshold
+        uint64_t gestures_recognized; // Gestures recognized
+    } gesture_engine;
+    
+    // Accessibility support
+    struct accessibility_manager {
+        bool enabled;                  // Accessibility enabled
+        struct accessibility_profile *profiles; // User profiles
+        int num_profiles;              // Number of profiles
+        struct accessibility_settings *current; // Current settings
+        bool screen_reader_active;     // Screen reader active
+        bool voice_control_active;     // Voice control active
+    } accessibility_mgr;
+    
+    // Security manager
+    struct hid_security_manager {
+        bool enabled;                  // Security features enabled
+        struct device_whitelist *whitelist; // Trusted device whitelist
+        struct intrusion_detector *detector; // Intrusion detection
+        bool keylogger_protection;     // Keylogger protection
+        bool injection_protection;     // Input injection protection
+        uint64_t security_violations;  // Security violations detected
+    } security_mgr;
+    
+    struct workqueue_struct *workqueue; // HID work queue
+    bool initialized;                  // Controller initialized
+};
+
+// Global HID controller instance
+struct hid_controller hid_ctrl;
+
+// HID initialization
+int __init hid_controller_init(struct hid_controller *hid) {
+    int ret;
+    
+    pr_info("Initializing LimitlessOS HID controller\n");
+    
+    // Initialize HID controller structure
+    memset(hid, 0, sizeof(*hid));
+    INIT_LIST_HEAD(&hid->devices);
+    mutex_init(&hid->devices_mutex);
+    
+    // Create HID work queue
+    hid->workqueue = alloc_workqueue("hid-limitless", WQ_UNBOUND | WQ_HIGHPRI, 0);
+    if (!hid->workqueue) {
+        pr_err("Failed to create HID work queue\n");
+        return -ENOMEM;
+    }
+    
+    // Initialize input subsystem integration
+    ret = hid_init_input_handlers(hid);
+    if (ret) {
+        pr_err("Failed to initialize input handlers: %d\n", ret);
+        goto err_workqueue;
+    }
+    
+    // Initialize AI input optimizer
+    if (CONFIG_LIMITLESS_AI) {
+        ret = ai_input_optimizer_init(&hid->ai_optimizer);
+        if (ret) {
+            pr_warn("AI input optimization disabled\n");
+            hid->ai_optimizer.enabled = false;
+        } else {
+            hid->ai_optimizer.enabled = true;
+            pr_info("AI input optimization enabled\n");
+        }
+    }
+    
+    // Initialize gesture recognition engine
+    ret = gesture_engine_init(&hid->gesture_engine);
+    if (ret) {
+        pr_warn("Gesture recognition disabled\n");
+        hid->gesture_engine.enabled = false;
+    } else {
+        hid->gesture_engine.enabled = true;
+        pr_info("Gesture recognition enabled\n");
+    }
+    
+    // Initialize accessibility manager
+    ret = accessibility_manager_init(&hid->accessibility_mgr);
+    if (ret) {
+        pr_warn("Accessibility features disabled\n");
+        hid->accessibility_mgr.enabled = false;
+    } else {
+        hid->accessibility_mgr.enabled = true;
+        pr_info("Accessibility features enabled\n");
+    }
+    
+    // Initialize security manager
+    ret = hid_security_manager_init(&hid->security_mgr);
+    if (ret) {
+        pr_warn("HID security features disabled\n");
+        hid->security_mgr.enabled = false;
+    } else {
+        hid->security_mgr.enabled = true;
+        pr_info("HID security features enabled\n");
+    }
+    
+    hid->initialized = true;
+    pr_info("HID controller initialized successfully\n");
+    return 0;
+    
+err_workqueue:
+    destroy_workqueue(hid->workqueue);
+    return ret;
+}
+
+// HID device registration
+int hid_register_device(struct hid_device *hdev) {
+    int ret;
+    
+    // Validate device
+    if (!hdev || !hdev->ops) {
+        pr_err("Invalid HID device\n");
+        return -EINVAL;
+    }
+    
+    // Parse HID descriptors
+    ret = hid_parse_descriptors(hdev);
+    if (ret) {
+        pr_err("Failed to parse HID descriptors: %d\n", ret);
+        return ret;
+    }
+    
+    // Determine device type
+    hid_classify_device(hdev);
+    
+    // Initialize device buffers
+    ret = hid_init_buffers(hdev);
+    if (ret) {
+        pr_err("Failed to initialize HID buffers: %d\n", ret);
+        return ret;
+    }
+    
+    // Create input device
+    ret = hid_create_input_device(hdev);
+    if (ret) {
+        pr_err("Failed to create input device: %d\n", ret);
+        goto err_buffers;
+    }
+    
+    // Initialize AI profile
+    if (hid_ctrl.ai_optimizer.enabled) {
+        ai_init_device_profile(hdev);
+    }
+    
+    // Initialize accessibility features
+    if (hid_ctrl.accessibility_mgr.enabled) {
+        accessibility_init_device(hdev);
+    }
+    
+    // Security validation
+    if (hid_ctrl.security_mgr.enabled) {
+        ret = hid_security_validate_device(hdev);
+        if (ret) {
+            pr_warn("HID device failed security validation: %d\n", ret);
+            goto err_input;
+        }
+    }
+    
+    // Add to device list
+    mutex_lock(&hid_ctrl.devices_mutex);
+    list_add_tail(&hdev->dev.sibling, &hid_ctrl.devices);
+    hid_ctrl.device_count++;
+    mutex_unlock(&hid_ctrl.devices_mutex);
+    
+    pr_info("HID device registered: %s (type=%d)\n", 
+            hdev->id.product, hdev->id.type);
+    
+    return 0;
+    
+err_input:
+    input_unregister_device(hdev->input_device);
+err_buffers:
+    hid_free_buffers(hdev);
+    return ret;
+}
+
+// HID report processing with AI optimization
+void hid_process_report(struct hid_device *hdev, uint8_t *buffer, size_t size) {
+    struct hid_report_info *report;
+    
+    // Validate report
+    if (!buffer || size == 0) {
+        hdev->stats.parse_errors++;
+        return;
+    }
+    
+    // Security validation
+    if (hid_ctrl.security_mgr.enabled) {
+        if (!hid_security_validate_report(hdev, buffer, size)) {
+            hdev->stats.parse_errors++;
+            return;
+        }
+    }
+    
+    // Find matching report
+    report = hid_find_report(hdev, buffer[0]);
+    if (!report) {
+        hdev->stats.parse_errors++;
+        return;
+    }
+    
+    // AI input prediction and optimization
+    if (hid_ctrl.ai_optimizer.enabled && hdev->ai_profile.ai_enabled) {
+        ai_process_input_prediction(hdev, buffer, size);
+    }
+    
+    // Process based on device type
+    switch (hdev->id.type) {
+    case HID_TYPE_KEYBOARD:
+        hid_process_keyboard_report(hdev, buffer, size);
+        break;
+    case HID_TYPE_MOUSE:
+        hid_process_mouse_report(hdev, buffer, size);
+        break;
+    case HID_TYPE_TOUCHSCREEN:
+    case HID_TYPE_TOUCHPAD:
+        hid_process_touch_report(hdev, buffer, size);
+        break;
+    case HID_TYPE_GAMEPAD:
+    case HID_TYPE_JOYSTICK:
+        hid_process_gamepad_report(hdev, buffer, size);
+        break;
+    default:
+        hid_process_generic_report(hdev, buffer, size);
+        break;
+    }
+    
+    // Gesture recognition
+    if (hid_ctrl.gesture_engine.enabled) {
+        gesture_analyze_input(hdev, buffer, size);
+    }
+    
+    // Accessibility processing
+    if (hid_ctrl.accessibility_mgr.enabled && hdev->accessibility.enabled) {
+        accessibility_process_input(hdev, buffer, size);
+    }
+    
+    hdev->stats.input_reports++;
+    hdev->stats.last_activity = jiffies;
+}
+
+// Keyboard report processing
+static void hid_process_keyboard_report(struct hid_device *hdev, 
+                                       uint8_t *buffer, size_t size) {
+    struct keyboard_data *kb = &hdev->device_data.keyboard;
+    struct input_dev *input = hdev->input_device;
+    uint8_t *keys;
+    int i, j;
+    bool key_found;
+    
+    if (size < 8) {
+        hdev->stats.parse_errors++;
+        return;
+    }
+    
+    // Update modifier state
+    kb->modifier_state = buffer[0];
+    
+    // Process modifier keys
+    input_report_key(input, KEY_LEFTCTRL, !!(buffer[0] & 0x01));
+    input_report_key(input, KEY_LEFTSHIFT, !!(buffer[0] & 0x02));
+    input_report_key(input, KEY_LEFTALT, !!(buffer[0] & 0x04));
+    input_report_key(input, KEY_LEFTMETA, !!(buffer[0] & 0x08));
+    input_report_key(input, KEY_RIGHTCTRL, !!(buffer[0] & 0x10));
+    input_report_key(input, KEY_RIGHTSHIFT, !!(buffer[0] & 0x20));
+    input_report_key(input, KEY_RIGHTALT, !!(buffer[0] & 0x40));
+    input_report_key(input, KEY_RIGHTMETA, !!(buffer[0] & 0x80));
+    
+    keys = &buffer[2]; // Skip modifier and reserved byte
+    
+    // Handle key releases
+    for (i = 0; i < kb->num_pressed; i++) {
+        key_found = false;
+        for (j = 0; j < 6; j++) {
+            if (keys[j] == kb->pressed_keys[i]) {
+                key_found = true;
+                break;
+            }
+        }
+        
+        if (!key_found) {
+            // Key released
+            int keycode = hid_keyboard_translate(kb->pressed_keys[i]);
+            if (keycode) {
+                input_report_key(input, keycode, 0);
+                
+                // AI learning from key release
+                if (hdev->ai_profile.ai_enabled) {
+                    ai_learn_key_release(hdev, kb->pressed_keys[i]);
+                }
+            }
+        }
+    }
+    
+    // Handle key presses
+    kb->num_pressed = 0;
+    for (i = 0; i < 6; i++) {
+        if (keys[i] != 0) {
+            kb->pressed_keys[kb->num_pressed++] = keys[i];
+            
+            // Check if this is a new key press
+            key_found = false;
+            for (j = 0; j < 6; j++) {
+                if (j != i && keys[j] == keys[i]) {
+                    key_found = true;
+                    break;
+                }
+            }
+            
+            if (!key_found) {
+                // New key press
+                int keycode = hid_keyboard_translate(keys[i]);
+                if (keycode) {
+                    input_report_key(input, keycode, 1);
+                    
+                    // AI learning from key press
+                    if (hdev->ai_profile.ai_enabled) {
+                        ai_learn_key_press(hdev, keys[i]);
+                    }
+                    
+                    // Update typing statistics
+                    hdev->ai_profile.learning.stats.keystrokes++;
+                }
+            }
+        }
+    }
+    
+    input_sync(input);
+}
+
+// Mouse report processing
+static void hid_process_mouse_report(struct hid_device *hdev,
+                                    uint8_t *buffer, size_t size) {
+    struct mouse_data *mouse = &hdev->device_data.mouse;
+    struct input_dev *input = hdev->input_device;
+    int8_t dx, dy, wheel;
+    uint8_t buttons;
+    
+    if (size < 4) {
+        hdev->stats.parse_errors++;
+        return;
+    }
+    
+    buttons = buffer[0];
+    dx = (int8_t)buffer[1];
+    dy = (int8_t)buffer[2];
+    wheel = (int8_t)buffer[3];
+    
+    // AI mouse movement optimization
+    if (hdev->ai_profile.ai_enabled && hdev->ai_profile.adaptive.predictive_cursor) {
+        ai_optimize_mouse_movement(hdev, &dx, &dy);
+    }
+    
+    // Apply mouse settings
+    if (mouse->settings.sensitivity != 50) { // 50 is neutral
+        dx = (dx * mouse->settings.sensitivity) / 50;
+        dy = (dy * mouse->settings.sensitivity) / 50;
+    }
+    
+    // Apply acceleration
+    if (mouse->settings.acceleration > 0) {
+        float speed = sqrt(dx * dx + dy * dy);
+        if (speed > 1.0f) {
+            float accel = 1.0f + (mouse->settings.acceleration * speed / 100.0f);
+            dx = (int8_t)(dx * accel);
+            dy = (int8_t)(dy * accel);
+        }
+    }
+    
+    // Report mouse movement
+    mouse->x += dx;
+    mouse->y += dy;
+    input_report_rel(input, REL_X, dx);
+    input_report_rel(input, REL_Y, dy);
+    
+    // Report wheel movement
+    if (wheel != 0) {
+        if (mouse->settings.natural_scrolling)
+            wheel = -wheel;
+        input_report_rel(input, REL_WHEEL, wheel);
+        mouse->wheel_y += wheel;
+    }
+    
+    // Report button states
+    input_report_key(input, BTN_LEFT, !!(buttons & 0x01));
+    input_report_key(input, BTN_RIGHT, !!(buttons & 0x02));
+    input_report_key(input, BTN_MIDDLE, !!(buttons & 0x04));
+    
+    // Update button state
+    uint8_t button_changes = mouse->button_state ^ buttons;
+    mouse->button_state = buttons;
+    
+    // AI learning from mouse usage
+    if (hdev->ai_profile.ai_enabled && (dx || dy || button_changes)) {
+        ai_learn_mouse_usage(hdev, dx, dy, buttons);
+        hdev->ai_profile.learning.stats.mouse_distance += 
+            sqrt(dx * dx + dy * dy);
+        if (button_changes & buttons) {
+            hdev->ai_profile.learning.stats.mouse_clicks++;
+        }
+    }
+    
+    input_sync(input);
+}
+
+// Touch report processing with gesture recognition
+static void hid_process_touch_report(struct hid_device *hdev,
+                                    uint8_t *buffer, size_t size) {
+    struct touch_data *touch = &hdev->device_data.touch;
+    struct input_dev *input = hdev->input_device;
+    int contact_count;
+    int i;
+    
+    if (size < 2) {
+        hdev->stats.parse_errors++;
+        return;
+    }
+    
+    contact_count = buffer[0] & 0x0F;
+    
+    // Clear previous touch points
+    for (i = 0; i < touch->active_points; i++) {
+        touch->points[i].active = false;
+    }
+    
+    // Process each contact point
+    for (i = 0; i < contact_count && i < 10; i++) {
+        int offset = 1 + (i * 8); // Each contact is 8 bytes
+        
+        if (offset + 8 > size)
+            break;
+        
+        struct touch_point *point = &touch->points[i];
+        
+        point->id = buffer[offset];
+        point->x = *(uint16_t*)&buffer[offset + 1];
+        point->y = *(uint16_t*)&buffer[offset + 3];
+        point->pressure = *(uint16_t*)&buffer[offset + 5];
+        point->active = true;
+        
+        // Report touch point to input subsystem
+        input_mt_slot(input, i);
+        input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
+        input_report_abs(input, ABS_MT_POSITION_X, point->x);
+        input_report_abs(input, ABS_MT_POSITION_Y, point->y);
+        input_report_abs(input, ABS_MT_PRESSURE, point->pressure);
+    }
+    
+    touch->active_points = contact_count;
+    
+    // Gesture recognition
+    if (hid_ctrl.gesture_engine.enabled && touch->gestures.gesture_enabled) {
+        gesture_recognize_touch(hdev, touch->points, contact_count);
+    }
+    
+    // Palm rejection
+    if (touch->gestures.palm_rejection) {
+        palm_rejection_filter(hdev, touch->points, contact_count);
+    }
+    
+    // AI learning from touch patterns
+    if (hdev->ai_profile.ai_enabled) {
+        ai_learn_touch_patterns(hdev, touch->points, contact_count);
+        hdev->ai_profile.learning.stats.touch_events++;
+    }
+    
+    input_mt_sync_frame(input);
+    input_sync(input);
+}
+
+// Gamepad report processing
+static void hid_process_gamepad_report(struct hid_device *hdev,
+                                      uint8_t *buffer, size_t size) {
+    struct gamepad_data *pad = &hdev->device_data.gamepad;
+    struct input_dev *input = hdev->input_device;
+    
+    if (size < 12) {
+        hdev->stats.parse_errors++;
+        return;
+    }
+    
+    // Analog sticks
+    pad->left_stick.x = *(int16_t*)&buffer[0];
+    pad->left_stick.y = *(int16_t*)&buffer[2];
+    pad->right_stick.x = *(int16_t*)&buffer[4];
+    pad->right_stick.y = *(int16_t*)&buffer[6];
+    
+    // Apply deadzone
+    if (abs(pad->left_stick.x) < pad->left_stick.deadzone)
+        pad->left_stick.x = 0;
+    if (abs(pad->left_stick.y) < pad->left_stick.deadzone)
+        pad->left_stick.y = 0;
+    if (abs(pad->right_stick.x) < pad->right_stick.deadzone)
+        pad->right_stick.x = 0;
+    if (abs(pad->right_stick.y) < pad->right_stick.deadzone)
+        pad->right_stick.y = 0;
+    
+    // Report analog sticks
+    input_report_abs(input, ABS_X, pad->left_stick.x);
+    input_report_abs(input, ABS_Y, pad->left_stick.y);
+    input_report_abs(input, ABS_RX, pad->right_stick.x);
+    input_report_abs(input, ABS_RY, pad->right_stick.y);
+    
+    // Triggers
+    pad->left_trigger.value = *(uint16_t*)&buffer[8];
+    pad->right_trigger.value = *(uint16_t*)&buffer[10];
+    
+    input_report_abs(input, ABS_Z, pad->left_trigger.value);
+    input_report_abs(input, ABS_RZ, pad->right_trigger.value);
+    
+    // Buttons (assuming 2 bytes for buttons)
+    if (size >= 14) {
+        uint16_t buttons = *(uint16_t*)&buffer[12];
+        uint16_t button_changes = pad->button_state ^ buttons;
+        
+        // Report individual buttons
+        input_report_key(input, BTN_A, !!(buttons & 0x0001));
+        input_report_key(input, BTN_B, !!(buttons & 0x0002));
+        input_report_key(input, BTN_X, !!(buttons & 0x0004));
+        input_report_key(input, BTN_Y, !!(buttons & 0x0008));
+        input_report_key(input, BTN_TL, !!(buttons & 0x0010));
+        input_report_key(input, BTN_TR, !!(buttons & 0x0020));
+        input_report_key(input, BTN_SELECT, !!(buttons & 0x0040));
+        input_report_key(input, BTN_START, !!(buttons & 0x0080));
+        
+        pad->button_state = buttons;
+        
+        // AI learning from gamepad usage
+        if (hdev->ai_profile.ai_enabled && button_changes) {
+            ai_learn_gamepad_usage(hdev, buttons, button_changes);
+        }
+    }
+    
+    input_sync(input);
+}
+
+// HID controller cleanup
+void hid_controller_cleanup(struct hid_controller *hid) {
+    struct hid_device *hdev, *tmp;
+    
+    pr_info("Shutting down HID controller\n");
+    
+    // Cleanup all HID devices
+    mutex_lock(&hid->devices_mutex);
+    list_for_each_entry_safe(hdev, tmp, &hid->devices, dev.sibling) {
+        hid_unregister_device(hdev);
+    }
+    mutex_unlock(&hid->devices_mutex);
+    
+    // Cleanup AI optimizer
+    if (hid->ai_optimizer.enabled) {
+        ai_input_optimizer_cleanup(&hid->ai_optimizer);
+    }
+    
+    // Cleanup gesture engine
+    if (hid->gesture_engine.enabled) {
+        gesture_engine_cleanup(&hid->gesture_engine);
+    }
+    
+    // Cleanup accessibility manager
+    if (hid->accessibility_mgr.enabled) {
+        accessibility_manager_cleanup(&hid->accessibility_mgr);
+    }
+    
+    // Cleanup security manager
+    if (hid->security_mgr.enabled) {
+        hid_security_manager_cleanup(&hid->security_mgr);
+    }
+    
+    // Destroy work queue
+    if (hid->workqueue) {
+        destroy_workqueue(hid->workqueue);
+    }
+    
+    hid->initialized = false;
+    pr_info("HID controller shutdown complete\n");
+}

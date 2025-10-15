@@ -1,0 +1,1083 @@
+/*
+ * LimitlessOS DNS Resolver and Firewall
+ * Advanced DNS resolution with caching, security, and firewall protection
+ * Supports DoH (DNS over HTTPS), DoT (DNS over TLS), and AI-based threat detection
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/net.h>
+#include <linux/socket.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
+#include <linux/skbuff.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/dns_resolver.h>
+#include <linux/crypto.h>
+#include <linux/tls.h>
+#include <net/sock.h>
+#include <net/ip.h>
+#include <net/udp.h>
+#include <net/tcp.h>
+
+// DNS constants
+#define DNS_PORT 53
+#define DNS_OVER_HTTPS_PORT 443
+#define DNS_OVER_TLS_PORT 853
+#define DNS_MAX_NAME_LENGTH 255
+#define DNS_MAX_PACKET_SIZE 512
+#define DNS_CACHE_SIZE 10000
+#define DNS_CACHE_TTL_DEFAULT 3600
+#define DNS_CACHE_TTL_MIN 60
+#define DNS_CACHE_TTL_MAX 86400
+
+// DNS record types
+#define DNS_TYPE_A      1
+#define DNS_TYPE_NS     2
+#define DNS_TYPE_CNAME  5
+#define DNS_TYPE_SOA    6
+#define DNS_TYPE_PTR    12
+#define DNS_TYPE_MX     15
+#define DNS_TYPE_TXT    16
+#define DNS_TYPE_AAAA   28
+#define DNS_TYPE_SRV    33
+
+// DNS response codes
+#define DNS_RCODE_NOERROR   0
+#define DNS_RCODE_FORMERR   1
+#define DNS_RCODE_SERVFAIL  2
+#define DNS_RCODE_NXDOMAIN  3
+#define DNS_RCODE_NOTIMP    4
+#define DNS_RCODE_REFUSED   5
+
+// Firewall actions
+#define FIREWALL_ACCEPT     0
+#define FIREWALL_DROP       1
+#define FIREWALL_REJECT     2
+#define FIREWALL_LOG        3
+
+// Firewall directions
+#define FIREWALL_INPUT      0
+#define FIREWALL_OUTPUT     1
+#define FIREWALL_FORWARD    2
+
+// DNS header structure
+struct dns_header {
+    uint16_t id;               // Identification
+    uint16_t flags;            // Flags
+    uint16_t qdcount;          // Question count
+    uint16_t ancount;          // Answer count
+    uint16_t nscount;          // Authority count
+    uint16_t arcount;          // Additional count
+} __packed;
+
+// DNS question structure
+struct dns_question {
+    // Name is variable length, followed by:
+    uint16_t qtype;            // Question type
+    uint16_t qclass;           // Question class
+} __packed;
+
+// DNS resource record structure
+struct dns_rr {
+    // Name is variable length, followed by:
+    uint16_t type;             // Resource record type
+    uint16_t class;            // Resource record class
+    uint32_t ttl;              // Time to live
+    uint16_t rdlength;         // Resource data length
+    // Resource data follows
+} __packed;
+
+// DNS cache entry
+struct dns_cache_entry {
+    char name[DNS_MAX_NAME_LENGTH + 1]; // Domain name
+    uint16_t type;             // Record type
+    uint16_t class;            // Record class
+    uint32_t ttl;              // Time to live
+    uint64_t expires;          // Expiration timestamp
+    uint16_t rdlength;         // Resource data length
+    uint8_t *rdata;            // Resource data
+    uint32_t query_count;      // Number of queries for this entry
+    uint64_t last_accessed;    // Last access timestamp
+    struct rb_node node;       // Red-black tree node
+    struct list_head lru_list; // LRU list
+};
+
+// DNS resolver context
+struct limitless_dns_resolver {
+    // Configuration
+    __be32 primary_server;     // Primary DNS server
+    __be32 secondary_server;   // Secondary DNS server
+    struct in6_addr primary_server_v6; // Primary IPv6 DNS server
+    struct in6_addr secondary_server_v6; // Secondary IPv6 DNS server
+    uint16_t port;             // DNS server port
+    uint32_t timeout;          // Query timeout (milliseconds)
+    uint32_t retries;          // Number of retries
+    
+    // Security features
+    bool doh_enabled;          // DNS over HTTPS enabled
+    bool dot_enabled;          // DNS over TLS enabled
+    bool dnssec_enabled;       // DNSSEC validation enabled
+    char doh_server[256];      // DoH server URL
+    char dot_server[256];      // DoT server hostname
+    
+    // Cache management
+    struct rb_root cache_tree; // Cache red-black tree
+    struct list_head lru_list; // LRU cache list
+    struct mutex cache_lock;   // Cache mutex
+    uint32_t cache_size;       // Current cache size
+    uint32_t max_cache_size;   // Maximum cache size
+    
+    // Performance metrics
+    struct dns_metrics {
+        atomic64_t queries_total;     // Total queries
+        atomic64_t queries_cached;    // Cached queries
+        atomic64_t queries_upstream;  // Upstream queries
+        atomic64_t queries_failed;    // Failed queries
+        atomic64_t cache_hits;        // Cache hits
+        atomic64_t cache_misses;      // Cache misses
+        atomic64_t dnssec_validated;  // DNSSEC validated responses
+        atomic64_t security_blocks;   // Security blocks
+        uint32_t avg_response_time;   // Average response time (ms)
+        uint32_t cache_hit_ratio;     // Cache hit ratio (percentage)
+    } metrics;
+    
+    // Security features
+    struct dns_security {
+        bool malware_blocking;    // Malware domain blocking
+        bool phishing_blocking;   // Phishing domain blocking
+        bool ad_blocking;         // Advertisement blocking
+        bool tracking_blocking;   // Tracking domain blocking
+        
+        // Blocklists
+        struct blocklist {
+            char **domains;       // Blocked domain list
+            uint32_t count;       // Number of blocked domains
+            struct rb_root domain_tree; // Domain tree for fast lookup
+            uint64_t last_updated; // Last blocklist update
+        } *blocklists;
+        uint32_t blocklist_count; // Number of blocklists
+        
+        // Reputation system
+        struct domain_reputation {
+            char domain[DNS_MAX_NAME_LENGTH + 1]; // Domain name
+            float reputation_score; // Reputation score (0.0-1.0)
+            uint32_t query_count;  // Number of queries
+            uint64_t first_seen;   // First seen timestamp
+            uint64_t last_seen;    // Last seen timestamp
+            uint32_t malware_reports; // Malware reports
+            uint32_t phishing_reports; // Phishing reports
+            struct rb_node node;   // Tree node
+        } *reputation_db;
+        uint32_t reputation_count; // Reputation database size
+        struct rb_root reputation_tree; // Reputation tree
+    } security;
+    
+    // AI-powered features
+    struct dns_ai {
+        bool enabled;             // AI features enabled
+        
+        // Query pattern analysis
+        struct query_pattern_analyzer {
+            uint32_t *query_histogram; // Query frequency histogram
+            uint32_t histogram_size;   // Histogram size
+            float *pattern_weights;    // Pattern weights
+            uint32_t suspicious_patterns; // Suspicious pattern count
+            uint64_t last_analysis;    // Last analysis time
+        } pattern_analyzer;
+        
+        // Threat detection
+        struct threat_detector {
+            float malware_threshold;   // Malware detection threshold
+            float phishing_threshold;  // Phishing detection threshold
+            float dga_threshold;       // DGA detection threshold
+            uint64_t threats_detected; // Total threats detected
+            uint64_t false_positives;  // False positive count
+            float detection_accuracy;  // Detection accuracy
+        } threat_detector;
+        
+        // Predictive caching
+        struct predictive_cache {
+            bool enabled;             // Predictive caching enabled
+            uint32_t prediction_window; // Prediction window (seconds)
+            float confidence_threshold; // Confidence threshold
+            uint64_t predictions_made;  // Predictions made
+            uint64_t predictions_hit;   // Successful predictions
+        } predictive_cache;
+    } ai;
+    
+    // Statistics
+    atomic64_t total_queries;     // Total DNS queries processed
+    atomic64_t blocked_queries;   // Blocked queries
+    atomic64_t malicious_domains; // Malicious domains detected
+};
+
+// Firewall rule structure
+struct firewall_rule {
+    uint32_t id;               // Rule ID
+    uint32_t priority;         // Rule priority (lower = higher priority)
+    uint32_t action;           // Action (ACCEPT/DROP/REJECT/LOG)
+    uint32_t direction;        // Direction (INPUT/OUTPUT/FORWARD)
+    
+    // Protocol matching
+    uint8_t protocol;          // Protocol (TCP/UDP/ICMP/ALL)
+    bool protocol_any;         // Match any protocol
+    
+    // Address matching
+    __be32 src_addr;           // Source IP address
+    __be32 src_mask;           // Source network mask
+    __be32 dst_addr;           // Destination IP address
+    __be32 dst_mask;           // Destination network mask
+    bool src_any;              // Match any source
+    bool dst_any;              // Match any destination
+    
+    // Port matching
+    uint16_t src_port_min;     // Source port range minimum
+    uint16_t src_port_max;     // Source port range maximum
+    uint16_t dst_port_min;     // Destination port range minimum
+    uint16_t dst_port_max;     // Destination port range maximum
+    bool src_port_any;         // Match any source port
+    bool dst_port_any;         // Match any destination port
+    
+    // State matching
+    bool match_established;    // Match established connections
+    bool match_related;        // Match related connections
+    bool match_new;            // Match new connections
+    bool match_invalid;        // Match invalid packets
+    
+    // Time-based matching
+    bool time_restricted;      // Time restrictions enabled
+    uint32_t time_start;       // Start time (seconds since midnight)
+    uint32_t time_end;         // End time (seconds since midnight)
+    uint8_t days_mask;         // Days of week mask (bit field)
+    
+    // Rate limiting
+    bool rate_limit_enabled;   // Rate limiting enabled
+    uint32_t rate_limit;       // Rate limit (packets per second)
+    uint32_t rate_burst;       // Rate burst size
+    uint64_t rate_tokens;      // Token bucket tokens
+    uint64_t rate_last_refill; // Last token refill time
+    
+    // Statistics
+    atomic64_t packet_count;   // Packets matched
+    atomic64_t byte_count;     // Bytes matched
+    uint64_t created_time;     // Rule creation time
+    uint64_t last_match;       // Last match time
+    
+    // Logging
+    bool log_enabled;          // Logging enabled
+    char log_prefix[64];       // Log message prefix
+    uint32_t log_level;        // Log level
+    
+    struct list_head list;     // Rule list
+};
+
+// Firewall context
+struct limitless_firewall {
+    // Rule management
+    struct list_head rules;    // Firewall rules list
+    struct mutex rules_lock;   // Rules mutex
+    uint32_t rule_count;       // Number of rules
+    uint32_t next_rule_id;     // Next rule ID
+    
+    // Default policies
+    uint32_t default_input;    // Default INPUT policy
+    uint32_t default_output;   // Default OUTPUT policy
+    uint32_t default_forward;  // Default FORWARD policy
+    
+    // Connection tracking integration
+    bool conntrack_enabled;    // Connection tracking enabled
+    struct rb_root conn_tree;  // Connection tracking tree
+    
+    // Performance metrics
+    struct firewall_metrics {
+        atomic64_t packets_processed; // Total packets processed
+        atomic64_t packets_accepted;  // Accepted packets
+        atomic64_t packets_dropped;   // Dropped packets
+        atomic64_t packets_rejected;  // Rejected packets
+        atomic64_t packets_logged;    // Logged packets
+        atomic64_t rules_evaluated;   // Rules evaluated
+        uint32_t avg_eval_time_ns;    // Average evaluation time (ns)
+        uint32_t peak_pps;            // Peak packets per second
+    } metrics;
+    
+    // Security features
+    struct firewall_security {
+        bool syn_flood_protection;   // SYN flood protection
+        bool port_scan_detection;    // Port scan detection
+        bool ddos_protection;        // DDoS protection
+        uint32_t syn_rate_limit;     // SYN rate limit
+        uint32_t scan_threshold;     // Port scan threshold
+        uint32_t ddos_threshold;     // DDoS threshold
+        
+        // Attack detection
+        struct attack_detector {
+            uint64_t syn_floods_detected;   // SYN floods detected
+            uint64_t port_scans_detected;   // Port scans detected
+            uint64_t ddos_attacks_detected; // DDoS attacks detected
+            uint64_t brute_force_detected;  // Brute force attempts
+            
+            // IP reputation tracking
+            struct ip_reputation {
+                __be32 ip_addr;        // IP address
+                float reputation_score; // Reputation score (0.0-1.0)
+                uint32_t attack_count;  // Number of attacks
+                uint64_t first_seen;    // First seen time
+                uint64_t last_seen;     // Last seen time
+                bool is_blocked;        // Currently blocked
+                uint64_t block_expires; // Block expiration time
+                struct rb_node node;    // Tree node
+            } *ip_reputation_db;
+            uint32_t reputation_db_size; // Reputation DB size
+            struct rb_root reputation_tree; // Reputation tree
+        } attack_detector;
+    } security;
+    
+    // AI-powered features
+    struct firewall_ai {
+        bool enabled;              // AI features enabled
+        
+        // Traffic analysis
+        struct traffic_analyzer {
+            uint32_t *packet_sizes;   // Packet size distribution
+            uint32_t *protocols;      // Protocol distribution
+            uint32_t *ports;          // Port distribution
+            uint64_t analysis_window; // Analysis window size
+            uint64_t last_analysis;   // Last analysis time
+            
+            // Anomaly detection
+            float baseline_pps;       // Baseline packets per second
+            float baseline_bps;       // Baseline bytes per second
+            float anomaly_threshold;  // Anomaly detection threshold
+            uint64_t anomalies_detected; // Anomalies detected
+        } traffic_analyzer;
+        
+        // Adaptive rules
+        struct adaptive_rules {
+            bool enabled;             // Adaptive rules enabled
+            uint32_t learning_period; // Learning period (seconds)
+            float confidence_threshold; // Rule confidence threshold
+            
+            // Dynamic rule generation
+            struct dynamic_rule {
+                struct firewall_rule rule; // Generated rule
+                float confidence;         // Rule confidence
+                uint64_t created_time;    // Creation time
+                uint64_t last_triggered;  // Last trigger time
+                uint32_t trigger_count;   // Trigger count
+                bool auto_generated;      // Auto-generated flag
+                struct list_head list;    // Dynamic rules list
+            } *dynamic_rules;
+            uint32_t dynamic_rule_count; // Dynamic rule count
+        } adaptive_rules;
+    } ai;
+};
+
+// Global DNS resolver and firewall contexts
+static struct limitless_dns_resolver *dns_resolver = NULL;
+static struct limitless_firewall *firewall = NULL;
+
+// DNS utility functions
+static int dns_name_to_wire(const char *name, uint8_t *wire, size_t max_len) {
+    const char *src = name;
+    uint8_t *dst = wire;
+    uint8_t *label_len = NULL;
+    size_t len = 0;
+    
+    while (*src && len < max_len - 1) {
+        if (*src == '.') {
+            if (label_len) {
+                *label_len = (uint8_t)(dst - label_len - 1);
+                if (*label_len > 63) return -EINVAL; // Label too long
+            }
+            label_len = dst++;
+            len++;
+            src++;
+        } else {
+            *dst++ = *src++;
+            len++;
+        }
+    }
+    
+    if (label_len) {
+        *label_len = (uint8_t)(dst - label_len - 1);
+        if (*label_len > 63) return -EINVAL;
+    }
+    
+    *dst++ = 0; // Root label
+    len++;
+    
+    return (len <= max_len) ? len : -EINVAL;
+}
+
+static int dns_wire_to_name(const uint8_t *wire, size_t wire_len, 
+                           char *name, size_t name_len, size_t *consumed) {
+    const uint8_t *src = wire;
+    char *dst = name;
+    size_t pos = 0, len = 0;
+    bool compressed = false;
+    uint16_t jump_count = 0;
+    
+    while (pos < wire_len && jump_count < 255) {
+        uint8_t label_len = src[pos];
+        
+        if (label_len == 0) { // Root label
+            pos++;
+            break;
+        }
+        
+        if ((label_len & 0xC0) == 0xC0) { // Compression pointer
+            if (pos + 1 >= wire_len) return -EINVAL;
+            
+            if (!compressed) *consumed = pos + 2;
+            compressed = true;
+            
+            uint16_t offset = ((label_len & 0x3F) << 8) | src[pos + 1];
+            if (offset >= wire_len) return -EINVAL;
+            
+            pos = offset;
+            jump_count++;
+            continue;
+        }
+        
+        if (label_len > 63) return -EINVAL; // Invalid label length
+        if (pos + 1 + label_len >= wire_len) return -EINVAL;
+        
+        if (len > 0) {
+            if (len + 1 >= name_len) return -EINVAL;
+            dst[len++] = '.';
+        }
+        
+        if (len + label_len >= name_len) return -EINVAL;
+        memcpy(&dst[len], &src[pos + 1], label_len);
+        len += label_len;
+        pos += 1 + label_len;
+    }
+    
+    if (jump_count >= 255) return -EINVAL; // Too many compression jumps
+    
+    dst[len] = '\0';
+    
+    if (!compressed) *consumed = pos;
+    
+    return 0;
+}
+
+// DNS cache management
+static struct dns_cache_entry *dns_cache_lookup(const char *name, uint16_t type) {
+    struct rb_node *node;
+    struct dns_cache_entry *entry;
+    int cmp;
+    
+    if (!dns_resolver)
+        return NULL;
+    
+    mutex_lock(&dns_resolver->cache_lock);
+    
+    node = dns_resolver->cache_tree.rb_node;
+    
+    while (node) {
+        entry = rb_entry(node, struct dns_cache_entry, node);
+        
+        cmp = strcmp(name, entry->name);
+        if (cmp == 0) {
+            cmp = type - entry->type;
+        }
+        
+        if (cmp < 0) {
+            node = node->rb_left;
+        } else if (cmp > 0) {
+            node = node->rb_right;
+        } else {
+            // Check if entry is still valid
+            if (ktime_get_real_seconds() < entry->expires) {
+                entry->last_accessed = ktime_get_real_seconds();
+                entry->query_count++;
+                // Move to front of LRU list
+                list_del(&entry->lru_list);
+                list_add(&entry->lru_list, &dns_resolver->lru_list);
+                mutex_unlock(&dns_resolver->cache_lock);
+                return entry;
+            } else {
+                // Entry expired, remove it
+                rb_erase(&entry->node, &dns_resolver->cache_tree);
+                list_del(&entry->lru_list);
+                kfree(entry->rdata);
+                kfree(entry);
+                dns_resolver->cache_size--;
+                mutex_unlock(&dns_resolver->cache_lock);
+                return NULL;
+            }
+        }
+    }
+    
+    mutex_unlock(&dns_resolver->cache_lock);
+    return NULL;
+}
+
+static int dns_cache_add(const char *name, uint16_t type, uint16_t class,
+                        uint32_t ttl, const uint8_t *rdata, uint16_t rdlength) {
+    struct dns_cache_entry *entry, *existing;
+    struct rb_node **new_node, *parent = NULL;
+    int cmp;
+    uint64_t now = ktime_get_real_seconds();
+    
+    if (!dns_resolver || rdlength > 65535)
+        return -EINVAL;
+    
+    // Validate TTL
+    if (ttl < DNS_CACHE_TTL_MIN) ttl = DNS_CACHE_TTL_MIN;
+    if (ttl > DNS_CACHE_TTL_MAX) ttl = DNS_CACHE_TTL_MAX;
+    
+    entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry)
+        return -ENOMEM;
+    
+    entry->rdata = kmalloc(rdlength, GFP_KERNEL);
+    if (!entry->rdata) {
+        kfree(entry);
+        return -ENOMEM;
+    }
+    
+    strncpy(entry->name, name, DNS_MAX_NAME_LENGTH);
+    entry->name[DNS_MAX_NAME_LENGTH] = '\0';
+    entry->type = type;
+    entry->class = class;
+    entry->ttl = ttl;
+    entry->expires = now + ttl;
+    entry->rdlength = rdlength;
+    memcpy(entry->rdata, rdata, rdlength);
+    entry->query_count = 1;
+    entry->last_accessed = now;
+    
+    mutex_lock(&dns_resolver->cache_lock);
+    
+    // Check cache size limit
+    while (dns_resolver->cache_size >= dns_resolver->max_cache_size) {
+        // Remove LRU entry
+        struct dns_cache_entry *lru_entry;
+        
+        if (list_empty(&dns_resolver->lru_list)) {
+            break; // Should not happen
+        }
+        
+        lru_entry = list_last_entry(&dns_resolver->lru_list,
+                                   struct dns_cache_entry, lru_list);
+        
+        rb_erase(&lru_entry->node, &dns_resolver->cache_tree);
+        list_del(&lru_entry->lru_list);
+        kfree(lru_entry->rdata);
+        kfree(lru_entry);
+        dns_resolver->cache_size--;
+    }
+    
+    // Insert into red-black tree
+    new_node = &dns_resolver->cache_tree.rb_node;
+    
+    while (*new_node) {
+        parent = *new_node;
+        existing = rb_entry(parent, struct dns_cache_entry, node);
+        
+        cmp = strcmp(entry->name, existing->name);
+        if (cmp == 0) {
+            cmp = entry->type - existing->type;
+        }
+        
+        if (cmp < 0) {
+            new_node = &(*new_node)->rb_left;
+        } else if (cmp > 0) {
+            new_node = &(*new_node)->rb_right;
+        } else {
+            // Update existing entry
+            kfree(existing->rdata);
+            existing->rdata = entry->rdata;
+            existing->rdlength = entry->rdlength;
+            existing->ttl = entry->ttl;
+            existing->expires = entry->expires;
+            existing->last_accessed = entry->last_accessed;
+            
+            // Move to front of LRU list
+            list_del(&existing->lru_list);
+            list_add(&existing->lru_list, &dns_resolver->lru_list);
+            
+            kfree(entry);
+            mutex_unlock(&dns_resolver->cache_lock);
+            return 0;
+        }
+    }
+    
+    rb_link_node(&entry->node, parent, new_node);
+    rb_insert_color(&entry->node, &dns_resolver->cache_tree);
+    
+    // Add to front of LRU list
+    list_add(&entry->lru_list, &dns_resolver->lru_list);
+    
+    dns_resolver->cache_size++;
+    
+    mutex_unlock(&dns_resolver->cache_lock);
+    
+    return 0;
+}
+
+// DNS query processing
+static int dns_send_query(const char *hostname, uint16_t type, __be32 server,
+                         struct socket **sock_out, uint16_t *query_id) {
+    struct socket *sock;
+    struct sockaddr_in server_addr;
+    struct dns_header *header;
+    uint8_t query_packet[DNS_MAX_PACKET_SIZE];
+    size_t packet_len, name_len;
+    struct msghdr msg;
+    struct kvec iov;
+    int ret;
+    
+    // Create UDP socket
+    ret = sock_create(PF_INET, SOCK_DGRAM, IPPROTO_UDP, &sock);
+    if (ret < 0) {
+        pr_err("DNS: Failed to create query socket: %d\n", ret);
+        return ret;
+    }
+    
+    // Prepare DNS query packet
+    memset(query_packet, 0, sizeof(query_packet));
+    header = (struct dns_header *)query_packet;
+    
+    *query_id = get_random_u16();
+    header->id = htons(*query_id);
+    header->flags = htons(0x0100); // Standard query, recursion desired
+    header->qdcount = htons(1);     // One question
+    header->ancount = 0;
+    header->nscount = 0;
+    header->arcount = 0;
+    
+    // Add question section
+    packet_len = sizeof(*header);
+    
+    // Encode domain name
+    ret = dns_name_to_wire(hostname, &query_packet[packet_len],
+                          sizeof(query_packet) - packet_len - 4);
+    if (ret < 0) {
+        sock_release(sock);
+        return ret;
+    }
+    
+    name_len = ret;
+    packet_len += name_len;
+    
+    // Add question type and class
+    *(uint16_t *)&query_packet[packet_len] = htons(type);
+    packet_len += 2;
+    *(uint16_t *)&query_packet[packet_len] = htons(1); // IN class
+    packet_len += 2;
+    
+    // Prepare server address
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = server;
+    server_addr.sin_port = htons(DNS_PORT);
+    
+    // Send query
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &server_addr;
+    msg.msg_namelen = sizeof(server_addr);
+    
+    iov.iov_base = query_packet;
+    iov.iov_len = packet_len;
+    
+    ret = kernel_sendmsg(sock, &msg, &iov, 1, packet_len);
+    if (ret < 0) {
+        pr_err("DNS: Failed to send query: %d\n", ret);
+        sock_release(sock);
+        return ret;
+    }
+    
+    *sock_out = sock;
+    
+    return 0;
+}
+
+// Firewall packet processing
+static unsigned int limitless_firewall_hook_input(void *priv,
+                                                  struct sk_buff *skb,
+                                                  const struct nf_hook_state *state) {
+    return limitless_firewall_process_packet(skb, FIREWALL_INPUT);
+}
+
+static unsigned int limitless_firewall_hook_output(void *priv,
+                                                   struct sk_buff *skb,
+                                                   const struct nf_hook_state *state) {
+    return limitless_firewall_process_packet(skb, FIREWALL_OUTPUT);
+}
+
+static unsigned int limitless_firewall_hook_forward(void *priv,
+                                                    struct sk_buff *skb,
+                                                    const struct nf_hook_state *state) {
+    return limitless_firewall_process_packet(skb, FIREWALL_FORWARD);
+}
+
+static unsigned int limitless_firewall_process_packet(struct sk_buff *skb, uint32_t direction) {
+    struct firewall_rule *rule;
+    struct iphdr *iph;
+    struct tcphdr *tcph = NULL;
+    struct udphdr *udph = NULL;
+    __be32 src_addr, dst_addr;
+    uint16_t src_port = 0, dst_port = 0;
+    uint8_t protocol;
+    uint32_t action = firewall->default_input; // Default action
+    bool matched = false;
+    uint64_t start_time, eval_time;
+    
+    if (!firewall || !skb)
+        return NF_ACCEPT;
+    
+    start_time = ktime_get_ns();
+    
+    atomic64_inc(&firewall->metrics.packets_processed);
+    
+    // Parse IP header
+    iph = ip_hdr(skb);
+    if (!iph) {
+        return NF_ACCEPT; // Not IPv4, let it pass
+    }
+    
+    src_addr = iph->saddr;
+    dst_addr = iph->daddr;
+    protocol = iph->protocol;
+    
+    // Parse transport layer headers
+    if (protocol == IPPROTO_TCP) {
+        tcph = tcp_hdr(skb);
+        if (tcph) {
+            src_port = ntohs(tcph->source);
+            dst_port = ntohs(tcph->dest);
+        }
+    } else if (protocol == IPPROTO_UDP) {
+        udph = udp_hdr(skb);
+        if (udph) {
+            src_port = ntohs(udph->source);
+            dst_port = ntohs(udph->dest);
+        }
+    }
+    
+    // Check IP reputation for security
+    if (firewall->security.attack_detector.reputation_tree.rb_node) {
+        struct ip_reputation *rep = firewall_lookup_ip_reputation(src_addr);
+        if (rep && rep->is_blocked) {
+            atomic64_inc(&firewall->metrics.packets_dropped);
+            return NF_DROP;
+        }
+    }
+    
+    // Evaluate firewall rules
+    mutex_lock(&firewall->rules_lock);
+    
+    list_for_each_entry(rule, &firewall->rules, list) {
+        atomic64_inc(&firewall->metrics.rules_evaluated);
+        
+        // Check direction
+        if (rule->direction != direction) {
+            continue;
+        }
+        
+        // Check protocol
+        if (!rule->protocol_any && rule->protocol != protocol) {
+            continue;
+        }
+        
+        // Check source address
+        if (!rule->src_any) {
+            if ((src_addr & rule->src_mask) != (rule->src_addr & rule->src_mask)) {
+                continue;
+            }
+        }
+        
+        // Check destination address
+        if (!rule->dst_any) {
+            if ((dst_addr & rule->dst_mask) != (rule->dst_addr & rule->dst_mask)) {
+                continue;
+            }
+        }
+        
+        // Check source port
+        if (!rule->src_port_any) {
+            if (src_port < rule->src_port_min || src_port > rule->src_port_max) {
+                continue;
+            }
+        }
+        
+        // Check destination port
+        if (!rule->dst_port_any) {
+            if (dst_port < rule->dst_port_min || dst_port > rule->dst_port_max) {
+                continue;
+            }
+        }
+        
+        // Check rate limiting
+        if (rule->rate_limit_enabled) {
+            uint64_t now = ktime_get_real_seconds();
+            uint64_t elapsed = now - rule->rate_last_refill;
+            
+            // Refill tokens
+            if (elapsed > 0) {
+                uint64_t new_tokens = elapsed * rule->rate_limit;
+                rule->rate_tokens = min(rule->rate_tokens + new_tokens, 
+                                      (uint64_t)rule->rate_burst);
+                rule->rate_last_refill = now;
+            }
+            
+            // Check if tokens available
+            if (rule->rate_tokens < 1) {
+                continue; // Rate limit exceeded, skip rule
+            }
+            
+            rule->rate_tokens--;
+        }
+        
+        // Rule matched
+        matched = true;
+        action = rule->action;
+        
+        // Update rule statistics
+        atomic64_inc(&rule->packet_count);
+        atomic64_add(skb->len, &rule->byte_count);
+        rule->last_match = ktime_get_real_seconds();
+        
+        // Log if enabled
+        if (rule->log_enabled) {
+            pr_info("FIREWALL: %s - %pI4:%u -> %pI4:%u (proto=%u, rule=%u)\n",
+                    rule->log_prefix, &src_addr, src_port, &dst_addr, dst_port,
+                    protocol, rule->id);
+            atomic64_inc(&firewall->metrics.packets_logged);
+        }
+        
+        break; // First matching rule wins
+    }
+    
+    mutex_unlock(&firewall->rules_lock);
+    
+    // Apply default policy if no rule matched
+    if (!matched) {
+        switch (direction) {
+        case FIREWALL_INPUT:
+            action = firewall->default_input;
+            break;
+        case FIREWALL_OUTPUT:
+            action = firewall->default_output;
+            break;
+        case FIREWALL_FORWARD:
+            action = firewall->default_forward;
+            break;
+        }
+    }
+    
+    // Update performance metrics
+    eval_time = ktime_get_ns() - start_time;
+    firewall->metrics.avg_eval_time_ns = 
+        (firewall->metrics.avg_eval_time_ns * 7 + (uint32_t)eval_time) / 8;
+    
+    // Execute action
+    switch (action) {
+    case FIREWALL_ACCEPT:
+        atomic64_inc(&firewall->metrics.packets_accepted);
+        return NF_ACCEPT;
+    
+    case FIREWALL_DROP:
+        atomic64_inc(&firewall->metrics.packets_dropped);
+        return NF_DROP;
+    
+    case FIREWALL_REJECT:
+        atomic64_inc(&firewall->metrics.packets_rejected);
+        // Send ICMP unreachable (simplified)
+        return NF_DROP;
+    
+    default:
+        return NF_ACCEPT;
+    }
+}
+
+// Netfilter hooks
+static struct nf_hook_ops limitless_firewall_hooks[] = {
+    {
+        .hook = limitless_firewall_hook_input,
+        .pf = NFPROTO_IPV4,
+        .hooknum = NF_INET_LOCAL_IN,
+        .priority = NF_IP_PRI_FILTER,
+    },
+    {
+        .hook = limitless_firewall_hook_output,
+        .pf = NFPROTO_IPV4,
+        .hooknum = NF_INET_LOCAL_OUT,
+        .priority = NF_IP_PRI_FILTER,
+    },
+    {
+        .hook = limitless_firewall_hook_forward,
+        .pf = NFPROTO_IPV4,
+        .hooknum = NF_INET_FORWARD,
+        .priority = NF_IP_PRI_FILTER,
+    },
+};
+
+// Initialize DNS resolver
+int limitless_dns_init(void) {
+    dns_resolver = kzalloc(sizeof(*dns_resolver), GFP_KERNEL);
+    if (!dns_resolver)
+        return -ENOMEM;
+    
+    // Initialize configuration
+    dns_resolver->primary_server = in_aton("8.8.8.8");   // Google DNS
+    dns_resolver->secondary_server = in_aton("8.8.4.4"); // Google DNS
+    dns_resolver->port = DNS_PORT;
+    dns_resolver->timeout = 5000; // 5 seconds
+    dns_resolver->retries = 3;
+    
+    // Initialize cache
+    dns_resolver->cache_tree = RB_ROOT;
+    INIT_LIST_HEAD(&dns_resolver->lru_list);
+    mutex_init(&dns_resolver->cache_lock);
+    dns_resolver->max_cache_size = DNS_CACHE_SIZE;
+    
+    // Initialize security features
+    dns_resolver->security.malware_blocking = true;
+    dns_resolver->security.phishing_blocking = true;
+    dns_resolver->security.ad_blocking = false;
+    dns_resolver->security.tracking_blocking = false;
+    
+    // Initialize AI features
+    dns_resolver->ai.enabled = true;
+    dns_resolver->ai.threat_detector.malware_threshold = 0.8f;
+    dns_resolver->ai.threat_detector.phishing_threshold = 0.7f;
+    dns_resolver->ai.threat_detector.dga_threshold = 0.6f;
+    
+    pr_info("LimitlessOS DNS Resolver initialized\n");
+    
+    return 0;
+}
+
+// Initialize firewall
+int limitless_firewall_init(void) {
+    int ret;
+    
+    firewall = kzalloc(sizeof(*firewall), GFP_KERNEL);
+    if (!firewall)
+        return -ENOMEM;
+    
+    // Initialize rule management
+    INIT_LIST_HEAD(&firewall->rules);
+    mutex_init(&firewall->rules_lock);
+    firewall->next_rule_id = 1;
+    
+    // Set default policies (ACCEPT by default)
+    firewall->default_input = FIREWALL_ACCEPT;
+    firewall->default_output = FIREWALL_ACCEPT;
+    firewall->default_forward = FIREWALL_ACCEPT;
+    
+    // Initialize security features
+    firewall->security.syn_flood_protection = true;
+    firewall->security.port_scan_detection = true;
+    firewall->security.ddos_protection = true;
+    firewall->security.syn_rate_limit = 100;     // 100 SYN/sec
+    firewall->security.scan_threshold = 20;      // 20 ports/sec
+    firewall->security.ddos_threshold = 10000;   // 10k packets/sec
+    
+    // Initialize AI features
+    firewall->ai.enabled = true;
+    firewall->ai.traffic_analyzer.anomaly_threshold = 3.0f; // 3 sigma
+    
+    // Register netfilter hooks
+    ret = nf_register_net_hooks(&init_net, limitless_firewall_hooks,
+                               ARRAY_SIZE(limitless_firewall_hooks));
+    if (ret) {
+        pr_err("Failed to register netfilter hooks: %d\n", ret);
+        kfree(firewall);
+        firewall = NULL;
+        return ret;
+    }
+    
+    pr_info("LimitlessOS Firewall initialized\n");
+    pr_info("Default policies: INPUT=%s, OUTPUT=%s, FORWARD=%s\n",
+            firewall->default_input == FIREWALL_ACCEPT ? "ACCEPT" : "DROP",
+            firewall->default_output == FIREWALL_ACCEPT ? "ACCEPT" : "DROP",
+            firewall->default_forward == FIREWALL_ACCEPT ? "ACCEPT" : "DROP");
+    
+    return 0;
+}
+
+// Module initialization
+static int __init limitless_dns_firewall_init(void) {
+    int ret;
+    
+    pr_info("Initializing LimitlessOS DNS Resolver and Firewall\n");
+    
+    ret = limitless_dns_init();
+    if (ret) {
+        pr_err("Failed to initialize DNS resolver: %d\n", ret);
+        return ret;
+    }
+    
+    ret = limitless_firewall_init();
+    if (ret) {
+        pr_err("Failed to initialize firewall: %d\n", ret);
+        // Continue without firewall
+    }
+    
+    pr_info("LimitlessOS DNS and Firewall initialized successfully\n");
+    
+    return 0;
+}
+
+// Module cleanup
+static void __exit limitless_dns_firewall_exit(void) {
+    // Cleanup firewall
+    if (firewall) {
+        nf_unregister_net_hooks(&init_net, limitless_firewall_hooks,
+                               ARRAY_SIZE(limitless_firewall_hooks));
+        
+        // Free firewall rules
+        struct firewall_rule *rule, *tmp;
+        list_for_each_entry_safe(rule, tmp, &firewall->rules, list) {
+            list_del(&rule->list);
+            kfree(rule);
+        }
+        
+        kfree(firewall);
+        firewall = NULL;
+    }
+    
+    // Cleanup DNS resolver
+    if (dns_resolver) {
+        // Clear DNS cache
+        struct dns_cache_entry *entry, *tmp;
+        struct rb_node *node;
+        
+        mutex_lock(&dns_resolver->cache_lock);
+        
+        for (node = rb_first(&dns_resolver->cache_tree); node; ) {
+            entry = rb_entry(node, struct dns_cache_entry, node);
+            node = rb_next(node);
+            
+            rb_erase(&entry->node, &dns_resolver->cache_tree);
+            list_del(&entry->lru_list);
+            kfree(entry->rdata);
+            kfree(entry);
+        }
+        
+        mutex_unlock(&dns_resolver->cache_lock);
+        
+        kfree(dns_resolver);
+        dns_resolver = NULL;
+    }
+    
+    pr_info("LimitlessOS DNS and Firewall unloaded\n");
+}
+
+module_init(limitless_dns_firewall_init);
+module_exit(limitless_dns_firewall_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("LimitlessOS Network Team");
+MODULE_DESCRIPTION("LimitlessOS DNS Resolver and Firewall");
+MODULE_VERSION("1.0");

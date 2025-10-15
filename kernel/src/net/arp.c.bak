@@ -1,0 +1,8 @@
+#include "net/arp.h"
+#include "kernel.h"
+
+void arp_init(void) { /* loopback: not used */ }
+void arp_input(net_if_t* nif, net_buf_t* buf) { (void)nif; net_buf_free(buf); }
+int  arp_resolve(net_if_t* nif, u32 ip_be, u8 mac_out[6]) {
+    (void)nif; (void)ip_be; (void)mac_out; return K_ENOTSUP;
+}

@@ -1,0 +1,805 @@
+/*
+ * net_drivers.c - LimitlessOS Comprehensive Network Driver Framework
+ * 
+ * Universal network driver interface supporting Ethernet, WiFi, and various
+ * network hardware with advanced features like VLAN, bonding, and bridging.
+ */
+
+#include "kernel.h"
+#include "pci.h"
+#include "interrupt.h"
+#include "vmm.h"
+#include "timer.h"
+#include "net/ip.h"
+
+#define MAX_NETWORK_DEVICES     256
+#define MAX_RX_DESCRIPTORS      1024
+#define MAX_TX_DESCRIPTORS      1024
+#define NET_BUFFER_SIZE         2048
+#define MAX_VLANS               4096
+#define MAX_BOND_INTERFACES     8
+
+/* Network device types */
+#define NET_TYPE_ETHERNET       1
+#define NET_TYPE_WIFI           2
+#define NET_TYPE_LOOPBACK       3
+#define NET_TYPE_BRIDGE         4
+#define NET_TYPE_BOND           5
+#define NET_TYPE_VLAN           6
+
+/* Network device flags */
+#define NET_FLAG_UP             0x01
+#define NET_FLAG_BROADCAST      0x02
+#define NET_FLAG_MULTICAST      0x04
+#define NET_FLAG_PROMISC        0x08
+#define NET_FLAG_ALLMULTI       0x10
+#define NET_FLAG_RUNNING        0x20
+
+/* Bonding modes */
+#define BOND_MODE_ROUND_ROBIN   0
+#define BOND_MODE_ACTIVE_BACKUP 1
+#define BOND_MODE_XOR           2
+#define BOND_MODE_BROADCAST     3
+#define BOND_MODE_802_3AD       4
+#define BOND_MODE_TLB           5
+#define BOND_MODE_ALB           6
+
+/* Network packet structure */
+typedef struct net_packet {
+    void* data;                     /* Packet data */
+    size_t len;                     /* Packet length */
+    size_t capacity;                /* Buffer capacity */
+    
+    /* Metadata */
+    uint64_t timestamp;             /* Receive/transmit timestamp */
+    uint16_t vlan_id;               /* VLAN ID (0 = no VLAN) */
+    uint8_t priority;               /* Packet priority */
+    
+    /* Source information */
+    struct net_device* dev;         /* Source/destination device */
+    
+    /* Memory management */
+    atomic_t refcount;              /* Reference count */
+    
+    struct list_head list;          /* List linkage */
+    
+} net_packet_t;
+
+/* Network device statistics */
+typedef struct net_stats {
+    /* RX statistics */
+    uint64_t rx_packets;            /* Received packets */
+    uint64_t rx_bytes;              /* Received bytes */
+    uint64_t rx_errors;             /* Receive errors */
+    uint64_t rx_dropped;            /* Dropped on receive */
+    uint64_t rx_crc_errors;         /* CRC errors */
+    uint64_t rx_frame_errors;       /* Frame errors */
+    uint64_t rx_length_errors;      /* Length errors */
+    uint64_t rx_fifo_errors;        /* FIFO overruns */
+    
+    /* TX statistics */
+    uint64_t tx_packets;            /* Transmitted packets */
+    uint64_t tx_bytes;              /* Transmitted bytes */
+    uint64_t tx_errors;             /* Transmit errors */
+    uint64_t tx_dropped;            /* Dropped on transmit */
+    uint64_t tx_carrier_errors;     /* Carrier errors */
+    uint64_t tx_collisions;         /* Collisions */
+    uint64_t tx_aborted_errors;     /* Aborted transmissions */
+    uint64_t tx_fifo_errors;        /* FIFO underruns */
+    
+    /* Multicast */
+    uint64_t multicast;             /* Multicast packets */
+    
+} net_stats_t;
+
+/* Network device operations */
+struct net_device_ops {
+    int (*open)(struct net_device* dev);
+    int (*stop)(struct net_device* dev);
+    int (*start_xmit)(struct net_device* dev, net_packet_t* packet);
+    int (*set_mac_address)(struct net_device* dev, uint8_t* mac);
+    int (*set_mtu)(struct net_device* dev, uint32_t mtu);
+    int (*ioctl)(struct net_device* dev, uint32_t cmd, void* data);
+    void (*get_stats)(struct net_device* dev, net_stats_t* stats);
+    int (*set_promiscuous)(struct net_device* dev, bool enable);
+    int (*add_multicast)(struct net_device* dev, uint8_t* mac);
+    int (*del_multicast)(struct net_device* dev, uint8_t* mac);
+};
+
+/* VLAN interface */
+typedef struct vlan_interface {
+    uint16_t vlan_id;               /* VLAN ID */
+    struct net_device* parent;      /* Parent device */
+    struct net_device* dev;         /* VLAN device */
+    
+    struct list_head list;
+    
+} vlan_interface_t;
+
+/* Bond interface */
+typedef struct bond_interface {
+    uint8_t mode;                   /* Bonding mode */
+    struct net_device* slaves[MAX_BOND_INTERFACES]; /* Slave devices */
+    uint32_t slave_count;           /* Number of slaves */
+    uint32_t active_slave;          /* Active slave index */
+    
+    /* Load balancing */
+    uint32_t next_slave;            /* Next slave for round-robin */
+    
+    /* 802.3ad LACP */
+    bool lacp_enabled;
+    uint64_t partner_system_id;
+    uint16_t partner_key;
+    
+    spinlock_t lock;
+    
+} bond_interface_t;
+
+/* Network device structure */
+typedef struct net_device {
+    char name[16];                  /* Device name */
+    uint32_t index;                 /* Device index */
+    uint8_t type;                   /* Device type */
+    uint32_t flags;                 /* Device flags */
+    
+    /* Hardware information */
+    uint8_t mac_address[6];         /* MAC address */
+    uint32_t mtu;                   /* Maximum transmission unit */
+    uint32_t tx_queue_len;          /* Transmit queue length */
+    
+    /* Device operations */
+    const struct net_device_ops* ops;
+    
+    /* Hardware-specific data */
+    void* private_data;             /* Driver private data */
+    
+    /* PCI information (if applicable) */
+    struct pci_device* pci_dev;
+    
+    /* Interrupt handling */
+    uint32_t irq;
+    void (*irq_handler)(struct net_device* dev);
+    
+    /* Packet queues */
+    struct list_head tx_queue;      /* Transmit queue */
+    struct list_head rx_queue;      /* Receive queue */
+    spinlock_t tx_lock;
+    spinlock_t rx_lock;
+    
+    /* Statistics */
+    net_stats_t stats;
+    
+    /* VLAN support */
+    struct list_head vlans;         /* VLAN interfaces */
+    spinlock_t vlan_lock;
+    
+    /* Bonding support */
+    bond_interface_t* bond;         /* Bond configuration */
+    struct net_device* bond_master; /* Master device if enslaved */
+    
+    /* Power management */
+    bool power_managed;
+    uint8_t power_state;
+    
+    struct list_head list;          /* Global device list */
+    
+} net_device_t;
+
+/* E1000 driver specific structures */
+typedef struct e1000_device {
+    volatile void* mmio_base;       /* Memory-mapped I/O base */
+    uint32_t mmio_size;             /* MMIO region size */
+    
+    /* Descriptor rings */
+    struct e1000_rx_desc* rx_descriptors;
+    struct e1000_tx_desc* tx_descriptors;
+    void** rx_buffers;
+    void** tx_buffers;
+    
+    uint32_t rx_head;               /* RX descriptor head */
+    uint32_t rx_tail;               /* RX descriptor tail */
+    uint32_t tx_head;               /* TX descriptor head */
+    uint32_t tx_tail;               /* TX descriptor tail */
+    
+    /* Hardware configuration */
+    bool link_up;
+    uint32_t link_speed;            /* Link speed in Mbps */
+    bool full_duplex;
+    
+    spinlock_t hw_lock;
+    
+} e1000_device_t;
+
+/* E1000 register definitions */
+#define E1000_CTRL      0x0000      /* Device Control */
+#define E1000_STATUS    0x0008      /* Device Status */
+#define E1000_EECD      0x0010      /* EEPROM Control */
+#define E1000_EERD      0x0014      /* EEPROM Read */
+#define E1000_ICR       0x00C0      /* Interrupt Cause Read */
+#define E1000_IMS       0x00D0      /* Interrupt Mask Set */
+#define E1000_IMC       0x00D8      /* Interrupt Mask Clear */
+#define E1000_RCTL      0x0100      /* RX Control */
+#define E1000_TCTL      0x0400      /* TX Control */
+#define E1000_RDBAL     0x2800      /* RX Descriptor Base Low */
+#define E1000_RDBAH     0x2804      /* RX Descriptor Base High */
+#define E1000_RDLEN     0x2808      /* RX Descriptor Length */
+#define E1000_RDH       0x2810      /* RX Descriptor Head */
+#define E1000_RDT       0x2818      /* RX Descriptor Tail */
+#define E1000_TDBAL     0x3800      /* TX Descriptor Base Low */
+#define E1000_TDBAH     0x3804      /* TX Descriptor Base High */
+#define E1000_TDLEN     0x3808      /* TX Descriptor Length */
+#define E1000_TDH       0x3810      /* TX Descriptor Head */
+#define E1000_TDT       0x3818      /* TX Descriptor Tail */
+
+/* E1000 descriptor structures */
+struct e1000_rx_desc {
+    uint64_t buffer_addr;           /* Address of data buffer */
+    uint16_t length;                /* Length of data */
+    uint16_t csum;                  /* Packet checksum */
+    uint8_t status;                 /* Descriptor status */
+    uint8_t errors;                 /* Descriptor errors */
+    uint16_t special;               /* VLAN tag */
+};
+
+struct e1000_tx_desc {
+    uint64_t buffer_addr;           /* Address of data buffer */
+    uint16_t length;                /* Data length */
+    uint8_t cso;                    /* Checksum offset */
+    uint8_t cmd;                    /* Descriptor command */
+    uint8_t status;                 /* Descriptor status */
+    uint8_t css;                    /* Checksum start */
+    uint16_t special;               /* VLAN tag */
+};
+
+/* Global network state */
+static struct {
+    bool initialized;
+    
+    /* Device management */
+    struct list_head devices;
+    spinlock_t devices_lock;
+    uint32_t next_device_index;
+    uint32_t device_count;
+    
+    /* Packet processing */
+    struct list_head free_packets;
+    spinlock_t packet_lock;
+    uint32_t packet_pool_size;
+    
+    /* Statistics */
+    atomic64_t packets_received;
+    atomic64_t packets_transmitted;
+    atomic64_t bytes_received;
+    atomic64_t bytes_transmitted;
+    atomic64_t rx_errors;
+    atomic64_t tx_errors;
+    
+} g_netdrv = {0};
+
+/* Function prototypes */
+static int netdrv_register_device(net_device_t* dev);
+static void netdrv_unregister_device(net_device_t* dev);
+static net_packet_t* netdrv_alloc_packet(size_t size);
+static void netdrv_free_packet(net_packet_t* packet);
+static int netdrv_receive_packet(net_device_t* dev, void* data, size_t len);
+static int netdrv_transmit_packet(net_device_t* dev, net_packet_t* packet);
+
+/* E1000 driver functions */
+static int e1000_probe(struct pci_device* pci_dev);
+static int e1000_open(net_device_t* dev);
+static int e1000_stop(net_device_t* dev);
+static int e1000_start_xmit(net_device_t* dev, net_packet_t* packet);
+static void e1000_interrupt_handler(net_device_t* dev);
+static uint32_t e1000_read_reg(e1000_device_t* e1000, uint32_t reg);
+static void e1000_write_reg(e1000_device_t* e1000, uint32_t reg, uint32_t value);
+
+/* Initialize network driver subsystem */
+int netdrv_init(void) {
+    if (g_netdrv.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing network driver subsystem\n");
+    
+    memset(&g_netdrv, 0, sizeof(g_netdrv));
+    
+    INIT_LIST_HEAD(&g_netdrv.devices);
+    INIT_LIST_HEAD(&g_netdrv.free_packets);
+    spinlock_init(&g_netdrv.devices_lock);
+    spinlock_init(&g_netdrv.packet_lock);
+    
+    g_netdrv.next_device_index = 1;
+    
+    /* Allocate initial packet pool */
+    for (int i = 0; i < 1000; i++) {
+        net_packet_t* packet = (net_packet_t*)vmm_kmalloc(sizeof(net_packet_t), 32);
+        if (packet) {
+            memset(packet, 0, sizeof(net_packet_t));
+            packet->data = vmm_kmalloc(NET_BUFFER_SIZE, 1);
+            packet->capacity = NET_BUFFER_SIZE;
+            atomic_set(&packet->refcount, 0);
+            
+            if (packet->data) {
+                list_add(&packet->list, &g_netdrv.free_packets);
+                g_netdrv.packet_pool_size++;
+            } else {
+                vmm_kfree(packet, sizeof(net_packet_t));
+            }
+        }
+    }
+    
+    g_netdrv.initialized = true;
+    
+    /* Probe for network devices */
+    /* This would typically scan PCI bus for network controllers */
+    
+    printf("Network driver subsystem initialized with %u packet buffers\n", g_netdrv.packet_pool_size);
+    return 0;
+}
+
+/* Register network device */
+static int netdrv_register_device(net_device_t* dev) {
+    if (!dev || !dev->ops) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&g_netdrv.devices_lock);
+    
+    if (g_netdrv.device_count >= MAX_NETWORK_DEVICES) {
+        spin_unlock(&g_netdrv.devices_lock);
+        return -ENOSPC;
+    }
+    
+    /* Assign device index and name */
+    dev->index = g_netdrv.next_device_index++;
+    if (dev->name[0] == '\0') {
+        snprintf(dev->name, sizeof(dev->name), "eth%u", dev->index - 1);
+    }
+    
+    /* Initialize device structure */
+    if (dev->mtu == 0) {
+        dev->mtu = 1500; /* Standard Ethernet MTU */
+    }
+    
+    if (dev->tx_queue_len == 0) {
+        dev->tx_queue_len = 1000;
+    }
+    
+    INIT_LIST_HEAD(&dev->tx_queue);
+    INIT_LIST_HEAD(&dev->rx_queue);
+    INIT_LIST_HEAD(&dev->vlans);
+    spinlock_init(&dev->tx_lock);
+    spinlock_init(&dev->rx_lock);
+    spinlock_init(&dev->vlan_lock);
+    
+    /* Add to global device list */
+    list_add(&dev->list, &g_netdrv.devices);
+    g_netdrv.device_count++;
+    
+    spin_unlock(&g_netdrv.devices_lock);
+    
+    printf("Registered network device: %s (index=%u, type=%u)\n", 
+           dev->name, dev->index, dev->type);
+    
+    return 0;
+}
+
+/* Allocate network packet */
+static net_packet_t* netdrv_alloc_packet(size_t size) {
+    spin_lock(&g_netdrv.packet_lock);
+    
+    if (list_empty(&g_netdrv.free_packets)) {
+        spin_unlock(&g_netdrv.packet_lock);
+        
+        /* Allocate new packet if pool is empty */
+        net_packet_t* packet = (net_packet_t*)vmm_kmalloc(sizeof(net_packet_t), 32);
+        if (!packet) {
+            return NULL;
+        }
+        
+        memset(packet, 0, sizeof(net_packet_t));
+        packet->data = vmm_kmalloc(max(size, NET_BUFFER_SIZE), 1);
+        packet->capacity = max(size, NET_BUFFER_SIZE);
+        atomic_set(&packet->refcount, 1);
+        
+        if (!packet->data) {
+            vmm_kfree(packet, sizeof(net_packet_t));
+            return NULL;
+        }
+        
+        return packet;
+    }
+    
+    /* Get packet from free list */
+    net_packet_t* packet = list_first_entry(&g_netdrv.free_packets, net_packet_t, list);
+    list_del(&packet->list);
+    
+    spin_unlock(&g_netdrv.packet_lock);
+    
+    /* Reallocate buffer if needed */
+    if (packet->capacity < size) {
+        vmm_kfree(packet->data, packet->capacity);
+        packet->data = vmm_kmalloc(size, 1);
+        packet->capacity = size;
+        
+        if (!packet->data) {
+            /* Return to free list */
+            spin_lock(&g_netdrv.packet_lock);
+            list_add(&packet->list, &g_netdrv.free_packets);
+            spin_unlock(&g_netdrv.packet_lock);
+            return NULL;
+        }
+    }
+    
+    /* Reset packet state */
+    packet->len = 0;
+    packet->timestamp = 0;
+    packet->vlan_id = 0;
+    packet->priority = 0;
+    packet->dev = NULL;
+    atomic_set(&packet->refcount, 1);
+    
+    return packet;
+}
+
+/* Free network packet */
+static void netdrv_free_packet(net_packet_t* packet) {
+    if (!packet) {
+        return;
+    }
+    
+    if (atomic_dec_and_test(&packet->refcount)) {
+        /* Return to free list */
+        spin_lock(&g_netdrv.packet_lock);
+        list_add(&packet->list, &g_netdrv.free_packets);
+        spin_unlock(&g_netdrv.packet_lock);
+    }
+}
+
+/* Receive packet from hardware */
+static int netdrv_receive_packet(net_device_t* dev, void* data, size_t len) {
+    if (!dev || !data || len == 0) {
+        return -EINVAL;
+    }
+    
+    /* Allocate packet buffer */
+    net_packet_t* packet = netdrv_alloc_packet(len);
+    if (!packet) {
+        dev->stats.rx_dropped++;
+        return -ENOMEM;
+    }
+    
+    /* Copy packet data */
+    memcpy(packet->data, data, len);
+    packet->len = len;
+    packet->dev = dev;
+    packet->timestamp = timer_get_ticks();
+    
+    /* Update statistics */
+    dev->stats.rx_packets++;
+    dev->stats.rx_bytes += len;
+    atomic64_inc(&g_netdrv.packets_received);
+    atomic64_add(&g_netdrv.bytes_received, len);
+    
+    /* Process packet through network stack */
+    /* This would call the appropriate protocol handler (IP, ARP, etc.) */
+    
+    netdrv_free_packet(packet);
+    return 0;
+}
+
+/* Transmit packet */
+static int netdrv_transmit_packet(net_device_t* dev, net_packet_t* packet) {
+    if (!dev || !packet || !dev->ops || !dev->ops->start_xmit) {
+        return -EINVAL;
+    }
+    
+    if (!(dev->flags & NET_FLAG_UP)) {
+        dev->stats.tx_dropped++;
+        return -ENETDOWN;
+    }
+    
+    /* Check packet size */
+    if (packet->len > dev->mtu + 14) { /* Include Ethernet header */
+        dev->stats.tx_errors++;
+        return -EMSGSIZE;
+    }
+    
+    /* Call device-specific transmit function */
+    int result = dev->ops->start_xmit(dev, packet);
+    
+    if (result == 0) {
+        /* Update statistics */
+        dev->stats.tx_packets++;
+        dev->stats.tx_bytes += packet->len;
+        atomic64_inc(&g_netdrv.packets_transmitted);
+        atomic64_add(&g_netdrv.bytes_transmitted, packet->len);
+    } else {
+        dev->stats.tx_errors++;
+        atomic64_inc(&g_netdrv.tx_errors);
+    }
+    
+    return result;
+}
+
+/* E1000 driver implementation */
+static const struct net_device_ops e1000_netdev_ops = {
+    .open = e1000_open,
+    .stop = e1000_stop,
+    .start_xmit = e1000_start_xmit,
+};
+
+/* E1000 register access */
+static uint32_t e1000_read_reg(e1000_device_t* e1000, uint32_t reg) {
+    return *((volatile uint32_t*)((char*)e1000->mmio_base + reg));
+}
+
+static void e1000_write_reg(e1000_device_t* e1000, uint32_t reg, uint32_t value) {
+    *((volatile uint32_t*)((char*)e1000->mmio_base + reg)) = value;
+}
+
+/* E1000 probe function */
+static int e1000_probe(struct pci_device* pci_dev) {
+    printf("Probing E1000 device at %02x:%02x.%x\n", 
+           pci_dev->bus, pci_dev->device, pci_dev->function);
+    
+    /* Allocate device structures */
+    net_device_t* netdev = (net_device_t*)vmm_kmalloc(sizeof(net_device_t), 32);
+    if (!netdev) {
+        return -ENOMEM;
+    }
+    
+    e1000_device_t* e1000 = (e1000_device_t*)vmm_kmalloc(sizeof(e1000_device_t), 32);
+    if (!e1000) {
+        vmm_kfree(netdev, sizeof(net_device_t));
+        return -ENOMEM;
+    }
+    
+    memset(netdev, 0, sizeof(net_device_t));
+    memset(e1000, 0, sizeof(e1000_device_t));
+    
+    /* Initialize network device */
+    netdev->type = NET_TYPE_ETHERNET;
+    netdev->ops = &e1000_netdev_ops;
+    netdev->private_data = e1000;
+    netdev->pci_dev = pci_dev;
+    netdev->irq = pci_dev->interrupt_line;
+    netdev->irq_handler = e1000_interrupt_handler;
+    
+    /* Map MMIO region */
+    e1000->mmio_size = pci_dev->bar_size[0];
+    e1000->mmio_base = vmm_map_mmio(pci_dev->bar[0], e1000->mmio_size);
+    if (!e1000->mmio_base) {
+        vmm_kfree(e1000, sizeof(e1000_device_t));
+        vmm_kfree(netdev, sizeof(net_device_t));
+        return -ENOMEM;
+    }
+    
+    spinlock_init(&e1000->hw_lock);
+    
+    /* Enable PCI bus mastering */
+    uint16_t cmd = pci_read_config16(pci_dev, PCI_COMMAND);
+    cmd |= PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
+    pci_write_config16(pci_dev, PCI_COMMAND, cmd);
+    
+    /* Reset the device */
+    e1000_write_reg(e1000, E1000_CTRL, 0x04000000); /* Global reset */
+    timer_msleep(10);
+    
+    /* Read MAC address from EEPROM */
+    /* This would read the MAC address from EEPROM */
+    uint8_t default_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+    memcpy(netdev->mac_address, default_mac, 6);
+    
+    printf("E1000: MAC address %02x:%02x:%02x:%02x:%02x:%02x\n",
+           netdev->mac_address[0], netdev->mac_address[1], netdev->mac_address[2],
+           netdev->mac_address[3], netdev->mac_address[4], netdev->mac_address[5]);
+    
+    /* Register network device */
+    int result = netdrv_register_device(netdev);
+    if (result != 0) {
+        vmm_unmap_mmio(e1000->mmio_base, e1000->mmio_size);
+        vmm_kfree(e1000, sizeof(e1000_device_t));
+        vmm_kfree(netdev, sizeof(net_device_t));
+        return result;
+    }
+    
+    printf("E1000 device %s initialized successfully\n", netdev->name);
+    return 0;
+}
+
+/* E1000 device operations */
+static int e1000_open(net_device_t* dev) {
+    e1000_device_t* e1000 = (e1000_device_t*)dev->private_data;
+    
+    printf("Opening E1000 device %s\n", dev->name);
+    
+    /* Allocate descriptor rings */
+    e1000->rx_descriptors = (struct e1000_rx_desc*)vmm_kmalloc_aligned(
+        sizeof(struct e1000_rx_desc) * MAX_RX_DESCRIPTORS, 16);
+    e1000->tx_descriptors = (struct e1000_tx_desc*)vmm_kmalloc_aligned(
+        sizeof(struct e1000_tx_desc) * MAX_TX_DESCRIPTORS, 16);
+    
+    if (!e1000->rx_descriptors || !e1000->tx_descriptors) {
+        if (e1000->rx_descriptors) {
+            vmm_kfree(e1000->rx_descriptors, sizeof(struct e1000_rx_desc) * MAX_RX_DESCRIPTORS);
+        }
+        if (e1000->tx_descriptors) {
+            vmm_kfree(e1000->tx_descriptors, sizeof(struct e1000_tx_desc) * MAX_TX_DESCRIPTORS);
+        }
+        return -ENOMEM;
+    }
+    
+    /* Allocate buffer pointers */
+    e1000->rx_buffers = (void**)vmm_kmalloc(sizeof(void*) * MAX_RX_DESCRIPTORS, 32);
+    e1000->tx_buffers = (void**)vmm_kmalloc(sizeof(void*) * MAX_TX_DESCRIPTORS, 32);
+    
+    /* Initialize RX descriptors and buffers */
+    for (int i = 0; i < MAX_RX_DESCRIPTORS; i++) {
+        e1000->rx_buffers[i] = vmm_kmalloc(NET_BUFFER_SIZE, 1);
+        if (!e1000->rx_buffers[i]) {
+            /* Cleanup on failure */
+            for (int j = 0; j < i; j++) {
+                vmm_kfree(e1000->rx_buffers[j], NET_BUFFER_SIZE);
+            }
+            return -ENOMEM;
+        }
+        
+        e1000->rx_descriptors[i].buffer_addr = vmm_virt_to_phys(e1000->rx_buffers[i]);
+        e1000->rx_descriptors[i].status = 0;
+    }
+    
+    /* Configure RX registers */
+    uint64_t rx_desc_phys = vmm_virt_to_phys(e1000->rx_descriptors);
+    e1000_write_reg(e1000, E1000_RDBAL, (uint32_t)(rx_desc_phys & 0xFFFFFFFF));
+    e1000_write_reg(e1000, E1000_RDBAH, (uint32_t)(rx_desc_phys >> 32));
+    e1000_write_reg(e1000, E1000_RDLEN, MAX_RX_DESCRIPTORS * sizeof(struct e1000_rx_desc));
+    e1000_write_reg(e1000, E1000_RDH, 0);
+    e1000_write_reg(e1000, E1000_RDT, MAX_RX_DESCRIPTORS - 1);
+    
+    /* Configure TX registers */
+    uint64_t tx_desc_phys = vmm_virt_to_phys(e1000->tx_descriptors);
+    e1000_write_reg(e1000, E1000_TDBAL, (uint32_t)(tx_desc_phys & 0xFFFFFFFF));
+    e1000_write_reg(e1000, E1000_TDBAH, (uint32_t)(tx_desc_phys >> 32));
+    e1000_write_reg(e1000, E1000_TDLEN, MAX_TX_DESCRIPTORS * sizeof(struct e1000_tx_desc));
+    e1000_write_reg(e1000, E1000_TDH, 0);
+    e1000_write_reg(e1000, E1000_TDT, 0);
+    
+    /* Enable RX and TX */
+    e1000_write_reg(e1000, E1000_RCTL, 0x00008002); /* Enable RX */
+    e1000_write_reg(e1000, E1000_TCTL, 0x00000002); /* Enable TX */
+    
+    /* Enable interrupts */
+    e1000_write_reg(e1000, E1000_IMS, 0x000000FF);
+    
+    dev->flags |= NET_FLAG_UP | NET_FLAG_RUNNING;
+    
+    printf("E1000 device %s is now up\n", dev->name);
+    return 0;
+}
+
+static int e1000_stop(net_device_t* dev) {
+    printf("Stopping E1000 device %s\n", dev->name);
+    
+    dev->flags &= ~(NET_FLAG_UP | NET_FLAG_RUNNING);
+    
+    /* Disable interrupts and reset */
+    e1000_device_t* e1000 = (e1000_device_t*)dev->private_data;
+    e1000_write_reg(e1000, E1000_IMC, 0xFFFFFFFF);
+    e1000_write_reg(e1000, E1000_RCTL, 0);
+    e1000_write_reg(e1000, E1000_TCTL, 0);
+    
+    return 0;
+}
+
+static int e1000_start_xmit(net_device_t* dev, net_packet_t* packet) {
+    e1000_device_t* e1000 = (e1000_device_t*)dev->private_data;
+    
+    spin_lock(&e1000->hw_lock);
+    
+    /* Check if we have space in TX ring */
+    uint32_t next_tail = (e1000->tx_tail + 1) % MAX_TX_DESCRIPTORS;
+    if (next_tail == e1000->tx_head) {
+        spin_unlock(&e1000->hw_lock);
+        return -EBUSY; /* Ring full */
+    }
+    
+    /* Set up TX descriptor */
+    struct e1000_tx_desc* desc = &e1000->tx_descriptors[e1000->tx_tail];
+    
+    /* Allocate DMA buffer and copy data */
+    void* tx_buffer = vmm_kmalloc(packet->len, 1);
+    if (!tx_buffer) {
+        spin_unlock(&e1000->hw_lock);
+        return -ENOMEM;
+    }
+    
+    memcpy(tx_buffer, packet->data, packet->len);
+    e1000->tx_buffers[e1000->tx_tail] = tx_buffer;
+    
+    desc->buffer_addr = vmm_virt_to_phys(tx_buffer);
+    desc->length = packet->len;
+    desc->cmd = 0x0B; /* EOP | IFCS | RS */
+    desc->status = 0;
+    
+    /* Advance tail pointer */
+    e1000->tx_tail = next_tail;
+    e1000_write_reg(e1000, E1000_TDT, e1000->tx_tail);
+    
+    spin_unlock(&e1000->hw_lock);
+    
+    return 0;
+}
+
+static void e1000_interrupt_handler(net_device_t* dev) {
+    e1000_device_t* e1000 = (e1000_device_t*)dev->private_data;
+    
+    /* Read interrupt cause */
+    uint32_t icr = e1000_read_reg(e1000, E1000_ICR);
+    
+    if (icr & 0x80) { /* RX interrupt */
+        /* Process received packets */
+        while (e1000->rx_descriptors[e1000->rx_head].status & 0x01) { /* DD bit */
+            struct e1000_rx_desc* desc = &e1000->rx_descriptors[e1000->rx_head];
+            
+            /* Process received packet */
+            netdrv_receive_packet(dev, e1000->rx_buffers[e1000->rx_head], desc->length);
+            
+            /* Reset descriptor */
+            desc->status = 0;
+            
+            /* Advance head */
+            e1000->rx_head = (e1000->rx_head + 1) % MAX_RX_DESCRIPTORS;
+            e1000_write_reg(e1000, E1000_RDT, (e1000->rx_head - 1 + MAX_RX_DESCRIPTORS) % MAX_RX_DESCRIPTORS);
+        }
+    }
+    
+    if (icr & 0x01) { /* TX interrupt */
+        /* Clean up completed TX descriptors */
+        while (e1000->tx_head != e1000->tx_tail &&
+               e1000->tx_descriptors[e1000->tx_head].status & 0x01) { /* DD bit */
+            
+            /* Free TX buffer */
+            if (e1000->tx_buffers[e1000->tx_head]) {
+                vmm_kfree(e1000->tx_buffers[e1000->tx_head], 
+                         e1000->tx_descriptors[e1000->tx_head].length);
+                e1000->tx_buffers[e1000->tx_head] = NULL;
+            }
+            
+            e1000->tx_head = (e1000->tx_head + 1) % MAX_TX_DESCRIPTORS;
+        }
+    }
+}
+
+/* Get network driver statistics */
+void netdrv_get_stats(struct netdrv_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct netdrv_stats));
+    
+    stats->packets_received = atomic64_read(&g_netdrv.packets_received);
+    stats->packets_transmitted = atomic64_read(&g_netdrv.packets_transmitted);
+    stats->bytes_received = atomic64_read(&g_netdrv.bytes_received);
+    stats->bytes_transmitted = atomic64_read(&g_netdrv.bytes_transmitted);
+    stats->rx_errors = atomic64_read(&g_netdrv.rx_errors);
+    stats->tx_errors = atomic64_read(&g_netdrv.tx_errors);
+    
+    stats->active_devices = g_netdrv.device_count;
+    stats->packet_pool_size = g_netdrv.packet_pool_size;
+}
+
+/* Debug output */
+void netdrv_dump_stats(void) {
+    struct netdrv_stats stats;
+    netdrv_get_stats(&stats);
+    
+    printf("Network Driver Statistics:\n");
+    printf("  Active devices: %u\n", stats.active_devices);
+    printf("  Packets received: %lu\n", stats.packets_received);
+    printf("  Packets transmitted: %lu\n", stats.packets_transmitted);
+    printf("  Bytes received: %lu\n", stats.bytes_received);
+    printf("  Bytes transmitted: %lu\n", stats.bytes_transmitted);
+    printf("  RX errors: %lu\n", stats.rx_errors);
+    printf("  TX errors: %lu\n", stats.tx_errors);
+    printf("  Packet pool size: %u\n", stats.packet_pool_size);
+}

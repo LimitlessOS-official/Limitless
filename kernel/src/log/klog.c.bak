@@ -1,0 +1,70 @@
+#include "kernel.h"
+#include "log.h"
+#include "vfs.h"
+#include "config.h"
+
+#define KLOG_BUF_SIZE (64*1024)
+static char g_klog_buf[KLOG_BUF_SIZE];
+static u32  g_head=0, g_tail=0;
+static klog_level_t g_level = (klog_level_t)CONFIG_KLOG_DEFAULT_LEVEL;
+static spinlock_t g_lock;
+
+static void rb_write(const char* s, u32 n){
+    for(u32 i=0;i<n;i++){
+        g_klog_buf[g_head] = s[i];
+        g_head = (g_head + 1) % KLOG_BUF_SIZE;
+        if (g_head == g_tail) { g_tail = (g_tail + 1) % KLOG_BUF_SIZE; }
+    }
+}
+
+void klog_init(void){
+    spinlock_init(&g_lock);
+    const char* boot = "<6>klog: initialized\n";
+    rb_write(boot, (u32)k_strlen(boot));
+}
+
+void klog_set_level(klog_level_t lvl){ if(lvl>=KLOG_L_DEBUG && lvl<=KLOG_L_ERROR) g_level = lvl; }
+
+static const char* lvl_prefix(klog_level_t l){
+    switch(l){ case KLOG_L_DEBUG: return "<7>"; case KLOG_L_INFO: return "<6>"; case KLOG_L_WARN: return "<4>"; default: return "<3>"; }
+}
+
+void klog_vprintf(klog_level_t lvl, const char* tag, const char* fmt, __builtin_va_list ap){
+    if (lvl < g_level) return;
+    char line[512];
+    u64 ticks = timer_get_ticks();
+    int n0 = k_snprintf(line, sizeof(line), "%s[%08llu] %s: ", lvl_prefix(lvl), (unsigned long long)ticks, tag?tag:"-");
+    int n1 = k_vsnprintf(line + n0, sizeof(line) - n0, fmt, ap);
+    int n2 = k_snprintf(line + n0 + (n1>0?n1:0), sizeof(line) - n0 - (n1>0?n1:0), "\n"); (void)n2;
+    spin_lock(&g_lock);
+    rb_write(line, (u32)k_strlen(line));
+    spin_unlock(&g_lock);
+}
+
+void klog_printf(klog_level_t lvl, const char* tag, const char* fmt, ...){
+    __builtin_va_list ap; __builtin_va_start(ap, fmt);
+    klog_vprintf(lvl, tag, fmt, ap);
+    __builtin_va_end(ap);
+}
+
+int klog_read(char* buf, u32 maxlen){
+    if (!buf || maxlen==0) return 0;
+    spin_lock(&g_lock);
+    u32 n=0; while (g_tail != g_head && n < maxlen){ buf[n++] = g_klog_buf[g_tail]; g_tail = (g_tail + 1) % KLOG_BUF_SIZE; }
+    spin_unlock(&g_lock);
+    return (int)n;
+}
+
+/* Optional: expose /proc/kmsg */
+static int kmsg_read(vnode_t* node, u64 off, void* out, size_t len){ (void)node;(void)off; return klog_read((char*)out,(u32)len); }
+static int kmsg_readdir(vnode_t* vn, vfs_dirent_cb cb, void* ctx){ (void)vn;(void)cb;(void)ctx; return 0; }
+static vnode_t* kmsg_lookup(vnode_t* d, const char* n, size_t l){ (void)d;(void)n;(void)l; return NULL; }
+static void kmsg_release(vnode_t* vn){ (void)vn; }
+static vnode_ops_t kmsg_ops = { .read = kmsg_read, .readdir = kmsg_readdir, .lookup = kmsg_lookup, .release = kmsg_release };
+
+static vnode_t g_kmsg_node = { .mnt=NULL, .type=VNODE_FILE, .size=0, .ino=1, .fs_priv=NULL, .ops=&kmsg_ops };
+
+/* Helper to attach kmsg into a /proc mount if present; else ignored. */
+void klog_attach_proc(void){
+    /* For minimal system, attempt to mount a proc-like tmpfs at /proc and add kmsg node to lookups. This requires VFS support for synthetic nodes; if not available, skip. */
+}

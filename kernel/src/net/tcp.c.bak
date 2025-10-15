@@ -1,0 +1,916 @@
+/**
+ * TCP Protocol Implementation for LimitlessOS
+ * Provides reliable, connection-oriented transport layer
+ */
+
+#include "net/tcp.h"
+#include "net.h"
+#include "kernel.h"
+#include "vmm.h"
+#include "string.h"
+#include "timer.h"
+
+/* TCP connection table */
+#define MAX_TCP_CONNECTIONS 256
+
+/* Retransmission queue entry */
+typedef struct tcp_retrans_entry {
+    uint32_t seq_start;     /* Starting sequence number */
+    uint32_t seq_len;       /* Length of data */
+    uint8_t* data;          /* Copy of data for retransmission */
+    uint64_t send_time;     /* When packet was sent */
+    uint32_t retrans_count; /* Number of retransmissions */
+    struct tcp_retrans_entry* next;
+} tcp_retrans_entry_t;
+
+/* Congestion control state */
+typedef struct tcp_congestion {
+    uint32_t cwnd;          /* Congestion window */
+    uint32_t ssthresh;      /* Slow start threshold */
+    uint32_t duplicate_acks;/* Duplicate ACK count */
+    uint32_t bytes_acked;   /* Bytes ACKed in current RTT */
+    uint8_t state;          /* Congestion state (slow start, congestion avoidance, fast recovery) */
+} tcp_congestion_t;
+
+#define TCP_CC_SLOW_START      0
+#define TCP_CC_CONGESTION_AVOID 1
+#define TCP_CC_FAST_RECOVERY   2
+
+/* Enhanced TCP connection structure with reliability features */
+typedef struct tcp_connection {
+    bool in_use;
+    tcp_state_t state;
+    
+    /* Connection identifiers */
+    ipv4_addr_t local_ip;
+    ipv4_addr_t remote_ip;
+    uint16_t local_port;
+    uint16_t remote_port;
+    
+    /* Sequence numbers */
+    uint32_t send_seq;      /* Next sequence number to send */
+    uint32_t send_una;      /* Oldest unacknowledged sequence */
+    uint32_t send_ack;      /* Last ACK received */
+    uint32_t recv_seq;      /* Next sequence number expected */
+    uint32_t recv_ack;      /* Next ACK to send */
+    uint32_t iss;           /* Initial send sequence */
+    uint32_t irs;           /* Initial receive sequence */
+    
+    /* Window management */
+    uint16_t send_window;   /* Remote window size */
+    uint16_t recv_window;   /* Our window size */
+    uint16_t max_segment_size; /* MSS for this connection */
+    
+    /* Reliability and timing */
+    uint64_t timeout_time;  /* When current timeout expires */
+    uint32_t rto;           /* Retransmission timeout (ms) */
+    uint32_t srtt;          /* Smoothed round-trip time */
+    uint32_t rttvar;        /* RTT variance */
+    uint32_t last_ack_time; /* Time of last ACK received */
+    tcp_retrans_entry_t* retrans_queue; /* Retransmission queue */
+    
+    /* Congestion control */
+    tcp_congestion_t congestion;
+    
+    /* Flow control */
+    uint32_t snd_buf_size;  /* Send buffer size */
+    uint32_t snd_buf_used;  /* Send buffer bytes used */
+    uint8_t* snd_buffer;    /* Send buffer for flow control */
+    
+    /* Socket reference */
+    sock_t socket_id;
+    
+    /* Statistics */
+    uint32_t retrans_count; /* Total retransmissions */
+    uint32_t out_of_order_count; /* Out of order packets */
+} tcp_connection_t;
+
+static tcp_connection_t g_tcp_connections[MAX_TCP_CONNECTIONS];
+static uint32_t g_tcp_isn = 0x12345678;  /* Initial sequence number */
+
+/* TCP reliability constants */
+#define TCP_RTO_MIN     200     /* Minimum RTO (ms) */
+#define TCP_RTO_MAX     60000   /* Maximum RTO (ms) */
+#define TCP_RTO_INITIAL 3000    /* Initial RTO (ms) */
+#define TCP_SRTT_SHIFT  3       /* SRTT smoothing factor */
+#define TCP_RTTVAR_SHIFT 2      /* RTT variance smoothing factor */
+#define TCP_MAX_RETRANS 12      /* Maximum retransmission attempts */
+#define TCP_CWND_INIT   1       /* Initial congestion window (segments) */
+#define TCP_SSTHRESH_INIT 65535 /* Initial slow start threshold */
+
+/* Add packet to retransmission queue */
+static int tcp_add_retrans_entry(tcp_connection_t* conn, uint32_t seq, const void* data, uint32_t len) {
+    if (!conn || !data || len == 0) return K_EINVAL;
+    
+    tcp_retrans_entry_t* entry = kalloc(sizeof(tcp_retrans_entry_t));
+    if (!entry) return K_ENOMEM;
+    
+    entry->data = kalloc(len);
+    if (!entry->data) {
+        kfree(entry);
+        return K_ENOMEM;
+    }
+    
+    entry->seq_start = seq;
+    entry->seq_len = len;
+    k_memcpy(entry->data, data, len);
+    entry->send_time = timer_get_ticks();
+    entry->retrans_count = 0;
+    entry->next = NULL;
+    
+    /* Add to end of retransmission queue */
+    if (!conn->retrans_queue) {
+        conn->retrans_queue = entry;
+    } else {
+        tcp_retrans_entry_t* current = conn->retrans_queue;
+        while (current->next) {
+            current = current->next;
+        }
+        current->next = entry;
+    }
+    
+    return 0;
+}
+
+/* Remove ACKed packets from retransmission queue */
+static void tcp_remove_acked_retrans(tcp_connection_t* conn, uint32_t ack_seq) {
+    if (!conn) return;
+    
+    tcp_retrans_entry_t** current = &conn->retrans_queue;
+    while (*current) {
+        tcp_retrans_entry_t* entry = *current;
+        
+        /* Check if this packet is fully ACKed */
+        if ((entry->seq_start + entry->seq_len) <= ack_seq) {
+            *current = entry->next;
+            kfree(entry->data);
+            kfree(entry);
+        } else {
+            current = &entry->next;
+        }
+    }
+}
+
+/* Update RTT measurements and calculate new RTO */
+static void tcp_update_rtt(tcp_connection_t* conn, uint32_t rtt_sample) {
+    if (!conn || rtt_sample == 0) return;
+    
+    if (conn->srtt == 0) {
+        /* First RTT measurement */
+        conn->srtt = rtt_sample;
+        conn->rttvar = rtt_sample / 2;
+    } else {
+        /* RFC 2988 RTT estimation */
+        uint32_t abs_diff = (rtt_sample > conn->srtt) ? 
+                           (rtt_sample - conn->srtt) : (conn->srtt - rtt_sample);
+        
+        conn->rttvar = (3 * conn->rttvar + abs_diff) / 4;
+        conn->srtt = (7 * conn->srtt + rtt_sample) / 8;
+    }
+    
+    /* Calculate RTO: RTO = SRTT + max(G, K * RTTVAR) */
+    conn->rto = conn->srtt + (4 * conn->rttvar);
+    if (conn->rto < TCP_RTO_MIN) conn->rto = TCP_RTO_MIN;
+    if (conn->rto > TCP_RTO_MAX) conn->rto = TCP_RTO_MAX;
+}
+
+/* Initialize congestion control */
+static void tcp_init_congestion_control(tcp_connection_t* conn) {
+    if (!conn) return;
+    
+    conn->congestion.cwnd = TCP_CWND_INIT * conn->max_segment_size;
+    conn->congestion.ssthresh = TCP_SSTHRESH_INIT;
+    conn->congestion.duplicate_acks = 0;
+    conn->congestion.bytes_acked = 0;
+    conn->congestion.state = TCP_CC_SLOW_START;
+}
+
+/* Handle congestion control on ACK reception */
+static void tcp_congestion_control_ack(tcp_connection_t* conn, uint32_t acked_bytes) {
+    if (!conn || acked_bytes == 0) return;
+    
+    tcp_congestion_t* cc = &conn->congestion;
+    
+    switch (cc->state) {
+        case TCP_CC_SLOW_START:
+            /* Slow start: increase cwnd by acked_bytes */
+            cc->cwnd += acked_bytes;
+            
+            /* Check if we should transition to congestion avoidance */
+            if (cc->cwnd >= cc->ssthresh) {
+                cc->state = TCP_CC_CONGESTION_AVOID;
+                cc->bytes_acked = 0;
+            }
+            break;
+            
+        case TCP_CC_CONGESTION_AVOID:
+            /* Congestion avoidance: increase cwnd by MSS * MSS / cwnd per ACK */
+            cc->bytes_acked += acked_bytes;
+            if (cc->bytes_acked >= cc->cwnd) {
+                cc->cwnd += conn->max_segment_size;
+                cc->bytes_acked = 0;
+            }
+            break;
+            
+        case TCP_CC_FAST_RECOVERY:
+            /* Fast recovery: deflate window on new ACK */
+            cc->cwnd = cc->ssthresh + (cc->duplicate_acks * conn->max_segment_size);
+            cc->state = TCP_CC_CONGESTION_AVOID;
+            cc->duplicate_acks = 0;
+            cc->bytes_acked = 0;
+            break;
+    }
+}
+
+/* Handle duplicate ACK for fast retransmit */
+static void tcp_handle_duplicate_ack(tcp_connection_t* conn) {
+    if (!conn) return;
+    
+    tcp_congestion_t* cc = &conn->congestion;
+    cc->duplicate_acks++;
+    
+    if (cc->duplicate_acks == 3) {
+        /* Fast retransmit: retransmit missing segment */
+        if (conn->retrans_queue) {
+            tcp_retrans_entry_t* entry = conn->retrans_queue;
+            tcp_send_segment_data(conn, TCP_FLAG_ACK, entry->data, entry->seq_len, entry->seq_start);
+            entry->retrans_count++;
+        }
+        
+        /* Enter fast recovery */
+        cc->ssthresh = cc->cwnd / 2;
+        if (cc->ssthresh < 2 * conn->max_segment_size) {
+            cc->ssthresh = 2 * conn->max_segment_size;
+        }
+        cc->cwnd = cc->ssthresh + (3 * conn->max_segment_size);
+        cc->state = TCP_CC_FAST_RECOVERY;
+        
+    } else if (cc->duplicate_acks > 3 && cc->state == TCP_CC_FAST_RECOVERY) {
+        /* Inflate window */
+        cc->cwnd += conn->max_segment_size;
+    }
+}
+
+/* Handle timeout and retransmission */
+static void tcp_handle_timeout(tcp_connection_t* conn) {
+    if (!conn) return;
+    
+    /* Exponential backoff */
+    conn->rto *= 2;
+    if (conn->rto > TCP_RTO_MAX) conn->rto = TCP_RTO_MAX;
+    
+    /* Congestion control on timeout */
+    tcp_congestion_t* cc = &conn->congestion;
+    cc->ssthresh = cc->cwnd / 2;
+    if (cc->ssthresh < 2 * conn->max_segment_size) {
+        cc->ssthresh = 2 * conn->max_segment_size;
+    }
+    cc->cwnd = TCP_CWND_INIT * conn->max_segment_size;
+    cc->state = TCP_CC_SLOW_START;
+    cc->duplicate_acks = 0;
+    cc->bytes_acked = 0;
+    
+    /* Retransmit oldest unacknowledged segment */
+    if (conn->retrans_queue) {
+        tcp_retrans_entry_t* entry = conn->retrans_queue;
+        if (entry->retrans_count < TCP_MAX_RETRANS) {
+            tcp_send_segment_data(conn, TCP_FLAG_ACK, entry->data, entry->seq_len, entry->seq_start);
+            entry->retrans_count++;
+            entry->send_time = timer_get_ticks();
+            conn->timeout_time = timer_get_ticks() + conn->rto;
+        } else {
+            /* Too many retransmissions, abort connection */
+            conn->state = TCP_STATE_CLOSED;
+        }
+    }
+}
+
+/* Find TCP connection by socket ID */
+static tcp_connection_t* tcp_find_by_socket(sock_t s) {
+    for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+        if (g_tcp_connections[i].in_use && g_tcp_connections[i].socket_id == s) {
+            return &g_tcp_connections[i];
+        }
+    }
+    return NULL;
+}
+
+/* TCP checksum calculation */
+static uint16_t tcp_checksum(ipv4_addr_t src_ip, ipv4_addr_t dst_ip, const tcp_header_t* tcp_hdr, const void* data, size_t data_len) {
+    size_t tcp_len = sizeof(tcp_header_t) + data_len;
+    
+    /* Create pseudo-header for checksum */
+    struct {
+        ipv4_addr_t src_ip;
+        ipv4_addr_t dst_ip;
+        uint8_t zero;
+        uint8_t protocol;
+        uint16_t tcp_length;
+    } PACKED pseudo_hdr = {
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
+        .zero = 0,
+        .protocol = IP_PROTO_TCP,
+        .tcp_length = htons(tcp_len)
+    };
+    
+    uint32_t sum = 0;
+    
+    /* Checksum pseudo-header */
+    uint16_t* ptr = (uint16_t*)&pseudo_hdr;
+    for (size_t i = 0; i < sizeof(pseudo_hdr) / 2; i++) {
+        sum += ntohs(ptr[i]);
+    }
+    
+    /* Checksum TCP header */
+    ptr = (uint16_t*)tcp_hdr;
+    for (size_t i = 0; i < sizeof(tcp_header_t) / 2; i++) {
+        if (i == 8) continue;  /* Skip checksum field */
+        sum += ntohs(ptr[i]);
+    }
+    
+    /* Checksum data */
+    if (data && data_len > 0) {
+        ptr = (uint16_t*)data;
+        for (size_t i = 0; i < data_len / 2; i++) {
+            sum += ntohs(ptr[i]);
+        }
+        
+        /* Handle odd byte */
+        if (data_len & 1) {
+            sum += ((uint8_t*)data)[data_len - 1] << 8;
+        }
+    }
+    
+    /* Fold 32-bit sum to 16 bits */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    return (uint16_t)~sum;
+}
+
+/* Enhanced send function with specific sequence number */
+static status_t tcp_send_segment_data(tcp_connection_t* conn, uint8_t flags, const void* data, size_t len, uint32_t seq_num) {
+    if (!conn) return STATUS_ERROR;
+    
+    size_t tcp_len = sizeof(tcp_header_t) + len;
+    uint8_t* packet = (uint8_t*)vmm_kmalloc(tcp_len, 16);
+    if (!packet) return STATUS_NOMEM;
+    
+    tcp_header_t* tcp_hdr = (tcp_header_t*)packet;
+    k_memset(tcp_hdr, 0, sizeof(tcp_header_t));
+    
+    /* Fill TCP header */
+    tcp_hdr->src_port = htons(conn->local_port);
+    tcp_hdr->dst_port = htons(conn->remote_port);
+    tcp_hdr->seq_num = htonl(seq_num);
+    tcp_hdr->ack_num = htonl(conn->recv_ack);
+    tcp_hdr->data_offset_reserved = 0x50;  /* 20 byte header, no options */
+    tcp_hdr->flags = flags;
+    tcp_hdr->window = htons(conn->recv_window);
+    tcp_hdr->checksum = 0;
+    tcp_hdr->urgent_ptr = 0;
+    
+    /* Copy data */
+    if (data && len > 0) {
+        k_memcpy(packet + sizeof(tcp_header_t), data, len);
+    }
+    
+    /* Calculate checksum */
+    tcp_hdr->checksum = htons(tcp_checksum(conn->local_ip, conn->remote_ip, tcp_hdr, data, len));
+    
+    /* Send via IP layer */
+    net_interface_t* iface = net_get_interface(0);
+    status_t result = STATUS_ERROR;
+    if (iface) {
+        result = ip_send_packet(iface, &conn->remote_ip, IP_PROTO_TCP, packet, tcp_len);
+    }
+    
+    vmm_kfree(packet, tcp_len);
+    return result;
+}
+
+/* Send TCP segment with current sequence number */
+static status_t tcp_send_segment(tcp_connection_t* conn, uint8_t flags, const void* data, size_t len) {
+    if (!conn) return STATUS_ERROR;
+    
+    status_t result = tcp_send_segment_data(conn, flags, data, len, conn->send_seq);
+    
+    /* Add to retransmission queue if data or SYN/FIN */
+    if ((len > 0 || (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN))) && 
+        !(flags & TCP_FLAG_RST) && result == STATUS_OK) {
+        
+        /* Calculate effective length (data + SYN/FIN flags) */
+        uint32_t eff_len = len + ((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) ? 1 : 0);
+        
+        /* Add to retransmission queue */
+        if (len > 0) {
+            tcp_add_retrans_entry(conn, conn->send_seq, data, len);
+        }
+        
+        /* Update send sequence and unacknowledged */
+        if (conn->send_una == conn->send_seq) {
+            conn->send_una = conn->send_seq;
+        }
+        conn->send_seq += eff_len;
+        
+        /* Set timeout for retransmission */
+        conn->timeout_time = timer_get_ticks() + conn->rto;
+    }
+    
+    return result;
+}
+
+/* Check for timeouts and handle retransmissions */
+static void tcp_process_timeouts(void) {
+    uint64_t current_time = timer_get_ticks();
+    
+    for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+        tcp_connection_t* conn = &g_tcp_connections[i];
+        
+        if (!conn->in_use) continue;
+        
+        /* Check for retransmission timeout */
+        if (conn->timeout_time > 0 && current_time >= conn->timeout_time) {
+            tcp_handle_timeout(conn);
+        }
+        
+        /* Clean up TIME_WAIT connections */
+        if (conn->state == TCP_STATE_TIME_WAIT && 
+            current_time >= conn->timeout_time) {
+            k_memset(conn, 0, sizeof(tcp_connection_t));
+        }
+    }
+}
+
+/* Flow control: check if we can send more data */
+static bool tcp_can_send(tcp_connection_t* conn, uint32_t len) {
+    if (!conn) return false;
+    
+    /* Check congestion window */
+    uint32_t inflight = conn->send_seq - conn->send_una;
+    if (inflight + len > conn->congestion.cwnd) return false;
+    
+    /* Check send window */
+    if (inflight + len > conn->send_window) return false;
+    
+    /* Check send buffer space */
+    if (conn->snd_buf_used + len > conn->snd_buf_size) return false;
+    
+    return true;
+}
+
+/* TCP packet input handler */
+void tcp_input(net_interface_t* iface, ipv4_addr_t src_ip, ipv4_addr_t dst_ip, const void* data, size_t len) {
+    if (!iface || !data || len < sizeof(tcp_header_t)) {
+        return;
+    }
+    
+    const tcp_header_t* tcp_hdr = (const tcp_header_t*)data;
+    uint16_t src_port = ntohs(tcp_hdr->src_port);
+    uint16_t dst_port = ntohs(tcp_hdr->dst_port);
+    uint32_t seq_num = ntohl(tcp_hdr->seq_num);
+    uint32_t ack_num = ntohl(tcp_hdr->ack_num);
+    uint8_t flags = tcp_hdr->flags;
+    
+    /* Find matching connection */
+    tcp_connection_t* conn = NULL;
+    for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+        if (g_tcp_connections[i].in_use && 
+            ipv4_addr_equals(&g_tcp_connections[i].remote_ip, &src_ip) &&
+            g_tcp_connections[i].remote_port == src_port &&
+            g_tcp_connections[i].local_port == dst_port) {
+            conn = &g_tcp_connections[i];
+            break;
+        }
+    }
+    
+    if (!conn) {
+        /* No existing connection - check for listening socket */
+        for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+            if (g_tcp_connections[i].in_use &&
+                g_tcp_connections[i].state == TCP_STATE_LISTEN &&
+                g_tcp_connections[i].local_port == dst_port) {
+                /* TODO: Handle incoming SYN for listening socket */
+                return;
+            }
+        }
+        return; /* No matching connection or listener */
+    }
+    
+    /* Process packet based on connection state */
+    switch (conn->state) {
+        case TCP_STATE_SYN_SENT:
+            if ((flags & TCP_FLAG_SYN) && (flags & TCP_FLAG_ACK)) {
+                /* SYN+ACK received - measure RTT from SYN send */
+                uint64_t rtt_sample = timer_get_ticks() - (conn->timeout_time - conn->rto);
+                tcp_update_rtt(conn, (uint32_t)rtt_sample);
+                
+                conn->irs = seq_num;
+                conn->recv_seq = seq_num + 1;
+                conn->recv_ack = conn->recv_seq;
+                
+                /* Process ACK */
+                if (ack_num > conn->send_una) {
+                    tcp_remove_acked_retrans(conn, ack_num);
+                    conn->send_una = ack_num;
+                }
+                
+                conn->state = TCP_STATE_ESTABLISHED;
+                tcp_init_congestion_control(conn);
+                
+                /* Send ACK */
+                tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+            }
+            break;
+            
+        case TCP_STATE_ESTABLISHED:
+            /* Process ACK */
+            if (flags & TCP_FLAG_ACK) {
+                if (ack_num > conn->send_una) {
+                    /* New ACK - update RTT and congestion control */
+                    uint32_t acked_bytes = ack_num - conn->send_una;
+                    
+                    /* Measure RTT if we have timestamp */
+                    if (conn->retrans_queue && conn->retrans_queue->seq_start < ack_num) {
+                        uint64_t rtt_sample = timer_get_ticks() - conn->retrans_queue->send_time;
+                        tcp_update_rtt(conn, (uint32_t)rtt_sample);
+                    }
+                    
+                    /* Update congestion control */
+                    tcp_congestion_control_ack(conn, acked_bytes);
+                    
+                    /* Remove ACKed data from retransmission queue */
+                    tcp_remove_acked_retrans(conn, ack_num);
+                    conn->send_una = ack_num;
+                    conn->congestion.duplicate_acks = 0;
+                    
+                    /* Clear timeout if all data is ACKed */
+                    if (conn->send_una == conn->send_seq) {
+                        conn->timeout_time = 0;
+                    }
+                } else if (ack_num == conn->send_una && conn->send_seq > conn->send_una) {
+                    /* Duplicate ACK */
+                    tcp_handle_duplicate_ack(conn);
+                }
+            }
+            
+            /* Handle incoming data */
+            size_t data_len = len - sizeof(tcp_header_t);
+            if (data_len > 0) {
+                int conn_idx = conn - g_tcp_connections;
+                tcp_rx_buffer_t* rx_buf = &g_tcp_rx_buffers[conn_idx];
+                
+                if (seq_num == conn->recv_seq) {
+                    /* In-order data */
+                    const uint8_t* payload = (const uint8_t*)data + sizeof(tcp_header_t);
+                    
+                    /* Store data in receive buffer */
+                    for (size_t i = 0; i < data_len && rx_buf->data_size < TCP_RX_BUFFER_SIZE; i++) {
+                        rx_buf->data[rx_buf->write_pos] = payload[i];
+                        rx_buf->write_pos = (rx_buf->write_pos + 1) % TCP_RX_BUFFER_SIZE;
+                        rx_buf->data_size++;
+                    }
+                    
+                    conn->recv_seq += data_len;
+                    conn->recv_ack = conn->recv_seq;
+                    
+                    /* Send ACK */
+                    tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+                    
+                } else if (seq_num > conn->recv_seq) {
+                    /* Out-of-order data - send duplicate ACK */
+                    conn->out_of_order_count++;
+                    tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+                    
+                } else {
+                    /* Old data - just ACK */
+                    tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+                }
+            }
+            
+            if (flags & TCP_FLAG_FIN) {
+                /* Peer is closing connection */
+                if (seq_num == conn->recv_seq) {
+                    conn->recv_seq++;
+                    conn->recv_ack = conn->recv_seq;
+                    conn->state = TCP_STATE_CLOSE_WAIT;
+                    
+                    /* Send ACK */
+                    tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+                }
+            }
+            break;
+            
+        case TCP_STATE_FIN_WAIT_1:
+            if (flags & TCP_FLAG_ACK && ack_num > conn->send_una) {
+                tcp_remove_acked_retrans(conn, ack_num);
+                conn->send_una = ack_num;
+                
+                if (ack_num == conn->send_seq) {
+                    conn->state = TCP_STATE_FIN_WAIT_2;
+                }
+            }
+            if (flags & TCP_FLAG_FIN) {
+                conn->recv_seq++;
+                conn->recv_ack = conn->recv_seq;
+                
+                if (conn->state == TCP_STATE_FIN_WAIT_2) {
+                    conn->state = TCP_STATE_TIME_WAIT;
+                    conn->timeout_time = timer_get_ticks() + 120000; /* 2 * MSL */
+                } else {
+                    conn->state = TCP_STATE_CLOSING;
+                }
+                
+                tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+            }
+            break;
+            
+        case TCP_STATE_FIN_WAIT_2:
+            if (flags & TCP_FLAG_FIN) {
+                conn->recv_seq++;
+                conn->recv_ack = conn->recv_seq;
+                conn->state = TCP_STATE_TIME_WAIT;
+                conn->timeout_time = timer_get_ticks() + 120000; /* 2 * MSL */
+                
+                tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+            }
+            break;
+            
+        case TCP_STATE_CLOSE_WAIT:
+            /* Handle any remaining ACKs */
+            if (flags & TCP_FLAG_ACK && ack_num > conn->send_una) {
+                tcp_remove_acked_retrans(conn, ack_num);
+                conn->send_una = ack_num;
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+/* TCP close */
+int tcp_close(sock_t s) {
+    tcp_connection_t* conn = tcp_find_by_socket(s);
+    if (!conn) {
+        return K_EBADF;
+    }
+    
+    switch (conn->state) {
+        case TCP_STATE_CLOSED:
+            /* Already closed */
+            break;
+            
+        case TCP_STATE_LISTEN:
+        case TCP_STATE_SYN_SENT:
+            /* No connection established, just clean up */
+            conn->state = TCP_STATE_CLOSED;
+            break;
+            
+        case TCP_STATE_SYN_RECEIVED:
+        case TCP_STATE_ESTABLISHED:
+            /* Send FIN and wait for response */
+            conn->state = TCP_STATE_FIN_WAIT_1;
+            tcp_send_segment(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+            return 0;  /* Don't clean up yet, wait for proper close */
+            
+        case TCP_STATE_CLOSE_WAIT:
+            /* Send FIN in response to peer's FIN */
+            conn->state = TCP_STATE_LAST_ACK;
+            tcp_send_segment(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0);
+            return 0;  /* Don't clean up yet */
+            
+        default:
+            /* Other states - force close */
+            tcp_send_segment(conn, TCP_FLAG_RST, NULL, 0);
+            break;
+    }
+    
+    /* Clean up connection and receive buffer */
+    int conn_idx = conn - g_tcp_connections;
+    k_memset(&g_tcp_rx_buffers[conn_idx], 0, sizeof(tcp_rx_buffer_t));
+    tcp_cleanup_connection(conn);
+    
+    return 0;
+}
+
+/* Initialize TCP subsystem */
+void tcp_init(void) {
+    k_memset(g_tcp_connections, 0, sizeof(g_tcp_connections));
+    k_memset(g_tcp_rx_buffers, 0, sizeof(g_tcp_rx_buffers));
+    
+    for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+        g_tcp_connections[i].recv_window = 8192;     /* Default window size */
+        g_tcp_connections[i].rto = TCP_RTO_INITIAL;  /* Initial RTO */
+        g_tcp_connections[i].max_segment_size = 1460; /* Standard MSS */
+        g_tcp_connections[i].snd_buf_size = 32768;   /* 32KB send buffer */
+    }
+}
+
+/* TCP periodic processing for timeouts and maintenance */
+void tcp_timer_tick(void) {
+    tcp_process_timeouts();
+}
+
+/* Initialize a TCP connection */
+static void tcp_init_connection(tcp_connection_t* conn, sock_t socket_id) {
+    if (!conn) return;
+    
+    k_memset(conn, 0, sizeof(tcp_connection_t));
+    
+    conn->in_use = true;
+    conn->socket_id = socket_id;
+    conn->state = TCP_STATE_CLOSED;
+    conn->recv_window = 8192;
+    conn->rto = TCP_RTO_INITIAL;
+    conn->max_segment_size = 1460;
+    conn->snd_buf_size = 32768;
+    
+    /* Allocate send buffer */
+    conn->snd_buffer = kalloc(conn->snd_buf_size);
+    if (!conn->snd_buffer) {
+        conn->snd_buf_size = 0;  /* Fall back to no buffering */
+    }
+    
+    /* Initialize congestion control */
+    tcp_init_congestion_control(conn);
+}
+
+/* Clean up TCP connection */
+static void tcp_cleanup_connection(tcp_connection_t* conn) {
+    if (!conn) return;
+    
+    /* Free retransmission queue */
+    while (conn->retrans_queue) {
+        tcp_retrans_entry_t* entry = conn->retrans_queue;
+        conn->retrans_queue = entry->next;
+        kfree(entry->data);
+        kfree(entry);
+    }
+    
+    /* Free send buffer */
+    if (conn->snd_buffer) {
+        kfree(conn->snd_buffer);
+    }
+    
+    /* Clear connection */
+    k_memset(conn, 0, sizeof(tcp_connection_t));
+}
+
+/* TCP bind */
+int tcp_bind(sock_t s, const void* addr, u32 addrlen) {
+    if (!addr || addrlen < sizeof(sockaddr_in_t)) {
+        return K_EINVAL;
+    }
+    
+    /* Find free connection slot */
+    for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+        if (!g_tcp_connections[i].in_use) {
+            tcp_connection_t* conn = &g_tcp_connections[i];
+            const sockaddr_in_t* addr_in = (const sockaddr_in_t*)addr;
+            
+            tcp_init_connection(conn, s);
+            conn->local_ip = addr_in->sin_addr;
+            conn->local_port = ntohs(addr_in->sin_port);
+            
+            return 0;  /* Success */
+        }
+    }
+    
+    return K_ENOMEM;  /* No free connections */
+}
+
+/* TCP listen */
+int tcp_listen(sock_t s, int backlog) {
+    tcp_connection_t* conn = tcp_find_by_socket(s);
+    if (!conn || conn->state != TCP_STATE_CLOSED) {
+        return K_EINVAL;
+    }
+    
+    conn->state = TCP_STATE_LISTEN;
+    (void)backlog;  /* TODO: Implement backlog queue */
+    
+    return 0;
+}
+
+/* TCP connect */
+int tcp_connect(sock_t s, const void* addr, u32 addrlen) {
+    if (!addr || addrlen < sizeof(sockaddr_in_t)) {
+        return K_EINVAL;
+    }
+    
+    tcp_connection_t* conn = tcp_find_by_socket(s);
+    if (!conn || conn->state != TCP_STATE_CLOSED) {
+        return K_EINVAL;
+    }
+    
+    const sockaddr_in_t* addr_in = (const sockaddr_in_t*)addr;
+    
+    conn->remote_ip = addr_in->sin_addr;
+    conn->remote_port = ntohs(addr_in->sin_port);
+    conn->iss = g_tcp_isn++;
+    conn->send_seq = conn->iss;
+    conn->send_una = conn->iss;
+    
+    /* Send SYN */
+    conn->state = TCP_STATE_SYN_SENT;
+    
+    status_t result = tcp_send_segment(conn, TCP_FLAG_SYN, NULL, 0);
+    return (result == STATUS_OK) ? 0 : K_EIO;
+}
+
+/* Enhanced TCP send with flow control and segmentation */
+int tcp_send(sock_t s, const void* buf, u32 len) {
+    if (!buf || len == 0) {
+        return K_EINVAL;
+    }
+    
+    tcp_connection_t* conn = tcp_find_by_socket(s);
+    if (!conn || conn->state != TCP_STATE_ESTABLISHED) {
+        return K_ENOTCONN;
+    }
+    
+    const uint8_t* data = (const uint8_t*)buf;
+    uint32_t total_sent = 0;
+    
+    while (total_sent < len) {
+        /* Calculate maximum segment size we can send */
+        uint32_t remaining = len - total_sent;
+        uint32_t segment_size = (remaining < conn->max_segment_size) ? 
+                               remaining : conn->max_segment_size;
+        
+        /* Check flow control and congestion window */
+        if (!tcp_can_send(conn, segment_size)) {
+            /* Would block - return what we've sent so far */
+            if (total_sent > 0) {
+                return total_sent;
+            }
+            return K_EAGAIN;  /* Would block */
+        }
+        
+        /* Send segment */
+        uint8_t flags = TCP_FLAG_ACK;
+        if (total_sent + segment_size == len) {
+            flags |= TCP_FLAG_PSH;  /* Push flag on last segment */
+        }
+        
+        status_t result = tcp_send_segment(conn, flags, data + total_sent, segment_size);
+        if (result != STATUS_OK) {
+            return (total_sent > 0) ? total_sent : K_EIO;
+        }
+        
+        total_sent += segment_size;
+        
+        /* Update send buffer usage for flow control */
+        conn->snd_buf_used += segment_size;
+    }
+    
+    return total_sent;
+}
+
+/* TCP receive buffer per connection */
+#define TCP_RX_BUFFER_SIZE 8192
+
+typedef struct tcp_rx_buffer {
+    uint8_t data[TCP_RX_BUFFER_SIZE];
+    uint32_t read_pos;
+    uint32_t write_pos;
+    uint32_t data_size;
+} tcp_rx_buffer_t;
+
+static tcp_rx_buffer_t g_tcp_rx_buffers[MAX_TCP_CONNECTIONS];
+
+/* TCP receive */
+int tcp_recv(sock_t s, void* buf, u32 len) {
+    if (!buf || len == 0) {
+        return K_EINVAL;
+    }
+    
+    tcp_connection_t* conn = tcp_find_by_socket(s);
+    if (!conn) {
+        return K_EBADF;
+    }
+    
+    if (conn->state != TCP_STATE_ESTABLISHED) {
+        return K_ENOTCONN;
+    }
+    
+    /* Get connection index for buffer lookup */
+    int conn_idx = conn - g_tcp_connections;
+    tcp_rx_buffer_t* rx_buf = &g_tcp_rx_buffers[conn_idx];
+    
+    /* Copy available data to user buffer */
+    uint32_t bytes_copied = 0;
+    uint8_t* user_buf = (uint8_t*)buf;
+    
+    while (bytes_copied < len && rx_buf->data_size > 0) {
+        user_buf[bytes_copied] = rx_buf->data[rx_buf->read_pos];
+        rx_buf->read_pos = (rx_buf->read_pos + 1) % TCP_RX_BUFFER_SIZE;
+        rx_buf->data_size--;
+        bytes_copied++;
+    }
+    
+    return (int)bytes_copied;
+}

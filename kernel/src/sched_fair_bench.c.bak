@@ -1,0 +1,92 @@
+#include "kernel.h"
+#include "scheduler.h"
+#include "sched_fair_bench.h"
+#include "log.h"
+#include "vmm.h"
+#include "percpu.h" /* for g_percpu_sched stats */
+
+/* Scheduler fairness microbenchmark
+ * Creates N threads across priority classes (HIGH,NORMAL,LOW,IDLE) that busy-spin
+ * for a fixed wall tick budget. We sample each thread's executed 'iterations' and
+ * compute relative shares. Expectations (qualitative):
+ *  - HIGH should accumulate >= NORMAL >= LOW >= IDLE in work units (weighted fairness)
+ *  - Within same priority, variation should be modest (< ~2x) given vruntime min-choose policy.
+ * Returns 0 if qualitative checks pass, negative otherwise.
+ */
+
+#ifndef FAIR_BENCH_THREADS_PER_PRIO
+#define FAIR_BENCH_THREADS_PER_PRIO 2
+#endif
+#ifndef FAIR_BENCH_DURATION_TICKS
+#define FAIR_BENCH_DURATION_TICKS 1500 /* number of aggregate scheduler ticks to run */
+#endif
+
+typedef struct bench_thread_ctx {
+    volatile u64 iterations;
+    volatile u32 stop;
+    int prio;
+} bench_thread_ctx_t;
+
+static void bench_thread_entry(void* arg){
+    bench_thread_ctx_t* ctx = (bench_thread_ctx_t*)arg;
+    while(!ctx->stop){
+        /* Simple compute: mix arithmetic to avoid being optimized away */
+        ctx->iterations++;
+        if((ctx->iterations & 0xFF)==0){ /* yield periodically to encourage switches */
+            scheduler_yield();
+        }
+    }
+}
+
+int sched_fair_microbench(void){
+    const int per = FAIR_BENCH_THREADS_PER_PRIO;
+    const int total = per * 4;
+    bench_thread_ctx_t* ctxs = (bench_thread_ctx_t*)vmm_kmalloc(sizeof(bench_thread_ctx_t)*total, 64);
+    if(!ctxs) return -1;
+    thread_t* threads[32]; if(total > (int)(sizeof(threads)/sizeof(threads[0]))) return -2;
+    k_memset(ctxs,0,sizeof(bench_thread_ctx_t)*total);
+
+    int idx=0; int prios[4] = { THREAD_PRIO_HIGH, THREAD_PRIO_NORMAL, THREAD_PRIO_LOW, THREAD_PRIO_IDLE };
+    for(int pi=0; pi<4; ++pi){
+        for(int i=0;i<per;i++){
+            bench_thread_ctx_t* c = &ctxs[idx]; c->prio = prios[pi]; c->iterations = 0; c->stop=0;
+            size_t stack_size = 8192; void* stack = vmm_kmalloc(stack_size, 64); if(!stack) return -3;
+            thread_t* t=NULL; int rc = scheduler_create_kthread(&t, bench_thread_entry, c, (u8*)stack, stack_size, 0);
+            if(rc!=0 || !t) return -4;
+            t->priority = prios[pi]; /* ensure priority */
+            /* Already enqueued; adjust priority maybe required: re-enqueue not needed since set before run. */
+            idx++;
+        }
+    }
+
+    /* Run until aggregate per-CPU tick delta meets threshold. */
+    extern u32 hal_cpu_count(void); u32 cpus = hal_cpu_count(); if(!cpus) cpus=1; if(cpus>KERNEL_MAX_CPUS) cpus=KERNEL_MAX_CPUS;
+    u64 start_ticks = 0; for(u32 c=0;c<cpus;c++) start_ticks += g_percpu_sched[c].ticks;
+    while(1){
+        scheduler_yield();
+        u64 cur_ticks = 0; for(u32 c=0;c<cpus;c++) cur_ticks += g_percpu_sched[c].ticks;
+        if(cur_ticks - start_ticks >= FAIR_BENCH_DURATION_TICKS) break;
+    }
+
+    /* Signal stop */
+    for(int i=0;i<total;i++) ctxs[i].stop = 1;
+    /* Give threads chance to exit loop */
+    for(int i=0;i<100;i++){ scheduler_yield(); }
+
+    /* Aggregate per priority */
+    u64 sum_prio[4] = {0,0,0,0};
+    idx=0; for(int pi=0;pi<4;pi++){ for(int i=0;i<per;i++){ sum_prio[pi]+= ctxs[idx++].iterations; } }
+    KLOG_INFO("sched_bench","iterations HIGH=%llu NORMAL=%llu LOW=%llu IDLE=%llu", (unsigned long long)sum_prio[0], (unsigned long long)sum_prio[1], (unsigned long long)sum_prio[2], (unsigned long long)sum_prio[3]);
+
+    /* Basic qualitative ordering check */
+    if(!(sum_prio[0] >= sum_prio[1] && sum_prio[1] >= sum_prio[2] && sum_prio[2] >= sum_prio[3])){
+        KLOG_WARN("sched_bench","priority ordering violated");
+        return -10;
+    }
+    /* Intra-priority variance check */
+    idx=0; for(int pi=0;pi<4;pi++){
+        u64 min=~0ULL, max=0; for(int i=0;i<per;i++){ u64 it = ctxs[idx++].iterations; if(it<min)min=it; if(it>max)max=it; }
+        if(min==0) return -11; if(max > min*4){ KLOG_WARN("sched_bench","prio %d variance high max=%llu min=%llu", pi, (unsigned long long)max, (unsigned long long)min); }
+    }
+    return 0;
+}

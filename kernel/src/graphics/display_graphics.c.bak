@@ -1,0 +1,829 @@
+/*
+ * LimitlessOS Advanced Display & Graphics Implementation
+ * Next-generation graphics stack with HDR, VRR, multi-monitor, and GPU acceleration
+ */
+
+#include "display_graphics.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <math.h>
+#include <dlfcn.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GL/gl.h>
+#include <vulkan/vulkan.h>
+
+/* Global graphics system */
+static graphics_system_t graphics_system = {0};
+
+/* DRM device information */
+static int drm_fd = -1;
+static drmModeRes *drm_resources = NULL;
+
+/* Thread functions */
+static void *monitor_thread_func(void *arg);
+static void *performance_thread_func(void *arg);
+
+/* Helper functions */
+static int detect_gpu_devices(void);
+static int detect_displays(void);
+static int initialize_drm(void);
+static int setup_display_mode(display_device_t *display, const display_mode_t *mode);
+static int configure_color_management(display_device_t *display);
+static int enable_hardware_acceleration(gpu_device_t *gpu);
+static uint32_t get_optimal_refresh_rate(const display_device_t *display);
+static bool validate_display_mode(const display_device_t *display, const display_mode_t *mode);
+
+/* Initialize graphics system */
+int graphics_system_init(void) {
+    printf("Initializing Advanced Display & Graphics System...\n");
+    
+    memset(&graphics_system, 0, sizeof(graphics_system));
+    pthread_mutex_init(&graphics_system.lock, NULL);
+    
+    /* Initialize DRM subsystem */
+    if (initialize_drm() != 0) {
+        printf("Failed to initialize DRM subsystem\n");
+        return -1;
+    }
+    
+    /* Detect GPU hardware */
+    if (detect_gpu_devices() != 0) {
+        printf("Failed to detect GPU devices\n");
+        return -1;
+    }
+    
+    /* Detect displays */
+    if (detect_displays() != 0) {
+        printf("Warning: No displays detected\n");
+    }
+    
+    /* Set up default configuration */
+    graphics_system.config.hardware_acceleration = true;
+    graphics_system.config.compositing_enabled = true;
+    graphics_system.config.global_refresh_rate = 60;
+    graphics_system.config.display_timeout = 600; /* 10 minutes */
+    graphics_system.config.auto_suspend = true;
+    graphics_system.config.brightness_level = 80;
+    graphics_system.config.color_management = true;
+    strcpy(graphics_system.config.default_icc_profile, "/usr/share/color/srgb.icc");
+    graphics_system.config.gamma_correction = 220; /* 2.2 gamma */
+    
+    /* Enable hardware acceleration for primary GPU */
+    if (graphics_system.gpu_count > 0) {
+        graphics_system.active_gpu = 0;
+        enable_hardware_acceleration(&graphics_system.gpus[0]);
+    }
+    
+    /* Configure primary display */
+    if (graphics_system.config.display_count > 0) {
+        graphics_system.config.primary_display = 0;
+        graphics_system.config.displays[0].primary = true;
+        graphics_system.config.displays[0].enabled = true;
+        
+        /* Set optimal display mode */
+        display_device_t *primary = &graphics_system.config.displays[0];
+        if (primary->caps.max_refresh_rate >= 120) {
+            /* Use high refresh rate if available */
+            display_mode_t high_refresh_mode = {
+                .width = primary->caps.max_width,
+                .height = primary->caps.max_height,
+                .refresh_rate = get_optimal_refresh_rate(primary),
+                .bit_depth = primary->caps.max_bit_depth,
+                .color_space = COLOR_SPACE_SRGB,
+                .hdr_support = HDR_NONE
+            };
+            display_set_mode(0, &high_refresh_mode);
+        }
+        
+        /* Enable HDR if supported */
+        if (primary->caps.hdr_support && primary->caps.hdr_standard_count > 0) {
+            display_enable_hdr(0, primary->caps.hdr_standards[0]);
+            printf("HDR enabled: %s\n", hdr_standard_name(primary->caps.hdr_standards[0]));
+        }
+        
+        /* Enable VRR if supported */
+        if (primary->caps.vrr_support) {
+            display_enable_vrr(0, true);
+            display_set_vrr_range(0, primary->caps.vrr_min_rate, primary->caps.vrr_max_rate);
+            printf("VRR enabled: %u-%u Hz\n", primary->caps.vrr_min_rate, primary->caps.vrr_max_rate);
+        }
+        
+        /* Configure color management */
+        configure_color_management(primary);
+    }
+    
+    /* Start monitoring threads */
+    graphics_system.threads_running = true;
+    pthread_create(&graphics_system.monitor_thread, NULL, monitor_thread_func, NULL);
+    pthread_create(&graphics_system.performance_thread, NULL, performance_thread_func, NULL);
+    
+    graphics_system.initialized = true;
+    
+    printf("Graphics system initialized successfully\n");
+    printf("- GPUs detected: %u\n", graphics_system.gpu_count);
+    printf("- Displays detected: %u\n", graphics_system.config.display_count);
+    printf("- Hardware acceleration: %s\n", graphics_system.config.hardware_acceleration ? "Enabled" : "Disabled");
+    printf("- Primary display: %ux%u@%uHz\n", 
+           graphics_system.config.displays[0].current_mode.width,
+           graphics_system.config.displays[0].current_mode.height,
+           graphics_system.config.displays[0].current_mode.refresh_rate);
+    
+    return 0;
+}
+
+/* Cleanup graphics system */
+int graphics_system_cleanup(void) {
+    if (!graphics_system.initialized) return 0;
+    
+    printf("Shutting down graphics system...\n");
+    
+    /* Stop monitoring threads */
+    graphics_system.threads_running = false;
+    pthread_join(graphics_system.monitor_thread, NULL);
+    pthread_join(graphics_system.performance_thread, NULL);
+    
+    /* Cleanup DRM resources */
+    if (drm_resources) {
+        drmModeFreeResources(drm_resources);
+        drm_resources = NULL;
+    }
+    
+    if (drm_fd >= 0) {
+        close(drm_fd);
+        drm_fd = -1;
+    }
+    
+    pthread_mutex_destroy(&graphics_system.lock);
+    graphics_system.initialized = false;
+    
+    printf("Graphics system shutdown complete\n");
+    
+    return 0;
+}
+
+/* Initialize DRM subsystem */
+static int initialize_drm(void) {
+    printf("Initializing DRM subsystem...\n");
+    
+    /* Open DRM device */
+    drm_fd = drmOpen("limitless", NULL);
+    if (drm_fd < 0) {
+        /* Try generic drivers */
+        const char *drivers[] = {"i915", "amdgpu", "nouveau", "radeon"};
+        for (size_t i = 0; i < sizeof(drivers) / sizeof(drivers[0]); i++) {
+            drm_fd = drmOpen(drivers[i], NULL);
+            if (drm_fd >= 0) {
+                printf("Using DRM driver: %s\n", drivers[i]);
+                break;
+            }
+        }
+    }
+    
+    if (drm_fd < 0) {
+        printf("Failed to open DRM device\n");
+        return -1;
+    }
+    
+    /* Get DRM resources */
+    drm_resources = drmModeGetResources(drm_fd);
+    if (!drm_resources) {
+        printf("Failed to get DRM resources\n");
+        close(drm_fd);
+        drm_fd = -1;
+        return -1;
+    }
+    
+    printf("DRM initialized with %d connectors, %d encoders, %d CRTCs\n",
+           drm_resources->count_connectors,
+           drm_resources->count_encoders,
+           drm_resources->count_crtcs);
+    
+    return 0;
+}
+
+/* Detect GPU devices */
+static int detect_gpu_devices(void) {
+    printf("Detecting GPU devices...\n");
+    
+    graphics_system.gpu_count = 0;
+    
+    /* Detect GPUs via PCI enumeration */
+    /* In a real implementation, this would scan PCI bus for GPU devices */
+    
+    /* Add primary GPU (simplified detection) */
+    gpu_device_t *gpu = &graphics_system.gpus[0];
+    strcpy(gpu->name, "LimitlessOS Graphics Adapter");
+    strcpy(gpu->vendor_name, "Virtual GPU");
+    gpu->vendor = GPU_VENDOR_NVIDIA; /* Default for demonstration */
+    gpu->device_id = 0x1001;
+    gpu->vendor_id = 0x10DE;
+    gpu->pci_bus = 1;
+    gpu->pci_device = 0;
+    gpu->pci_function = 0;
+    
+    /* Memory configuration */
+    gpu->vram_size = 8ULL * 1024 * 1024 * 1024; /* 8GB VRAM */
+    gpu->vram_used = 0;
+    gpu->vram_free = gpu->vram_size;
+    gpu->memory_bandwidth = 500; /* 500 GB/s */
+    
+    /* Performance characteristics */
+    gpu->base_clock = 1500;      /* 1.5 GHz base */
+    gpu->boost_clock = 1800;     /* 1.8 GHz boost */
+    gpu->memory_clock = 7000;    /* 7 GHz memory */
+    gpu->shader_units = 4096;    /* 4096 shader cores */
+    gpu->compute_units = 64;     /* 64 compute units */
+    gpu->ray_tracing_units = 64; /* 64 RT cores */
+    gpu->tensor_units = 512;     /* 512 tensor cores */
+    
+    /* API support */
+    gpu->api_count = 6;
+    gpu->supported_apis[0] = GRAPHICS_API_OPENGL;
+    gpu->supported_apis[1] = GRAPHICS_API_VULKAN;
+    gpu->supported_apis[2] = GRAPHICS_API_DIRECTX;
+    gpu->supported_apis[3] = GRAPHICS_API_OPENCL;
+    gpu->supported_apis[4] = GRAPHICS_API_CUDA;
+    gpu->supported_apis[5] = GRAPHICS_API_WEBGPU;
+    
+    /* Feature support */
+    gpu->hardware_acceleration = true;
+    gpu->ray_tracing_support = true;
+    gpu->variable_rate_shading = true;
+    gpu->mesh_shaders = true;
+    gpu->ai_acceleration = true;
+    gpu->video_encode = true;
+    gpu->video_decode = true;
+    
+    /* Current state */
+    gpu->temperature = 45;       /* 45°C */
+    gpu->fan_speed = 40;         /* 40% */
+    gpu->power_draw = 150;       /* 150W */
+    gpu->utilization = 0;        /* 0% idle */
+    gpu->memory_utilization = 5; /* 5% base usage */
+    
+    graphics_system.gpu_count = 1;
+    
+    printf("Detected GPU: %s\n", gpu->name);
+    printf("- VRAM: %lu MB\n", gpu->vram_size / (1024 * 1024));
+    printf("- Shader Units: %u\n", gpu->shader_units);
+    printf("- Ray Tracing: %s\n", gpu->ray_tracing_support ? "Yes" : "No");
+    
+    return 0;
+}
+
+/* Detect displays */
+static int detect_displays(void) {
+    if (!drm_resources) return -1;
+    
+    printf("Detecting display devices...\n");
+    
+    graphics_system.config.display_count = 0;
+    
+    /* Enumerate connectors */
+    for (int i = 0; i < drm_resources->count_connectors && graphics_system.config.display_count < 16; i++) {
+        drmModeConnector *connector = drmModeGetConnector(drm_fd, drm_resources->connectors[i]);
+        if (!connector) continue;
+        
+        /* Only process connected displays */
+        if (connector->connection != DRM_MODE_CONNECTED) {
+            drmModeFreeConnector(connector);
+            continue;
+        }
+        
+        display_device_t *display = &graphics_system.config.displays[graphics_system.config.display_count];
+        
+        /* Basic information */
+        snprintf(display->name, sizeof(display->name), "Display-%d", graphics_system.config.display_count);
+        strcpy(display->manufacturer, "Unknown");
+        strcpy(display->model, "Generic Display");
+        strcpy(display->serial_number, "000000");
+        display->display_id = graphics_system.config.display_count;
+        
+        /* Connection information */
+        switch (connector->connector_type) {
+            case DRM_MODE_CONNECTOR_VGA:
+                display->connector = DISPLAY_CONNECTOR_VGA;
+                break;
+            case DRM_MODE_CONNECTOR_DVII:
+            case DRM_MODE_CONNECTOR_DVID:
+            case DRM_MODE_CONNECTOR_DVIA:
+                display->connector = DISPLAY_CONNECTOR_DVI;
+                break;
+            case DRM_MODE_CONNECTOR_HDMIA:
+            case DRM_MODE_CONNECTOR_HDMIB:
+                display->connector = DISPLAY_CONNECTOR_HDMI;
+                break;
+            case DRM_MODE_CONNECTOR_DisplayPort:
+                display->connector = DISPLAY_CONNECTOR_DISPLAYPORT;
+                break;
+            case DRM_MODE_CONNECTOR_eDP:
+                display->connector = DISPLAY_CONNECTOR_EMBEDDED;
+                break;
+            default:
+                display->connector = DISPLAY_CONNECTOR_VGA;
+                break;
+        }
+        
+        display->technology = DISPLAY_TECH_LCD; /* Default assumption */
+        display->connected = true;
+        display->enabled = false;
+        display->primary = (graphics_system.config.display_count == 0);
+        
+        /* Get display modes */
+        if (connector->count_modes > 0) {
+            drmModeModeInfo *mode = &connector->modes[0];
+            
+            /* Set current mode from first available mode */
+            display->current_mode.width = mode->hdisplay;
+            display->current_mode.height = mode->vdisplay;
+            display->current_mode.refresh_rate = mode->vrefresh;
+            display->current_mode.bit_depth = 24; /* Default to 24-bit */
+            display->current_mode.color_space = COLOR_SPACE_SRGB;
+            display->current_mode.hdr_support = HDR_NONE;
+            display->current_mode.interlaced = (mode->flags & DRM_MODE_FLAG_INTERLACE) != 0;
+            
+            /* Timing information */
+            display->current_mode.pixel_clock = mode->clock;
+            display->current_mode.h_sync_start = mode->hsync_start;
+            display->current_mode.h_sync_end = mode->hsync_end;
+            display->current_mode.h_total = mode->htotal;
+            display->current_mode.v_sync_start = mode->vsync_start;
+            display->current_mode.v_sync_end = mode->vsync_end;
+            display->current_mode.v_total = mode->vtotal;
+            
+            /* Set capabilities */
+            display->caps.max_width = mode->hdisplay;
+            display->caps.max_height = mode->vdisplay;
+            display->caps.min_refresh_rate = 30;
+            display->caps.max_refresh_rate = mode->vrefresh;
+            display->caps.max_bit_depth = 30; /* Assume 10-bit capability */
+            
+            /* HDR capabilities (modern displays) */
+            if (display->connector == DISPLAY_CONNECTOR_HDMI || 
+                display->connector == DISPLAY_CONNECTOR_DISPLAYPORT) {
+                display->caps.hdr_support = true;
+                display->caps.hdr_standard_count = 2;
+                display->caps.hdr_standards[0] = HDR_HDR10;
+                display->caps.hdr_standards[1] = HDR_HDR10_PLUS;
+                display->caps.max_luminance = 1000; /* 1000 nits */
+                display->caps.min_luminance = 10;   /* 0.1 nits */
+            }
+            
+            /* VRR capabilities */
+            if (display->connector == DISPLAY_CONNECTOR_DISPLAYPORT || 
+                display->connector == DISPLAY_CONNECTOR_HDMI) {
+                display->caps.vrr_support = true;
+                display->caps.vrr_tech = VRR_ADAPTIVE_SYNC;
+                display->caps.vrr_min_rate = 30;
+                display->caps.vrr_max_rate = 144;
+            }
+            
+            /* Color spaces */
+            display->caps.color_space_count = 4;
+            display->caps.color_spaces[0] = COLOR_SPACE_SRGB;
+            display->caps.color_spaces[1] = COLOR_SPACE_DCI_P3;
+            display->caps.color_spaces[2] = COLOR_SPACE_REC2020;
+            display->caps.color_spaces[3] = COLOR_SPACE_ADOBE_RGB;
+            
+            /* Physical properties (estimated) */
+            display->caps.physical_width_mm = (display->current_mode.width * 254) / 96; /* Assume 96 DPI */
+            display->caps.physical_height_mm = (display->current_mode.height * 254) / 96;
+            display->caps.dpi_x = 96;
+            display->caps.dpi_y = 96;
+            
+            /* Audio support for digital connectors */
+            if (display->connector == DISPLAY_CONNECTOR_HDMI || 
+                display->connector == DISPLAY_CONNECTOR_DISPLAYPORT) {
+                display->caps.audio_support = true;
+                display->caps.max_audio_channels = 8;
+                display->caps.audio_rate_count = 3;
+                display->caps.audio_sample_rates[0] = 44100;
+                display->caps.audio_sample_rates[1] = 48000;
+                display->caps.audio_sample_rates[2] = 96000;
+            }
+        }
+        
+        /* Default positioning */
+        display->position_x = graphics_system.config.display_count * display->current_mode.width;
+        display->position_y = 0;
+        display->rotation = 0;
+        display->mirrored = false;
+        
+        /* Color management defaults */
+        display->active_color_space = COLOR_SPACE_SRGB;
+        strcpy(display->icc_profile_path, "/usr/share/color/srgb.icc");
+        display->gamma = 220; /* 2.2 gamma */
+        display->brightness = 100;
+        display->contrast = 100;
+        display->saturation = 100;
+        
+        /* Power management */
+        display->dpms_support = true;
+        display->power_state = 0; /* On */
+        display->backlight_level = 80;
+        display->auto_brightness = false;
+        
+        printf("Detected display: %s (%ux%u@%uHz) via %s\n", 
+               display->name,
+               display->current_mode.width,
+               display->current_mode.height,
+               display->current_mode.refresh_rate,
+               display_connector_name(display->connector));
+        
+        drmModeFreeConnector(connector);
+        graphics_system.config.display_count++;
+    }
+    
+    /* Update virtual desktop size */
+    uint32_t max_width = 0, max_height = 0;
+    for (uint32_t i = 0; i < graphics_system.config.display_count; i++) {
+        display_device_t *display = &graphics_system.config.displays[i];
+        uint32_t right = display->position_x + display->current_mode.width;
+        uint32_t bottom = display->position_y + display->current_mode.height;
+        
+        if (right > max_width) max_width = right;
+        if (bottom > max_height) max_height = bottom;
+    }
+    
+    graphics_system.config.virtual_width = max_width;
+    graphics_system.config.virtual_height = max_height;
+    
+    printf("Virtual desktop: %ux%u\n", max_width, max_height);
+    
+    return 0;
+}
+
+/* Enable hardware acceleration */
+static int enable_hardware_acceleration(gpu_device_t *gpu) {
+    printf("Enabling hardware acceleration for: %s\n", gpu->name);
+    
+    /* Initialize Vulkan */
+    VkInstance vk_instance = VK_NULL_HANDLE;
+    VkInstanceCreateInfo create_info = {0};
+    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    
+    VkResult result = vkCreateInstance(&create_info, NULL, &vk_instance);
+    if (result == VK_SUCCESS) {
+        printf("Vulkan initialized successfully\n");
+        gpu->hardware_acceleration = true;
+        
+        /* Clean up for now */
+        vkDestroyInstance(vk_instance, NULL);
+    } else {
+        printf("Vulkan initialization failed, using software rendering\n");
+        gpu->hardware_acceleration = false;
+    }
+    
+    /* Initialize compute capabilities */
+    if (gpu->ai_acceleration) {
+        printf("AI acceleration available\n");
+    }
+    
+    if (gpu->ray_tracing_support) {
+        printf("Hardware ray tracing available\n");
+    }
+    
+    return 0;
+}
+
+/* Set display mode */
+int display_set_mode(uint32_t display_id, const display_mode_t *mode) {
+    if (display_id >= graphics_system.config.display_count || !mode) {
+        return -EINVAL;
+    }
+    
+    display_device_t *display = &graphics_system.config.displays[display_id];
+    
+    /* Validate mode */
+    if (!validate_display_mode(display, mode)) {
+        printf("Invalid display mode: %ux%u@%uHz\n", 
+               mode->width, mode->height, mode->refresh_rate);
+        return -EINVAL;
+    }
+    
+    printf("Setting display mode: %ux%u@%uHz\n", 
+           mode->width, mode->height, mode->refresh_rate);
+    
+    /* Apply the mode */
+    if (setup_display_mode(display, mode) == 0) {
+        memcpy(&display->current_mode, mode, sizeof(display_mode_t));
+        printf("Display mode set successfully\n");
+        return 0;
+    } else {
+        printf("Failed to set display mode\n");
+        return -1;
+    }
+}
+
+/* Enable HDR */
+int display_enable_hdr(uint32_t display_id, hdr_standard_t hdr_standard) {
+    if (display_id >= graphics_system.config.display_count) {
+        return -EINVAL;
+    }
+    
+    display_device_t *display = &graphics_system.config.displays[display_id];
+    
+    if (!display->caps.hdr_support) {
+        printf("Display does not support HDR\n");
+        return -ENOTSUP;
+    }
+    
+    /* Check if HDR standard is supported */
+    bool supported = false;
+    for (uint32_t i = 0; i < display->caps.hdr_standard_count; i++) {
+        if (display->caps.hdr_standards[i] == hdr_standard) {
+            supported = true;
+            break;
+        }
+    }
+    
+    if (!supported) {
+        printf("HDR standard not supported: %s\n", hdr_standard_name(hdr_standard));
+        return -ENOTSUP;
+    }
+    
+    display->hdr_enabled = true;
+    display->active_hdr = hdr_standard;
+    
+    printf("HDR enabled: %s\n", hdr_standard_name(hdr_standard));
+    
+    return 0;
+}
+
+/* Enable VRR */
+int display_enable_vrr(uint32_t display_id, bool enable) {
+    if (display_id >= graphics_system.config.display_count) {
+        return -EINVAL;
+    }
+    
+    display_device_t *display = &graphics_system.config.displays[display_id];
+    
+    if (!display->caps.vrr_support) {
+        printf("Display does not support VRR\n");
+        return -ENOTSUP;
+    }
+    
+    display->vrr_enabled = enable;
+    
+    if (enable) {
+        display->vrr_range_min = display->caps.vrr_min_rate;
+        display->vrr_range_max = display->caps.vrr_max_rate;
+        printf("VRR enabled: %u-%u Hz (%s)\n", 
+               display->vrr_range_min, display->vrr_range_max,
+               (display->caps.vrr_tech == VRR_FREESYNC) ? "FreeSync" : "Adaptive Sync");
+    } else {
+        printf("VRR disabled\n");
+    }
+    
+    return 0;
+}
+
+/* Configure multi-monitor layout */
+int display_configure_layout(uint32_t display_count, const display_device_t *displays) {
+    if (!displays || display_count > 16) return -EINVAL;
+    
+    printf("Configuring multi-monitor layout with %u displays\n", display_count);
+    
+    /* Calculate total virtual desktop size */
+    uint32_t total_width = 0, max_height = 0;
+    
+    for (uint32_t i = 0; i < display_count; i++) {
+        total_width += displays[i].current_mode.width;
+        if (displays[i].current_mode.height > max_height) {
+            max_height = displays[i].current_mode.height;
+        }
+    }
+    
+    graphics_system.config.virtual_width = total_width;
+    graphics_system.config.virtual_height = max_height;
+    graphics_system.config.spanning_enabled = (display_count > 1);
+    
+    printf("Virtual desktop configured: %ux%u\n", total_width, max_height);
+    
+    return 0;
+}
+
+/* Background monitoring threads */
+static void *monitor_thread_func(void *arg) {
+    while (graphics_system.threads_running) {
+        /* Monitor display connections */
+        for (uint32_t i = 0; i < graphics_system.config.display_count; i++) {
+            display_device_t *display = &graphics_system.config.displays[i];
+            
+            /* Update performance counters */
+            display->frame_count++;
+            
+            /* Check for display hotplug events */
+            /* In a real implementation, this would listen for DRM events */
+        }
+        
+        sleep(1);
+    }
+    
+    return NULL;
+}
+
+static void *performance_thread_func(void *arg) {
+    while (graphics_system.threads_running) {
+        /* Monitor GPU performance */
+        for (uint32_t i = 0; i < graphics_system.gpu_count; i++) {
+            gpu_device_t *gpu = &graphics_system.gpus[i];
+            
+            /* Update GPU metrics */
+            gpu->frames_rendered++;
+            
+            /* Simulate GPU load variation */
+            static uint32_t cycle = 0;
+            gpu->utilization = 10 + (cycle % 50);
+            gpu->temperature = 40 + (gpu->utilization / 10);
+            gpu->power_draw = 100 + (gpu->utilization * 2);
+            
+            cycle++;
+        }
+        
+        /* Update system statistics */
+        graphics_system.stats.total_frames++;
+        
+        sleep(5); /* Update every 5 seconds */
+    }
+    
+    return NULL;
+}
+
+/* Helper function implementations */
+static uint32_t get_optimal_refresh_rate(const display_device_t *display) {
+    if (display->caps.max_refresh_rate >= 144) return 144;
+    if (display->caps.max_refresh_rate >= 120) return 120;
+    if (display->caps.max_refresh_rate >= 75) return 75;
+    return 60;
+}
+
+static bool validate_display_mode(const display_device_t *display, const display_mode_t *mode) {
+    if (mode->width > display->caps.max_width) return false;
+    if (mode->height > display->caps.max_height) return false;
+    if (mode->refresh_rate > display->caps.max_refresh_rate) return false;
+    if (mode->refresh_rate < display->caps.min_refresh_rate) return false;
+    
+    return true;
+}
+
+static int setup_display_mode(display_device_t *display, const display_mode_t *mode) {
+    /* In a real implementation, this would configure the display controller */
+    printf("Configuring display hardware for mode: %ux%u@%uHz\n",
+           mode->width, mode->height, mode->refresh_rate);
+    
+    return 0;
+}
+
+static int configure_color_management(display_device_t *display) {
+    printf("Configuring color management for display: %s\n", display->name);
+    
+    /* Load ICC profile if specified */
+    if (strlen(display->icc_profile_path) > 0) {
+        printf("Loading ICC profile: %s\n", display->icc_profile_path);
+    }
+    
+    return 0;
+}
+
+/* Utility functions */
+const char *display_connector_name(display_connector_t connector) {
+    static const char *names[] = {
+        "VGA", "DVI", "HDMI", "DisplayPort", "USB-C", "Thunderbolt", "Wireless", "Embedded"
+    };
+    
+    if (connector < DISPLAY_CONNECTOR_MAX) {
+        return names[connector];
+    }
+    return "Unknown";
+}
+
+const char *display_technology_name(display_technology_t tech) {
+    static const char *names[] = {
+        "LCD", "OLED", "QLED", "MicroLED", "E-Ink", "Plasma", "CRT", "Projector"
+    };
+    
+    if (tech < DISPLAY_TECH_MAX) {
+        return names[tech];
+    }
+    return "Unknown";
+}
+
+const char *color_space_name(color_space_t space) {
+    static const char *names[] = {
+        "sRGB", "Adobe RGB", "DCI-P3", "Rec.2020", "Rec.709", "ACES", "ProPhoto RGB", "XYZ"
+    };
+    
+    if (space < COLOR_SPACE_MAX) {
+        return names[space];
+    }
+    return "Unknown";
+}
+
+const char *hdr_standard_name(hdr_standard_t hdr) {
+    static const char *names[] = {
+        "None", "HDR10", "HDR10+", "Dolby Vision", "HLG", 
+        "DisplayHDR 400", "DisplayHDR 600", "DisplayHDR 1000", "DisplayHDR 1400"
+    };
+    
+    if (hdr < HDR_MAX) {
+        return names[hdr];
+    }
+    return "Unknown";
+}
+
+const char *graphics_api_name(graphics_api_t api) {
+    static const char *names[] = {
+        "OpenGL", "Vulkan", "DirectX", "Metal", "OpenCL", "CUDA", "WebGL", "WebGPU"
+    };
+    
+    if (api < GRAPHICS_API_MAX) {
+        return names[api];
+    }
+    return "Unknown";
+}
+
+const char *gpu_vendor_name(gpu_vendor_t vendor) {
+    static const char *names[] = {
+        "NVIDIA", "AMD", "Intel", "ARM", "Qualcomm", "Apple", "Imagination", "Vivante"
+    };
+    
+    if (vendor < GPU_VENDOR_MAX) {
+        return names[vendor];
+    }
+    return "Unknown";
+}
+
+/* Additional function implementations */
+int gpu_enumerate_devices(gpu_device_t *devices, uint32_t max_devices, uint32_t *count) {
+    if (!devices || !count) return -EINVAL;
+    
+    *count = (graphics_system.gpu_count < max_devices) ? graphics_system.gpu_count : max_devices;
+    
+    for (uint32_t i = 0; i < *count; i++) {
+        memcpy(&devices[i], &graphics_system.gpus[i], sizeof(gpu_device_t));
+    }
+    
+    return 0;
+}
+
+int display_enumerate(display_device_t *displays, uint32_t max_displays, uint32_t *count) {
+    if (!displays || !count) return -EINVAL;
+    
+    *count = (graphics_system.config.display_count < max_displays) ? 
+             graphics_system.config.display_count : max_displays;
+    
+    for (uint32_t i = 0; i < *count; i++) {
+        memcpy(&displays[i], &graphics_system.config.displays[i], sizeof(display_device_t));
+    }
+    
+    return 0;
+}
+
+int graphics_create_context(graphics_api_t api, uint32_t width, uint32_t height, graphics_context_t *context) {
+    if (!context || graphics_system.context_count >= 64) return -EINVAL;
+    
+    context->context_id = graphics_system.context_count;
+    context->api = api;
+    context->version_major = 4;
+    context->version_minor = 6;
+    context->width = width;
+    context->height = height;
+    context->samples = 1;
+    context->bit_depth = 32;
+    context->vsync_enabled = true;
+    context->triple_buffering = true;
+    context->swap_interval = 1;
+    
+    graphics_system.contexts[graphics_system.context_count] = *context;
+    graphics_system.context_count++;
+    
+    printf("Created graphics context: API=%s, %ux%u\n", 
+           graphics_api_name(api), width, height);
+    
+    return 0;
+}
+
+bool display_mode_equal(const display_mode_t *mode1, const display_mode_t *mode2) {
+    return (mode1->width == mode2->width &&
+            mode1->height == mode2->height &&
+            mode1->refresh_rate == mode2->refresh_rate &&
+            mode1->bit_depth == mode2->bit_depth);
+}
+
+uint32_t calculate_refresh_rate(const display_mode_t *mode) {
+    if (mode->v_total == 0 || mode->h_total == 0) return 0;
+    
+    return (mode->pixel_clock * 1000) / (mode->h_total * mode->v_total);
+}

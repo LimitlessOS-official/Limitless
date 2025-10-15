@@ -1,0 +1,221 @@
+/*
+ * PCI Bus Enumeration and Device Discovery
+ * Provides basic PCI device detection and configuration
+ */
+
+#include "kernel.h"
+
+/* PCI Configuration Space Registers */
+#define PCI_VENDOR_ID           0x00
+#define PCI_DEVICE_ID           0x02
+#define PCI_COMMAND             0x04
+#define PCI_STATUS              0x06
+#define PCI_REVISION_ID         0x08
+#define PCI_PROG_IF             0x09
+#define PCI_SUBCLASS            0x0A
+#define PCI_CLASS_CODE          0x0B
+#define PCI_CACHE_LINE_SIZE     0x0C
+#define PCI_LATENCY_TIMER       0x0D
+#define PCI_HEADER_TYPE         0x0E
+#define PCI_BIST                0x0F
+
+/* PCI Class Codes */
+#define PCI_CLASS_STORAGE       0x01
+#define PCI_CLASS_NETWORK       0x02
+#define PCI_CLASS_DISPLAY       0x03
+#define PCI_CLASS_MULTIMEDIA    0x04
+#define PCI_CLASS_BRIDGE        0x06
+#define PCI_CLASS_SERIAL        0x0C
+
+/* Storage Subclasses */
+#define PCI_SUBCLASS_IDE        0x01
+#define PCI_SUBCLASS_SATA       0x06
+#define PCI_SUBCLASS_NVME       0x08
+
+/* Network Subclasses */
+#define PCI_SUBCLASS_ETHERNET   0x00
+#define PCI_SUBCLASS_WIFI       0x80
+
+/* USB Subclasses */
+#define PCI_SUBCLASS_USB_OHCI   0x10
+#define PCI_SUBCLASS_USB_EHCI   0x20
+#define PCI_SUBCLASS_USB_XHCI   0x30
+
+/* PCI Device Structure */
+typedef struct pci_device {
+    u8 bus;
+    u8 device;
+    u8 function;
+    u16 vendor_id;
+    u16 device_id;
+    u8 class_code;
+    u8 subclass;
+    u8 prog_if;
+    const char* device_name;
+    struct pci_device* next;
+} pci_device_t;
+
+/* Global PCI device list */
+static pci_device_t* g_pci_devices = NULL;
+static u32 g_pci_device_count = 0;
+
+/* Known PCI Vendors - removed to avoid unused function warning */
+
+/* Get device name based on class/subclass */
+static const char* pci_get_device_name(u8 class_code, u8 subclass, u8 prog_if) {
+    switch (class_code) {
+        case PCI_CLASS_STORAGE:
+            switch (subclass) {
+                case PCI_SUBCLASS_IDE: return "IDE Controller";
+                case PCI_SUBCLASS_SATA: return "SATA Controller";
+                case PCI_SUBCLASS_NVME: return "NVMe Controller";
+                default: return "Storage Controller";
+            }
+        case PCI_CLASS_NETWORK:
+            switch (subclass) {
+                case PCI_SUBCLASS_ETHERNET: return "Ethernet Controller";
+                case PCI_SUBCLASS_WIFI: return "WiFi Controller";
+                default: return "Network Controller";
+            }
+        case PCI_CLASS_DISPLAY:
+            return "Display Controller";
+        case PCI_CLASS_MULTIMEDIA:
+            return "Multimedia Controller";
+        case PCI_CLASS_BRIDGE:
+            return "Bridge Device";
+        case PCI_CLASS_SERIAL:
+            switch (subclass) {
+                case PCI_SUBCLASS_USB_OHCI: return "USB OHCI Controller";
+                case PCI_SUBCLASS_USB_EHCI: return "USB EHCI Controller";  
+                case PCI_SUBCLASS_USB_XHCI: return "USB xHCI Controller";
+                default: return "Serial Controller";
+            }
+        default:
+            return "Unknown Device";
+    }
+}
+
+/* Read PCI configuration register */
+static u32 pci_config_read32(u8 bus, u8 device, u8 function, u8 offset) {
+    /* Use HAL function to read PCI config */
+    return hal_pci_cfg_read32(bus, device, function, offset);
+}
+
+/* Check if device exists */
+static bool pci_device_exists(u8 bus, u8 device, u8 function) {
+    u32 vendor_device = pci_config_read32(bus, device, function, PCI_VENDOR_ID);
+    return (vendor_device != 0xFFFFFFFF) && ((vendor_device & 0xFFFF) != 0xFFFF);
+}
+
+/* Add device to global list */
+static void pci_add_device(u8 bus, u8 device, u8 function, 
+                          u16 vendor_id, u16 device_id,
+                          u8 class_code, u8 subclass, u8 prog_if) {
+    pci_device_t* dev = (pci_device_t*)kalloc(sizeof(pci_device_t));
+    if (!dev) return;
+    
+    dev->bus = bus;
+    dev->device = device;
+    dev->function = function;
+    dev->vendor_id = vendor_id;
+    dev->device_id = device_id;
+    dev->class_code = class_code;
+    dev->subclass = subclass;
+    dev->prog_if = prog_if;
+    dev->device_name = pci_get_device_name(class_code, subclass, prog_if);
+    dev->next = g_pci_devices;
+    
+    g_pci_devices = dev;
+    g_pci_device_count++;
+}
+
+/* Scan single PCI function */
+static void pci_scan_function(u8 bus, u8 device, u8 function) {
+    if (!pci_device_exists(bus, device, function)) return;
+    
+    u32 vendor_device = pci_config_read32(bus, device, function, PCI_VENDOR_ID);
+    u16 vendor_id = vendor_device & 0xFFFF;
+    u16 device_id = (vendor_device >> 16) & 0xFFFF;
+    
+    u32 class_rev = pci_config_read32(bus, device, function, PCI_REVISION_ID);
+    u8 class_code = (class_rev >> 24) & 0xFF;
+    u8 subclass = (class_rev >> 16) & 0xFF;
+    u8 prog_if = (class_rev >> 8) & 0xFF;
+    
+    pci_add_device(bus, device, function, vendor_id, device_id, 
+                   class_code, subclass, prog_if);
+}
+
+/* Scan PCI device (may have multiple functions) */
+static void pci_scan_device(u8 bus, u8 device) {
+    if (!pci_device_exists(bus, device, 0)) return;
+    
+    /* Scan function 0 */
+    pci_scan_function(bus, device, 0);
+    
+    /* Check if multi-function device */
+    u32 header_type = pci_config_read32(bus, device, 0, PCI_HEADER_TYPE);
+    if (header_type & 0x80) {  /* Multi-function device */
+        for (u8 func = 1; func < 8; func++) {
+            pci_scan_function(bus, device, func);
+        }
+    }
+}
+
+/* Scan entire PCI bus */
+static void pci_scan_bus(u8 bus) {
+    for (u8 device = 0; device < 32; device++) {
+        pci_scan_device(bus, device);
+    }
+}
+
+/* Initialize PCI subsystem and enumerate devices */
+void pci_init(void) {
+    /* Scan all PCI buses (0-255) */
+    for (u16 bus = 0; bus < 256; bus++) {
+        pci_scan_bus((u8)bus);
+    }
+    
+    /* Print discovered devices */
+    pci_device_t* dev = g_pci_devices;
+    u32 count = 0;
+    while (dev && count < 20) {  /* Limit output */
+        /* Device info would be printed in real implementation */
+        dev = dev->next;
+        count++;
+    }
+}
+
+/* Get device count by class */
+u32 pci_get_device_count_by_class(u8 class_code) {
+    u32 count = 0;
+    pci_device_t* dev = g_pci_devices;
+    
+    while (dev) {
+        if (dev->class_code == class_code) {
+            count++;
+        }
+        dev = dev->next;
+    }
+    
+    return count;
+}
+
+/* Find first device by class and subclass */
+pci_device_t* pci_find_device_by_class(u8 class_code, u8 subclass) {
+    pci_device_t* dev = g_pci_devices;
+    
+    while (dev) {
+        if (dev->class_code == class_code && dev->subclass == subclass) {
+            return dev;
+        }
+        dev = dev->next;
+    }
+    
+    return NULL;
+}
+
+/* Get total discovered device count */
+u32 pci_get_total_device_count(void) {
+    return g_pci_device_count;
+}

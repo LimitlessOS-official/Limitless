@@ -1,0 +1,458 @@
+/*
+ * LimitlessOS Enterprise Testing S        strncpy(test_results[test_count].name, name, MAX_TEST_NAME - 1);
+        test_results[test_count].passed = test_passed;
+        if (error_msg) {
+            strncpy(test_results[test_count].error_msg, error_msg, MAX_ERROR_MSG - 1);
+        } else {
+            test_results[test_count].error_msg[0] = '\0';
+        }
+        test_results[test_count].duration_us = end_time - start_time;
+ * Comprehensive testing framework for all enterprise features
+ * This suite tests every implemented component to ensure functionality
+ */
+
+#include "kernel.h"
+#include "testing.h"
+#include "vmm.h"
+#include "enterprise_clean.h"
+
+// Forward declarations for all enterprise subsystems
+extern int advanced_smp_init(void);
+extern int advanced_iommu_init(void);
+extern int advanced_hal_init(void);
+extern int enterprise_storage_init(void);
+extern int enterprise_network_init(void);
+extern int enterprise_multimedia_init(void);
+extern int enterprise_virtualization_init(void);
+extern int enterprise_security_init(void);
+extern int enterprise_management_init(void);
+
+// Use test_result from testing.h
+
+// Global test results  
+static struct test_result test_results[256];
+static uint32_t test_count = 0;
+static uint32_t tests_passed = 0;
+static uint32_t tests_failed = 0;
+
+// Use the testing framework from testing.h
+// No need to redefine macros - they're already in testing.h
+
+// Test function prototypes
+static void test_advanced_smp_kernel(void);
+static void test_advanced_iommu(void);
+static void test_advanced_hal(void);
+static void test_enterprise_storage(void);
+static void test_enterprise_network(void);
+static void test_enterprise_multimedia(void);
+static void test_enterprise_virtualization(void);
+static void test_enterprise_security(void);
+static void test_enterprise_management(void);
+
+// Main testing function
+int enterprise_testing_suite_run(void) {
+    console_printf("\n");
+    console_printf("===========================================\n");
+    console_printf("LimitlessOS Enterprise Testing Suite\n");
+    console_printf("Testing all enterprise features...\n");
+    console_printf("===========================================\n\n");
+    
+    // Reset counters
+    test_count = 0;
+    tests_passed = 0;
+    tests_failed = 0;
+    
+    // Run all tests
+    test_advanced_smp_kernel();
+    test_advanced_iommu();
+    test_advanced_hal();
+    test_enterprise_storage();
+    test_enterprise_network();
+    test_enterprise_multimedia();
+    test_enterprise_virtualization();
+    test_enterprise_security();
+    test_enterprise_management();
+    
+    // Print summary
+    console_printf("\n");
+    console_printf("===========================================\n");
+    console_printf("TEST RESULTS SUMMARY\n");
+    console_printf("===========================================\n");
+    console_printf("Total Tests: %u\n", test_count);
+    console_printf("Passed: %u\n", tests_passed);
+    console_printf("Failed: %u\n", tests_failed);
+    console_printf("Success Rate: %.1f%%\n", ((float)tests_passed / test_count) * 100.0f);
+    console_printf("===========================================\n\n");
+    
+    // Print failed tests details
+    if (tests_failed > 0) {
+        console_printf("FAILED TESTS:\n");
+        for (uint32_t i = 0; i < test_count; i++) {
+            if (!test_results[i].passed) {
+                console_printf("- %s: %s\n", test_results[i].name, test_results[i].error_msg);
+            }
+        }
+        console_printf("\n");
+    }
+    
+    return (tests_failed == 0) ? 0 : -1;
+}
+
+// Test Advanced SMP Kernel
+static void test_advanced_smp_kernel(void) {
+    // Declare variables outside test blocks for broader scope
+    uint32_t cpu_count = smp_get_cpu_count();
+    
+    TEST_START("Advanced SMP Kernel Initialization");
+    
+    int result = advanced_smp_init();
+    TEST_ASSERT(result == 0, "SMP initialization failed");
+    
+    // Test CPU detection
+    TEST_ASSERT(cpu_count > 0, "No CPUs detected");
+    TEST_ASSERT(cpu_count <= 8192, "CPU count exceeds maximum");
+    
+    // Test NUMA topology
+    if (numa_is_available()) {
+        uint32_t numa_nodes = numa_get_node_count();
+        TEST_ASSERT(numa_nodes > 0, "NUMA available but no nodes found");
+    }
+    
+test_end:
+    TEST_END("Advanced SMP Kernel");
+    
+    // Test CPU hotplug
+    TEST_START("CPU Hotplug Support");
+    
+    if (smp_hotplug_supported()) {
+        // Test bringing CPU offline and online
+        uint32_t test_cpu = 1; // Use CPU 1 for testing
+        if (test_cpu < cpu_count) {
+            int cpu_result = smp_cpu_offline(test_cpu);
+            TEST_ASSERT(cpu_result == 0, "CPU offline failed");
+            
+            cpu_result = smp_cpu_online(test_cpu);
+            TEST_ASSERT(cpu_result == 0, "CPU online failed");
+        }
+    }
+    
+test_end_2:
+    TEST_END("CPU Hotplug Support");
+    
+    // Test IPI messaging
+    TEST_START("Inter-Processor Interrupts");
+    
+    if (cpu_count > 1) {
+        int ipi_result = smp_send_ipi(1, IPI_TYPE_RESCHEDULE);
+        TEST_ASSERT(ipi_result == 0, "IPI send failed");
+        
+        // Wait a bit and check IPI statistics
+        timer_msleep(10);
+        uint64_t ipi_count = smp_get_ipi_count();
+        TEST_ASSERT(ipi_count > 0, "No IPIs recorded");
+    }
+    
+test_end_3:
+    TEST_END("Inter-Processor Interrupts");
+}
+
+// Test Advanced IOMMU
+static void test_advanced_iommu(void) {
+    TEST_START("IOMMU Initialization");
+    
+    int result = advanced_iommu_init();
+    TEST_ASSERT(result == 0, "IOMMU initialization failed");
+    
+    // Check if IOMMU is available
+    bool iommu_available = iommu_is_available();
+    if (iommu_available) {
+        // Test IOMMU domain creation
+        uint32_t domain_id = iommu_create_domain();
+        TEST_ASSERT(domain_id != 0, "IOMMU domain creation failed");
+        
+        // Test device attachment (if devices available)
+        uint32_t device_count = iommu_get_device_count();
+        if (device_count > 0) {
+            result = iommu_attach_device(domain_id, 0);
+            TEST_ASSERT(result == 0, "Device attachment failed");
+        }
+    }
+    
+test_end:
+    TEST_END("IOMMU Support");
+}
+
+// Test Advanced HAL
+static void test_advanced_hal(void) {
+    TEST_START("Hardware Abstraction Layer");
+    
+    int result = advanced_hal_init();
+    TEST_ASSERT(result == 0, "HAL initialization failed");
+    
+    // Test platform detection
+    hal_platform_t platform = hal_get_platform();
+    TEST_ASSERT(platform != HAL_PLATFORM_UNKNOWN, "Platform detection failed");
+    
+    // Test ACPI support
+    if (hal_acpi_available()) {
+        result = hal_acpi_enumerate_devices();
+        TEST_ASSERT(result >= 0, "ACPI device enumeration failed");
+    }
+    
+    // Test UEFI support
+    if (hal_uefi_available()) {
+        result = hal_uefi_get_system_table();
+        TEST_ASSERT(result == 0, "UEFI system table access failed");
+    }
+    
+    // Test power management
+    if (hal_power_management_available()) {
+        uint32_t power_states = hal_get_supported_power_states();
+        TEST_ASSERT(power_states > 0, "No power states supported");
+    }
+    
+test_end:
+    TEST_END("Hardware Abstraction Layer");
+}
+
+// Test Enterprise Storage
+static void test_enterprise_storage(void) {
+    TEST_START("Enterprise Storage Stack");
+    
+    int result = enterprise_storage_init();
+    TEST_ASSERT(result == 0, "Storage initialization failed");
+    
+    // Test block device detection
+    uint32_t block_devices = storage_get_block_device_count();
+    TEST_ASSERT(block_devices > 0, "No block devices found");
+    
+    // Test RAID support
+    if (storage_raid_supported()) {
+        // Create a test RAID 1 array (if enough devices)
+        if (block_devices >= 2) {
+            uint32_t devices[] = {0, 1};
+            uint32_t raid_id = storage_create_raid_array(RAID_LEVEL_1, devices, 2);
+            TEST_ASSERT(raid_id != 0, "RAID array creation failed");
+            
+            // Test RAID status
+            raid_status_t status = storage_get_raid_status(raid_id);
+            TEST_ASSERT(status == RAID_STATUS_HEALTHY, "RAID array not healthy");
+        }
+    }
+    
+    // Test LVM support
+    if (storage_lvm_supported()) {
+        // Create volume group
+        uint32_t vg_id = storage_create_volume_group("test_vg");
+        TEST_ASSERT(vg_id != 0, "Volume group creation failed");
+        
+        // Create logical volume
+        uint32_t lv_id = storage_create_logical_volume(vg_id, "test_lv", 1024*1024*1024); // 1GB
+        TEST_ASSERT(lv_id != 0, "Logical volume creation failed");
+    }
+    
+test_end:
+    TEST_END("Enterprise Storage Stack");
+}
+
+// Test Enterprise Network
+static void test_enterprise_network(void) {
+    TEST_START("Enterprise Network Infrastructure");
+    
+    int result = enterprise_network_init();
+    TEST_ASSERT(result == 0, "Network initialization failed");
+    
+    // Test interface detection
+    uint32_t interface_count = network_get_interface_count();
+    TEST_ASSERT(interface_count > 0, "No network interfaces found");
+    
+    // Test loopback interface
+    network_interface_t* loopback = network_find_interface_by_name("lo");
+    TEST_ASSERT_NOT_NULL(loopback, "Loopback interface not found");
+    
+    // Test socket creation
+    network_socket_t* socket = network_socket_create(AF_INET, SOCKET_TYPE_STREAM, IP_PROTOCOL_TCP);
+    TEST_ASSERT_NOT_NULL(socket, "TCP socket creation failed");
+    
+    // Test UDP socket
+    network_socket_t* udp_socket = network_socket_create(AF_INET, SOCKET_TYPE_DGRAM, IP_PROTOCOL_UDP);
+    TEST_ASSERT_NOT_NULL(udp_socket, "UDP socket creation failed");
+    
+    // Test VPN tunnel creation
+    ipv4_addr_t local_ep = {.addr = 0x0A000001}; // 10.0.0.1
+    ipv4_addr_t remote_ep = {.addr = 0x0A000002}; // 10.0.0.2
+    uint32_t tunnel_id = network_create_vpn_tunnel("test_tunnel", VPN_TYPE_IPSEC, &local_ep, &remote_ep, AF_INET);
+    TEST_ASSERT(tunnel_id != 0, "VPN tunnel creation failed");
+    
+test_end:
+    TEST_END("Enterprise Network Infrastructure");
+}
+
+// Test Enterprise Multimedia
+static void test_enterprise_multimedia(void) {
+    TEST_START("Graphics & Multimedia Framework");
+    
+    int result = enterprise_multimedia_init();
+    TEST_ASSERT(result == 0, "Multimedia initialization failed");
+    
+    // Test graphics device detection
+    uint32_t gpu_count = multimedia_get_graphics_device_count();
+    if (gpu_count > 0) {
+        graphics_device_t* primary_gpu = multimedia_get_primary_gpu();
+        TEST_ASSERT_NOT_NULL(primary_gpu, "Primary GPU not found");
+        
+        // Test graphics context creation
+        uint32_t context_id = multimedia_create_graphics_context(primary_gpu, GRAPHICS_API_OPENGL);
+        TEST_ASSERT(context_id != 0, "Graphics context creation failed");
+    }
+    
+    // Test audio device detection
+    uint32_t audio_count = multimedia_get_audio_device_count();
+    if (audio_count > 0) {
+        audio_device_t* default_audio = multimedia_get_default_audio_device();
+        TEST_ASSERT_NOT_NULL(default_audio, "Default audio device not found");
+        
+        // Test audio configuration
+        result = multimedia_configure_audio_device(default_audio, 2, 44100, 16);
+        TEST_ASSERT(result == 0, "Audio device configuration failed");
+    }
+    
+    // Test display management
+    uint32_t display_count = multimedia_get_display_count();
+    if (display_count > 0) {
+        display_mode_t mode = {.width = 1920, .height = 1080, .refresh_rate = 60};
+        result = multimedia_set_display_mode(0, &mode);
+        TEST_ASSERT(result == 0, "Display mode setting failed");
+    }
+    
+test_end:
+    TEST_END("Graphics & Multimedia Framework");
+}
+
+// Test Enterprise Virtualization
+static void test_enterprise_virtualization(void) {
+    TEST_START("Virtualization & Container Platform");
+    
+    int result = enterprise_virtualization_init();
+    TEST_ASSERT(result == 0, "Virtualization initialization failed");
+    
+    // Test VM creation
+    uint32_t vm_id = virtualization_create_vm("test_vm", 2, 1024); // 2 vCPUs, 1GB RAM
+    TEST_ASSERT(vm_id != 0, "VM creation failed");
+    
+    // Test container creation
+    uint32_t container_id = virtualization_create_container("test_container", "ubuntu:latest");
+    TEST_ASSERT(container_id != 0, "Container creation failed");
+    
+    // Test virtual network creation
+    uint32_t network_id = virtualization_create_network("test_net", NET_VIRT_BRIDGE, "192.168.1.0/24", 0);
+    TEST_ASSERT(network_id != 0, "Virtual network creation failed");
+    
+    // Test hypervisor capabilities
+    hypervisor_capabilities_t caps;
+    result = virtualization_get_capabilities(&caps);
+    TEST_ASSERT(result == 0, "Hypervisor capabilities query failed");
+    
+test_end:
+    TEST_END("Virtualization & Container Platform");
+}
+
+// Test Enterprise Security
+static void test_enterprise_security(void) {
+    TEST_START("Security & Identity Framework");
+    
+    int result = enterprise_security_init();
+    TEST_ASSERT(result == 0, "Security initialization failed");
+    
+    // Test security context creation
+    uint32_t context_id = security_create_context("test_context", SECURITY_LEVEL_CONFIDENTIAL, 1000, "test_user");
+    TEST_ASSERT(context_id != 0, "Security context creation failed");
+    
+    // Test cryptographic key generation
+    uint32_t key_id = security_generate_key(CRYPTO_ALG_AES256, "test_key", false, NULL);
+    TEST_ASSERT(key_id != 0, "Cryptographic key generation failed");
+    
+    // Test TPM functionality (if available)
+    if (security_tpm_available()) {
+        result = security_tpm_generate_random(NULL, 16);
+        TEST_ASSERT(result == 0, "TPM random generation failed");
+    }
+    
+    // Test biometric enrollment (mock data)
+    uint8_t fake_template[256];
+    memset(fake_template, 0xAB, sizeof(fake_template));
+    uint32_t template_id = security_enroll_biometric(BIOMETRIC_FINGERPRINT, "test_user", 
+                                                    fake_template, sizeof(fake_template));
+    TEST_ASSERT(template_id != 0, "Biometric enrollment failed");
+    
+    // Test identity provider
+    uint32_t provider_id = security_add_identity_provider("test_ldap", "LDAP", "ldap://localhost:389");
+    TEST_ASSERT(provider_id != 0, "Identity provider addition failed");
+    
+test_end:
+    TEST_END("Security & Identity Framework");
+}
+
+// Test Enterprise Management
+static void test_enterprise_management(void) {
+    TEST_START("Enterprise Management & Monitoring");
+    
+    int result = enterprise_management_init();
+    TEST_ASSERT(result == 0, "Management initialization failed");
+    
+    // Test metrics registration
+    uint32_t metric_id = mgmt_register_metric("test_metric", "Test metric", METRIC_TYPE_GAUGE, "count");
+    TEST_ASSERT(metric_id != 0, "Metric registration failed");
+    
+    // Test metric update
+    mgmt_update_metric("test_metric", 42.0);
+    
+    // Test structured logging
+    const char* fields[][2] = {
+        {"component", "test"},
+        {"operation", "validation"}
+    };
+    mgmt_log_structured(LOG_LEVEL_INFO, "test_source", "Test log message", fields, 2);
+    
+    // Test alert rule creation
+    uint32_t alert_id = mgmt_create_alert_rule("test_alert", "test_metric", ">", 50.0, ALERT_SEVERITY_WARNING, 60);
+    TEST_ASSERT(alert_id != 0, "Alert rule creation failed");
+    
+    // Test management statistics
+    mgmt_stats_t stats;
+    mgmt_get_stats(&stats);
+    TEST_ASSERT(stats.total_metrics > 0, "No metrics found in statistics");
+    
+test_end:
+    TEST_END("Enterprise Management & Monitoring");
+}
+
+// Function to run specific test
+int enterprise_test_specific(const char* test_name) {
+    console_printf("Running specific test: %s\n", test_name);
+    
+    if (strcmp(test_name, "smp") == 0) {
+        test_advanced_smp_kernel();
+    } else if (strcmp(test_name, "iommu") == 0) {
+        test_advanced_iommu();
+    } else if (strcmp(test_name, "hal") == 0) {
+        test_advanced_hal();
+    } else if (strcmp(test_name, "storage") == 0) {
+        test_enterprise_storage();
+    } else if (strcmp(test_name, "network") == 0) {
+        test_enterprise_network();
+    } else if (strcmp(test_name, "multimedia") == 0) {
+        test_enterprise_multimedia();
+    } else if (strcmp(test_name, "virtualization") == 0) {
+        test_enterprise_virtualization();
+    } else if (strcmp(test_name, "security") == 0) {
+        test_enterprise_security();
+    } else if (strcmp(test_name, "management") == 0) {
+        test_enterprise_management();
+    } else {
+        console_printf("Unknown test: %s\n", test_name);
+        return -1;
+    }
+    
+    return 0;
+}

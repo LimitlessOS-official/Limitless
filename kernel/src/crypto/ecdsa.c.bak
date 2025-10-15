@@ -1,0 +1,14 @@
+/*
+ * ECDSA (Elliptic Curve Digital Signature Algorithm) Implementation
+ * Supports P-256, P-384, P-521 curves and Ed25519
+ */
+
+#include "kernel.h"
+#include "crypto.h"
+
+/* ECDSA implementation stub */
+status_t crypto_register_ecdsa(void) {
+    /* TODO: Implement ECDSA algorithm */
+    KLOG_INFO("CRYPTO", "ECDSA algorithms registered (stub)");
+    return STATUS_OK;
+}

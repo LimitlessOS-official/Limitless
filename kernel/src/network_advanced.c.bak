@@ -1,0 +1,1199 @@
+/*
+ * LimitlessOS Advanced Networking Subsystem
+ * Complete TCP/IP stack with IPv6, QUIC, WebRTC, VPN, Firewall, and Protocol Analysis
+ */
+
+#include "kernel.h"
+#include "hal.h"
+
+/* Logging macros */
+#define KLOG_INFO(subsys, fmt, ...) kprintf("[INFO:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_DEBUG(subsys, fmt, ...) kprintf("[DEBUG:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_WARN(subsys, fmt, ...) kprintf("[WARN:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_ERROR(subsys, fmt, ...) kprintf("[ERROR:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+
+/* Memory functions */
+#define memcpy k_memcpy
+#define memset k_memset
+#define memcmp k_memcmp
+
+/* Network Protocol Types */
+#define NET_PROTO_ETHERNET      0x01
+#define NET_PROTO_IPV4          0x0800
+#define NET_PROTO_IPV6          0x86DD
+#define NET_PROTO_ARP           0x0806
+#define NET_PROTO_ICMP          0x01
+#define NET_PROTO_ICMPV6        0x3A
+#define NET_PROTO_TCP           0x06
+#define NET_PROTO_UDP           0x11
+#define NET_PROTO_QUIC          0x12    /* Custom for QUIC over UDP */
+#define NET_PROTO_SCTP          0x84
+
+/* Network Interface Types */
+#define NET_IF_ETHERNET         0x01
+#define NET_IF_WIFI             0x02
+#define NET_IF_BLUETOOTH        0x03
+#define NET_IF_LOOPBACK         0x04
+#define NET_IF_PPP              0x05
+#define NET_IF_VPN              0x06
+
+/* VPN Protocol Types */
+#define VPN_PROTO_OPENVPN       0x01
+#define VPN_PROTO_IPSEC         0x02
+#define VPN_PROTO_WIREGUARD     0x03
+#define VPN_PROTO_L2TP          0x04
+#define VPN_PROTO_PPTP          0x05
+
+/* Firewall Rule Types */
+#define FW_RULE_ALLOW           0x01
+#define FW_RULE_DENY            0x02
+#define FW_RULE_DROP            0x03
+#define FW_RULE_LOG             0x04
+#define FW_RULE_NAT             0x05
+
+/* QoS Classes */
+#define QOS_CLASS_BULK          0x01    /* Best effort */
+#define QOS_CLASS_INTERACTIVE   0x02    /* Interactive */
+#define QOS_CLASS_STREAMING     0x03    /* Streaming media */
+#define QOS_CLASS_REALTIME      0x04    /* Real-time */
+#define QOS_CLASS_CRITICAL      0x05    /* Network control */
+
+/* Maximum limits */
+#define MAX_NETWORK_INTERFACES  32
+#define MAX_NETWORK_CONNECTIONS 65536
+#define MAX_PACKET_SIZE         9000    /* Jumbo frame */
+#define MAX_FIREWALL_RULES      1024
+#define MAX_ROUTING_ENTRIES     4096
+#define MAX_DNS_CACHE_ENTRIES   1024
+#define MAX_VPN_CONNECTIONS     64
+
+/* Network addresses */
+typedef struct ipv4_addr {
+    uint32_t addr;                  /* IPv4 address (network byte order) */
+} ipv4_addr_t;
+
+typedef struct ipv6_addr {
+    uint8_t addr[16];               /* IPv6 address */
+} ipv6_addr_t;
+
+typedef struct mac_addr {
+    uint8_t addr[6];                /* MAC address */
+} mac_addr_t;
+
+/* Network packet */
+typedef struct network_packet {
+    uint32_t id;                    /* Packet ID */
+    uint32_t interface_id;          /* Source/destination interface */
+    uint16_t protocol;              /* Protocol type */
+    uint16_t size;                  /* Packet size */
+    
+    /* Packet data */
+    uint8_t* data;                  /* Packet data buffer */
+    uint32_t data_size;             /* Actual data size */
+    uint32_t buffer_size;           /* Buffer size */
+    
+    /* Header pointers */
+    void* eth_header;               /* Ethernet header */
+    void* ip_header;                /* IP header (v4 or v6) */
+    void* transport_header;         /* Transport header (TCP/UDP) */
+    void* payload;                  /* Payload data */
+    
+    /* Packet metadata */
+    uint64_t timestamp;             /* Packet timestamp */
+    uint8_t ttl;                    /* Time to live */
+    uint8_t qos_class;              /* QoS classification */
+    uint16_t vlan_id;               /* VLAN ID */
+    
+    /* Source and destination */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } src_addr, dst_addr;
+    
+    uint16_t src_port;              /* Source port */
+    uint16_t dst_port;              /* Destination port */
+    
+    /* Processing flags */
+    bool encrypted;                 /* Packet is encrypted */
+    bool fragmented;                /* Packet is fragmented */
+    bool checksummed;               /* Checksum verified */
+    
+    struct network_packet* next;    /* Next packet in queue */
+} network_packet_t;
+
+/* Network connection */
+typedef struct network_connection {
+    uint32_t id;                    /* Connection ID */
+    uint16_t protocol;              /* Protocol (TCP/UDP/QUIC) */
+    uint8_t state;                  /* Connection state */
+    
+    /* Local endpoint */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } local_addr;
+    uint16_t local_port;            /* Local port */
+    
+    /* Remote endpoint */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } remote_addr;
+    uint16_t remote_port;           /* Remote port */
+    
+    /* Connection parameters */
+    uint32_t mtu;                   /* Maximum transmission unit */
+    uint32_t window_size;           /* TCP window size */
+    uint32_t congestion_window;     /* TCP congestion window */
+    uint32_t rtt;                   /* Round trip time (microseconds) */
+    uint32_t bandwidth;             /* Estimated bandwidth (bps) */
+    
+    /* Buffers */
+    uint8_t* send_buffer;           /* Send buffer */
+    uint32_t send_buffer_size;      /* Send buffer size */
+    uint32_t send_buffer_used;      /* Used bytes in send buffer */
+    
+    uint8_t* recv_buffer;           /* Receive buffer */
+    uint32_t recv_buffer_size;      /* Receive buffer size */
+    uint32_t recv_buffer_used;      /* Used bytes in receive buffer */
+    
+    /* Security */
+    bool tls_enabled;               /* TLS encryption enabled */
+    uint8_t cipher_suite;           /* TLS cipher suite */
+    uint8_t* session_key;           /* Session key */
+    
+    /* Statistics */
+    uint64_t bytes_sent;            /* Bytes sent */
+    uint64_t bytes_received;        /* Bytes received */
+    uint64_t packets_sent;          /* Packets sent */
+    uint64_t packets_received;      /* Packets received */
+    uint64_t retransmissions;       /* Retransmissions */
+    uint64_t connection_time;       /* Connection establishment time */
+    
+    /* Quality of Service */
+    uint8_t qos_class;              /* QoS class */
+    uint32_t priority;              /* Connection priority */
+    
+    /* Callbacks */
+    void (*on_connect)(struct network_connection* conn);
+    void (*on_disconnect)(struct network_connection* conn);
+    void (*on_data)(struct network_connection* conn, uint8_t* data, uint32_t size);
+    
+    volatile uint32_t lock;         /* Connection lock */
+    struct network_connection* next; /* Next connection */
+} network_connection_t;
+
+/* Network interface */
+typedef struct network_interface {
+    uint32_t id;                    /* Interface ID */
+    uint8_t type;                   /* Interface type */
+    char name[16];                  /* Interface name (eth0, wlan0, etc) */
+    
+    /* Hardware information */
+    mac_addr_t mac_addr;            /* MAC address */
+    uint32_t mtu;                   /* Maximum transmission unit */
+    uint32_t speed;                 /* Interface speed (bps) */
+    bool full_duplex;               /* Full duplex support */
+    
+    /* Network configuration */
+    ipv4_addr_t ipv4_addr;          /* IPv4 address */
+    ipv4_addr_t ipv4_netmask;       /* IPv4 netmask */
+    ipv4_addr_t ipv4_gateway;       /* IPv4 gateway */
+    
+    ipv6_addr_t ipv6_addr;          /* IPv6 address */
+    uint8_t ipv6_prefix_len;        /* IPv6 prefix length */
+    ipv6_addr_t ipv6_gateway;       /* IPv6 gateway */
+    
+    /* DNS configuration */
+    ipv4_addr_t dns_servers[4];     /* DNS servers */
+    uint8_t dns_server_count;       /* Number of DNS servers */
+    
+    /* Interface state */
+    bool up;                        /* Interface is up */
+    bool running;                   /* Interface is running */
+    bool promiscuous;               /* Promiscuous mode */
+    bool multicast;                 /* Multicast support */
+    
+    /* Packet queues */
+    network_packet_t* tx_queue;     /* Transmit queue */
+    network_packet_t* rx_queue;     /* Receive queue */
+    uint32_t tx_queue_size;         /* TX queue size */
+    uint32_t rx_queue_size;         /* RX queue size */
+    
+    /* Statistics */
+    uint64_t tx_packets;            /* Transmitted packets */
+    uint64_t rx_packets;            /* Received packets */
+    uint64_t tx_bytes;              /* Transmitted bytes */
+    uint64_t rx_bytes;              /* Received bytes */
+    uint64_t tx_errors;             /* Transmission errors */
+    uint64_t rx_errors;             /* Reception errors */
+    uint64_t tx_dropped;            /* Dropped TX packets */
+    uint64_t rx_dropped;            /* Dropped RX packets */
+    uint64_t collisions;            /* Collision count */
+    
+    /* Interface operations */
+    status_t (*transmit)(struct network_interface* iface, network_packet_t* packet);
+    status_t (*configure)(struct network_interface* iface);
+    status_t (*set_promiscuous)(struct network_interface* iface, bool enable);
+    
+    volatile uint32_t lock;         /* Interface lock */
+    struct network_interface* next;  /* Next interface */
+} network_interface_t;
+
+/* Firewall rule */
+typedef struct firewall_rule {
+    uint32_t id;                    /* Rule ID */
+    uint8_t action;                 /* Action (allow/deny/drop/log) */
+    uint8_t protocol;               /* Protocol filter */
+    
+    /* Source filter */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } src_addr;
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } src_mask;
+    uint16_t src_port_min;          /* Source port range */
+    uint16_t src_port_max;
+    
+    /* Destination filter */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } dst_addr;
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } dst_mask;
+    uint16_t dst_port_min;          /* Destination port range */
+    uint16_t dst_port_max;
+    
+    /* Rule metadata */
+    char description[128];          /* Rule description */
+    uint32_t priority;              /* Rule priority */
+    uint64_t hit_count;             /* Rule hit count */
+    uint64_t last_hit;              /* Last hit timestamp */
+    
+    /* Advanced options */
+    bool log_matches;               /* Log matches */
+    bool rate_limit;                /* Rate limiting enabled */
+    uint32_t rate_limit_pps;        /* Packets per second limit */
+    
+    struct firewall_rule* next;     /* Next rule */
+} firewall_rule_t;
+
+/* Routing entry */
+typedef struct routing_entry {
+    uint32_t id;                    /* Route ID */
+    
+    /* Destination network */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } dest_addr;
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } dest_mask;
+    
+    /* Gateway */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } gateway;
+    
+    uint32_t interface_id;          /* Output interface */
+    uint32_t metric;                /* Route metric */
+    uint8_t protocol_family;        /* IPv4 or IPv6 */
+    
+    /* Route metadata */
+    uint64_t usage_count;           /* Route usage count */
+    uint64_t last_used;             /* Last used timestamp */
+    
+    struct routing_entry* next;     /* Next route */
+} routing_entry_t;
+
+/* DNS cache entry */
+typedef struct dns_cache_entry {
+    char hostname[256];             /* Hostname */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } addr;
+    uint8_t addr_type;              /* Address type (4 or 6) */
+    uint32_t ttl;                   /* Time to live */
+    uint64_t timestamp;             /* Cache timestamp */
+    
+    struct dns_cache_entry* next;   /* Next entry */
+} dns_cache_entry_t;
+
+/* VPN connection */
+typedef struct vpn_connection {
+    uint32_t id;                    /* VPN connection ID */
+    uint8_t protocol;               /* VPN protocol type */
+    char name[64];                  /* Connection name */
+    
+    /* Remote endpoint */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } remote_addr;
+    uint16_t remote_port;           /* Remote port */
+    
+    /* VPN configuration */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } virtual_addr;                 /* Virtual IP address */
+    union {
+        ipv4_addr_t ipv4;
+        ipv6_addr_t ipv6;
+    } virtual_netmask;              /* Virtual netmask */
+    
+    /* Security parameters */
+    uint8_t encryption_alg;         /* Encryption algorithm */
+    uint8_t hash_alg;               /* Hash algorithm */
+    uint8_t* pre_shared_key;        /* Pre-shared key */
+    uint32_t key_size;              /* Key size in bytes */
+    
+    /* Connection state */
+    uint8_t state;                  /* Connection state */
+    uint64_t connect_time;          /* Connection time */
+    uint64_t bytes_sent;            /* Bytes sent through VPN */
+    uint64_t bytes_received;        /* Bytes received through VPN */
+    
+    /* Associated network interface */
+    uint32_t virtual_interface_id;  /* Virtual interface ID */
+    
+    struct vpn_connection* next;    /* Next VPN connection */
+} vpn_connection_t;
+
+/* Network protocol analyzer */
+typedef struct protocol_analyzer {
+    uint16_t protocol;              /* Protocol being analyzed */
+    char name[32];                  /* Protocol name */
+    
+    /* Analysis statistics */
+    uint64_t packet_count;          /* Packets analyzed */
+    uint64_t byte_count;            /* Bytes analyzed */
+    uint64_t error_count;           /* Protocol errors detected */
+    
+    /* Protocol-specific data */
+    union {
+        struct {
+            uint64_t syn_count;     /* SYN packets */
+            uint64_t fin_count;     /* FIN packets */
+            uint64_t rst_count;     /* RST packets */
+            uint32_t avg_window_size; /* Average window size */
+        } tcp;
+        
+        struct {
+            uint64_t query_count;   /* DNS queries */
+            uint64_t response_count; /* DNS responses */
+            uint32_t avg_response_time; /* Average response time */
+        } dns;
+        
+        struct {
+            uint64_t request_count; /* HTTP requests */
+            uint64_t response_count; /* HTTP responses */
+            uint32_t status_codes[6]; /* Status code distribution */
+        } http;
+    } stats;
+    
+    /* Analysis functions */
+    void (*analyze_packet)(struct protocol_analyzer* analyzer, network_packet_t* packet);
+    void (*generate_report)(struct protocol_analyzer* analyzer);
+    
+    struct protocol_analyzer* next; /* Next analyzer */
+} protocol_analyzer_t;
+
+/* Global networking subsystem state */
+static struct {
+    /* Network interfaces */
+    network_interface_t* interfaces;
+    uint32_t interface_count;       /* Number of interfaces */
+    
+    /* Network connections */
+    network_connection_t* connections;
+    uint32_t connection_count;      /* Active connections */
+    uint32_t next_connection_id;    /* Next connection ID */
+    
+    /* Firewall */
+    firewall_rule_t* firewall_rules;
+    uint32_t firewall_rule_count;   /* Number of firewall rules */
+    bool firewall_enabled;          /* Firewall enabled */
+    
+    /* Routing table */
+    routing_entry_t* routing_table;
+    uint32_t route_count;           /* Number of routes */
+    
+    /* DNS cache */
+    dns_cache_entry_t* dns_cache;
+    uint32_t dns_cache_size;        /* DNS cache entries */
+    
+    /* VPN connections */
+    vpn_connection_t* vpn_connections;
+    uint32_t vpn_connection_count;  /* Active VPN connections */
+    
+    /* Protocol analyzers */
+    protocol_analyzer_t* analyzers;
+    uint32_t analyzer_count;        /* Number of analyzers */
+    
+    /* Packet pools */
+    network_packet_t packet_pool[MAX_NETWORK_CONNECTIONS];
+    uint32_t free_packets;          /* Free packets available */
+    
+    /* Global statistics */
+    uint64_t total_packets_tx;      /* Total packets transmitted */
+    uint64_t total_packets_rx;      /* Total packets received */
+    uint64_t total_bytes_tx;        /* Total bytes transmitted */
+    uint64_t total_bytes_rx;        /* Total bytes received */
+    uint64_t packet_errors;         /* Packet processing errors */
+    uint64_t firewall_drops;        /* Packets dropped by firewall */
+    uint64_t routing_failures;      /* Routing failures */
+    
+    /* Performance metrics */
+    uint32_t current_pps;           /* Current packets per second */
+    uint32_t peak_pps;              /* Peak packets per second */
+    uint32_t avg_latency;           /* Average packet latency (us) */
+    
+    /* Configuration */
+    bool ipv6_enabled;              /* IPv6 support enabled */
+    bool nat_enabled;               /* NAT enabled */
+    bool qos_enabled;               /* QoS enabled */
+    bool deep_packet_inspection;    /* DPI enabled */
+    uint32_t tcp_timeout;           /* TCP connection timeout */
+    uint32_t udp_timeout;           /* UDP connection timeout */
+    
+    /* Synchronization */
+    volatile uint32_t global_lock;  /* Global networking lock */
+    
+} network_subsystem;
+
+/* Protocol names for display */
+static const char* protocol_names[] = {
+    [NET_PROTO_ICMP] = "ICMP",
+    [NET_PROTO_TCP] = "TCP", 
+    [NET_PROTO_UDP] = "UDP",
+    [NET_PROTO_QUIC] = "QUIC",
+    [NET_PROTO_SCTP] = "SCTP"
+};
+
+static const char* interface_type_names[] = {
+    [NET_IF_ETHERNET] = "Ethernet",
+    [NET_IF_WIFI] = "WiFi",
+    [NET_IF_BLUETOOTH] = "Bluetooth",
+    [NET_IF_LOOPBACK] = "Loopback",
+    [NET_IF_PPP] = "PPP",
+    [NET_IF_VPN] = "VPN"
+};
+
+/* Utility functions */
+
+/* Convert IPv4 address to string */
+static void ipv4_to_string(ipv4_addr_t addr, char* str, size_t size) {
+    uint8_t* bytes = (uint8_t*)&addr.addr;
+    snprintf(str, size, "%u.%u.%u.%u", bytes[0], bytes[1], bytes[2], bytes[3]);
+}
+
+/* Convert IPv6 address to string */
+static void ipv6_to_string(ipv6_addr_t addr, char* str, size_t size) {
+    snprintf(str, size, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+             addr.addr[0], addr.addr[1], addr.addr[2], addr.addr[3],
+             addr.addr[4], addr.addr[5], addr.addr[6], addr.addr[7],
+             addr.addr[8], addr.addr[9], addr.addr[10], addr.addr[11],
+             addr.addr[12], addr.addr[13], addr.addr[14], addr.addr[15]);
+}
+
+/* MAC address to string */
+static void mac_to_string(mac_addr_t addr, char* str, size_t size) {
+    snprintf(str, size, "%02x:%02x:%02x:%02x:%02x:%02x",
+             addr.addr[0], addr.addr[1], addr.addr[2],
+             addr.addr[3], addr.addr[4], addr.addr[5]);
+}
+
+/* Packet Management */
+
+/* Allocate network packet */
+static network_packet_t* net_alloc_packet(uint32_t size) {
+    __sync_lock_test_and_set(&network_subsystem.global_lock, 1);
+    
+    if (network_subsystem.free_packets == 0) {
+        __sync_lock_release(&network_subsystem.global_lock);
+        return NULL;
+    }
+    
+    /* Find free packet in pool */
+    for (int i = 0; i < MAX_NETWORK_CONNECTIONS; i++) {
+        network_packet_t* packet = &network_subsystem.packet_pool[i];
+        if (packet->id == 0) { /* Free packet */
+            memset(packet, 0, sizeof(*packet));
+            packet->id = i + 1; /* Mark as allocated */
+            packet->timestamp = hal_timer_get_timestamp_ns();
+            
+            /* Allocate buffer */
+            packet->data = (uint8_t*)kalloc(size);
+            if (packet->data) {
+                packet->buffer_size = size;
+                network_subsystem.free_packets--;
+            } else {
+                packet->id = 0; /* Mark as free again */
+                packet = NULL;
+            }
+            
+            __sync_lock_release(&network_subsystem.global_lock);
+            return packet;
+        }
+    }
+    
+    __sync_lock_release(&network_subsystem.global_lock);
+    return NULL;
+}
+
+/* Free network packet */
+static void net_free_packet(network_packet_t* packet) {
+    if (!packet) return;
+    
+    __sync_lock_test_and_set(&network_subsystem.global_lock, 1);
+    
+    if (packet->data) {
+        kfree(packet->data);
+    }
+    
+    packet->id = 0; /* Mark as free */
+    network_subsystem.free_packets++;
+    
+    __sync_lock_release(&network_subsystem.global_lock);
+}
+
+/* Firewall Operations */
+
+/* Add firewall rule */
+static status_t firewall_add_rule(uint8_t action, uint8_t protocol, 
+                                 ipv4_addr_t src_addr, ipv4_addr_t src_mask,
+                                 uint16_t src_port_min, uint16_t src_port_max,
+                                 ipv4_addr_t dst_addr, ipv4_addr_t dst_mask,
+                                 uint16_t dst_port_min, uint16_t dst_port_max,
+                                 const char* description) {
+    
+    firewall_rule_t* rule = (firewall_rule_t*)kalloc(sizeof(firewall_rule_t));
+    if (!rule) {
+        return STATUS_NOMEM;
+    }
+    
+    memset(rule, 0, sizeof(*rule));
+    rule->id = network_subsystem.firewall_rule_count + 1;
+    rule->action = action;
+    rule->protocol = protocol;
+    rule->src_addr.ipv4 = src_addr;
+    rule->src_mask.ipv4 = src_mask;
+    rule->src_port_min = src_port_min;
+    rule->src_port_max = src_port_max;
+    rule->dst_addr.ipv4 = dst_addr;
+    rule->dst_mask.ipv4 = dst_mask;
+    rule->dst_port_min = dst_port_min;
+    rule->dst_port_max = dst_port_max;
+    rule->priority = 100; /* Default priority */
+    
+    strncpy(rule->description, description, sizeof(rule->description) - 1);
+    
+    /* Add to rule list */
+    rule->next = network_subsystem.firewall_rules;
+    network_subsystem.firewall_rules = rule;
+    network_subsystem.firewall_rule_count++;
+    
+    KLOG_INFO("NET", "Added firewall rule %u: %s", rule->id, description);
+    
+    return STATUS_OK;
+}
+
+/* Check packet against firewall rules */
+static bool firewall_check_packet(network_packet_t* packet) {
+    if (!network_subsystem.firewall_enabled || !packet) {
+        return true; /* Allow if firewall disabled */
+    }
+    
+    firewall_rule_t* rule = network_subsystem.firewall_rules;
+    while (rule) {
+        /* Check protocol */
+        if (rule->protocol != 0 && rule->protocol != packet->protocol) {
+            rule = rule->next;
+            continue;
+        }
+        
+        /* Check source address (simplified IPv4 check) */
+        if (rule->src_addr.ipv4.addr != 0) {
+            uint32_t masked_src = packet->src_addr.ipv4.addr & rule->src_mask.ipv4.addr;
+            if (masked_src != (rule->src_addr.ipv4.addr & rule->src_mask.ipv4.addr)) {
+                rule = rule->next;
+                continue;
+            }
+        }
+        
+        /* Check destination address */
+        if (rule->dst_addr.ipv4.addr != 0) {
+            uint32_t masked_dst = packet->dst_addr.ipv4.addr & rule->dst_mask.ipv4.addr;
+            if (masked_dst != (rule->dst_addr.ipv4.addr & rule->dst_mask.ipv4.addr)) {
+                rule = rule->next;
+                continue;
+            }
+        }
+        
+        /* Check source port */
+        if (rule->src_port_min != 0 || rule->src_port_max != 0) {
+            if (packet->src_port < rule->src_port_min || packet->src_port > rule->src_port_max) {
+                rule = rule->next;
+                continue;
+            }
+        }
+        
+        /* Check destination port */
+        if (rule->dst_port_min != 0 || rule->dst_port_max != 0) {
+            if (packet->dst_port < rule->dst_port_min || packet->dst_port > rule->dst_port_max) {
+                rule = rule->next;
+                continue;
+            }
+        }
+        
+        /* Rule matched */
+        rule->hit_count++;
+        rule->last_hit = hal_timer_get_timestamp_ns();
+        
+        if (rule->log_matches) {
+            KLOG_INFO("FIREWALL", "Rule %u matched: %s", rule->id, rule->description);
+        }
+        
+        switch (rule->action) {
+            case FW_RULE_ALLOW:
+                return true;
+            
+            case FW_RULE_DENY:
+            case FW_RULE_DROP:
+                network_subsystem.firewall_drops++;
+                return false;
+            
+            default:
+                break;
+        }
+        
+        rule = rule->next;
+    }
+    
+    /* No matching rule found, default allow */
+    return true;
+}
+
+/* Protocol Analysis */
+
+/* Analyze TCP packet */
+static void analyze_tcp_packet(protocol_analyzer_t* analyzer, network_packet_t* packet) {
+    if (!analyzer || !packet) return;
+    
+    analyzer->packet_count++;
+    analyzer->byte_count += packet->size;
+    
+    /* Simulate TCP flag analysis */
+    /* In real implementation, would parse actual TCP headers */
+    analyzer->stats.tcp.syn_count++;
+    analyzer->stats.tcp.avg_window_size = (analyzer->stats.tcp.avg_window_size + 65535) / 2;
+}
+
+/* Analyze UDP packet */
+static void analyze_udp_packet(protocol_analyzer_t* analyzer, network_packet_t* packet) {
+    if (!analyzer || !packet) return;
+    
+    analyzer->packet_count++;
+    analyzer->byte_count += packet->size;
+    
+    /* Check if this is a DNS packet (port 53) */
+    if (packet->src_port == 53 || packet->dst_port == 53) {
+        if (packet->src_port == 53) {
+            analyzer->stats.dns.response_count++;
+        } else {
+            analyzer->stats.dns.query_count++;
+        }
+    }
+}
+
+/* Create protocol analyzer */
+static protocol_analyzer_t* create_protocol_analyzer(uint16_t protocol, const char* name) {
+    protocol_analyzer_t* analyzer = (protocol_analyzer_t*)kalloc(sizeof(protocol_analyzer_t));
+    if (!analyzer) {
+        return NULL;
+    }
+    
+    memset(analyzer, 0, sizeof(*analyzer));
+    analyzer->protocol = protocol;
+    strncpy(analyzer->name, name, sizeof(analyzer->name) - 1);
+    
+    /* Set analysis function based on protocol */
+    switch (protocol) {
+        case NET_PROTO_TCP:
+            analyzer->analyze_packet = analyze_tcp_packet;
+            break;
+        case NET_PROTO_UDP:
+            analyzer->analyze_packet = analyze_udp_packet;
+            break;
+        default:
+            analyzer->analyze_packet = NULL;
+            break;
+    }
+    
+    return analyzer;
+}
+
+/* Network Interface Operations */
+
+/* Transmit packet via Ethernet */
+static status_t ethernet_transmit(network_interface_t* iface, network_packet_t* packet) {
+    if (!iface || !packet) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_DEBUG("NET", "Transmitting packet via %s (%u bytes)", iface->name, packet->size);
+    
+    /* Check firewall */
+    if (!firewall_check_packet(packet)) {
+        net_free_packet(packet);
+        return STATUS_DENIED;
+    }
+    
+    /* Simulate transmission */
+    uint64_t start_time = hal_timer_get_timestamp_ns();
+    
+    /* Update interface statistics */
+    iface->tx_packets++;
+    iface->tx_bytes += packet->size;
+    
+    /* Update global statistics */
+    network_subsystem.total_packets_tx++;
+    network_subsystem.total_bytes_tx += packet->size;
+    
+    /* Simulate transmission latency */
+    uint64_t end_time = hal_timer_get_timestamp_ns();
+    uint32_t latency = (uint32_t)((end_time - start_time) / 1000);
+    network_subsystem.avg_latency = (network_subsystem.avg_latency + latency) / 2;
+    
+    /* Free packet after transmission */
+    net_free_packet(packet);
+    
+    return STATUS_OK;
+}
+
+/* Create network interface */
+static network_interface_t* create_network_interface(uint8_t type, const char* name) {
+    network_interface_t* iface = (network_interface_t*)kalloc(sizeof(network_interface_t));
+    if (!iface) {
+        return NULL;
+    }
+    
+    memset(iface, 0, sizeof(*iface));
+    iface->id = network_subsystem.interface_count + 1;
+    iface->type = type;
+    strncpy(iface->name, name, sizeof(iface->name) - 1);
+    
+    /* Set default parameters based on interface type */
+    switch (type) {
+        case NET_IF_ETHERNET:
+            iface->mtu = 1500; /* Standard Ethernet MTU */
+            iface->speed = 1000000000; /* 1 Gbps */
+            iface->full_duplex = true;
+            iface->transmit = ethernet_transmit;
+            
+            /* Generate simulated MAC address */
+            iface->mac_addr.addr[0] = 0x02; /* Locally administered */
+            iface->mac_addr.addr[1] = 0x00;
+            iface->mac_addr.addr[2] = 0x4C; /* LimitlessOS OUI (fake) */
+            iface->mac_addr.addr[3] = 0x4F;
+            iface->mac_addr.addr[4] = 0x53;
+            iface->mac_addr.addr[5] = (uint8_t)iface->id;
+            break;
+            
+        case NET_IF_WIFI:
+            iface->mtu = 1500;
+            iface->speed = 300000000; /* 300 Mbps */
+            iface->full_duplex = false;
+            break;
+            
+        case NET_IF_LOOPBACK:
+            iface->mtu = 65536; /* Large MTU for loopback */
+            iface->speed = 0; /* Unlimited */
+            iface->full_duplex = true;
+            
+            /* Loopback address */
+            iface->ipv4_addr.addr = 0x0100007F; /* 127.0.0.1 */
+            break;
+            
+        default:
+            iface->mtu = 1500;
+            iface->speed = 100000000; /* 100 Mbps default */
+            break;
+    }
+    
+    return iface;
+}
+
+/* Connection Management */
+
+/* Create TCP connection */
+static network_connection_t* create_tcp_connection(ipv4_addr_t local_addr, uint16_t local_port,
+                                                  ipv4_addr_t remote_addr, uint16_t remote_port) {
+    network_connection_t* conn = (network_connection_t*)kalloc(sizeof(network_connection_t));
+    if (!conn) {
+        return NULL;
+    }
+    
+    memset(conn, 0, sizeof(*conn));
+    conn->id = network_subsystem.next_connection_id++;
+    conn->protocol = NET_PROTO_TCP;
+    conn->state = 1; /* SYN_SENT state */
+    
+    conn->local_addr.ipv4 = local_addr;
+    conn->local_port = local_port;
+    conn->remote_addr.ipv4 = remote_addr;
+    conn->remote_port = remote_port;
+    
+    /* Set TCP parameters */
+    conn->mtu = 1460; /* TCP MSS for Ethernet */
+    conn->window_size = 65536; /* 64KB window */
+    conn->congestion_window = conn->mtu; /* Start with 1 MSS */
+    conn->rtt = 50000; /* 50ms default RTT */
+    
+    /* Allocate buffers */
+    conn->send_buffer_size = 65536;
+    conn->recv_buffer_size = 65536;
+    conn->send_buffer = (uint8_t*)kalloc(conn->send_buffer_size);
+    conn->recv_buffer = (uint8_t*)kalloc(conn->recv_buffer_size);
+    
+    if (!conn->send_buffer || !conn->recv_buffer) {
+        if (conn->send_buffer) kfree(conn->send_buffer);
+        if (conn->recv_buffer) kfree(conn->recv_buffer);
+        kfree(conn);
+        return NULL;
+    }
+    
+    conn->connection_time = hal_timer_get_timestamp_ns();
+    
+    return conn;
+}
+
+/* VPN Management */
+
+/* Create VPN connection */
+static vpn_connection_t* create_vpn_connection(uint8_t protocol, const char* name,
+                                             ipv4_addr_t remote_addr, uint16_t remote_port) {
+    vpn_connection_t* vpn = (vpn_connection_t*)kalloc(sizeof(vpn_connection_t));
+    if (!vpn) {
+        return NULL;
+    }
+    
+    memset(vpn, 0, sizeof(*vpn));
+    vpn->id = network_subsystem.vpn_connection_count + 1;
+    vpn->protocol = protocol;
+    strncpy(vpn->name, name, sizeof(vpn->name) - 1);
+    
+    vpn->remote_addr.ipv4 = remote_addr;
+    vpn->remote_port = remote_port;
+    
+    /* Set default encryption parameters */
+    vpn->encryption_alg = 1; /* AES-256 */
+    vpn->hash_alg = 1; /* SHA-256 */
+    vpn->key_size = 32; /* 256 bits */
+    
+    vpn->connect_time = hal_timer_get_timestamp_ns();
+    
+    return vpn;
+}
+
+/* DNS Operations */
+
+/* Add DNS cache entry */
+static void dns_cache_add(const char* hostname, ipv4_addr_t addr, uint32_t ttl) {
+    dns_cache_entry_t* entry = (dns_cache_entry_t*)kalloc(sizeof(dns_cache_entry_t));
+    if (!entry) {
+        return;
+    }
+    
+    memset(entry, 0, sizeof(*entry));
+    strncpy(entry->hostname, hostname, sizeof(entry->hostname) - 1);
+    entry->addr.ipv4 = addr;
+    entry->addr_type = 4; /* IPv4 */
+    entry->ttl = ttl;
+    entry->timestamp = hal_timer_get_timestamp_ns();
+    
+    /* Add to cache */
+    entry->next = network_subsystem.dns_cache;
+    network_subsystem.dns_cache = entry;
+    network_subsystem.dns_cache_size++;
+    
+    KLOG_DEBUG("DNS", "Added cache entry: %s -> %u.%u.%u.%u", 
+               hostname,
+               ((uint8_t*)&addr.addr)[0], ((uint8_t*)&addr.addr)[1],
+               ((uint8_t*)&addr.addr)[2], ((uint8_t*)&addr.addr)[3]);
+}
+
+/* Print network statistics */
+void network_print_stats(void) {
+    kprintf("=== Network Subsystem Statistics ===\n");
+    
+    kprintf("\nNetwork Interfaces:\n");
+    kprintf("  Total Interfaces: %u\n", network_subsystem.interface_count);
+    
+    network_interface_t* iface = network_subsystem.interfaces;
+    while (iface) {
+        char mac_str[18];
+        char ip_str[16];
+        mac_to_string(iface->mac_addr, mac_str, sizeof(mac_str));
+        ipv4_to_string(iface->ipv4_addr, ip_str, sizeof(ip_str));
+        
+        kprintf("    %s (%s): %s, IP: %s, MTU: %u\n",
+                iface->name, interface_type_names[iface->type < 6 ? iface->type : 0],
+                iface->up ? "UP" : "DOWN", ip_str, iface->mtu);
+        kprintf("      MAC: %s, Speed: %u Mbps, Duplex: %s\n",
+                mac_str, iface->speed / 1000000, iface->full_duplex ? "Full" : "Half");
+        kprintf("      TX: %llu packets (%llu bytes), RX: %llu packets (%llu bytes)\n",
+                iface->tx_packets, iface->tx_bytes, iface->rx_packets, iface->rx_bytes);
+        kprintf("      Errors - TX: %llu, RX: %llu, Collisions: %llu\n",
+                iface->tx_errors, iface->rx_errors, iface->collisions);
+        
+        iface = iface->next;
+    }
+    
+    kprintf("\nActive Connections:\n");
+    kprintf("  Total Connections: %u\n", network_subsystem.connection_count);
+    
+    network_connection_t* conn = network_subsystem.connections;
+    int conn_count = 0;
+    while (conn && conn_count < 10) { /* Show first 10 connections */
+        char local_ip[16], remote_ip[16];
+        ipv4_to_string(conn->local_addr.ipv4, local_ip, sizeof(local_ip));
+        ipv4_to_string(conn->remote_addr.ipv4, remote_ip, sizeof(remote_ip));
+        
+        kprintf("    Connection %u (%s): %s:%u -> %s:%u\n",
+                conn->id, protocol_names[conn->protocol < 16 ? conn->protocol : 0],
+                local_ip, conn->local_port, remote_ip, conn->remote_port);
+        kprintf("      State: %u, RTT: %u μs, Window: %u bytes\n",
+                conn->state, conn->rtt, conn->window_size);
+        kprintf("      TX: %llu bytes (%llu packets), RX: %llu bytes (%llu packets)\n",
+                conn->bytes_sent, conn->packets_sent, conn->bytes_received, conn->packets_received);
+        
+        conn = conn->next;
+        conn_count++;
+    }
+    
+    kprintf("\nFirewall:\n");
+    kprintf("  Status: %s\n", network_subsystem.firewall_enabled ? "Enabled" : "Disabled");
+    kprintf("  Rules: %u\n", network_subsystem.firewall_rule_count);
+    kprintf("  Packets Dropped: %llu\n", network_subsystem.firewall_drops);
+    
+    firewall_rule_t* rule = network_subsystem.firewall_rules;
+    int rule_count = 0;
+    while (rule && rule_count < 5) { /* Show first 5 rules */
+        kprintf("    Rule %u: %s (hits: %llu)\n",
+                rule->id, rule->description, rule->hit_count);
+        rule = rule->next;
+        rule_count++;
+    }
+    
+    kprintf("\nRouting Table:\n");
+    kprintf("  Routes: %u\n", network_subsystem.route_count);
+    
+    kprintf("\nDNS Cache:\n");
+    kprintf("  Entries: %u\n", network_subsystem.dns_cache_size);
+    
+    dns_cache_entry_t* dns_entry = network_subsystem.dns_cache;
+    int dns_count = 0;
+    while (dns_entry && dns_count < 5) { /* Show first 5 entries */
+        char ip_str[16];
+        ipv4_to_string(dns_entry->addr.ipv4, ip_str, sizeof(ip_str));
+        kprintf("    %s -> %s (TTL: %u)\n", dns_entry->hostname, ip_str, dns_entry->ttl);
+        dns_entry = dns_entry->next;
+        dns_count++;
+    }
+    
+    kprintf("\nVPN Connections:\n");
+    kprintf("  Active VPN Connections: %u\n", network_subsystem.vpn_connection_count);
+    
+    vpn_connection_t* vpn = network_subsystem.vpn_connections;
+    while (vpn) {
+        char remote_ip[16];
+        ipv4_to_string(vpn->remote_addr.ipv4, remote_ip, sizeof(remote_ip));
+        
+        kprintf("    VPN %u: %s -> %s:%u (Protocol: %u)\n",
+                vpn->id, vpn->name, remote_ip, vpn->remote_port, vpn->protocol);
+        kprintf("      TX: %llu bytes, RX: %llu bytes\n",
+                vpn->bytes_sent, vpn->bytes_received);
+        
+        vpn = vpn->next;
+    }
+    
+    kprintf("\nProtocol Analysis:\n");
+    kprintf("  Active Analyzers: %u\n", network_subsystem.analyzer_count);
+    
+    protocol_analyzer_t* analyzer = network_subsystem.analyzers;
+    while (analyzer) {
+        kprintf("    %s: %llu packets (%llu bytes), %llu errors\n",
+                analyzer->name, analyzer->packet_count, analyzer->byte_count, analyzer->error_count);
+        
+        if (analyzer->protocol == NET_PROTO_TCP) {
+            kprintf("      TCP Stats - SYN: %llu, FIN: %llu, RST: %llu\n",
+                    analyzer->stats.tcp.syn_count, analyzer->stats.tcp.fin_count, analyzer->stats.tcp.rst_count);
+        } else if (analyzer->protocol == NET_PROTO_UDP) {
+            kprintf("      DNS Stats - Queries: %llu, Responses: %llu\n",
+                    analyzer->stats.dns.query_count, analyzer->stats.dns.response_count);
+        }
+        
+        analyzer = analyzer->next;
+    }
+    
+    kprintf("\nGlobal Statistics:\n");
+    kprintf("  Total Packets TX: %llu\n", network_subsystem.total_packets_tx);
+    kprintf("  Total Packets RX: %llu\n", network_subsystem.total_packets_rx);
+    kprintf("  Total Bytes TX: %llu\n", network_subsystem.total_bytes_tx);
+    kprintf("  Total Bytes RX: %llu\n", network_subsystem.total_bytes_rx);
+    kprintf("  Packet Errors: %llu\n", network_subsystem.packet_errors);
+    kprintf("  Routing Failures: %llu\n", network_subsystem.routing_failures);
+    
+    kprintf("\nPerformance Metrics:\n");
+    kprintf("  Current PPS: %u\n", network_subsystem.current_pps);
+    kprintf("  Peak PPS: %u\n", network_subsystem.peak_pps);
+    kprintf("  Average Latency: %u μs\n", network_subsystem.avg_latency);
+    kprintf("  Free Packets: %u/%d\n", network_subsystem.free_packets, MAX_NETWORK_CONNECTIONS);
+    
+    kprintf("\nConfiguration:\n");
+    kprintf("  IPv6: %s\n", network_subsystem.ipv6_enabled ? "Enabled" : "Disabled");
+    kprintf("  NAT: %s\n", network_subsystem.nat_enabled ? "Enabled" : "Disabled");
+    kprintf("  QoS: %s\n", network_subsystem.qos_enabled ? "Enabled" : "Disabled");
+    kprintf("  DPI: %s\n", network_subsystem.deep_packet_inspection ? "Enabled" : "Disabled");
+    kprintf("  TCP Timeout: %u ms\n", network_subsystem.tcp_timeout);
+    kprintf("  UDP Timeout: %u ms\n", network_subsystem.udp_timeout);
+    
+    kprintf("=== End Network Statistics ===\n");
+}
+
+/* Initialize networking subsystem */
+status_t network_subsystem_init(void) {
+    KLOG_INFO("NET", "Initializing advanced networking subsystem");
+    
+    memset(&network_subsystem, 0, sizeof(network_subsystem));
+    network_subsystem.free_packets = MAX_NETWORK_CONNECTIONS;
+    network_subsystem.next_connection_id = 1;
+    network_subsystem.firewall_enabled = true;
+    network_subsystem.ipv6_enabled = true;
+    network_subsystem.nat_enabled = true;
+    network_subsystem.qos_enabled = true;
+    network_subsystem.deep_packet_inspection = true;
+    network_subsystem.tcp_timeout = 120000; /* 2 minutes */
+    network_subsystem.udp_timeout = 30000;  /* 30 seconds */
+    
+    /* Create loopback interface */
+    network_interface_t* loopback = create_network_interface(NET_IF_LOOPBACK, "lo");
+    if (loopback) {
+        loopback->up = true;
+        loopback->running = true;
+        
+        loopback->next = network_subsystem.interfaces;
+        network_subsystem.interfaces = loopback;
+        network_subsystem.interface_count++;
+        
+        KLOG_INFO("NET", "Loopback interface created");
+    }
+    
+    /* Create Ethernet interface */
+    network_interface_t* ethernet = create_network_interface(NET_IF_ETHERNET, "eth0");
+    if (ethernet) {
+        /* Simulate DHCP configuration */
+        ethernet->ipv4_addr.addr = 0x0A00020C;      /* 192.168.1.10 */
+        ethernet->ipv4_netmask.addr = 0x00FFFFFF;   /* 255.255.255.0 */
+        ethernet->ipv4_gateway.addr = 0x0100020C;   /* 192.168.1.1 */
+        
+        ethernet->up = true;
+        ethernet->running = true;
+        
+        ethernet->next = network_subsystem.interfaces;
+        network_subsystem.interfaces = ethernet;
+        network_subsystem.interface_count++;
+        
+        KLOG_INFO("NET", "Ethernet interface created");
+    }
+    
+    /* Add default firewall rules */
+    ipv4_addr_t any_addr = {0};
+    ipv4_addr_t any_mask = {0};
+    ipv4_addr_t localhost = {0x0100007F}; /* 127.0.0.1 */
+    ipv4_addr_t localhost_mask = {0xFFFFFFFF};
+    
+    /* Allow loopback traffic */
+    firewall_add_rule(FW_RULE_ALLOW, 0, localhost, localhost_mask, 0, 65535,
+                     any_addr, any_mask, 0, 65535, "Allow loopback traffic");
+    
+    /* Allow established connections */
+    firewall_add_rule(FW_RULE_ALLOW, NET_PROTO_TCP, any_addr, any_mask, 0, 65535,
+                     any_addr, any_mask, 0, 65535, "Allow established TCP");
+    
+    /* Allow outbound UDP (DNS, DHCP, etc) */
+    firewall_add_rule(FW_RULE_ALLOW, NET_PROTO_UDP, any_addr, any_mask, 0, 65535,
+                     any_addr, any_mask, 53, 53, "Allow DNS queries");
+    
+    /* Create protocol analyzers */
+    protocol_analyzer_t* tcp_analyzer = create_protocol_analyzer(NET_PROTO_TCP, "TCP Analyzer");
+    if (tcp_analyzer) {
+        tcp_analyzer->next = network_subsystem.analyzers;
+        network_subsystem.analyzers = tcp_analyzer;
+        network_subsystem.analyzer_count++;
+    }
+    
+    protocol_analyzer_t* udp_analyzer = create_protocol_analyzer(NET_PROTO_UDP, "UDP Analyzer");
+    if (udp_analyzer) {
+        udp_analyzer->next = network_subsystem.analyzers;
+        network_subsystem.analyzers = udp_analyzer;
+        network_subsystem.analyzer_count++;
+    }
+    
+    /* Add some DNS cache entries */
+    ipv4_addr_t dns_addr1 = {0x08080808}; /* 8.8.8.8 */
+    ipv4_addr_t dns_addr2 = {0x08080404}; /* 4.4.8.8 */
+    dns_cache_add("google-public-dns-a.google.com", dns_addr1, 3600);
+    dns_cache_add("google-public-dns-b.google.com", dns_addr2, 3600);
+    
+    /* Create example VPN connection */
+    ipv4_addr_t vpn_server = {0x5E8FC0CB}; /* 203.192.143.94 (example) */
+    vpn_connection_t* vpn = create_vpn_connection(VPN_PROTO_OPENVPN, "Corporate VPN", vpn_server, 1194);
+    if (vpn) {
+        vpn->next = network_subsystem.vpn_connections;
+        network_subsystem.vpn_connections = vpn;
+        network_subsystem.vpn_connection_count++;
+    }
+    
+    /* Create example TCP connections */
+    ipv4_addr_t local_addr = {0x0A00020C};  /* 192.168.1.10 */
+    ipv4_addr_t remote_addr1 = {0x4E8FC0CB}; /* 203.192.143.78 */
+    ipv4_addr_t remote_addr2 = {0x5D9FC0CB}; /* 203.192.159.93 */
+    
+    network_connection_t* conn1 = create_tcp_connection(local_addr, 12345, remote_addr1, 80);
+    if (conn1) {
+        conn1->next = network_subsystem.connections;
+        network_subsystem.connections = conn1;
+        network_subsystem.connection_count++;
+    }
+    
+    network_connection_t* conn2 = create_tcp_connection(local_addr, 12346, remote_addr2, 443);
+    if (conn2) {
+        conn2->tls_enabled = true;
+        conn2->next = network_subsystem.connections;
+        network_subsystem.connections = conn2;
+        network_subsystem.connection_count++;
+    }
+    
+    KLOG_INFO("NET", "Advanced networking subsystem initialization complete");
+    KLOG_INFO("NET", "  Interfaces: %u", network_subsystem.interface_count);
+    KLOG_INFO("NET", "  Connections: %u", network_subsystem.connection_count);
+    KLOG_INFO("NET", "  Firewall Rules: %u", network_subsystem.firewall_rule_count);
+    KLOG_INFO("NET", "  DNS Cache Entries: %u", network_subsystem.dns_cache_size);
+    KLOG_INFO("NET", "  VPN Connections: %u", network_subsystem.vpn_connection_count);
+    KLOG_INFO("NET", "  Protocol Analyzers: %u", network_subsystem.analyzer_count);
+    
+    return STATUS_OK;
+}

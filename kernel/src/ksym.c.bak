@@ -1,0 +1,77 @@
+// Kernel symbolizer: loads /boot/limitless.elf and resolves addresses
+#include "ksym.h"
+#include "string.h"
+#include "vfs.h"
+#include "elf.h"
+#include "vmm.h"
+
+static int g_inited = 0;
+static void* g_elf_image = NULL;
+static u64 g_elf_size = 0;
+static const Elf64_Sym* g_symtab = NULL;
+static size_t g_sym_count = 0;
+static const char* g_strtab = NULL;
+
+static int ksym_load_elf(void){
+    const char* path = "/boot/limitless.elf";
+    file_t* f=NULL; if (vfs_open(path, VFS_O_RDONLY, &f) != 0) return -1;
+    vfs_seek(f, 0, VFS_SEEK_END); u64 sz = vfs_tell(f); vfs_seek(f, 0, VFS_SEEK_SET);
+    if (sz < sizeof(Elf64_Ehdr)) { vfs_close(f); return -1; }
+    void* img = vmm_kmalloc((size_t)sz, 64); if (!img) { vfs_close(f); return -1; }
+    u64 rd=0; int rc = vfs_read(f, img, sz, &rd); vfs_close(f); if (rc!=0 || rd!=sz){ vmm_kfree(img, (size_t)sz); return -1; }
+
+    Elf64_Ehdr* eh = (Elf64_Ehdr*)img; if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' || eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F') { vmm_kfree(img,(size_t)sz); return -1; }
+    if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) || eh->e_shnum == 0) { vmm_kfree(img,(size_t)sz); return -1; }
+    Elf64_Shdr* sh = (Elf64_Shdr*)((u8*)img + eh->e_shoff);
+
+    Elf64_Shdr* sym = NULL; Elf64_Shdr* str = NULL;
+    for (u16 i=0;i<eh->e_shnum;i++){
+        if (sh[i].sh_type == SHT_SYMTAB) {
+            sym = &sh[i];
+            if (sym->sh_link < eh->e_shnum) {
+                str = &sh[sym->sh_link];
+            }
+            break;
+        }
+    }
+    if (!sym || !str) { vmm_kfree(img,(size_t)sz); return -1; }
+    if (sym->sh_offset + sym->sh_size > sz || str->sh_offset + str->sh_size > sz) { vmm_kfree(img,(size_t)sz); return -1; }
+
+    g_elf_image = img; g_elf_size = sz;
+    g_symtab = (const Elf64_Sym*)((u8*)img + sym->sh_offset);
+    g_sym_count = sym->sh_size / sizeof(Elf64_Sym);
+    g_strtab = (const char*)((u8*)img + str->sh_offset);
+    return 0;
+}
+
+int ksym_init(void){
+    if (g_inited) return 0;
+    if (ksym_load_elf() == 0) { g_inited = 1; return 0; }
+    g_inited = -1; return -1;
+}
+
+int ksym_resolve(u64 addr, char* out, size_t outsz){
+    if (!out || outsz==0) return -1;
+    if (!g_inited) ksym_init();
+    const char* fmt_hex = "0x%llx";
+    if (g_inited != 1 || !g_symtab || !g_strtab) {
+        k_snprintf(out, outsz, fmt_hex, (unsigned long long)addr);
+        return -1;
+    }
+    // Find nearest symbol <= addr with non-zero size if possible
+    const Elf64_Sym* best = NULL; u64 best_off = (u64)-1;
+    for (size_t i=0;i<g_sym_count;i++){
+        const Elf64_Sym* s = &g_symtab[i];
+        if (s->st_name == 0) continue;
+        u64 saddr = (u64)s->st_value; if (saddr > addr) continue;
+        u64 off = addr - saddr; if (off < best_off) { best = s; best_off = off; if (off==0) break; }
+    }
+    if (!best) {
+        k_snprintf(out, outsz, fmt_hex, (unsigned long long)addr);
+        return -1;
+    }
+    const char* name = g_strtab + best->st_name;
+    if (best_off == 0) k_snprintf(out, outsz, "%s", name);
+    else k_snprintf(out, outsz, "%s+0x%llx", name, (unsigned long long)best_off);
+    return 0;
+}

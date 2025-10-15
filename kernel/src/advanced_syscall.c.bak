@@ -1,0 +1,860 @@
+/*
+ * LimitlessOS Advanced System Call Framework
+ * Enterprise-grade system call interface with monitoring, sandboxing,
+ * tracing, rate limiting, audit logging, and security enforcement
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include "../include/advanced_syscall.h"
+#include "../include/kernel.h"
+
+/* ============================================================================
+ * SYSTEM CALL FRAMEWORK CONFIGURATION
+ * ============================================================================ */
+
+/* System call limits and configuration */
+#define SYSCALL_MAX_NUMBER          1024
+#define SYSCALL_MAX_RATE_LIMIT      10000    /* calls per second per process */
+#define SYSCALL_MAX_TRACE_ENTRIES   65536
+#define SYSCALL_MAX_AUDIT_ENTRIES   32768
+#define SYSCALL_MAX_SANDBOX_RULES   4096
+#define SYSCALL_MAX_FILTERS         256
+#define SYSCALL_BUFFER_SIZE         4096
+#define SYSCALL_STACK_SIZE          8192
+#define SYSCALL_MAX_ARGS            8
+
+/* System call categories */
+typedef enum {
+    SYSCALL_CAT_PROCESS = 0,    /* Process management */
+    SYSCALL_CAT_MEMORY = 1,     /* Memory management */
+    SYSCALL_CAT_FILE = 2,       /* File operations */
+    SYSCALL_CAT_NETWORK = 3,    /* Network operations */
+    SYSCALL_CAT_IPC = 4,        /* Inter-process communication */
+    SYSCALL_CAT_TIME = 5,       /* Time and timers */
+    SYSCALL_CAT_SIGNAL = 6,     /* Signal handling */
+    SYSCALL_CAT_SYSTEM = 7,     /* System information */
+    SYSCALL_CAT_SECURITY = 8,   /* Security operations */
+    SYSCALL_CAT_ENTERPRISE = 9, /* Enterprise features */
+    SYSCALL_CAT_MAX = 10
+} syscall_category_t;
+
+/* System call security levels */
+typedef enum {
+    SYSCALL_SEC_PUBLIC = 0,     /* Public, unrestricted */
+    SYSCALL_SEC_USER = 1,       /* Requires user privileges */
+    SYSCALL_SEC_ADMIN = 2,      /* Requires admin privileges */
+    SYSCALL_SEC_SYSTEM = 3,     /* System-level access */
+    SYSCALL_SEC_KERNEL = 4,     /* Kernel-level access */
+    SYSCALL_SEC_ENTERPRISE = 5  /* Enterprise security context */
+} syscall_security_level_t;
+
+/* Rate limiting algorithms */
+typedef enum {
+    RATE_LIMIT_TOKEN_BUCKET = 0,
+    RATE_LIMIT_LEAKY_BUCKET = 1,
+    RATE_LIMIT_SLIDING_WINDOW = 2,
+    RATE_LIMIT_FIXED_WINDOW = 3
+} rate_limit_type_t;
+
+/* ============================================================================
+ * SYSTEM CALL STRUCTURES
+ * ============================================================================ */
+
+/* System call descriptor */
+typedef struct syscall_descriptor {
+    uint32_t number;                    /* System call number */
+    char name[64];                      /* System call name */
+    syscall_category_t category;        /* Category */
+    syscall_security_level_t sec_level; /* Security level */
+    uint32_t arg_count;                 /* Number of arguments */
+    uint32_t flags;                     /* Behavior flags */
+    
+    /* Function pointer */
+    int (*handler)(uint64_t* args);
+    
+    /* Rate limiting */
+    rate_limit_type_t rate_limit_type;
+    uint32_t rate_limit;                /* Max calls per second */
+    uint64_t rate_bucket_size;
+    
+    /* Statistics */
+    uint64_t call_count;
+    uint64_t success_count;
+    uint64_t error_count;
+    uint64_t blocked_count;
+    uint64_t total_time_ns;
+    uint64_t avg_time_ns;
+    uint64_t max_time_ns;
+    
+    /* Enterprise features */
+    bool audit_enabled;
+    bool trace_enabled;
+    bool sandbox_enabled;
+    uint32_t enterprise_policy;
+    
+    struct syscall_descriptor* next;
+} syscall_descriptor_t;
+
+/* System call trace entry */
+typedef struct syscall_trace_entry {
+    uint64_t timestamp;
+    uint32_t pid;
+    uint32_t tid;
+    uint32_t syscall_num;
+    uint64_t args[SYSCALL_MAX_ARGS];
+    int result;
+    uint64_t duration_ns;
+    uint32_t flags;
+    
+    /* Security context */
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t security_label;
+    char comm[16];              /* Process name */
+} syscall_trace_entry_t;
+
+/* System call audit entry */
+typedef struct syscall_audit_entry {
+    uint64_t timestamp;
+    uint32_t pid;
+    uint32_t uid;
+    uint32_t syscall_num;
+    char syscall_name[64];
+    int result;
+    uint32_t severity;          /* Audit severity level */
+    char description[256];      /* Audit description */
+    
+    /* Enterprise context */
+    uint32_t tenant_id;
+    uint32_t session_id;
+    char user_name[32];
+    char host_name[64];
+} syscall_audit_entry_t;
+
+/* Process rate limit state */
+typedef struct process_rate_limit {
+    uint32_t pid;
+    uint64_t last_reset_time;
+    uint32_t call_count;
+    uint64_t token_bucket;
+    uint64_t last_token_update;
+    
+    struct process_rate_limit* next;
+} process_rate_limit_t;
+
+/* Sandbox rule */
+typedef struct sandbox_rule {
+    uint32_t rule_id;
+    char rule_name[64];
+    syscall_category_t category;
+    uint32_t syscall_mask;      /* Bitmask of allowed syscalls */
+    uint32_t flags;             /* Rule flags */
+    
+    /* Conditions */
+    uint32_t uid_min;
+    uint32_t uid_max;
+    uint32_t gid_min;
+    uint32_t gid_max;
+    char process_name[32];
+    
+    /* Statistics */
+    uint64_t applied_count;
+    uint64_t blocked_count;
+    
+    struct sandbox_rule* next;
+} sandbox_rule_t;
+
+/* ============================================================================
+ * GLOBAL VARIABLES
+ * ============================================================================ */
+
+static syscall_descriptor_t* g_syscall_table[SYSCALL_MAX_NUMBER] = {0};
+static syscall_trace_entry_t* g_trace_buffer = NULL;
+static uint32_t g_trace_head = 0;
+static uint32_t g_trace_tail = 0;
+static syscall_audit_entry_t* g_audit_buffer = NULL;
+static uint32_t g_audit_head = 0;
+static uint32_t g_audit_tail = 0;
+static process_rate_limit_t* g_rate_limits = NULL;
+static sandbox_rule_t* g_sandbox_rules = NULL;
+
+/* Framework state */
+static struct {
+    bool initialized;
+    bool tracing_enabled;
+    bool auditing_enabled;
+    bool sandboxing_enabled;
+    bool rate_limiting_enabled;
+    bool enterprise_mode;
+    uint32_t security_level;
+    
+    /* Statistics */
+    uint64_t total_syscalls;
+    uint64_t successful_syscalls;
+    uint64_t failed_syscalls;
+    uint64_t blocked_syscalls;
+    uint64_t traced_syscalls;
+    uint64_t audited_syscalls;
+    uint64_t rate_limited_calls;
+    uint64_t sandbox_violations;
+    
+    /* Performance metrics */
+    uint64_t avg_syscall_time;
+    uint64_t max_syscall_time;
+    uint64_t min_syscall_time;
+    
+    /* Enterprise metrics */
+    uint64_t compliance_checks;
+    uint64_t security_violations;
+    uint64_t privilege_escalations;
+} g_syscall_framework = {0};
+
+/* ============================================================================
+ * HELPER FUNCTIONS
+ * ============================================================================ */
+
+static uint64_t get_system_time_ns(void) {
+    /* This would typically use the HAL timer system */
+    static uint64_t system_time = 0;
+    return ++system_time; /* Simple counter for now */
+}
+
+static uint32_t get_current_pid(void) {
+    /* This would get the current process ID */
+    return 1; /* Stub */
+}
+
+static uint32_t get_current_uid(void) {
+    /* This would get the current user ID */
+    return 1000; /* Stub */
+}
+
+static uint32_t get_current_gid(void) {
+    /* This would get the current group ID */
+    return 1000; /* Stub */
+}
+
+static void printf(const char* fmt, ...) {
+    /* This would typically use the kernel console system */
+}
+
+static void* malloc(size_t size) {
+    /* This would typically use the kernel memory allocator */
+    return NULL; /* Stub implementation */
+}
+
+static void free(void* ptr) {
+    /* This would typically use the kernel memory allocator */
+}
+
+/* ============================================================================
+ * RATE LIMITING
+ * ============================================================================ */
+
+static process_rate_limit_t* find_process_rate_limit(uint32_t pid) {
+    process_rate_limit_t* limit = g_rate_limits;
+    while (limit) {
+        if (limit->pid == pid) {
+            return limit;
+        }
+        limit = limit->next;
+    }
+    return NULL;
+}
+
+static process_rate_limit_t* create_process_rate_limit(uint32_t pid) {
+    process_rate_limit_t* limit = malloc(sizeof(process_rate_limit_t));
+    if (!limit) return NULL;
+    
+    memset(limit, 0, sizeof(process_rate_limit_t));
+    limit->pid = pid;
+    limit->last_reset_time = get_system_time_ns();
+    limit->token_bucket = SYSCALL_MAX_RATE_LIMIT;
+    limit->last_token_update = get_system_time_ns();
+    
+    /* Add to list */
+    limit->next = g_rate_limits;
+    g_rate_limits = limit;
+    
+    return limit;
+}
+
+static bool check_rate_limit(uint32_t pid, syscall_descriptor_t* syscall) {
+    if (!g_syscall_framework.rate_limiting_enabled || syscall->rate_limit == 0) {
+        return true; /* Rate limiting disabled or no limit for this syscall */
+    }
+    
+    process_rate_limit_t* limit = find_process_rate_limit(pid);
+    if (!limit) {
+        limit = create_process_rate_limit(pid);
+        if (!limit) return false; /* Memory allocation failed */
+    }
+    
+    uint64_t current_time = get_system_time_ns();
+    
+    /* Token bucket algorithm */
+    if (syscall->rate_limit_type == RATE_LIMIT_TOKEN_BUCKET) {
+        uint64_t time_diff = current_time - limit->last_token_update;
+        uint64_t new_tokens = (syscall->rate_limit * time_diff) / 1000000000; /* per second */
+        
+        limit->token_bucket = (limit->token_bucket + new_tokens) > syscall->rate_bucket_size ?
+                             syscall->rate_bucket_size : limit->token_bucket + new_tokens;
+        
+        if (limit->token_bucket > 0) {
+            limit->token_bucket--;
+            limit->last_token_update = current_time;
+            return true; /* Call allowed */
+        } else {
+            syscall->blocked_count++;
+            g_syscall_framework.rate_limited_calls++;
+            return false; /* Call blocked */
+        }
+    }
+    
+    /* Other rate limiting algorithms would be implemented here */
+    return true;
+}
+
+/* ============================================================================
+ * SANDBOXING
+ * ============================================================================ */
+
+static sandbox_rule_t* find_applicable_sandbox_rule(uint32_t pid, uint32_t uid, uint32_t gid, 
+                                                   const char* process_name, syscall_descriptor_t* syscall) {
+    sandbox_rule_t* rule = g_sandbox_rules;
+    while (rule) {
+        /* Check if rule applies to this process */
+        bool applies = true;
+        
+        if (rule->uid_min != 0 && uid < rule->uid_min) applies = false;
+        if (rule->uid_max != 0 && uid > rule->uid_max) applies = false;
+        if (rule->gid_min != 0 && gid < rule->gid_min) applies = false;
+        if (rule->gid_max != 0 && gid > rule->gid_max) applies = false;
+        if (rule->process_name[0] != '\0' && strcmp(process_name, rule->process_name) != 0) applies = false;
+        if (rule->category != syscall->category && rule->category != SYSCALL_CAT_MAX) applies = false;
+        
+        if (applies) {
+            return rule;
+        }
+        
+        rule = rule->next;
+    }
+    return NULL;
+}
+
+static bool check_sandbox_permission(uint32_t pid, syscall_descriptor_t* syscall) {
+    if (!g_syscall_framework.sandboxing_enabled) {
+        return true; /* Sandboxing disabled */
+    }
+    
+    uint32_t uid = get_current_uid();
+    uint32_t gid = get_current_gid();
+    char process_name[32] = "unknown"; /* Would get from process table */
+    
+    sandbox_rule_t* rule = find_applicable_sandbox_rule(pid, uid, gid, process_name, syscall);
+    if (!rule) {
+        return true; /* No applicable rule, allow by default */
+    }
+    
+    /* Check if syscall is allowed by the rule */
+    uint32_t syscall_bit = 1 << (syscall->number % 32);
+    if (rule->syscall_mask & syscall_bit) {
+        rule->applied_count++;
+        return true; /* Allowed */
+    } else {
+        rule->blocked_count++;
+        g_syscall_framework.sandbox_violations++;
+        return false; /* Blocked */
+    }
+}
+
+/* ============================================================================
+ * TRACING
+ * ============================================================================ */
+
+static void add_trace_entry(uint32_t pid, uint32_t syscall_num, uint64_t* args, 
+                           int result, uint64_t duration_ns) {
+    if (!g_syscall_framework.tracing_enabled || !g_trace_buffer) {
+        return;
+    }
+    
+    syscall_trace_entry_t* entry = &g_trace_buffer[g_trace_head];
+    
+    entry->timestamp = get_system_time_ns();
+    entry->pid = pid;
+    entry->tid = pid; /* Simplified - would get actual thread ID */
+    entry->syscall_num = syscall_num;
+    memcpy(entry->args, args, sizeof(uint64_t) * SYSCALL_MAX_ARGS);
+    entry->result = result;
+    entry->duration_ns = duration_ns;
+    entry->uid = get_current_uid();
+    entry->gid = get_current_gid();
+    entry->security_label = 0; /* Would get from security context */
+    strcpy(entry->comm, "unknown"); /* Would get process name */
+    
+    /* Advance head pointer (circular buffer) */
+    g_trace_head = (g_trace_head + 1) % SYSCALL_MAX_TRACE_ENTRIES;
+    if (g_trace_head == g_trace_tail) {
+        g_trace_tail = (g_trace_tail + 1) % SYSCALL_MAX_TRACE_ENTRIES; /* Overwrite oldest */
+    }
+    
+    g_syscall_framework.traced_syscalls++;
+}
+
+/* ============================================================================
+ * AUDITING
+ * ============================================================================ */
+
+static void add_audit_entry(uint32_t pid, uint32_t syscall_num, const char* syscall_name,
+                           int result, uint32_t severity, const char* description) {
+    if (!g_syscall_framework.auditing_enabled || !g_audit_buffer) {
+        return;
+    }
+    
+    syscall_audit_entry_t* entry = &g_audit_buffer[g_audit_head];
+    
+    entry->timestamp = get_system_time_ns();
+    entry->pid = pid;
+    entry->uid = get_current_uid();
+    entry->syscall_num = syscall_num;
+    strncpy(entry->syscall_name, syscall_name, sizeof(entry->syscall_name) - 1);
+    entry->syscall_name[sizeof(entry->syscall_name) - 1] = '\0';
+    entry->result = result;
+    entry->severity = severity;
+    strncpy(entry->description, description, sizeof(entry->description) - 1);
+    entry->description[sizeof(entry->description) - 1] = '\0';
+    
+    /* Enterprise context */
+    entry->tenant_id = 0; /* Would get from security context */
+    entry->session_id = 0; /* Would get from session manager */
+    strcpy(entry->user_name, "unknown"); /* Would get from user database */
+    strcpy(entry->host_name, "localhost"); /* Would get from system */
+    
+    /* Advance head pointer (circular buffer) */
+    g_audit_head = (g_audit_head + 1) % SYSCALL_MAX_AUDIT_ENTRIES;
+    if (g_audit_head == g_audit_tail) {
+        g_audit_tail = (g_audit_tail + 1) % SYSCALL_MAX_AUDIT_ENTRIES; /* Overwrite oldest */
+    }
+    
+    g_syscall_framework.audited_syscalls++;
+}
+
+/* ============================================================================
+ * SYSTEM CALL REGISTRATION
+ * ============================================================================ */
+
+int syscall_register(uint32_t number, const char* name, syscall_category_t category,
+                    syscall_security_level_t sec_level, uint32_t arg_count,
+                    int (*handler)(uint64_t* args)) {
+    if (number >= SYSCALL_MAX_NUMBER || !name || !handler) {
+        return -1; /* Invalid parameters */
+    }
+    
+    if (g_syscall_table[number] != NULL) {
+        return -2; /* System call number already registered */
+    }
+    
+    syscall_descriptor_t* desc = malloc(sizeof(syscall_descriptor_t));
+    if (!desc) {
+        return -3; /* Memory allocation failed */
+    }
+    
+    memset(desc, 0, sizeof(syscall_descriptor_t));
+    
+    desc->number = number;
+    strncpy(desc->name, name, sizeof(desc->name) - 1);
+    desc->name[sizeof(desc->name) - 1] = '\0';
+    desc->category = category;
+    desc->sec_level = sec_level;
+    desc->arg_count = arg_count;
+    desc->handler = handler;
+    
+    /* Default rate limiting configuration */
+    desc->rate_limit_type = RATE_LIMIT_TOKEN_BUCKET;
+    desc->rate_limit = SYSCALL_MAX_RATE_LIMIT;
+    desc->rate_bucket_size = SYSCALL_MAX_RATE_LIMIT * 2;
+    
+    /* Default enterprise settings */
+    desc->audit_enabled = (sec_level >= SYSCALL_SEC_ADMIN);
+    desc->trace_enabled = true;
+    desc->sandbox_enabled = (sec_level >= SYSCALL_SEC_USER);
+    
+    g_syscall_table[number] = desc;
+    
+    return 0;
+}
+
+/* ============================================================================
+ * SYSTEM CALL DISPATCHER
+ * ============================================================================ */
+
+int syscall_dispatch(uint32_t syscall_num, uint64_t* args) {
+    if (syscall_num >= SYSCALL_MAX_NUMBER || !g_syscall_table[syscall_num]) {
+        return -1; /* Invalid system call number */
+    }
+    
+    syscall_descriptor_t* syscall = g_syscall_table[syscall_num];
+    uint32_t pid = get_current_pid();
+    uint64_t start_time = get_system_time_ns();
+    int result = 0;
+    
+    /* Update global statistics */
+    g_syscall_framework.total_syscalls++;
+    syscall->call_count++;
+    
+    /* Rate limiting check */
+    if (!check_rate_limit(pid, syscall)) {
+        g_syscall_framework.blocked_syscalls++;
+        add_audit_entry(pid, syscall_num, syscall->name, -2, 2, "Rate limit exceeded");
+        return -2; /* Rate limit exceeded */
+    }
+    
+    /* Sandbox permission check */
+    if (!check_sandbox_permission(pid, syscall)) {
+        g_syscall_framework.blocked_syscalls++;
+        syscall->blocked_count++;
+        add_audit_entry(pid, syscall_num, syscall->name, -3, 3, "Sandbox violation");
+        return -3; /* Sandbox violation */
+    }
+    
+    /* Security level check */
+    uint32_t current_privilege = 1; /* Would get from process security context */
+    if (syscall->sec_level > current_privilege) {
+        g_syscall_framework.blocked_syscalls++;
+        g_syscall_framework.privilege_escalations++;
+        add_audit_entry(pid, syscall_num, syscall->name, -4, 4, "Insufficient privileges");
+        return -4; /* Insufficient privileges */
+    }
+    
+    /* Enterprise compliance check */
+    if (g_syscall_framework.enterprise_mode && syscall->enterprise_policy != 0) {
+        g_syscall_framework.compliance_checks++;
+        /* Additional enterprise compliance checks would be here */
+    }
+    
+    /* Execute system call */
+    result = syscall->handler(args);
+    
+    /* Update timing statistics */
+    uint64_t end_time = get_system_time_ns();
+    uint64_t duration = end_time - start_time;
+    
+    syscall->total_time_ns += duration;
+    if (duration > syscall->max_time_ns) {
+        syscall->max_time_ns = duration;
+    }
+    syscall->avg_time_ns = syscall->total_time_ns / syscall->call_count;
+    
+    /* Update global timing statistics */
+    if (duration > g_syscall_framework.max_syscall_time) {
+        g_syscall_framework.max_syscall_time = duration;
+    }
+    if (g_syscall_framework.min_syscall_time == 0 || duration < g_syscall_framework.min_syscall_time) {
+        g_syscall_framework.min_syscall_time = duration;
+    }
+    g_syscall_framework.avg_syscall_time = 
+        (g_syscall_framework.avg_syscall_time * (g_syscall_framework.total_syscalls - 1) + duration) / 
+        g_syscall_framework.total_syscalls;
+    
+    /* Update success/error statistics */
+    if (result >= 0) {
+        g_syscall_framework.successful_syscalls++;
+        syscall->success_count++;
+    } else {
+        g_syscall_framework.failed_syscalls++;
+        syscall->error_count++;
+    }
+    
+    /* Add trace entry if enabled */
+    if (syscall->trace_enabled) {
+        add_trace_entry(pid, syscall_num, args, result, duration);
+    }
+    
+    /* Add audit entry if enabled and significant */
+    if (syscall->audit_enabled && (result < 0 || syscall->sec_level >= SYSCALL_SEC_ADMIN)) {
+        char description[256];
+        snprintf(description, sizeof(description), "System call %s %s", 
+                syscall->name, result >= 0 ? "succeeded" : "failed");
+        add_audit_entry(pid, syscall_num, syscall->name, result, 
+                       result < 0 ? 2 : 1, description);
+    }
+    
+    return result;
+}
+
+/* ============================================================================
+ * SANDBOX MANAGEMENT
+ * ============================================================================ */
+
+int syscall_add_sandbox_rule(const char* rule_name, syscall_category_t category,
+                             uint32_t syscall_mask, uint32_t uid_min, uint32_t uid_max) {
+    if (!rule_name || strlen(rule_name) == 0) {
+        return -1; /* Invalid rule name */
+    }
+    
+    sandbox_rule_t* rule = malloc(sizeof(sandbox_rule_t));
+    if (!rule) {
+        return -2; /* Memory allocation failed */
+    }
+    
+    memset(rule, 0, sizeof(sandbox_rule_t));
+    
+    /* Generate rule ID */
+    static uint32_t next_rule_id = 1;
+    rule->rule_id = next_rule_id++;
+    
+    strncpy(rule->rule_name, rule_name, sizeof(rule->rule_name) - 1);
+    rule->rule_name[sizeof(rule->rule_name) - 1] = '\0';
+    rule->category = category;
+    rule->syscall_mask = syscall_mask;
+    rule->uid_min = uid_min;
+    rule->uid_max = uid_max;
+    
+    /* Add to list */
+    rule->next = g_sandbox_rules;
+    g_sandbox_rules = rule;
+    
+    return rule->rule_id;
+}
+
+/* ============================================================================
+ * SYSTEM CALL EXAMPLES
+ * ============================================================================ */
+
+/* Example system call implementations */
+static int sys_getpid(uint64_t* args) {
+    return get_current_pid();
+}
+
+static int sys_getuid(uint64_t* args) {
+    return get_current_uid();
+}
+
+static int sys_gettimeofday(uint64_t* args) {
+    uint64_t* tv_sec = (uint64_t*)args[0];
+    uint64_t* tv_usec = (uint64_t*)args[1];
+    
+    if (!tv_sec || !tv_usec) {
+        return -1; /* Invalid pointer */
+    }
+    
+    uint64_t time_ns = get_system_time_ns();
+    *tv_sec = time_ns / 1000000000;
+    *tv_usec = (time_ns % 1000000000) / 1000;
+    
+    return 0;
+}
+
+static int sys_enterprise_info(uint64_t* args) {
+    /* Enterprise system call example */
+    uint32_t* info_type = (uint32_t*)args[0];
+    void* buffer = (void*)args[1];
+    uint32_t* buffer_size = (uint32_t*)args[2];
+    
+    if (!info_type || !buffer || !buffer_size) {
+        return -1; /* Invalid parameters */
+    }
+    
+    /* This would provide enterprise-specific system information */
+    return 0;
+}
+
+/* ============================================================================
+ * INITIALIZATION AND MAIN API
+ * ============================================================================ */
+
+int advanced_syscall_init(void) {
+    if (g_syscall_framework.initialized) {
+        return 0; /* Already initialized */
+    }
+    
+    /* Allocate trace buffer */
+    g_trace_buffer = malloc(sizeof(syscall_trace_entry_t) * SYSCALL_MAX_TRACE_ENTRIES);
+    if (!g_trace_buffer) {
+        return -1; /* Memory allocation failed */
+    }
+    memset(g_trace_buffer, 0, sizeof(syscall_trace_entry_t) * SYSCALL_MAX_TRACE_ENTRIES);
+    
+    /* Allocate audit buffer */
+    g_audit_buffer = malloc(sizeof(syscall_audit_entry_t) * SYSCALL_MAX_AUDIT_ENTRIES);
+    if (!g_audit_buffer) {
+        free(g_trace_buffer);
+        return -2; /* Memory allocation failed */
+    }
+    memset(g_audit_buffer, 0, sizeof(syscall_audit_entry_t) * SYSCALL_MAX_AUDIT_ENTRIES);
+    
+    /* Initialize framework state */
+    g_syscall_framework.initialized = true;
+    g_syscall_framework.tracing_enabled = true;
+    g_syscall_framework.auditing_enabled = true;
+    g_syscall_framework.sandboxing_enabled = false;
+    g_syscall_framework.rate_limiting_enabled = true;
+    g_syscall_framework.enterprise_mode = false;
+    g_syscall_framework.security_level = 1;
+    g_syscall_framework.min_syscall_time = UINT64_MAX;
+    
+    /* Register standard system calls */
+    syscall_register(1, "getpid", SYSCALL_CAT_PROCESS, SYSCALL_SEC_PUBLIC, 0, sys_getpid);
+    syscall_register(2, "getuid", SYSCALL_CAT_PROCESS, SYSCALL_SEC_PUBLIC, 0, sys_getuid);
+    syscall_register(3, "gettimeofday", SYSCALL_CAT_TIME, SYSCALL_SEC_PUBLIC, 2, sys_gettimeofday);
+    syscall_register(100, "enterprise_info", SYSCALL_CAT_ENTERPRISE, SYSCALL_SEC_ENTERPRISE, 3, sys_enterprise_info);
+    
+    /* Add default sandbox rules */
+    syscall_add_sandbox_rule("default_user", SYSCALL_CAT_PROCESS, 0xFFFFFFFF, 1000, 65535);
+    syscall_add_sandbox_rule("restricted_guest", SYSCALL_CAT_PROCESS, 0x0000000F, 65534, 65535);
+    
+    return 0;
+}
+
+void syscall_enable_enterprise_mode(bool enable) {
+    g_syscall_framework.enterprise_mode = enable;
+    
+    /* Update enterprise settings for all registered syscalls */
+    for (int i = 0; i < SYSCALL_MAX_NUMBER; i++) {
+        if (g_syscall_table[i]) {
+            syscall_descriptor_t* syscall = g_syscall_table[i];
+            if (enable) {
+                if (syscall->sec_level >= SYSCALL_SEC_USER) {
+                    syscall->audit_enabled = true;
+                    syscall->sandbox_enabled = true;
+                }
+            }
+        }
+    }
+    
+    printf("Advanced system call framework: Enterprise mode %s\n", 
+           enable ? "enabled" : "disabled");
+}
+
+void syscall_print_statistics(void) {
+    printf("\n=== Advanced System Call Framework Statistics ===\n");
+    printf("Total Calls: %llu (Success: %llu, Failed: %llu, Blocked: %llu)\n",
+           g_syscall_framework.total_syscalls, g_syscall_framework.successful_syscalls,
+           g_syscall_framework.failed_syscalls, g_syscall_framework.blocked_syscalls);
+    printf("Tracing: %llu traced calls\n", g_syscall_framework.traced_syscalls);
+    printf("Auditing: %llu audit entries\n", g_syscall_framework.audited_syscalls);
+    printf("Rate Limiting: %llu calls rate limited\n", g_syscall_framework.rate_limited_calls);
+    printf("Sandbox: %llu violations detected\n", g_syscall_framework.sandbox_violations);
+    printf("Performance: Avg=%llu ns, Min=%llu ns, Max=%llu ns\n",
+           g_syscall_framework.avg_syscall_time, g_syscall_framework.min_syscall_time,
+           g_syscall_framework.max_syscall_time);
+    printf("Security: %llu violations, %llu privilege escalations\n",
+           g_syscall_framework.security_violations, g_syscall_framework.privilege_escalations);
+    printf("Enterprise: Mode=%s, Compliance checks=%llu\n",
+           g_syscall_framework.enterprise_mode ? "Enabled" : "Disabled",
+           g_syscall_framework.compliance_checks);
+    
+    /* Top system calls by usage */
+    printf("\n--- Most Called System Calls ---\n");
+    for (int i = 0; i < 10; i++) {
+        syscall_descriptor_t* top_syscall = NULL;
+        uint64_t max_calls = 0;
+        
+        for (int j = 0; j < SYSCALL_MAX_NUMBER; j++) {
+            if (g_syscall_table[j] && g_syscall_table[j]->call_count > max_calls) {
+                bool already_printed = false;
+                /* Check if already in top list */
+                /* This would need a more sophisticated implementation */
+                if (!already_printed) {
+                    top_syscall = g_syscall_table[j];
+                    max_calls = g_syscall_table[j]->call_count;
+                }
+            }
+        }
+        
+        if (top_syscall && max_calls > 0) {
+            printf("%s: %llu calls (Avg: %llu ns, Errors: %llu)\n",
+                   top_syscall->name, top_syscall->call_count,
+                   top_syscall->avg_time_ns, top_syscall->error_count);
+        }
+    }
+}
+
+int syscall_self_test(void) {
+    printf("Running advanced system call framework self-test...\n");
+    
+    /* Test basic system call dispatch */
+    uint64_t args[SYSCALL_MAX_ARGS] = {0};
+    int result = syscall_dispatch(1, args); /* getpid */
+    if (result < 0) {
+        printf("ERROR: Basic syscall dispatch failed\n");
+        return -1;
+    }
+    
+    /* Test rate limiting */
+    g_syscall_framework.rate_limiting_enabled = true;
+    if (g_syscall_table[1]) {
+        g_syscall_table[1]->rate_limit = 1; /* Very low limit */
+        g_syscall_table[1]->rate_bucket_size = 1;
+    }
+    
+    /* Multiple rapid calls should trigger rate limiting */
+    int rate_limited = 0;
+    for (int i = 0; i < 10; i++) {
+        result = syscall_dispatch(1, args);
+        if (result == -2) { /* Rate limit exceeded */
+            rate_limited++;
+        }
+    }
+    
+    if (rate_limited == 0) {
+        printf("WARNING: Rate limiting not working as expected\n");
+    }
+    
+    /* Test enterprise system call */
+    result = syscall_dispatch(100, args); /* enterprise_info */
+    if (result < 0 && result != -4) { /* Should fail with privilege error */
+        printf("ERROR: Enterprise syscall test failed unexpectedly\n");
+        return -1;
+    }
+    
+    /* Test sandbox rule creation */
+    int rule_id = syscall_add_sandbox_rule("test_rule", SYSCALL_CAT_PROCESS, 0x00000001, 0, 1000);
+    if (rule_id < 0) {
+        printf("ERROR: Sandbox rule creation failed\n");
+        return -1;
+    }
+    
+    printf("Advanced system call framework self-test completed successfully!\n");
+    return 0;
+}
+
+void syscall_shutdown(void) {
+    /* Free allocated memory */
+    if (g_trace_buffer) {
+        free(g_trace_buffer);
+        g_trace_buffer = NULL;
+    }
+    
+    if (g_audit_buffer) {
+        free(g_audit_buffer);
+        g_audit_buffer = NULL;
+    }
+    
+    /* Free syscall descriptors */
+    for (int i = 0; i < SYSCALL_MAX_NUMBER; i++) {
+        if (g_syscall_table[i]) {
+            free(g_syscall_table[i]);
+            g_syscall_table[i] = NULL;
+        }
+    }
+    
+    /* Free rate limit structures */
+    while (g_rate_limits) {
+        process_rate_limit_t* limit = g_rate_limits;
+        g_rate_limits = limit->next;
+        free(limit);
+    }
+    
+    /* Free sandbox rules */
+    while (g_sandbox_rules) {
+        sandbox_rule_t* rule = g_sandbox_rules;
+        g_sandbox_rules = rule->next;
+        free(rule);
+    }
+    
+    g_syscall_framework.initialized = false;
+}

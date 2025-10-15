@@ -1,0 +1,690 @@
+/**
+ * Real-Time Priority Inheritance and Bandwidth Management for LimitlessOS
+ * Advanced real-time features for enterprise systems
+ */
+
+#include "kernel.h"
+#include "realtime_scheduler.h"
+#include "timer.h"
+#include "security.h"
+
+/* Priority inheritance chain tracking */
+typedef struct pi_chain_node {
+    rt_task_t* task;
+    uint32_t original_priority;
+    uint32_t inherited_priority;
+    struct pi_chain_node* next;
+} pi_chain_node_t;
+
+/* Resource tracking for priority inheritance */
+typedef struct rt_resource {
+    uint32_t resource_id;
+    uint32_t resource_type;         /* Mutex, semaphore, etc. */
+    rt_task_t* owner;               /* Current owner */
+    rt_task_t* highest_waiter;      /* Highest priority waiter */
+    pi_chain_node_t* pi_chain;     /* Priority inheritance chain */
+    uint32_t lock_count;            /* For recursive locks */
+    
+    spinlock_t lock;
+    struct rt_resource* next;
+} rt_resource_t;
+
+/* Bandwidth reservation for CPU partitions */
+typedef struct rt_bandwidth {
+    uint32_t cpu_id;
+    uint64_t period_ns;
+    uint64_t runtime_ns;
+    uint64_t deadline_ns;
+    
+    /* Current state */
+    uint64_t consumed_ns;           /* Runtime consumed in current period */
+    uint64_t period_start_ns;       /* Start of current period */
+    bool throttled;                 /* Bandwidth exceeded */
+    
+    /* Statistics */
+    uint64_t periods_completed;
+    uint64_t periods_throttled;
+    uint64_t total_runtime_ns;
+    
+    spinlock_t lock;
+} rt_bandwidth_t;
+
+/* Cache partitioning for real-time tasks */
+typedef struct rt_cache_partition {
+    uint32_t partition_id;
+    uint32_t cache_level;           /* L1, L2, L3 */
+    uint64_t size_bytes;
+    uint32_t ways;                  /* Number of cache ways */
+    uint32_t assigned_tasks;        /* Number of tasks using this partition */
+    
+    rt_task_t* task_list;           /* Tasks using this partition */
+    
+    spinlock_t lock;
+} rt_cache_partition_t;
+
+/* Global RT resource management */
+static struct {
+    rt_resource_t* resource_list;
+    uint32_t next_resource_id;
+    rt_bandwidth_t cpu_bandwidth[MAX_CPUS];
+    rt_cache_partition_t cache_partitions[16];  /* Max 16 cache partitions */
+    uint32_t cache_partition_count;
+    
+    /* Priority inheritance statistics */
+    uint64_t pi_activations;
+    uint64_t pi_chain_length_total;
+    uint32_t pi_max_chain_length;
+    
+    spinlock_t global_lock;
+} g_rt_resources = {0};
+
+/* Initialize RT resource management */
+status_t rt_resource_management_init(void) {
+    k_memset(&g_rt_resources, 0, sizeof(g_rt_resources));
+    
+    spinlock_init(&g_rt_resources.global_lock);
+    g_rt_resources.next_resource_id = 1;
+    
+    /* Initialize per-CPU bandwidth reservations */
+    extern realtime_scheduler_t g_rt_scheduler;
+    for (uint32_t i = 0; i < g_rt_scheduler.cpu_count; i++) {
+        rt_bandwidth_t* bw = &g_rt_resources.cpu_bandwidth[i];
+        
+        bw->cpu_id = i;
+        bw->period_ns = g_rt_scheduler.global_period_ns;
+        bw->runtime_ns = (g_rt_scheduler.global_period_ns * g_rt_scheduler.rt_bandwidth_percent) / 100;
+        bw->deadline_ns = bw->period_ns;
+        bw->consumed_ns = 0;
+        bw->period_start_ns = timer_get_ticks_ns();
+        bw->throttled = false;
+        
+        spinlock_init(&bw->lock);
+    }
+    
+    /* Initialize cache partitions */
+    g_rt_resources.cache_partition_count = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        rt_cache_partition_t* partition = &g_rt_resources.cache_partitions[i];
+        k_memset(partition, 0, sizeof(rt_cache_partition_t));
+        spinlock_init(&partition->lock);
+    }
+    
+    console_printf("RT resource management initialized\n");
+    
+    return STATUS_OK;
+}
+
+/* Create RT resource for priority inheritance */
+status_t rt_resource_create(uint32_t resource_type, uint32_t* resource_id) {
+    if (!resource_id) {
+        return STATUS_ERROR;
+    }
+    
+    rt_resource_t* resource = k_malloc(sizeof(rt_resource_t));
+    if (!resource) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(resource, 0, sizeof(rt_resource_t));
+    
+    spin_lock(&g_rt_resources.global_lock);
+    
+    resource->resource_id = g_rt_resources.next_resource_id++;
+    resource->resource_type = resource_type;
+    resource->owner = NULL;
+    resource->highest_waiter = NULL;
+    resource->pi_chain = NULL;
+    resource->lock_count = 0;
+    
+    spinlock_init(&resource->lock);
+    
+    /* Add to global list */
+    resource->next = g_rt_resources.resource_list;
+    g_rt_resources.resource_list = resource;
+    
+    spin_unlock(&g_rt_resources.global_lock);
+    
+    *resource_id = resource->resource_id;
+    
+    console_printf("RT resource %u created (type %u)\n", resource->resource_id, resource_type);
+    
+    return STATUS_OK;
+}
+
+/* Acquire RT resource with priority inheritance */
+status_t rt_resource_acquire(uint32_t resource_id, uint32_t task_id, uint64_t timeout_ns) {
+    /* Find resource */
+    rt_resource_t* resource = NULL;
+    
+    spin_lock(&g_rt_resources.global_lock);
+    
+    rt_resource_t* current = g_rt_resources.resource_list;
+    while (current) {
+        if (current->resource_id == resource_id) {
+            resource = current;
+            break;
+        }
+        current = current->next;
+    }
+    
+    spin_unlock(&g_rt_resources.global_lock);
+    
+    if (!resource) {
+        return STATUS_ERROR;
+    }
+    
+    /* Find requesting task */
+    extern realtime_scheduler_t g_rt_scheduler;
+    rt_task_t* requesting_task = NULL;
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    rt_task_t* task = g_rt_scheduler.task_list;
+    while (task) {
+        if (task->task_id == task_id) {
+            requesting_task = task;
+            break;
+        }
+        task = task->next;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    if (!requesting_task) {
+        return STATUS_ERROR;
+    }
+    
+    uint64_t start_time = timer_get_ticks_ns();
+    
+    spin_lock(&resource->lock);
+    
+    /* Check if resource is available */
+    if (!resource->owner) {
+        /* Resource available - acquire it */
+        resource->owner = requesting_task;
+        resource->lock_count = 1;
+        spin_unlock(&resource->lock);
+        
+        console_printf("RT task %u acquired resource %u\n", task_id, resource_id);
+        return STATUS_OK;
+    }
+    
+    /* Resource is owned - check for recursive acquisition */
+    if (resource->owner == requesting_task) {
+        resource->lock_count++;
+        spin_unlock(&resource->lock);
+        return STATUS_OK;
+    }
+    
+    /* Resource blocked - apply priority inheritance */
+    if (g_rt_scheduler.priority_inheritance) {
+        rt_task_t* owner = resource->owner;
+        
+        /* Check if requesting task has higher priority */
+        bool needs_inheritance = false;
+        
+        if (requesting_task->class == RT_CLASS_DEADLINE && owner->class == RT_CLASS_DEADLINE) {
+            /* EDF - compare deadlines */
+            needs_inheritance = rt_task_has_earlier_deadline(requesting_task, owner);
+        } else if (requesting_task->class != RT_CLASS_DEADLINE && owner->class != RT_CLASS_DEADLINE) {
+            /* Fixed priority - compare priorities */
+            needs_inheritance = requesting_task->params.priority < owner->params.priority;
+        } else if (requesting_task->class == RT_CLASS_DEADLINE) {
+            /* Deadline task blocked by non-deadline task - always inherit */
+            needs_inheritance = true;
+        }
+        
+        if (needs_inheritance) {
+            /* Apply priority inheritance */
+            pi_chain_node_t* pi_node = k_malloc(sizeof(pi_chain_node_t));
+            if (pi_node) {
+                pi_node->task = owner;
+                pi_node->original_priority = owner->params.priority;
+                pi_node->inherited_priority = requesting_task->params.priority;
+                pi_node->next = resource->pi_chain;
+                resource->pi_chain = pi_node;
+                
+                /* Boost owner's priority */
+                spin_lock(&owner->lock);
+                owner->priority_boost = requesting_task->params.priority;
+                spin_unlock(&owner->lock);
+                
+                /* Update statistics */
+                g_rt_resources.pi_activations++;
+                
+                /* Calculate chain length */
+                uint32_t chain_length = 0;
+                pi_chain_node_t* chain_node = resource->pi_chain;
+                while (chain_node) {
+                    chain_length++;
+                    chain_node = chain_node->next;
+                }
+                
+                g_rt_resources.pi_chain_length_total += chain_length;
+                if (chain_length > g_rt_resources.pi_max_chain_length) {
+                    g_rt_resources.pi_max_chain_length = chain_length;
+                }
+                
+                console_printf("Priority inheritance: task %u -> task %u (priority %u -> %u)\n",
+                              requesting_task->task_id, owner->task_id,
+                              pi_node->original_priority, pi_node->inherited_priority);
+            }
+        }
+        
+        /* Track highest priority waiter */
+        if (!resource->highest_waiter || 
+            (requesting_task->params.priority < resource->highest_waiter->params.priority)) {
+            resource->highest_waiter = requesting_task;
+        }
+    }
+    
+    spin_unlock(&resource->lock);
+    
+    /* Block requesting task */
+    spin_lock(&requesting_task->lock);
+    requesting_task->state = RT_STATE_BLOCKED;
+    spin_unlock(&requesting_task->lock);
+    
+    /* Wait for resource with timeout */
+    uint64_t wait_start = timer_get_ticks_ns();
+    
+    while (true) {
+        spin_lock(&resource->lock);
+        
+        if (resource->owner == requesting_task) {
+            /* We got the resource */
+            spin_unlock(&resource->lock);
+            
+            spin_lock(&requesting_task->lock);
+            requesting_task->state = RT_STATE_READY;
+            spin_unlock(&requesting_task->lock);
+            
+            console_printf("RT task %u acquired resource %u after waiting %llu ns\n",
+                          task_id, resource_id, timer_get_ticks_ns() - wait_start);
+            
+            return STATUS_OK;
+        }
+        
+        spin_unlock(&resource->lock);
+        
+        /* Check timeout */
+        if (timeout_ns > 0 && (timer_get_ticks_ns() - wait_start) > timeout_ns) {
+            spin_lock(&requesting_task->lock);
+            requesting_task->state = RT_STATE_READY;
+            spin_unlock(&requesting_task->lock);
+            
+            console_printf("RT task %u timed out waiting for resource %u\n", task_id, resource_id);
+            return STATUS_ERROR;
+        }
+        
+        /* Yield and try again */
+        timer_sleep_ns(1000);  /* 1μs sleep */
+    }
+}
+
+/* Release RT resource and restore priorities */
+status_t rt_resource_release(uint32_t resource_id, uint32_t task_id) {
+    /* Find resource */
+    rt_resource_t* resource = NULL;
+    
+    spin_lock(&g_rt_resources.global_lock);
+    
+    rt_resource_t* current = g_rt_resources.resource_list;
+    while (current) {
+        if (current->resource_id == resource_id) {
+            resource = current;
+            break;
+        }
+        current = current->next;
+    }
+    
+    spin_unlock(&g_rt_resources.global_lock);
+    
+    if (!resource) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&resource->lock);
+    
+    /* Check if task owns the resource */
+    if (!resource->owner || resource->owner->task_id != task_id) {
+        spin_unlock(&resource->lock);
+        return STATUS_ERROR;
+    }
+    
+    /* Handle recursive releases */
+    resource->lock_count--;
+    if (resource->lock_count > 0) {
+        spin_unlock(&resource->lock);
+        return STATUS_OK;
+    }
+    
+    rt_task_t* previous_owner = resource->owner;
+    
+    /* Restore original priorities */
+    if (resource->pi_chain) {
+        pi_chain_node_t* pi_node = resource->pi_chain;
+        while (pi_node) {
+            spin_lock(&pi_node->task->lock);
+            pi_node->task->priority_boost = 0;  /* Remove boost */
+            spin_unlock(&pi_node->task->lock);
+            
+            pi_chain_node_t* next = pi_node->next;
+            k_free(pi_node);
+            pi_node = next;
+        }
+        resource->pi_chain = NULL;
+    }
+    
+    /* Transfer ownership to highest priority waiter */
+    if (resource->highest_waiter) {
+        resource->owner = resource->highest_waiter;
+        resource->lock_count = 1;
+        resource->highest_waiter = NULL;
+        
+        /* Wake up new owner */
+        spin_lock(&resource->owner->lock);
+        if (resource->owner->state == RT_STATE_BLOCKED) {
+            resource->owner->state = RT_STATE_READY;
+        }
+        spin_unlock(&resource->owner->lock);
+        
+        console_printf("RT resource %u transferred from task %u to task %u\n",
+                      resource_id, task_id, resource->owner->task_id);
+    } else {
+        /* No waiters - resource becomes free */
+        resource->owner = NULL;
+        resource->lock_count = 0;
+        
+        console_printf("RT task %u released resource %u\n", task_id, resource_id);
+    }
+    
+    spin_unlock(&resource->lock);
+    
+    /* Trigger rescheduling on owner's CPU */
+    if (previous_owner) {
+        rt_schedule(previous_owner->assigned_cpu);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Check and enforce CPU bandwidth limits */
+status_t rt_bandwidth_check(uint32_t cpu_id, uint64_t runtime_request_ns) {
+    if (cpu_id >= MAX_CPUS) {
+        return STATUS_ERROR;
+    }
+    
+    rt_bandwidth_t* bw = &g_rt_resources.cpu_bandwidth[cpu_id];
+    uint64_t current_time = timer_get_ticks_ns();
+    
+    spin_lock(&bw->lock);
+    
+    /* Check if we're in a new period */
+    if (current_time >= bw->period_start_ns + bw->period_ns) {
+        /* Start new period */
+        bw->period_start_ns = current_time;
+        bw->consumed_ns = 0;
+        bw->throttled = false;
+        bw->periods_completed++;
+    }
+    
+    /* Check bandwidth availability */
+    if (bw->consumed_ns + runtime_request_ns > bw->runtime_ns) {
+        /* Bandwidth exceeded - throttle */
+        bw->throttled = true;
+        bw->periods_throttled++;
+        
+        spin_unlock(&bw->lock);
+        
+        console_printf("CPU %u bandwidth exceeded: requested %llu ns, available %llu ns\n",
+                      cpu_id, runtime_request_ns, bw->runtime_ns - bw->consumed_ns);
+        
+        return STATUS_ERROR;
+    }
+    
+    /* Reserve bandwidth */
+    bw->consumed_ns += runtime_request_ns;
+    bw->total_runtime_ns += runtime_request_ns;
+    
+    spin_unlock(&bw->lock);
+    
+    return STATUS_OK;
+}
+
+/* Create cache partition for RT tasks */
+status_t rt_create_cache_partition(uint32_t cache_level, uint64_t size_bytes, uint32_t* partition_id) {
+    if (!partition_id || g_rt_resources.cache_partition_count >= 16) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_rt_resources.global_lock);
+    
+    uint32_t id = g_rt_resources.cache_partition_count++;
+    rt_cache_partition_t* partition = &g_rt_resources.cache_partitions[id];
+    
+    partition->partition_id = id;
+    partition->cache_level = cache_level;
+    partition->size_bytes = size_bytes;
+    partition->ways = size_bytes / (64 * 1024);  /* Assume 64KB per way */
+    partition->assigned_tasks = 0;
+    partition->task_list = NULL;
+    
+    spin_unlock(&g_rt_resources.global_lock);
+    
+    *partition_id = id;
+    
+    console_printf("Cache partition %u created: L%u cache, %llu KB, %u ways\n",
+                  id, cache_level, size_bytes / 1024, partition->ways);
+    
+    return STATUS_OK;
+}
+
+/* Assign task to cache partition */
+status_t rt_set_cache_partition(uint32_t task_id, uint32_t partition_id) {
+    if (partition_id >= g_rt_resources.cache_partition_count) {
+        return STATUS_ERROR;
+    }
+    
+    /* Find task */
+    extern realtime_scheduler_t g_rt_scheduler;
+    rt_task_t* task = NULL;
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    rt_task_t* current = g_rt_scheduler.task_list;
+    while (current) {
+        if (current->task_id == task_id) {
+            task = current;
+            break;
+        }
+        current = current->next;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    if (!task) {
+        return STATUS_ERROR;
+    }
+    
+    rt_cache_partition_t* partition = &g_rt_resources.cache_partitions[partition_id];
+    
+    spin_lock(&partition->lock);
+    
+    /* Update task's cache partition */
+    spin_lock(&task->lock);
+    task->params.cache_partition = partition_id;
+    spin_unlock(&task->lock);
+    
+    /* Add task to partition's task list */
+    /* In real implementation, would configure hardware cache partitioning */
+    partition->assigned_tasks++;
+    
+    spin_unlock(&partition->lock);
+    
+    console_printf("RT task %u assigned to cache partition %u\n", task_id, partition_id);
+    
+    return STATUS_OK;
+}
+
+/* Set memory bandwidth reservation for task */
+status_t rt_set_memory_bandwidth_reservation(uint32_t task_id, uint32_t bandwidth_mbps) {
+    /* Find task */
+    extern realtime_scheduler_t g_rt_scheduler;
+    rt_task_t* task = NULL;
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    rt_task_t* current = g_rt_scheduler.task_list;
+    while (current) {
+        if (current->task_id == task_id) {
+            task = current;
+            break;
+        }
+        current = current->next;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    if (!task) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&task->lock);
+    task->params.memory_bandwidth_mbps = bandwidth_mbps;
+    spin_unlock(&task->lock);
+    
+    console_printf("RT task %u memory bandwidth reservation: %u MB/s\n", task_id, bandwidth_mbps);
+    
+    return STATUS_OK;
+}
+
+/* Enable deadline enforcement for task */
+status_t rt_enable_deadline_enforcement(uint32_t task_id, bool enforce) {
+    /* Find task */
+    extern realtime_scheduler_t g_rt_scheduler;
+    rt_task_t* task = NULL;
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    rt_task_t* current = g_rt_scheduler.task_list;
+    while (current) {
+        if (current->task_id == task_id) {
+            task = current;
+            break;
+        }
+        current = current->next;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    if (!task) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&task->lock);
+    task->deadline_enforced = enforce;
+    spin_unlock(&task->lock);
+    
+    console_printf("RT task %u deadline enforcement: %s\n", task_id, enforce ? "enabled" : "disabled");
+    
+    return STATUS_OK;
+}
+
+/* Get priority inheritance statistics */
+status_t rt_get_pi_statistics(rt_pi_stats_t* stats) {
+    if (!stats) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_rt_resources.global_lock);
+    
+    k_memset(stats, 0, sizeof(rt_pi_stats_t));
+    
+    stats->pi_activations = g_rt_resources.pi_activations;
+    stats->max_chain_length = g_rt_resources.pi_max_chain_length;
+    
+    if (g_rt_resources.pi_activations > 0) {
+        stats->avg_chain_length = g_rt_resources.pi_chain_length_total / g_rt_resources.pi_activations;
+    }
+    
+    /* Count active PI chains */
+    rt_resource_t* resource = g_rt_resources.resource_list;
+    while (resource) {
+        spin_lock(&resource->lock);
+        if (resource->pi_chain) {
+            stats->active_pi_chains++;
+        }
+        spin_unlock(&resource->lock);
+        resource = resource->next;
+    }
+    
+    spin_unlock(&g_rt_resources.global_lock);
+    
+    return STATUS_OK;
+}
+
+/* Dump RT resource statistics */
+status_t rt_dump_resource_stats(void) {
+    console_printf("=== Real-Time Resource Statistics ===\n");
+    
+    /* Priority inheritance statistics */
+    rt_pi_stats_t pi_stats;
+    if (rt_get_pi_statistics(&pi_stats) == STATUS_OK) {
+        console_printf("Priority Inheritance:\n");
+        console_printf("  Total Activations: %llu\n", pi_stats.pi_activations);
+        console_printf("  Active Chains: %u\n", pi_stats.active_pi_chains);
+        console_printf("  Average Chain Length: %u\n", pi_stats.avg_chain_length);
+        console_printf("  Maximum Chain Length: %u\n", pi_stats.max_chain_length);
+    }
+    
+    /* CPU bandwidth statistics */
+    console_printf("\nCPU Bandwidth Reservations:\n");
+    extern realtime_scheduler_t g_rt_scheduler;
+    for (uint32_t i = 0; i < g_rt_scheduler.cpu_count; i++) {
+        rt_bandwidth_t* bw = &g_rt_resources.cpu_bandwidth[i];
+        
+        spin_lock(&bw->lock);
+        
+        uint32_t utilization_percent = 0;
+        if (bw->runtime_ns > 0) {
+            utilization_percent = (uint32_t)((bw->consumed_ns * 100) / bw->runtime_ns);
+        }
+        
+        uint32_t throttle_rate_percent = 0;
+        if (bw->periods_completed > 0) {
+            throttle_rate_percent = (uint32_t)((bw->periods_throttled * 100) / bw->periods_completed);
+        }
+        
+        console_printf("  CPU %u:\n", i);
+        console_printf("    Period: %llu ns\n", bw->period_ns);
+        console_printf("    Runtime Budget: %llu ns\n", bw->runtime_ns);
+        console_printf("    Current Utilization: %u%%\n", utilization_percent);
+        console_printf("    Throttled: %s\n", bw->throttled ? "Yes" : "No");
+        console_printf("    Periods Completed: %llu\n", bw->periods_completed);
+        console_printf("    Periods Throttled: %llu (%u%%)\n", bw->periods_throttled, throttle_rate_percent);
+        console_printf("    Total Runtime: %llu ns\n", bw->total_runtime_ns);
+        
+        spin_unlock(&bw->lock);
+    }
+    
+    /* Cache partition statistics */
+    console_printf("\nCache Partitions:\n");
+    for (uint32_t i = 0; i < g_rt_resources.cache_partition_count; i++) {
+        rt_cache_partition_t* partition = &g_rt_resources.cache_partitions[i];
+        
+        spin_lock(&partition->lock);
+        
+        console_printf("  Partition %u:\n", i);
+        console_printf("    Cache Level: L%u\n", partition->cache_level);
+        console_printf("    Size: %llu KB\n", partition->size_bytes / 1024);
+        console_printf("    Ways: %u\n", partition->ways);
+        console_printf("    Assigned Tasks: %u\n", partition->assigned_tasks);
+        
+        spin_unlock(&partition->lock);
+    }
+    
+    console_printf("=== End RT Resource Statistics ===\n");
+    
+    return STATUS_OK;
+}

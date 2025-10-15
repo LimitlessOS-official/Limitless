@@ -1,0 +1,695 @@
+/*
+ * posix_apis.c - LimitlessOS Advanced POSIX API Implementation
+ * 
+ * Implementation of advanced POSIX APIs including mmap variants,
+ * advanced IPC mechanisms, and comprehensive POSIX compliance.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "vfs.h"
+#include "vmm.h"
+#include "syscall.h"
+#include "timer.h"
+#include "network.h"
+
+/* mmap flags */
+#define MAP_SHARED              0x01    /* Share changes */
+#define MAP_PRIVATE             0x02    /* Changes are private */
+#define MAP_FIXED               0x10    /* Interpret addr exactly */
+#define MAP_ANONYMOUS           0x20    /* Don't use a file */
+#define MAP_GROWSDOWN           0x0100  /* Stack-like segment */
+#define MAP_DENYWRITE           0x0800  /* Don't allow writes to file */
+#define MAP_EXECUTABLE          0x1000  /* Mark it as an executable */
+#define MAP_LOCKED              0x2000  /* Lock the mapping */
+#define MAP_NORESERVE           0x4000  /* Don't check for reservations */
+#define MAP_POPULATE            0x8000  /* Populate (prefault) pagetables */
+#define MAP_NONBLOCK            0x10000 /* Do not block on IO */
+#define MAP_STACK               0x20000 /* Allocation is for a stack */
+#define MAP_HUGETLB             0x40000 /* Create huge page mapping */
+
+/* mprotect flags */
+#define PROT_NONE               0x0     /* No permissions */
+#define PROT_READ               0x1     /* Read permission */
+#define PROT_WRITE              0x2     /* Write permission */
+#define PROT_EXEC               0x4     /* Execute permission */
+
+/* msync flags */
+#define MS_ASYNC                1       /* Sync memory asynchronously */
+#define MS_INVALIDATE           2       /* Invalidate the caches */
+#define MS_SYNC                 4       /* Synchronous memory sync */
+
+/* madvise advice */
+#define MADV_NORMAL             0       /* No further special treatment */
+#define MADV_RANDOM             1       /* Expect random page references */
+#define MADV_SEQUENTIAL         2       /* Expect sequential page references */
+#define MADV_WILLNEED           3       /* Will need these pages */
+#define MADV_DONTNEED           4       /* Don't need these pages */
+#define MADV_REMOVE             9       /* Remove these pages & resources */
+#define MADV_DONTFORK           10      /* Don't inherit across fork */
+#define MADV_DOFORK             11      /* Do inherit across fork */
+#define MADV_MERGEABLE          12      /* KSM may merge identical pages */
+#define MADV_UNMERGEABLE        13      /* KSM may not merge identical pages */
+#define MADV_HUGEPAGE           14      /* Worth backing with hugepages */
+#define MADV_NOHUGEPAGE         15      /* Not worth backing with hugepages */
+
+/* Memory mapping structure */
+typedef struct vm_area_struct {
+    uint64_t vm_start;              /* Start address */
+    uint64_t vm_end;                /* End address */
+    uint32_t vm_flags;              /* Protection and flags */
+    
+    struct file* vm_file;           /* File we map to (can be NULL) */
+    uint64_t vm_pgoff;              /* Offset in PAGE_SIZE units */
+    
+    /* Memory management */
+    struct page** vm_pages;         /* Array of pages */
+    uint32_t vm_page_count;         /* Number of pages */
+    
+    /* Anonymous mapping */
+    bool is_anonymous;              /* Anonymous mapping */
+    
+    /* Shared mapping */
+    bool is_shared;                 /* Shared mapping */
+    struct list_head shared_list;   /* List of shared mappings */
+    
+    /* Statistics */
+    atomic64_t page_faults;         /* Page faults in this VMA */
+    atomic64_t cow_faults;          /* COW faults */
+    atomic64_t access_count;        /* Access count */
+    uint64_t last_access;           /* Last access time */
+    
+    struct list_head vm_list;       /* Process VMA list */
+    
+    spinlock_t lock;
+    
+} vm_area_struct_t;
+
+/* Process memory management */
+typedef struct mm_struct {
+    struct list_head mmap_list;     /* VMA list */
+    vm_area_struct_t* mmap_cache;   /* Last accessed VMA */
+    
+    uint64_t mmap_base;             /* Base of mmap area */
+    uint64_t mmap_legacy_base;      /* Base of legacy mmap area */
+    uint64_t task_size;             /* Size of user space */
+    
+    uint32_t map_count;             /* Number of VMAs */
+    
+    /* Memory statistics */
+    atomic64_t total_vm;            /* Total virtual memory */
+    atomic64_t locked_vm;           /* Locked virtual memory */
+    atomic64_t pinned_vm;           /* Pinned virtual memory */
+    atomic64_t data_vm;             /* Data segment size */
+    atomic64_t exec_vm;             /* Executable segment size */
+    atomic64_t stack_vm;            /* Stack segment size */
+    
+    /* Anonymous memory */
+    atomic64_t anon_vma_count;      /* Anonymous VMA count */
+    
+    /* File mappings */
+    atomic64_t file_vma_count;      /* File VMA count */
+    
+    spinlock_t mmap_lock;
+    
+} mm_struct_t;
+
+/* POSIX message queue */
+typedef struct mq_info {
+    char name[256];                 /* Queue name */
+    int oflag;                      /* Open flags */
+    mode_t mode;                    /* Permissions */
+    
+    /* Queue attributes */
+    long mq_flags;                  /* Message queue flags */
+    long mq_maxmsg;                 /* Maximum messages */
+    long mq_msgsize;                /* Maximum message size */
+    long mq_curmsgs;                /* Current messages */
+    
+    /* Message storage */
+    struct mq_msg {
+        char* msg_ptr;              /* Message data */
+        size_t msg_len;             /* Message length */
+        unsigned int msg_prio;      /* Message priority */
+        uint64_t timestamp;         /* Timestamp */
+        struct list_head list;
+    } *messages;
+    
+    struct list_head msg_list;      /* Message list */
+    struct list_head readers;       /* Waiting readers */
+    struct list_head writers;       /* Waiting writers */
+    
+    /* Statistics */
+    atomic64_t send_count;          /* Messages sent */
+    atomic64_t recv_count;          /* Messages received */
+    atomic64_t overflow_count;      /* Queue overflows */
+    
+    atomic_t refcount;
+    spinlock_t lock;
+    
+    struct list_head global_list;   /* Global MQ list */
+    
+} mq_info_t;
+
+/* POSIX shared memory */
+typedef struct shm_info {
+    char name[256];                 /* Shared memory name */
+    size_t size;                    /* Size in bytes */
+    mode_t mode;                    /* Permissions */
+    
+    void* addr;                     /* Kernel virtual address */
+    struct page** pages;            /* Physical pages */
+    uint32_t page_count;            /* Number of pages */
+    
+    /* Mappings */
+    struct list_head mappings;      /* Process mappings */
+    atomic32_t map_count;           /* Number of mappings */
+    
+    /* Statistics */
+    atomic64_t access_count;        /* Access count */
+    uint64_t creation_time;         /* Creation time */
+    uint64_t last_access;           /* Last access time */
+    
+    atomic_t refcount;
+    spinlock_t lock;
+    
+    struct list_head global_list;   /* Global SHM list */
+    
+} shm_info_t;
+
+/* Global POSIX API state */
+static struct {
+    bool initialized;
+    
+    /* Memory management */
+    struct list_head global_vma_list; /* All VMAs */
+    spinlock_t vma_lock;
+    atomic64_t total_mappings;
+    
+    /* POSIX message queues */
+    struct list_head mq_list;       /* All message queues */
+    spinlock_t mq_lock;
+    atomic32_t mq_count;
+    
+    /* POSIX shared memory */
+    struct list_head shm_list;      /* All shared memory objects */
+    spinlock_t shm_lock;
+    atomic32_t shm_count;
+    
+    /* Statistics */
+    atomic64_t mmap_calls;          /* mmap() calls */
+    atomic64_t munmap_calls;        /* munmap() calls */
+    atomic64_t mprotect_calls;      /* mprotect() calls */
+    atomic64_t madvise_calls;       /* madvise() calls */
+    atomic64_t page_faults;         /* Total page faults */
+    atomic64_t cow_faults;          /* COW faults */
+    
+} g_posix_api = {0};
+
+/* Function prototypes */
+static vm_area_struct_t* find_vma(mm_struct_t* mm, uint64_t addr);
+static int do_mmap(struct file* file, uint64_t addr, size_t len, 
+                   int prot, int flags, uint64_t offset, void** result);
+static int do_munmap(uint64_t addr, size_t len);
+static int handle_page_fault(vm_area_struct_t* vma, uint64_t addr, bool write);
+
+/* Initialize POSIX API subsystem */
+int posix_api_init(void) {
+    if (g_posix_api.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing advanced POSIX APIs\n");
+    
+    memset(&g_posix_api, 0, sizeof(g_posix_api));
+    
+    INIT_LIST_HEAD(&g_posix_api.global_vma_list);
+    INIT_LIST_HEAD(&g_posix_api.mq_list);
+    INIT_LIST_HEAD(&g_posix_api.shm_list);
+    
+    spinlock_init(&g_posix_api.vma_lock);
+    spinlock_init(&g_posix_api.mq_lock);
+    spinlock_init(&g_posix_api.shm_lock);
+    
+    g_posix_api.initialized = true;
+    
+    printf("POSIX APIs initialized\n");
+    return 0;
+}
+
+/* Initialize process memory management */
+int mm_init_process(process_t* proc) {
+    if (!proc) {
+        return -EINVAL;
+    }
+    
+    mm_struct_t* mm = (mm_struct_t*)vmm_kmalloc(sizeof(mm_struct_t), 32);
+    if (!mm) {
+        return -ENOMEM;
+    }
+    
+    memset(mm, 0, sizeof(mm_struct_t));
+    
+    INIT_LIST_HEAD(&mm->mmap_list);
+    spinlock_init(&mm->mmap_lock);
+    
+    /* Set up memory layout */
+    mm->mmap_base = 0x40000000;         /* 1GB */
+    mm->task_size = 0x800000000000ULL;  /* 128TB user space */
+    
+    proc->mm = mm;
+    
+    return 0;
+}
+
+/* Find VMA containing address */
+static vm_area_struct_t* find_vma(mm_struct_t* mm, uint64_t addr) {
+    if (!mm) {
+        return NULL;
+    }
+    
+    /* Check cache first */
+    if (mm->mmap_cache && 
+        addr >= mm->mmap_cache->vm_start && 
+        addr < mm->mmap_cache->vm_end) {
+        return mm->mmap_cache;
+    }
+    
+    vm_area_struct_t* vma;
+    list_for_each_entry(vma, &mm->mmap_list, vm_list) {
+        if (addr >= vma->vm_start && addr < vma->vm_end) {
+            mm->mmap_cache = vma;
+            return vma;
+        }
+    }
+    
+    return NULL;
+}
+
+/* Handle page fault */
+static int handle_page_fault(vm_area_struct_t* vma, uint64_t addr, bool write) {
+    if (!vma) {
+        return -EFAULT;
+    }
+    
+    atomic64_inc(&vma->page_faults);
+    atomic64_inc(&g_posix_api.page_faults);
+    vma->last_access = timer_get_ticks();
+    
+    uint64_t page_addr = addr & ~(PAGE_SIZE - 1);
+    uint64_t offset = (page_addr - vma->vm_start) / PAGE_SIZE;
+    
+    if (offset >= vma->vm_page_count) {
+        return -EFAULT;
+    }
+    
+    /* Check if page is already allocated */
+    if (vma->vm_pages[offset]) {
+        /* COW fault handling */
+        if (write && (vma->vm_flags & PROT_WRITE)) {
+            atomic64_inc(&vma->cow_faults);
+            atomic64_inc(&g_posix_api.cow_faults);
+            
+            /* Allocate new page for COW */
+            struct page* new_page = vmm_alloc_page();
+            if (!new_page) {
+                return -ENOMEM;
+            }
+            
+            /* Copy data from original page */
+            memcpy(page_to_virt(new_page), page_to_virt(vma->vm_pages[offset]), PAGE_SIZE);
+            
+            vma->vm_pages[offset] = new_page;
+        }
+        
+        return 0;
+    }
+    
+    /* Allocate new page */
+    struct page* page = vmm_alloc_page();
+    if (!page) {
+        return -ENOMEM;
+    }
+    
+    vma->vm_pages[offset] = page;
+    
+    /* Initialize page */
+    if (vma->vm_file) {
+        /* File-backed mapping - read from file */
+        uint64_t file_offset = vma->vm_pgoff + offset;
+        
+        /* TODO: Read from file */
+        memset(page_to_virt(page), 0, PAGE_SIZE);
+    } else {
+        /* Anonymous mapping - zero-fill */
+        memset(page_to_virt(page), 0, PAGE_SIZE);
+    }
+    
+    return 0;
+}
+
+/* mmap implementation */
+static int do_mmap(struct file* file, uint64_t addr, size_t len, 
+                   int prot, int flags, uint64_t offset, void** result) {
+    
+    if (!current_process || !current_process->mm) {
+        return -ESRCH;
+    }
+    
+    mm_struct_t* mm = current_process->mm;
+    
+    /* Validate parameters */
+    if (len == 0) {
+        return -EINVAL;
+    }
+    
+    /* Round up to page size */
+    len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    
+    /* Check for conflicting flags */
+    if (!(flags & (MAP_SHARED | MAP_PRIVATE))) {
+        return -EINVAL;
+    }
+    
+    /* Find address */
+    if (flags & MAP_FIXED) {
+        /* Use specified address */
+        if (addr & (PAGE_SIZE - 1)) {
+            return -EINVAL;
+        }
+    } else {
+        /* Find free address */
+        addr = mm->mmap_base;
+        mm->mmap_base += len;
+    }
+    
+    /* Create VMA */
+    vm_area_struct_t* vma = (vm_area_struct_t*)vmm_kmalloc(sizeof(vm_area_struct_t), 32);
+    if (!vma) {
+        return -ENOMEM;
+    }
+    
+    memset(vma, 0, sizeof(vm_area_struct_t));
+    
+    vma->vm_start = addr;
+    vma->vm_end = addr + len;
+    vma->vm_flags = prot;
+    vma->vm_file = file;
+    vma->vm_pgoff = offset / PAGE_SIZE;
+    vma->is_anonymous = (file == NULL);
+    vma->is_shared = (flags & MAP_SHARED) != 0;
+    
+    /* Allocate page array */
+    vma->vm_page_count = len / PAGE_SIZE;
+    vma->vm_pages = (struct page**)vmm_kmalloc(
+        vma->vm_page_count * sizeof(struct page*), 32);
+    
+    if (!vma->vm_pages) {
+        vmm_kfree(vma, sizeof(vm_area_struct_t));
+        return -ENOMEM;
+    }
+    
+    memset(vma->vm_pages, 0, vma->vm_page_count * sizeof(struct page*));
+    
+    spinlock_init(&vma->lock);
+    INIT_LIST_HEAD(&vma->vm_list);
+    INIT_LIST_HEAD(&vma->shared_list);
+    
+    /* Add to process VMA list */
+    spin_lock(&mm->mmap_lock);
+    list_add(&vma->vm_list, &mm->mmap_list);
+    mm->map_count++;
+    atomic64_add(&mm->total_vm, len);
+    
+    if (vma->is_anonymous) {
+        atomic64_inc(&mm->anon_vma_count);
+    } else {
+        atomic64_inc(&mm->file_vma_count);
+    }
+    spin_unlock(&mm->mmap_lock);
+    
+    /* Add to global VMA list */
+    spin_lock(&g_posix_api.vma_lock);
+    list_add(&vma->shared_list, &g_posix_api.global_vma_list);
+    atomic64_inc(&g_posix_api.total_mappings);
+    spin_unlock(&g_posix_api.vma_lock);
+    
+    /* Handle special flags */
+    if (flags & MAP_POPULATE) {
+        /* Prefault pages */
+        for (uint32_t i = 0; i < vma->vm_page_count; i++) {
+            handle_page_fault(vma, addr + i * PAGE_SIZE, false);
+        }
+    }
+    
+    if (flags & MAP_LOCKED) {
+        atomic64_add(&mm->locked_vm, len);
+    }
+    
+    *result = (void*)addr;
+    
+    atomic64_inc(&g_posix_api.mmap_calls);
+    
+    printf("posix: mmap %p-%p (len=%zu, prot=%d, flags=%d)\n", 
+           (void*)addr, (void*)(addr + len), len, prot, flags);
+    
+    return 0;
+}
+
+/* munmap implementation */
+static int do_munmap(uint64_t addr, size_t len) {
+    if (!current_process || !current_process->mm) {
+        return -ESRCH;
+    }
+    
+    mm_struct_t* mm = current_process->mm;
+    
+    /* Round to page boundaries */
+    uint64_t start = addr & ~(PAGE_SIZE - 1);
+    uint64_t end = (addr + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    len = end - start;
+    
+    vm_area_struct_t* vma = find_vma(mm, start);
+    if (!vma || vma->vm_start != start || vma->vm_end != end) {
+        return -EINVAL;
+    }
+    
+    /* Free pages */
+    for (uint32_t i = 0; i < vma->vm_page_count; i++) {
+        if (vma->vm_pages[i]) {
+            vmm_free_page(vma->vm_pages[i]);
+        }
+    }
+    
+    /* Remove from lists */
+    spin_lock(&mm->mmap_lock);
+    list_del(&vma->vm_list);
+    mm->map_count--;
+    atomic64_sub(&mm->total_vm, len);
+    
+    if (vma->is_anonymous) {
+        atomic64_dec(&mm->anon_vma_count);
+    } else {
+        atomic64_dec(&mm->file_vma_count);
+    }
+    spin_unlock(&mm->mmap_lock);
+    
+    spin_lock(&g_posix_api.vma_lock);
+    list_del(&vma->shared_list);
+    atomic64_dec(&g_posix_api.total_mappings);
+    spin_unlock(&g_posix_api.vma_lock);
+    
+    /* Free VMA */
+    vmm_kfree(vma->vm_pages, vma->vm_page_count * sizeof(struct page*));
+    vmm_kfree(vma, sizeof(vm_area_struct_t));
+    
+    atomic64_inc(&g_posix_api.munmap_calls);
+    
+    return 0;
+}
+
+/* System call implementations */
+
+/* mmap system call */
+void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    struct file* file = NULL;
+    
+    if (!(flags & MAP_ANONYMOUS)) {
+        file = process_get_file(current_process, fd);
+        if (!file) {
+            return MAP_FAILED;
+        }
+    }
+    
+    void* result;
+    int error = do_mmap(file, (uint64_t)addr, length, prot, flags, offset, &result);
+    
+    if (error != 0) {
+        errno = -error;
+        return MAP_FAILED;
+    }
+    
+    return result;
+}
+
+/* munmap system call */
+int sys_munmap(void* addr, size_t length) {
+    int error = do_munmap((uint64_t)addr, length);
+    
+    if (error != 0) {
+        errno = -error;
+        return -1;
+    }
+    
+    return 0;
+}
+
+/* mprotect system call */
+int sys_mprotect(void* addr, size_t len, int prot) {
+    if (!current_process || !current_process->mm) {
+        errno = ESRCH;
+        return -1;
+    }
+    
+    uint64_t start = (uint64_t)addr & ~(PAGE_SIZE - 1);
+    uint64_t end = ((uint64_t)addr + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    
+    mm_struct_t* mm = current_process->mm;
+    vm_area_struct_t* vma = find_vma(mm, start);
+    
+    if (!vma || start < vma->vm_start || end > vma->vm_end) {
+        errno = ENOMEM;
+        return -1;
+    }
+    
+    vma->vm_flags = (vma->vm_flags & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) | prot;
+    
+    atomic64_inc(&g_posix_api.mprotect_calls);
+    
+    return 0;
+}
+
+/* msync system call */
+int sys_msync(void* addr, size_t length, int flags) {
+    if (!current_process || !current_process->mm) {
+        errno = ESRCH;
+        return -1;
+    }
+    
+    vm_area_struct_t* vma = find_vma(current_process->mm, (uint64_t)addr);
+    if (!vma) {
+        errno = ENOMEM;
+        return -1;
+    }
+    
+    /* TODO: Implement actual sync to storage */
+    
+    return 0;
+}
+
+/* madvise system call */
+int sys_madvise(void* addr, size_t length, int advice) {
+    if (!current_process || !current_process->mm) {
+        errno = ESRCH;
+        return -1;
+    }
+    
+    vm_area_struct_t* vma = find_vma(current_process->mm, (uint64_t)addr);
+    if (!vma) {
+        errno = ENOMEM;
+        return -1;
+    }
+    
+    atomic64_inc(&g_posix_api.madvise_calls);
+    
+    switch (advice) {
+        case MADV_NORMAL:
+        case MADV_RANDOM:
+        case MADV_SEQUENTIAL:
+            /* Adjust readahead behavior */
+            break;
+            
+        case MADV_WILLNEED:
+            /* Prefault pages */
+            for (uint64_t va = vma->vm_start; va < vma->vm_end; va += PAGE_SIZE) {
+                handle_page_fault(vma, va, false);
+            }
+            break;
+            
+        case MADV_DONTNEED:
+            /* Free pages but keep VMA */
+            for (uint32_t i = 0; i < vma->vm_page_count; i++) {
+                if (vma->vm_pages[i]) {
+                    vmm_free_page(vma->vm_pages[i]);
+                    vma->vm_pages[i] = NULL;
+                }
+            }
+            break;
+            
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+    
+    return 0;
+}
+
+/* POSIX message queue open */
+mqd_t sys_mq_open(const char* name, int oflag, mode_t mode, struct mq_attr* attr) {
+    if (!name) {
+        errno = EINVAL;
+        return (mqd_t)-1;
+    }
+    
+    /* TODO: Implement POSIX message queue */
+    
+    errno = ENOSYS;
+    return (mqd_t)-1;
+}
+
+/* POSIX shared memory open */
+int sys_shm_open(const char* name, int oflag, mode_t mode) {
+    if (!name) {
+        errno = EINVAL;
+        return -1;
+    }
+    
+    /* TODO: Implement POSIX shared memory */
+    
+    errno = ENOSYS;
+    return -1;
+}
+
+/* Get POSIX API statistics */
+void posix_api_get_stats(struct posix_api_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct posix_api_stats));
+    
+    stats->mmap_calls = atomic64_read(&g_posix_api.mmap_calls);
+    stats->munmap_calls = atomic64_read(&g_posix_api.munmap_calls);
+    stats->mprotect_calls = atomic64_read(&g_posix_api.mprotect_calls);
+    stats->madvise_calls = atomic64_read(&g_posix_api.madvise_calls);
+    stats->page_faults = atomic64_read(&g_posix_api.page_faults);
+    stats->cow_faults = atomic64_read(&g_posix_api.cow_faults);
+    stats->total_mappings = atomic64_read(&g_posix_api.total_mappings);
+    stats->mq_count = atomic32_read(&g_posix_api.mq_count);
+    stats->shm_count = atomic32_read(&g_posix_api.shm_count);
+}
+
+/* Debug output */
+void posix_api_dump_stats(void) {
+    struct posix_api_stats stats;
+    posix_api_get_stats(&stats);
+    
+    printf("POSIX API Statistics:\n");
+    printf("  mmap() calls: %lu\n", stats.mmap_calls);
+    printf("  munmap() calls: %lu\n", stats.munmap_calls);
+    printf("  mprotect() calls: %lu\n", stats.mprotect_calls);
+    printf("  madvise() calls: %lu\n", stats.madvise_calls);
+    printf("  Page faults: %lu\n", stats.page_faults);
+    printf("  COW faults: %lu\n", stats.cow_faults);
+    printf("  Total mappings: %lu\n", stats.total_mappings);
+    printf("  Message queues: %u\n", stats.mq_count);
+    printf("  Shared memory objects: %u\n", stats.shm_count);
+}

@@ -1,0 +1,51 @@
+#include "kernel.h"
+#include "alloc_test.h"
+#include "log.h"
+#include "vmm.h"
+
+/* Allocator self-test covers:
+ * 1. Alignment guarantees for various requested alignments.
+ * 2. Poison pattern 0xAA on allocation.
+ * 3. Poison pattern 0x55 on free (best-effort for bump allocator; we verify immediately after free).
+ * 4. Non-overlap of sequential allocations.
+ * 5. Large allocation near heap end should not overflow (returns NULL if insufficient space).
+ */
+
+static int check_pattern(const u8* p, size_t n, u8 val){
+    for(size_t i=0;i<n;i+= (n>256? 67:1)) if(p[i]!=val) return -1; return 0;
+}
+
+int alloc_selftest(void){
+    size_t sizes[] = {16, 31, 64, 5, 4096};
+    size_t aligns[] = {0, 8, 16, 32, 64};
+    void* prev_end = NULL;
+    for(size_t si=0; si<sizeof(sizes)/sizeof(sizes[0]); si++){
+        for(size_t ai=0; ai<sizeof(aligns)/sizeof(aligns[0]); ai++){
+            size_t sz = sizes[si]; size_t al = aligns[ai];
+            void* p = vmm_kmalloc(sz, al);
+            if(!p){ KLOG_ERROR("alloc_test","kmalloc failed sz=%u al=%u", (unsigned)sz,(unsigned)al); return -10; }
+            if(al==0) al=8; if(((uintptr_t)p) & (al-1)){ KLOG_ERROR("alloc_test","alignment fail sz=%u al=%u ptr=0x%p",(unsigned)sz,(unsigned)al,p); return -11; }
+            /* Poison check (0xAA) */
+            if(check_pattern((const u8*)p, sz, 0xAA)!=0){ KLOG_ERROR("alloc_test","alloc poison mismatch sz=%u al=%u",(unsigned)sz,(unsigned)al); return -12; }
+            /* Track non-overlap: previous end should be <= current start */
+            if(prev_end && prev_end > p){ KLOG_ERROR("alloc_test","overlap detected prev_end=%p p=%p", prev_end, p); return -13; }
+            prev_end = (u8*)p + sz;
+            /* Free (poison 0x55) */
+            vmm_kfree(p, sz);
+            if(check_pattern((const u8*)p, sz, 0x55)!=0){ KLOG_WARN("alloc_test","free poison mismatch (non-fatal) sz=%u", (unsigned)sz); }
+        }
+    }
+    /* Stress: allocate a series of small blocks to advance heap, then attempt huge block to ensure NULL or success within bounds */
+    void* smalls[128];
+    for(int i=0;i<128;i++){ smalls[i] = vmm_kmalloc(128, 16); if(!smalls[i]) { KLOG_ERROR("alloc_test","small alloc failed i=%d", i); return -14; } }
+    /* Attempt very large alloc (e.g., 8MB) expecting NULL if beyond heap */
+    void* big = vmm_kmalloc(8*1024*1024, 4096);
+    if(big){ /* If succeeded, ensure pattern present */
+        if(check_pattern((const u8*)big, 4096, 0xAA)!=0){ KLOG_ERROR("alloc_test","large alloc poison mismatch"); return -15; }
+    } else {
+        KLOG_INFO("alloc_test","large alloc correctly returned NULL (capacity test)");
+    }
+    /* No frees for smalls due to bump allocator; acceptable leak for self-test context */
+    KLOG_INFO("alloc_test","allocator selftest complete");
+    return 0;
+}

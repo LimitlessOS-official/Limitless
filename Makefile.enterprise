@@ -1,0 +1,5 @@
+
+# LimitlessOS Enterprise Build
+all:
+	@echo "🚀 Building LimitlessOS Enterprise Edition..."
+	@$(MAKE) -f Makefile

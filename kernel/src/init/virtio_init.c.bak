@@ -1,0 +1,12 @@
+#include "kernel.h"
+
+/* Driver init functions */
+void virtio_blk_init(void);
+void virtio_net_init(void);
+
+void virtio_phase6_init(void) {
+    /* PCI enumeration must be ready at this point */
+    virtio_blk_init();
+    virtio_net_init();
+    /* virtio_net_init() should register a net_if_t via net_if_register() so DHCP/syscalls can use it */
+}

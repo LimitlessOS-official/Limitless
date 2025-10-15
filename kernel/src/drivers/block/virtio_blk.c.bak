@@ -1,0 +1,255 @@
+#include "kernel.h"
+#include "block.h"
+#include "block_hw.h"
+#include "pci.h"
+#include "virtio_pci.h"
+#include "virtio_ring.h"
+
+/*
+ * Virtio-blk (Phase 6)
+ * - Single queue, polled completion
+ * - Synchronous read/write using a DMA bounce buffer
+ *
+ * TODO:
+ * - MSI/MSI-X and interrupt completion
+ * - Multiple in-flight requests
+ * - Flush/discard/feature negotiation extensions
+ */
+
+#define VIRTIO_BLK_T_IN     0
+#define VIRTIO_BLK_T_OUT    1
+#define VIRTIO_BLK_T_FLUSH  4
+
+#define VIRTIO_BLK_F_RO            (1u<<5)
+#define VIRTIO_BLK_F_BLK_SIZE      (1u<<6)
+#define VIRTIO_BLK_F_FLUSH         (1u<<9)
+
+#pragma pack(push, 1)
+typedef struct {
+    u32 type;
+    u32 reserved;
+    u64 sector;
+} virtio_blk_req_hdr_t;
+
+typedef struct {
+    u64 capacity;   /* 512-byte sectors */
+    u32 size_max;
+    u32 seg_max;
+    u16 blk_size;
+    u16 topology_phys_block_exp;
+    u16 topology_alignment_offset;
+    u16 min_io_size;
+    u32 opt_io_size;
+    u8  wce;
+    u8  rsvd1[3];
+    u32 max_discard_sectors;
+    u32 max_discard_seg;
+    u32 discard_sector_alignment;
+    u32 max_write_zeroes_sectors;
+    u32 max_write_zeroes_seg;
+    u8  write_zeroes_may_unmap;
+    u8  rsvd2[3];
+} virtio_blk_config_t;
+#pragma pack(pop)
+
+typedef struct {
+    const pci_device_t* pci;
+    virtio_pci_common_cfg_t* common;
+    void* notify_base;
+    u32 notify_mul;
+    virtio_blk_config_t* devcfg;
+
+    u16 qsz;
+    dma_region_t desc_dma, avail_dma, used_dma;
+    vring_desc*  desc; vring_avail* avail; vring_used* used;
+    u16 aidx, uidx;
+
+    dma_region_t bounce; /* header + data + status */
+
+    block_dev_t bdev;
+    u32 features;
+    u32 blk_size;
+    u64 capacity;
+    int read_only;
+} vblk_t;
+
+static inline void* vblk_notify_addr(vblk_t* d) {
+    u16 off = d->common->queue_notify_off;
+    return (u8*)d->notify_base + (u32)off * d->notify_mul;
+}
+
+static int vblk_setup_queue(vblk_t* d) {
+    d->common->queue_select = 0;
+    u16 qsz = d->common->queue_size;
+    if (!qsz) return K_EIO;
+    d->qsz = qsz;
+
+    if (dma_alloc(vring_desc_size(qsz), 4096, &d->desc_dma)!=0) return K_ENOMEM;
+    if (dma_alloc(vring_avail_size(qsz), 4096, &d->avail_dma)!=0) return K_ENOMEM;
+    if (dma_alloc(vring_used_size(qsz), 4096, &d->used_dma)!=0) return K_ENOMEM;
+    d->desc = (vring_desc*)d->desc_dma.va;
+    d->avail = (vring_avail*)d->avail_dma.va;
+    d->used  = (vring_used*)d->used_dma.va;
+    k_memset(d->desc,0,d->desc_dma.len);
+    k_memset(d->avail,0,d->avail_dma.len);
+    k_memset(d->used, 0,d->used_dma.len);
+
+    d->common->queue_desc  = d->desc_dma.pa;
+    d->common->queue_avail = d->avail_dma.pa;
+    d->common->queue_used  = d->used_dma.pa;
+    d->common->queue_enable = 1;
+
+    d->aidx = 0; d->uidx = 0;
+    return 0;
+}
+
+static int vblk_init(vblk_t* d, const pci_device_t* dev) {
+    d->pci = dev;
+    if (virtio_find_caps(dev, &d->common, (void**)&d->notify_base, &d->notify_mul, (void**)&d->devcfg)!=0) {
+        kprintf("virtio-blk: caps not found\n"); return K_EIO;
+    }
+
+    d->common->device_status = 0;
+    d->common->device_status = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+
+    d->common->device_feature_select = 0;
+    u32 f0 = d->common->device_feature;
+    d->features = f0;
+
+    u32 drv0 = 0;
+    if (f0 & VIRTIO_BLK_F_BLK_SIZE) drv0 |= VIRTIO_BLK_F_BLK_SIZE;
+    if (f0 & VIRTIO_BLK_F_FLUSH)    drv0 |= VIRTIO_BLK_F_FLUSH;
+
+    d->common->driver_feature_select = 0;
+    d->common->driver_feature = drv0;
+
+    d->common->device_status |= VIRTIO_STATUS_FEATURES_OK;
+
+    if (vblk_setup_queue(d)!=0) return K_EIO;
+
+    d->common->device_status |= VIRTIO_STATUS_DRIVER_OK;
+
+    d->capacity = d->devcfg->capacity;
+    d->blk_size = d->devcfg->blk_size ? d->devcfg->blk_size : 512;
+    d->read_only = (f0 & VIRTIO_BLK_F_RO) ? 1 : 0;
+
+    /* Allocate a 256KiB bounce: [hdr][data][status] */
+    size_t max_io = 256*1024;
+    if (dma_bounce_alloc(sizeof(virtio_blk_req_hdr_t) + max_io + 1, &d->bounce)!=0) return K_ENOMEM;
+
+    kprintf("virtio-blk: capacity=%llu sectors, block=%u bytes\n",
+        (unsigned long long)d->capacity, d->blk_size);
+    return 0;
+}
+
+static int vblk_submit_rw(vblk_t* d, int write, u64 sector, void* buf, u32 bytes) {
+    if (bytes == 0) return 0;
+    if (bytes > d->bounce.len - (sizeof(virtio_blk_req_hdr_t)+1)) return K_EINVAL;
+
+    /* Layout: [hdr][data][status] in bounce */
+    u8* base = (u8*)d->bounce.va;
+    u64 pa_base = d->bounce.pa;
+
+    virtio_blk_req_hdr_t* hdr = (virtio_blk_req_hdr_t*)base;
+    hdr->type = write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+    hdr->reserved = 0;
+    hdr->sector = sector;
+    u8* data = base + sizeof(*hdr);
+    u8* status = data + bytes;
+    *status = 0xFF;
+
+    if (write) {
+        k_memcpy(base, hdr, sizeof(*hdr));
+        k_memcpy(data, buf, bytes);
+        dma_sync_for_device(&d->bounce);
+    } else {
+        dma_sync_for_device(&d->bounce);
+    }
+
+    d->desc[0].addr = pa_base;
+    d->desc[0].len  = sizeof(*hdr);
+    d->desc[0].flags= VRING_DESC_F_NEXT;
+    d->desc[0].next = 1;
+
+    d->desc[1].addr = pa_base + sizeof(*hdr);
+    d->desc[1].len  = bytes;
+    d->desc[1].flags= write ? 0 : VRING_DESC_F_WRITE;
+    d->desc[1].next = 2;
+
+    d->desc[2].addr = pa_base + sizeof(*hdr) + bytes;
+    d->desc[2].len  = 1;
+    d->desc[2].flags= VRING_DESC_F_WRITE;
+    d->desc[2].next = 0;
+
+    d->avail->ring[d->aidx % d->qsz] = 0;
+    mmio_wmb();
+    d->avail->idx = ++d->aidx;
+
+    vmmio_write16(vblk_notify_addr(d), 0);
+
+    const u64 SPIN_MAX = 10000000ull;
+    u64 spins = 0;
+    while (d->uidx == d->used->idx && spins++ < SPIN_MAX) {
+        mmio_rmb();
+        cpu_relax();
+    }
+    if (d->uidx == d->used->idx) return K_ETIMEDOUT;
+    d->uidx++;
+
+    dma_sync_for_cpu(&d->bounce);
+    if (*status != 0) return K_EIO;
+
+    if (!write) {
+        k_memcpy(buf, data, bytes);
+    }
+    return 0;
+}
+
+/* Block ops */
+static int vblk_read(block_dev_t* bdev, blk_io_t* io) {
+    if (!bdev || !io || !io->buf) return K_EINVAL;
+    vblk_t* d = (vblk_t*)bdev->drv;
+    return vblk_submit_rw(d, 0, io->lba, io->buf, io->count * 512u);
+}
+static int vblk_write(block_dev_t* bdev, const blk_io_t* io) {
+    if (!bdev || !io || !io->buf) return K_EINVAL;
+    vblk_t* d = (vblk_t*)bdev->drv;
+    if (d->read_only) return K_EROFS;
+    return vblk_submit_rw(d, 1, io->lba, (void*)io->buf, io->count * 512u);
+}
+static u32 vblk_sector_size(block_dev_t* bdev) {
+    vblk_t* d = (vblk_t*)bdev->drv;
+    return d->blk_size ? d->blk_size : 512;
+}
+static u64 vblk_capacity(block_dev_t* bdev) {
+    vblk_t* d = (vblk_t*)bdev->drv;
+    return d->capacity;
+}
+static void vblk_flush(block_dev_t* bdev) { (void)bdev; /* TODO: implement flush */ }
+
+/* PCI enumeration */
+static void virtio_blk_probe(const pci_device_t* dev, void* user) {
+    (void)user;
+    if (dev->vendor_id != VIRTIO_PCI_VENDOR) return;
+
+    static vblk_t g;
+    k_memset(&g, 0, sizeof(g));
+    if (vblk_init(&g, dev)!=0) return;
+
+    g.bdev.drv = &g;
+    k_strlcpy(g.bdev.name, "vda", sizeof(g.bdev.name));
+    g.bdev.ops.read = vblk_read;
+    g.bdev.ops.write = vblk_write;
+    g.bdev.ops.sector_size = vblk_sector_size;
+    g.bdev.ops.capacity_sectors = vblk_capacity;
+    g.bdev.ops.flush = vblk_flush;
+    g.bdev.sector_sz = vblk_sector_size(&g.bdev);
+    g.bdev.sectors = vblk_capacity(&g.bdev);
+
+    block_register(&g.bdev);
+    kprintf("virtio-blk: %s registered\n", g.bdev.name);
+}
+
+void virtio_blk_init(void) {
+    pci_enumerate(virtio_blk_probe, NULL);
+}

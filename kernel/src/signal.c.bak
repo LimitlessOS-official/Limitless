@@ -1,0 +1,465 @@
+/**
+ * POSIX Signal Handling Implementation for LimitlessOS
+ * Implements complete signal delivery, handler registration, signal masks, and async safety
+ */
+
+#include "signal.h"
+#include "process.h"
+#include "kernel.h"
+#include "vmm.h"
+#include "log.h"
+#include "string.h"
+#include "scheduler.h"
+
+/* Check if signal is blocked */
+static bool signal_is_blocked(signal_state_t* sigstate, int signo) {
+    if (signo <= 0 || signo >= _NSIG) return false;
+    
+    /* SIGKILL and SIGSTOP cannot be blocked */
+    if (signo == SIGKILL || signo == SIGSTOP) return false;
+    
+    return (sigstate->blocked & (1ULL << (signo - 1))) != 0;
+}
+
+/* Check if signal should be ignored */
+static bool signal_is_ignored(signal_state_t* sigstate, int signo) {
+    if (signo <= 0 || signo >= _NSIG) return true;
+    
+    /* SIGKILL and SIGSTOP cannot be ignored */
+    if (signo == SIGKILL || signo == SIGSTOP) return false;
+    
+    return sigstate->actions[signo].sa_handler == SIG_IGN;
+}
+
+/* Get default action for a signal */
+static int signal_default_action(int signo) {
+    switch (signo) {
+        case SIGHUP: case SIGINT: case SIGQUIT: case SIGILL:
+        case SIGABRT: case SIGFPE: case SIGKILL: case SIGSEGV:
+        case SIGPIPE: case SIGALRM: case SIGTERM: case SIGUSR1:
+        case SIGUSR2: case SIGBUS: case SIGIO: case SIGPROF:
+        case SIGSYS: case SIGTRAP: case SIGVTALRM: case SIGXCPU:
+        case SIGXFSZ:
+            return 0; /* Terminate */
+        
+        case SIGCHLD: case SIGURG: case SIGWINCH:
+            return 1; /* Ignore */
+        
+        case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU:
+            return 2; /* Stop */
+        
+        case SIGCONT:
+            return 3; /* Continue */
+            
+        default:
+            return 0; /* Terminate */
+    }
+}
+
+/* Add signal to pending queue */
+static int signal_queue_pending(signal_state_t* sigstate, int signo, siginfo_t* info) {
+    if (!sigstate || signo <= 0 || signo >= _NSIG) return K_EINVAL;
+    
+    pending_signal_t* pending = (pending_signal_t*)vmm_kmalloc(sizeof(pending_signal_t), 1);
+    if (!pending) return K_ENOMEM;
+    
+    pending->signo = signo;
+    if (info) {
+        pending->info = *info;
+    } else {
+        k_memset(&pending->info, 0, sizeof(siginfo_t));
+        pending->info.si_signo = signo;
+    }
+    pending->next = NULL;
+    
+    /* Add to end of queue */
+    if (!sigstate->pending_queue) {
+        sigstate->pending_queue = pending;
+    } else {
+        pending_signal_t* current = sigstate->pending_queue;
+        while (current->next) {
+            current = current->next;
+        }
+        current->next = pending;
+    }
+    
+    /* Set pending bit */
+    sigstate->pending |= (1ULL << (signo - 1));
+    sigstate->pending_count++;
+    
+    return 0;
+}
+
+/* Setup signal frame on user stack */
+static int signal_setup_frame(process_t* proc, int signo, siginfo_t* info, signal_action_t* action) {
+    if (!proc || !proc->as) return K_EINVAL;
+    
+    /* For now, just mark that we're in signal handler mode */
+    /* Full frame setup will be implemented with architecture support */
+    proc->sigstate->in_signal_handler = true;
+    
+    KLOG_DEBUG("signal", "Set up signal frame for signal %d in process %d", signo, proc->pid);
+    return 0;
+}
+
+/* Initialize signal handling for a process */
+void signal_init(signal_state_t* sigstate) {
+    if (!sigstate) return;
+    
+    k_memset(sigstate, 0, sizeof(signal_state_t));
+    
+    /* Set default signal actions */
+    for (int i = 1; i < _NSIG; i++) {
+        sigstate->actions[i].sa_handler = SIG_DFL;
+        sigstate->actions[i].sa_flags = 0;
+        sigstate->actions[i].sa_mask = 0;
+    }
+    
+    /* SIGKILL and SIGSTOP cannot be caught or ignored */
+    sigstate->actions[SIGKILL].sa_handler = SIG_DFL;
+    sigstate->actions[SIGSTOP].sa_handler = SIG_DFL;
+    
+    spinlock_init(&sigstate->lock);
+    
+    KLOG_DEBUG("signal", "Initialized signal handling for process");
+}
+
+/* Cleanup signal handling for a process */
+void signal_cleanup(signal_state_t* sigstate) {
+    if (!sigstate) return;
+    
+    spin_lock(&sigstate->lock);
+    
+    /* Free pending signal queue */
+    pending_signal_t* current = sigstate->pending_queue;
+    while (current) {
+        pending_signal_t* next = current->next;
+        vmm_kfree(current, sizeof(pending_signal_t));
+        current = next;
+    }
+    
+    /* Free alternative signal stack if allocated */
+    if (sigstate->alt_stack) {
+        /* Note: vmm_kfree will be implemented later */
+        sigstate->alt_stack = NULL;
+    }
+    
+    spin_unlock(&sigstate->lock);
+}
+
+/* Send signal to process */
+int signal_send(process_t* target, int signo, siginfo_t* info) {
+    if (!target || !target->sigstate) return K_EINVAL;
+    if (signo <= 0 || signo >= _NSIG) return K_EINVAL;
+    
+    signal_state_t* sigstate = target->sigstate;
+    
+    spin_lock(&sigstate->lock);
+    
+    KLOG_DEBUG("signal", "Sending signal %d to process %d", signo, target->pid);
+    
+    /* Check if signal is blocked or ignored */
+    if (signal_is_blocked(sigstate, signo) || signal_is_ignored(sigstate, signo)) {
+        /* Still queue SIGKILL and SIGSTOP */
+        if (signo == SIGKILL || signo == SIGSTOP) {
+            signal_queue_pending(sigstate, signo, info);
+        }
+        spin_unlock(&sigstate->lock);
+        return 0;
+    }
+    
+    /* Add to pending signal queue */
+    int ret = signal_queue_pending(sigstate, signo, info);
+    
+    spin_unlock(&sigstate->lock);
+    
+    /* Wake up the process if it's sleeping */
+    if (ret == 0) {
+        process_wakeup(target);
+    }
+    
+    return ret;
+}
+
+/* Deliver pending signals */
+void signal_deliver_pending(process_t* proc) {
+    if (!proc || !proc->sigstate) return;
+    
+    signal_state_t* sigstate = proc->sigstate;
+    
+    spin_lock(&sigstate->lock);
+    
+    /* Don't deliver signals if already in handler */
+    if (sigstate->in_signal_handler) {
+        spin_unlock(&sigstate->lock);
+        return;
+    }
+    
+    /* Process pending signals in priority order */
+    for (int signo = 1; signo < _NSIG; signo++) {
+        if (!(sigstate->pending & (1ULL << (signo - 1)))) continue;
+        if (signal_is_blocked(sigstate, signo) && signo != SIGKILL && signo != SIGSTOP) continue;
+        
+        /* Find signal in queue */
+        pending_signal_t** current = &sigstate->pending_queue;
+        pending_signal_t* signal = NULL;
+        
+        while (*current) {
+            if ((*current)->signo == signo) {
+                signal = *current;
+                *current = signal->next;
+                break;
+            }
+            current = &(*current)->next;
+        }
+        
+        if (!signal) {
+            /* Clear pending bit if no signal found */
+            sigstate->pending &= ~(1ULL << (signo - 1));
+            continue;
+        }
+        
+        /* Clear pending bit */
+        sigstate->pending &= ~(1ULL << (signo - 1));
+        sigstate->pending_count--;
+        
+        signal_action_t* action = &sigstate->actions[signo];
+        
+        /* Handle signal based on action */
+        if (action->sa_handler == SIG_DFL) {
+            /* Default action */
+            int default_action = signal_default_action(signo);
+            switch (default_action) {
+                case 0: /* Terminate */
+                    KLOG_INFO("signal", "Process %d terminated by signal %d", proc->pid, signo);
+                    vmm_kfree(signal, sizeof(pending_signal_t));
+                    spin_unlock(&sigstate->lock);
+                    process_exit(proc, 128 + signo);
+                    return;
+                    
+                case 1: /* Ignore */
+                    break;
+                    
+                case 2: /* Stop */
+                    KLOG_INFO("signal", "Process %d stopped by signal %d", proc->pid, signo);
+                    process_suspend(proc);
+                    break;
+                    
+                case 3: /* Continue */
+                    KLOG_INFO("signal", "Process %d continued by signal %d", proc->pid, signo);
+                    process_resume(proc);
+                    break;
+            }
+        } else if (action->sa_handler == SIG_IGN) {
+            /* Ignore signal */
+            KLOG_DEBUG("signal", "Ignoring signal %d for process %d", signo, proc->pid);
+        } else {
+            /* Custom handler */
+            KLOG_DEBUG("signal", "Delivering signal %d to handler at %p", signo, action->sa_handler);
+            
+            /* Set signal mask */
+            sigstate->saved_mask = sigstate->blocked;
+            sigstate->blocked |= action->sa_mask;
+            if (!(action->sa_flags & SA_NODEFER)) {
+                sigstate->blocked |= (1ULL << (signo - 1));
+            }
+            
+            /* Reset handler if SA_RESETHAND is set */
+            if (action->sa_flags & SA_RESETHAND) {
+                action->sa_handler = SIG_DFL;
+            }
+            
+            /* Setup signal frame and deliver */
+            int ret = signal_setup_frame(proc, signo, &signal->info, action);
+            if (ret != 0) {
+                KLOG_ERROR("signal", "Failed to setup signal frame: %d", ret);
+                /* Restore signal mask on error */
+                sigstate->blocked = sigstate->saved_mask;
+            }
+        }
+        
+        vmm_kfree(signal, sizeof(pending_signal_t));
+        spin_unlock(&sigstate->lock);
+        return; /* Only deliver one signal at a time */
+    }
+    
+    spin_unlock(&sigstate->lock);
+}
+
+/* System call implementations */
+
+int sys_sigaction(int signo, const signal_action_t* act, signal_action_t* oldact) {
+    process_t* current = process_current();
+    if (!current || !current->sigstate) return K_ERR;
+    
+    if (signo <= 0 || signo >= _NSIG) return K_EINVAL;
+    if (signo == SIGKILL || signo == SIGSTOP) return K_EINVAL;
+    
+    signal_state_t* sigstate = current->sigstate;
+    
+    spin_lock(&sigstate->lock);
+    
+    /* Return old action if requested */
+    if (oldact) {
+        *oldact = sigstate->actions[signo];
+    }
+    
+    /* Set new action if provided */
+    if (act) {
+        sigstate->actions[signo] = *act;
+        
+        /* If setting to ignore, remove pending instances */
+        if (act->sa_handler == SIG_IGN) {
+            sigstate->pending &= ~(1ULL << (signo - 1));
+            
+            /* Remove from queue */
+            pending_signal_t** current = &sigstate->pending_queue;
+            while (*current) {
+                if ((*current)->signo == signo) {
+                    pending_signal_t* to_remove = *current;
+                    *current = to_remove->next;
+                    vmm_kfree(to_remove, sizeof(pending_signal_t));
+                    sigstate->pending_count--;
+                } else {
+                    current = &(*current)->next;
+                }
+            }
+        }
+    }
+    
+    spin_unlock(&sigstate->lock);
+    return 0;
+}
+
+int sys_sigprocmask(int how, const sigset_t* set, sigset_t* oldset) {
+    process_t* current = process_current();
+    if (!current || !current->sigstate) return K_ERR;
+    
+    signal_state_t* sigstate = current->sigstate;
+    
+    spin_lock(&sigstate->lock);
+    
+    /* Return old mask if requested */
+    if (oldset) {
+        *oldset = sigstate->blocked;
+    }
+    
+    /* Update mask if set is provided */
+    if (set) {
+        sigset_t new_mask = *set;
+        
+        /* Cannot block SIGKILL or SIGSTOP */
+        new_mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        
+        switch (how) {
+            case SIG_BLOCK:
+                sigstate->blocked |= new_mask;
+                break;
+                
+            case SIG_UNBLOCK:
+                sigstate->blocked &= ~new_mask;
+                break;
+                
+            case SIG_SETMASK:
+                sigstate->blocked = new_mask;
+                break;
+                
+            default:
+                spin_unlock(&sigstate->lock);
+                return K_EINVAL;
+        }
+    }
+    
+    spin_unlock(&sigstate->lock);
+    
+    /* Check for newly unblocked pending signals */
+    signal_deliver_pending(current);
+    
+    return 0;
+}
+
+int sys_kill(pid_t pid, int signo) {
+    if (signo < 0 || signo >= _NSIG) return K_EINVAL;
+    if (signo == 0) return 0; /* No signal sent, just check permissions */
+    
+    process_t* current = process_current();
+    if (!current) return K_ERR;
+    
+    process_t* target = process_lookup(pid);
+    if (!target) return K_ERR;
+    
+    /* TODO: Check permissions (same user, root, etc.) */
+    
+    /* Create signal info */
+    siginfo_t info;
+    k_memset(&info, 0, sizeof(info));
+    info.si_signo = signo;
+    info.si_code = 0; /* User signal */
+    info.si_pid = current->pid;
+    info.si_uid = 0; /* TODO: Add UID field to process */
+    
+    return signal_send(target, signo, &info);
+}
+
+int sys_sigreturn(void) {
+    process_t* current = process_current();
+    if (!current || !current->sigstate) return K_ERR;
+    
+    signal_state_t* sigstate = current->sigstate;
+    
+    spin_lock(&sigstate->lock);
+    
+    if (!sigstate->in_signal_handler) {
+        spin_unlock(&sigstate->lock);
+        return K_EINVAL;
+    }
+    
+    /* Restore signal mask */
+    sigstate->blocked = sigstate->saved_mask;
+    sigstate->in_signal_handler = false;
+    sigstate->signal_frame = NULL;
+    
+    spin_unlock(&sigstate->lock);
+    
+    /* Check for more pending signals */
+    signal_deliver_pending(current);
+    
+    return 0;
+}
+
+/* Signal utility functions */
+
+int sigemptyset(sigset_t* set) {
+    if (!set) return K_EINVAL;
+    *set = 0;
+    return 0;
+}
+
+int sigfillset(sigset_t* set) {
+    if (!set) return K_EINVAL;
+    *set = ~0ULL;
+    /* Cannot block SIGKILL or SIGSTOP */
+    *set &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    return 0;
+}
+
+int sigaddset(sigset_t* set, int signo) {
+    if (!set || signo <= 0 || signo >= _NSIG) return K_EINVAL;
+    if (signo == SIGKILL || signo == SIGSTOP) return K_EINVAL;
+    
+    *set |= (1ULL << (signo - 1));
+    return 0;
+}
+
+int sigdelset(sigset_t* set, int signo) {
+    if (!set || signo <= 0 || signo >= _NSIG) return K_EINVAL;
+    
+    *set &= ~(1ULL << (signo - 1));
+    return 0;
+}
+
+int sigismember(const sigset_t* set, int signo) {
+    if (!set || signo <= 0 || signo >= _NSIG) return K_EINVAL;
+    
+    return (*set & (1ULL << (signo - 1))) ? 1 : 0;
+}

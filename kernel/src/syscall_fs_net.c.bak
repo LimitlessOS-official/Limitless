@@ -1,0 +1,220 @@
+#include "uapi/syscalls.h"
+#include "syscall.h"
+#include "vfs.h"
+#include "net/net.h"
+#include "net/socket.h"
+#include "process.h"
+
+typedef struct file_handle {
+    file_t* f;
+    int     can_write; /* computed at open: 1 if writes permitted for this fd */
+} file_handle_t;
+
+#define MAX_FD 128
+static file_handle_t g_fdtab[MAX_FD];
+
+static int fd_alloc(void) {
+    for (int i=3;i<MAX_FD;i++) if (!g_fdtab[i].f) return i;
+    return -1;
+}
+
+static long sys_mount_impl(const char* type, const char* dev, const char* dir, const char* opts) {
+    (void)opts; /* future: parse mount options */
+    /* Map simplified syscall to existing helper; mount at provided dir or root if NULL */
+    const char* path = (dir && *dir) ? dir : "/";
+    int rc = vfs_mount_device_by_name(type, dev, path);
+    return rc == 0 ? 0 : -rc;
+}
+
+/* Minimal policy helper until per-file uid/gid/mode are enforced in VFS */
+/* Permission helper using vnode mode bits (simplified POSIX). */
+static int vnode_can_write(vnode_t* vn) {
+    if (!vn) return 0;
+    extern long sys_getuid(void) __attribute__((weak));
+    extern long sys_getgid(void) __attribute__((weak));
+    long uid = sys_getuid ? sys_getuid() : 0;
+    long gid = sys_getgid ? sys_getgid() : 0;
+    if (uid == 0) return 1; /* root bypass */
+    u32 mode = vn->mode;
+    if (uid == (long)vn->uid) return (mode & 0200) != 0;
+    if (gid == (long)vn->gid) return (mode & 0020) != 0;
+    return (mode & 0002) != 0;
+}
+
+static long sys_open_impl(const char* path, int flags, int mode) {
+    (void)mode;
+    int fd = fd_alloc(); if (fd < 0) return -K_EBUSY;
+    int of = 0;
+    if (flags & 1) of |= VFS_O_WRONLY;
+    else of |= VFS_O_RDONLY;
+    if (flags & 2) of |= VFS_O_RDWR;
+    if (flags & 0x40) of |= VFS_O_CREAT;
+
+    file_t* f=NULL;
+    int rc = vfs_open(path, of, &f);
+    if (rc != 0) return -rc;
+    /* Determine write permission for this fd: root OR under /tmp */
+    extern long sys_getuid(void);
+    int wants_write = ((of & VFS_O_WRONLY) || (of & VFS_O_RDWR)) ? 1 : 0;
+    int can_write = 0;
+    if (wants_write) {
+        /* Evaluate permission on vnode */
+        can_write = vnode_can_write(f->vn);
+        if (!can_write) { vfs_close(f); return -K_EPERM; }
+    }
+    g_fdtab[fd].f = f;
+    g_fdtab[fd].can_write = can_write;
+    return fd;
+}
+
+static long sys_read_impl(int fd, void* buf, u64 len) {
+    if (fd < 0 || fd >= MAX_FD || !g_fdtab[fd].f) return -K_EINVAL;
+    u64 rd=0;
+    int rc = vfs_read(g_fdtab[fd].f, buf, len, &rd);
+    if (rc != 0) return -rc;
+    return (long)rd;
+}
+
+static long sys_pwrite_impl(int fd, const void* buf, u64 len, u64 off) {
+    if (fd < 0 || fd >= MAX_FD || !g_fdtab[fd].f) return -K_EINVAL;
+    /* Enforce minimal permission: writes allowed if fd was opened with permission (root or /tmp) */
+    if (!g_fdtab[fd].can_write) return -K_EPERM;
+    u64 wr=0;
+    vfs_seek(g_fdtab[fd].f, (s64)off, VFS_SEEK_SET);
+    int rc = vfs_write(g_fdtab[fd].f, buf, len, &wr);
+    if (rc != 0) return -rc;
+    return (long)wr;
+}
+
+static long sys_close_impl(int fd) {
+    if (fd < 0 || fd >= MAX_FD || !g_fdtab[fd].f) return -K_EINVAL;
+    vfs_close(g_fdtab[fd].f);
+    g_fdtab[fd].f = NULL;
+    return 0;
+}
+
+/* stat: fill basic metadata for path */
+static long sys_stat_impl(const char* path, u_stat_t* out) {
+    if (!path || !out) return -K_EINVAL;
+    vnode_t* vn = NULL;
+    int rc = vfs_lookup(path, &vn);
+    if (rc != 0) return -rc;
+    /* vnode_t has type, size, ino */
+    out->size = vn->size;
+    out->type = (u32)vn->type;
+    out->mode = vn->mode;
+    out->ino  = vn->ino;
+    out->uid  = vn->uid;
+    out->gid  = vn->gid;
+    return 0;
+}
+
+/* readdir: enumerate a directory into user buffer using callback adapter */
+typedef struct { u_dirent_t* out; u64 cap; u64 count; } readdir_ctx_t;
+static int sys_readdir_cb(const char* name, size_t namelen, int is_dir, void* ctx) {
+    readdir_ctx_t* c = (readdir_ctx_t*)ctx;
+    if (c->count >= c->cap) return K_ENOSPC;
+    u_dirent_t* d = &c->out[c->count++];
+    size_t n = namelen; if (n > sizeof(d->name)-1) n = sizeof(d->name)-1;
+    for (size_t i=0;i<n;i++) d->name[i] = name[i];
+    d->name[n] = '\0';
+    d->is_dir = is_dir ? 1u : 0u;
+    d->_pad = 0;
+    return 0;
+}
+
+static long sys_readdir_impl(const char* path, u_dirent_t* out, u64 max_entries) {
+    if (!path || !out) return -K_EINVAL;
+    readdir_ctx_t ctx = { .out = out, .cap = max_entries, .count = 0 };
+    int rc = vfs_listdir(path, sys_readdir_cb, &ctx);
+    if (rc != 0 && rc != K_ENOSPC) return -rc;
+    return (long)ctx.count;
+}
+
+/* mkdir/unlink: Phase A may be read-only on ext4/fat32; provide calls that forward to VFS later */
+static long sys_mkdir_impl(const char* path, int mode) {
+    if (!path) return -K_EINVAL;
+    int rc = vfs_mkdir_path(path, (u32)(mode & 0777));
+    return rc==0 ? 0 : -rc;
+}
+static long sys_unlink_impl(const char* path) {
+    if (!path) return -K_EINVAL;
+    int rc = vfs_unlink_path(path);
+    return rc==0 ? 0 : -rc;
+}
+
+long sys_symlink_impl(const char* target, const char* linkpath) {
+    int rc = vfs_symlink_path(target, linkpath, 0777);
+    return rc==0 ? 0 : -rc;
+}
+
+long sys_readlink_impl(const char* path, char* buf, u64 buflen) {
+    u64 out_len=0; int rc = vfs_readlink_path(path, buf, (size_t)buflen, &out_len);
+    return rc==0 ? (long)out_len : -rc;
+}
+
+long sys_chmod_impl(const char* path, u32 mode) {
+    if (!path) return -K_EINVAL;
+    vnode_t* vn=NULL; int rc = vfs_lookup(path, &vn); if(rc!=0) return -rc;
+    /* Only owner or root may chmod */
+    extern long sys_getuid(void);
+    long uid = sys_getuid();
+    if (uid != 0 && (u32)uid != vn->uid) return -K_EPERM;
+    vn->mode = (mode & 0777);
+    return 0;
+}
+
+long sys_chown_impl(const char* path, u32 uid, u32 gid) {
+    if (!path) return -K_EINVAL;
+    vnode_t* vn=NULL; int rc = vfs_lookup(path, &vn); if(rc!=0) return -rc;
+    extern long sys_getuid(void);
+    long cu = sys_getuid();
+    if (cu != 0) return -K_EPERM; /* only root for now */
+    vn->uid = uid; vn->gid = gid ? gid : uid;
+    return 0;
+}
+
+long sys_umask_impl(u32 new_mask) {
+    process_t* p = process_current(); if(!p) return -K_EINVAL;
+    u16 old = p->umask; p->umask = (u16)(new_mask & 0777);
+    return (long)old;
+}
+
+/* Socket syscalls mapping to kernel net core */
+static long sys_socket_impl(int domain, int type, int proto) {
+    sock_t s=0; int rc = sock_create(domain, type, proto, &s);
+    return rc==0 ? (long)s : -rc;
+}
+static long sys_bind_impl(int s, const void* addr, u64 addrlen) {
+    return -sock_bind((sock_t)s, addr, (u32)addrlen);
+}
+static long sys_sendto_impl(int s, const void* buf, u64 len, u64 flags, const void* addr, u64 addrlen) {
+    return -sock_sendto((sock_t)s, buf, (u32)len, (u32)flags, addr, (u32)addrlen);
+}
+static long sys_recvfrom_impl(int s, void* buf, u64 len, u64 flags, void* addr, u64* addrlen) {
+    u32 al = addrlen ? (u32)*addrlen : 0;
+    int rc = sock_recvfrom((sock_t)s, buf, (u32)len, (u32)flags, addr, addrlen?&al:NULL);
+    if (addrlen) *addrlen = al;
+    return -rc;
+}
+static long sys_setnonblock_impl(int s, int nb) {
+    return -sock_set_nonblock((sock_t)s, nb);
+}
+
+/* Hook these into dispatcher by weak aliases or add into syscall.c table if split is not supported.
+   For Phase 5, arch should call syscall_dispatch() which includes these using externs. */
+
+long ksys_mount(const char* type, const char* dev, const char* dir, const char* opts) { return sys_mount_impl(type, dev, dir, opts); }
+long ksys_open(const char* path, int flags, int mode) { return sys_open_impl(path, flags, mode); }
+long ksys_read(int fd, void* buf, u64 len) { return sys_read_impl(fd, buf, len); }
+long ksys_pwrite(int fd, const void* buf, u64 len, u64 off) { return sys_pwrite_impl(fd, buf, len, off); }
+long ksys_close(int fd) { return sys_close_impl(fd); }
+long ksys_stat(const char* path, u_stat_t* out) { return sys_stat_impl(path, out); }
+long ksys_readdir(const char* path, u_dirent_t* out, u64 maxe) { return sys_readdir_impl(path, out, maxe); }
+long ksys_mkdir(const char* path, int mode) { return sys_mkdir_impl(path, mode); }
+long ksys_unlink(const char* path) { return sys_unlink_impl(path); }
+long ksys_socket(int d, int t, int p) { return sys_socket_impl(d,t,p); }
+long ksys_bind(int s, const void* a, u64 al) { return sys_bind_impl(s,a,al); }
+long ksys_sendto(int s, const void* b, u64 l, u64 f, const void* a, u64 al) { return sys_sendto_impl(s,b,l,f,a,al); }
+long ksys_recvfrom(int s, void* b, u64 l, u64 f, void* a, u64* al) { return sys_recvfrom_impl(s,b,l,f,a,al); }
+long ksys_setnonblock(int s, int nb) { return sys_setnonblock_impl(s, nb); }

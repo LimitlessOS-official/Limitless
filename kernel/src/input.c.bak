@@ -1,0 +1,22 @@
+#include "input.h"
+
+/* Minimal routing: print pressed keys to console if available */
+extern void console_putchar(char c);
+
+void input_init(void) { /* nothing */ }
+
+static char translate_scancode(u8 sc) {
+    /* Very minimal: map scancode directly for ASCII subset if already ASCII */
+    if (sc >= 32 && sc < 127) return (char)sc;
+    return 0;
+}
+
+void input_push_key(const key_event_t* ev) {
+    if (!ev || !ev->pressed) return;
+    char c = translate_scancode(ev->scancode);
+    if (c) console_putchar(c);
+}
+
+void input_push_mouse(const mouse_event_t* ev) {
+    (void)ev;
+}

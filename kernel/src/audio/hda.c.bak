@@ -1,0 +1,16 @@
+#include "audio.h"
+#include "kernel.h"
+#include "pci.h"
+
+/* HDA stub */
+
+static void hda_probe(const pci_device_t* dev, void* user) {
+    (void)user;
+    if (dev->class_code == 0x04 && dev->subclass == 0x03) {
+        kprintf("HDA controller at %02x:%02x.%x\n", dev->bus, dev->slot, dev->func);
+    }
+}
+
+void hda_init(void) {
+    pci_enumerate(hda_probe, NULL);
+}

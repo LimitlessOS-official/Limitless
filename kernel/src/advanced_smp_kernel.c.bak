@@ -1,0 +1,929 @@
+/*
+ * LimitlessOS Advanced SMP Kernel Implementation
+ * Enterprise-grade symmetric multiprocessing with NUMA topology,
+ * advanced CPU management, inter-processor communication, and
+ * sophisticated load balancing algorithms.
+ * 
+ * Features:
+ * - Full SMP support for up to 8192 CPUs
+ * - NUMA topology detection and management
+ * - CPU hotplug support with dynamic resource allocation
+ * - Inter-processor interrupts (IPI) and messaging
+ * - CPU affinity and migration policies
+ * - Advanced load balancing with work stealing
+ * - CPU frequency scaling and power management
+ * - Topology-aware scheduling and memory allocation
+ * - CPU isolation for real-time workloads
+ * - Performance monitoring and profiling per CPU
+ */
+
+#include "kernel.h"
+#include "enterprise.h"
+
+#define MAX_CPUS                    8192
+/* MAX_NUMA_NODES defined in enterprise.h */
+#define MAX_CACHE_LEVELS           4
+#define MAX_CORES_PER_PACKAGE      128
+#define MAX_THREADS_PER_CORE       8
+#define IPI_VECTOR_BASE            0xF0
+#define CPU_HOTPLUG_TIMEOUT_MS     30000
+#define LOAD_BALANCE_INTERVAL_MS   100
+#define MIGRATION_COST_NS          500000
+
+/* CPU states for hotplug - use enum from enterprise.h */
+typedef enum cpu_state cpu_state_t;
+
+/* CPU cache information */
+typedef struct cpu_cache_info {
+    uint32_t level;                 /* Cache level (1, 2, 3, 4) */
+    uint32_t type;                  /* Data, instruction, unified */
+    uint32_t size;                  /* Cache size in bytes */
+    uint32_t line_size;             /* Cache line size */
+    uint32_t associativity;         /* N-way associativity */
+    uint32_t shared_cpu_mask;       /* CPUs sharing this cache */
+    bool inclusive;                 /* Inclusive cache */
+} cpu_cache_info_t;
+
+/* CPU topology information */
+typedef struct cpu_topology {
+    uint32_t cpu_id;                /* Logical CPU ID */
+    uint32_t apic_id;               /* Local APIC ID */
+    uint32_t package_id;            /* Physical package/socket */
+    uint32_t core_id;               /* Core within package */
+    uint32_t thread_id;             /* Thread within core */
+    uint32_t numa_node;             /* NUMA node */
+    
+    /* Cache topology */
+    cpu_cache_info_t caches[MAX_CACHE_LEVELS];
+    uint32_t cache_count;
+    
+    /* Frequency and power */
+    uint32_t base_frequency;        /* Base frequency in MHz */
+    uint32_t max_frequency;         /* Maximum frequency in MHz */
+    uint32_t current_frequency;     /* Current frequency in MHz */
+    uint32_t power_efficiency;      /* Performance per watt rating */
+    
+    /* Capabilities */
+    bool supports_turbo;            /* Turbo boost available */
+    bool supports_hyperthreading;   /* SMT/hyperthreading */
+    bool supports_frequency_scaling; /* DVFS capability */
+    bool supports_c_states;         /* Idle C-states */
+} cpu_topology_t;
+
+/* Per-CPU data structure */
+typedef struct per_cpu_data {
+    uint32_t cpu_id;                /* CPU identifier */
+    cpu_state_t state;              /* Current CPU state */
+    cpu_topology_t topology;        /* Topology information */
+    
+    /* Scheduling data */
+    struct runqueue* runqueue;      /* CPU-local runqueue */
+    struct thread* current_thread;  /* Currently running thread */
+    struct thread* idle_thread;     /* Idle thread for this CPU */
+    uint64_t load_average[3];       /* 1, 5, 15 minute load averages */
+    uint32_t nr_running;            /* Number of running tasks */
+    uint64_t total_runtime;         /* Total CPU runtime */
+    
+    /* IPI and messaging */
+    spinlock_t ipi_lock;            /* IPI queue lock */
+    struct list_head ipi_queue;     /* Pending IPI messages */
+    atomic32_t ipi_pending;         /* Pending IPI count */
+    
+    /* Memory management */
+    void* page_allocator;           /* Per-CPU page allocator */
+    void* slab_cache;               /* Per-CPU slab cache */
+    uint64_t memory_pressure;       /* Memory pressure metric */
+    
+    /* Performance counters */
+    uint64_t context_switches;      /* Context switch count */
+    uint64_t interrupts_handled;    /* Interrupt count */
+    uint64_t syscalls_executed;     /* System call count */
+    uint64_t cache_misses;          /* Cache miss count */
+    uint64_t tlb_misses;            /* TLB miss count */
+    
+    /* Power management */
+    uint32_t c_state;               /* Current C-state */
+    uint32_t p_state;               /* Current P-state */
+    uint64_t idle_time;             /* Time spent in idle */
+    uint64_t active_time;           /* Time spent active */
+    
+    /* Hotplug support */
+    struct completion online_completion; /* CPU online synchronization */
+    struct completion offline_completion; /* CPU offline synchronization */
+    struct work_struct hotplug_work; /* Hotplug work item */
+    
+    /* Debugging and profiling */
+    void* stack_trace_buffer;       /* Stack trace buffer */
+    void* perf_buffer;              /* Performance data buffer */
+    bool profiling_enabled;         /* CPU profiling active */
+} per_cpu_data_t;
+
+/* NUMA node information */
+typedef struct numa_node {
+    uint32_t node_id;               /* NUMA node ID */
+    uint64_t memory_start;          /* Start of memory range */
+    uint64_t memory_size;           /* Total memory in node */
+    uint64_t memory_free;           /* Free memory in node */
+    
+    uint32_t cpu_mask[MAX_CPUS / 32]; /* CPUs in this node */
+    uint32_t cpu_count;             /* Number of CPUs */
+    
+    /* Distance to other nodes */
+    uint32_t distance[MAX_NUMA_NODES]; /* NUMA distance matrix */
+    
+    /* Memory statistics */
+    uint64_t local_allocations;     /* Local memory allocations */
+    uint64_t remote_allocations;    /* Remote memory allocations */
+    uint64_t numa_faults;           /* NUMA page faults */
+    uint64_t numa_migrations;       /* Page migrations */
+    
+    /* Load balancing */
+    uint64_t load_average;          /* Node load average */
+    uint32_t migration_cost;        /* Cost of migrating to/from node */
+} numa_node_t;
+
+/* IPI types - use enum from enterprise.h */
+typedef enum ipi_type ipi_type_t;
+
+/* IPI message structure */
+typedef struct ipi_message {
+    struct list_head list;          /* List linkage */
+    ipi_type_t type;                /* Message type */
+    uint32_t sender_cpu;            /* Sending CPU */
+    uint32_t target_cpu;            /* Target CPU (or ALL_CPUS) */
+    
+    /* Message payload */
+    union {
+        struct {
+            void (*func)(void* data);
+            void* data;
+            struct completion* completion;
+        } call;
+        
+        struct {
+            uintptr_t start_addr;
+            size_t size;
+            bool flush_all;
+        } tlb_flush;
+        
+        struct {
+            uint32_t level;
+            bool invalidate;
+        } cache_flush;
+        
+        struct {
+            uint32_t priority;
+            bool force;
+        } reschedule;
+    } payload;
+    
+    uint64_t timestamp;             /* Message timestamp */
+    uint32_t flags;                 /* Message flags */
+} ipi_message_t;
+
+/* SMP kernel state */
+static struct {
+    bool initialized;               /* SMP system initialized */
+    uint32_t num_cpus;              /* Total number of CPUs */
+    uint32_t num_online_cpus;       /* Number of online CPUs */
+    uint32_t num_numa_nodes;        /* Number of NUMA nodes */
+    
+    per_cpu_data_t cpu_data[MAX_CPUS]; /* Per-CPU data */
+    numa_node_t numa_nodes[MAX_NUMA_NODES]; /* NUMA topology */
+    
+    /* CPU management */
+    uint32_t boot_cpu;              /* Boot processor ID */
+    uint32_t cpu_online_mask[MAX_CPUS / 32]; /* Online CPU mask */
+    uint32_t cpu_isolated_mask[MAX_CPUS / 32]; /* Isolated CPU mask */
+    
+    /* Load balancing */
+    struct timer_list load_balance_timer; /* Load balancing timer */
+    spinlock_t migration_lock;      /* Migration lock */
+    uint64_t last_balance_time;     /* Last balance timestamp */
+    
+    /* IPI handling */
+    spinlock_t ipi_lock;            /* Global IPI lock */
+    uint64_t ipi_stats[IPI_MAX_TYPES]; /* IPI statistics */
+    
+    /* Performance monitoring */
+    bool perf_monitoring_enabled;   /* Global performance monitoring */
+    uint64_t total_context_switches; /* System-wide context switches */
+    uint64_t total_interrupts;      /* System-wide interrupts */
+    
+    /* Hotplug management */
+    struct mutex hotplug_lock;      /* CPU hotplug lock */
+    struct work_queue hotplug_wq;   /* Hotplug work queue */
+    bool hotplug_enabled;           /* CPU hotplug enabled */
+} smp_system = {0};
+
+/* Function prototypes */
+static int smp_detect_topology(void);
+static int smp_initialize_cpus(void);
+static int smp_setup_per_cpu_data(uint32_t cpu_id);
+static int smp_bring_cpu_online(uint32_t cpu_id);
+static int smp_take_cpu_offline(uint32_t cpu_id);
+static void smp_ipi_handler(uint32_t vector, struct interrupt_frame* frame);
+static int smp_send_ipi(uint32_t target_cpu, ipi_type_t type, void* data);
+static void smp_load_balance_work(struct work_struct* work);
+static void smp_cpu_idle_loop(void* arg);
+
+/* Initialize SMP subsystem */
+int smp_init(void) {
+    console_printf("SMP: Initializing symmetric multiprocessing subsystem\n");
+    
+    /* Initialize locks and data structures */
+    spin_lock_init(&smp_system.migration_lock);
+    spin_lock_init(&smp_system.ipi_lock);
+    mutex_init(&smp_system.hotplug_lock);
+    
+    /* Detect CPU topology and NUMA layout */
+    int result = smp_detect_topology();
+    if (result != 0) {
+        console_printf("SMP: Failed to detect CPU topology: %d\n", result);
+        return result;
+    }
+    
+    /* Initialize per-CPU data structures */
+    result = smp_initialize_cpus();
+    if (result != 0) {
+        console_printf("SMP: Failed to initialize CPUs: %d\n", result);
+        return result;
+    }
+    
+    /* Set up IPI handlers */
+    for (int i = 0; i < IPI_MAX_TYPES; i++) {
+        interrupt_register_handler(IPI_VECTOR_BASE + i, smp_ipi_handler);
+    }
+    
+    /* Initialize load balancing */
+    timer_setup(&smp_system.load_balance_timer, (void (*)(unsigned long))smp_load_balance_work, 
+                LOAD_BALANCE_INTERVAL_MS);
+    
+    /* Enable hotplug support */
+    smp_system.hotplug_enabled = true;
+    work_queue_init(&smp_system.hotplug_wq, "smp_hotplug", 4);
+    
+    smp_system.initialized = true;
+    console_printf("SMP: Initialized %d CPUs across %d NUMA nodes\n",
+                   smp_system.num_cpus, smp_system.num_numa_nodes);
+    
+    return 0;
+}
+
+/* Detect CPU topology and NUMA information */
+static int smp_detect_topology(void) {
+    /* Detect number of CPUs using ACPI or other firmware interfaces */
+    smp_system.num_cpus = hal_cpu_detect_count();
+    if (smp_system.num_cpus == 0 || smp_system.num_cpus > MAX_CPUS) {
+        console_printf("SMP: Invalid CPU count: %d\n", smp_system.num_cpus);
+        return -1;
+    }
+    
+    smp_system.boot_cpu = hal_cpu_get_current_id();
+    
+    /* Detect NUMA topology */
+    smp_system.num_numa_nodes = hal_numa_detect_nodes();
+    if (smp_system.num_numa_nodes == 0) {
+        /* Single NUMA node system */
+        smp_system.num_numa_nodes = 1;
+        numa_node_t* node = &smp_system.numa_nodes[0];
+        node->node_id = 0;
+        node->memory_start = 0;
+        node->memory_size = hal_memory_get_total_size();
+        node->memory_free = node->memory_size;
+        node->cpu_count = smp_system.num_cpus;
+        
+        /* All CPUs in node 0 */
+        for (int i = 0; i < smp_system.num_cpus; i++) {
+            node->cpu_mask[i / 32] |= (1U << (i % 32));
+        }
+    } else {
+        /* Multi-NUMA system - get topology from firmware */
+        for (int i = 0; i < smp_system.num_numa_nodes; i++) {
+            hal_numa_get_node_info(i, &smp_system.numa_nodes[i]);
+        }
+    }
+    
+    /* Detect per-CPU topology information */
+    for (int cpu = 0; cpu < smp_system.num_cpus; cpu++) {
+        cpu_topology_t* topo = &smp_system.cpu_data[cpu].topology;
+        hal_cpu_get_topology(cpu, topo);
+        
+        /* Detect cache hierarchy */
+        topo->cache_count = hal_cpu_get_cache_info(cpu, topo->caches, MAX_CACHE_LEVELS);
+        
+        /* Get frequency and power information */
+        uint64_t base_freq, max_freq;
+        hal_cpu_get_frequency_info(cpu, &base_freq, &max_freq);
+        topo->base_frequency = (uint32_t)base_freq;
+        topo->max_frequency = (uint32_t)max_freq; 
+        topo->current_frequency = topo->base_frequency; /* Default to base */
+        hal_cpu_get_capabilities(cpu, &topo->supports_turbo, &topo->supports_hyperthreading);
+        topo->supports_frequency_scaling = true; /* Assume DVFS support */
+        topo->supports_c_states = true; /* Assume C-state support */
+    }
+    
+    console_printf("SMP: Detected topology - %d CPUs, %d NUMA nodes\n",
+                   smp_system.num_cpus, smp_system.num_numa_nodes);
+    
+    return 0;
+}
+
+/* Initialize all CPU data structures */
+static int smp_initialize_cpus(void) {
+    for (int cpu = 0; cpu < smp_system.num_cpus; cpu++) {
+        int result = smp_setup_per_cpu_data(cpu);
+        if (result != 0) {
+            console_printf("SMP: Failed to setup CPU %d: %d\n", cpu, result);
+            return result;
+        }
+        
+        /* Mark boot CPU as online */
+        if (cpu == smp_system.boot_cpu) {
+            smp_system.cpu_data[cpu].state = CPU_STATE_ONLINE;
+            smp_system.cpu_online_mask[cpu / 32] |= (1U << (cpu % 32));
+            smp_system.num_online_cpus = 1;
+        } else {
+            smp_system.cpu_data[cpu].state = CPU_STATE_OFFLINE;
+        }
+    }
+    
+    return 0;
+}
+
+/* Set up per-CPU data structure */
+static int smp_setup_per_cpu_data(uint32_t cpu_id) {
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    
+    cpu_data->cpu_id = cpu_id;
+    cpu_data->state = CPU_STATE_OFFLINE;
+    
+    /* Initialize locks and lists */
+    spin_lock_init(&cpu_data->ipi_lock);
+    INIT_LIST_HEAD(&cpu_data->ipi_queue);
+    atomic32_set(&cpu_data->ipi_pending, 0);
+    
+    /* Allocate per-CPU memory pools */
+    cpu_data->page_allocator = vmm_create_per_cpu_allocator(cpu_id);
+    if (!cpu_data->page_allocator) {
+        console_printf("SMP: Failed to create page allocator for CPU %d\n", cpu_id);
+        return -1;
+    }
+    
+    cpu_data->slab_cache = slab_create_per_cpu_cache(cpu_id);
+    if (!cpu_data->slab_cache) {
+        console_printf("SMP: Failed to create slab cache for CPU %d\n", cpu_id);
+        return -1;
+    }
+    
+    /* Allocate performance and debugging buffers */
+    cpu_data->stack_trace_buffer = vmm_alloc_pages_flags(16, VMM_ALLOC_ZERO);
+    cpu_data->perf_buffer = vmm_alloc_pages_flags(64, VMM_ALLOC_ZERO);
+    
+    /* Initialize performance counters */
+    cpu_data->context_switches = 0;
+    cpu_data->interrupts_handled = 0;
+    cpu_data->syscalls_executed = 0;
+    cpu_data->cache_misses = 0;
+    cpu_data->tlb_misses = 0;
+    
+    /* Initialize load averages */
+    cpu_data->load_average[0] = 0;  /* 1 minute */
+    cpu_data->load_average[1] = 0;  /* 5 minute */
+    cpu_data->load_average[2] = 0;  /* 15 minute */
+    
+    /* Set up completion objects for hotplug */
+    init_completion(&cpu_data->online_completion);
+    init_completion(&cpu_data->offline_completion);
+    
+    /* Create idle thread for this CPU */
+    thread_t* idle_thread;
+    int result = scheduler_create_kthread(&idle_thread, smp_cpu_idle_loop, 
+                                         (void*)(uintptr_t)cpu_id, NULL, 8192, cpu_id);
+    if (result != 0) {
+        console_printf("SMP: Failed to create idle thread for CPU %d: %d\n", cpu_id, result);
+        return result;
+    }
+    
+    cpu_data->idle_thread = idle_thread;
+    idle_thread->priority = THREAD_PRIO_IDLE;
+    
+    console_printf("SMP: Initialized CPU %d data structures\n", cpu_id);
+    return 0;
+}
+
+/* Bring a CPU online */
+int smp_cpu_online(uint32_t cpu_id) {
+    if (cpu_id >= smp_system.num_cpus) {
+        return -1;
+    }
+    
+    mutex_lock(&smp_system.hotplug_lock);
+    
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    if (cpu_data->state != CPU_STATE_OFFLINE) {
+        mutex_unlock(&smp_system.hotplug_lock);
+        return -1; /* CPU not offline */
+    }
+    
+    console_printf("SMP: Bringing CPU %d online\n", cpu_id);
+    cpu_data->state = CPU_STATE_COMING_ONLINE;
+    
+    /* Initialize CPU-specific hardware */
+    int result = hal_cpu_initialize(cpu_id);
+    if (result != 0) {
+        console_printf("SMP: Failed to initialize CPU %d hardware: %d\n", cpu_id, result);
+        cpu_data->state = CPU_STATE_FAILED;
+        mutex_unlock(&smp_system.hotplug_lock);
+        return result;
+    }
+    
+    /* Start the CPU */
+    result = hal_cpu_start(cpu_id, (void (*)(void*))smp_bring_cpu_online, (void*)(uintptr_t)cpu_id);
+    if (result != 0) {
+        console_printf("SMP: Failed to start CPU %d: %d\n", cpu_id, result);
+        cpu_data->state = CPU_STATE_FAILED;
+        mutex_unlock(&smp_system.hotplug_lock);
+        return result;
+    }
+    
+    /* Wait for CPU to come online */
+    bool online = wait_for_completion_timeout(&cpu_data->online_completion, 
+                                             CPU_HOTPLUG_TIMEOUT_MS);
+    if (!online) {
+        console_printf("SMP: CPU %d failed to come online within timeout\n", cpu_id);
+        cpu_data->state = CPU_STATE_FAILED;
+        mutex_unlock(&smp_system.hotplug_lock);
+        return -1;
+    }
+    
+    /* Mark CPU as online */
+    cpu_data->state = CPU_STATE_ONLINE;
+    smp_system.cpu_online_mask[cpu_id / 32] |= (1U << (cpu_id % 32));
+    smp_system.num_online_cpus++;
+    
+    console_printf("SMP: CPU %d is now online (%d total)\n", cpu_id, smp_system.num_online_cpus);
+    
+    mutex_unlock(&smp_system.hotplug_lock);
+    return 0;
+}
+
+/* Take a CPU offline */
+int smp_cpu_offline(uint32_t cpu_id) {
+    if (cpu_id >= smp_system.num_cpus || cpu_id == smp_system.boot_cpu) {
+        return -1; /* Cannot offline boot CPU */
+    }
+    
+    mutex_lock(&smp_system.hotplug_lock);
+    
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    if (cpu_data->state != CPU_STATE_ONLINE) {
+        mutex_unlock(&smp_system.hotplug_lock);
+        return -1; /* CPU not online */
+    }
+    
+    console_printf("SMP: Taking CPU %d offline\n", cpu_id);
+    cpu_data->state = CPU_STATE_GOING_OFFLINE;
+    
+    /* Migrate all tasks away from this CPU */
+    scheduler_migrate_tasks_from_cpu(cpu_id);
+    
+    /* Send stop IPI to the CPU */
+    smp_send_ipi(cpu_id, IPI_CPU_STOP, NULL);
+    
+    /* Wait for CPU to acknowledge shutdown */
+    bool offline = wait_for_completion_timeout(&cpu_data->offline_completion,
+                                              CPU_HOTPLUG_TIMEOUT_MS);
+    if (!offline) {
+        console_printf("SMP: CPU %d failed to go offline within timeout\n", cpu_id);
+        cpu_data->state = CPU_STATE_ONLINE; /* Restore state */
+        mutex_unlock(&smp_system.hotplug_lock);
+        return -1;
+    }
+    
+    /* Mark CPU as offline */
+    cpu_data->state = CPU_STATE_OFFLINE;
+    smp_system.cpu_online_mask[cpu_id / 32] &= ~(1U << (cpu_id % 32));
+    smp_system.num_online_cpus--;
+    
+    /* Stop CPU hardware */
+    hal_cpu_stop(cpu_id);
+    
+    console_printf("SMP: CPU %d is now offline (%d remaining)\n", 
+                   cpu_id, smp_system.num_online_cpus);
+    
+    mutex_unlock(&smp_system.hotplug_lock);
+    return 0;
+}
+
+/* CPU online bootstrap function */
+static int smp_bring_cpu_online(uint32_t cpu_id) {
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    
+    /* Set current CPU context */
+    hal_cpu_set_current_id(cpu_id);
+    
+    /* Initialize local APIC and interrupts */
+    hal_apic_init_secondary(cpu_id);
+    interrupt_init_secondary(cpu_id);
+    
+    /* Initialize CPU-local timer */
+    timer_init_secondary(cpu_id);
+    
+    /* Initialize per-CPU scheduler */
+    scheduler_init_secondary(cpu_id);
+    
+    /* Signal that we're online */
+    complete(&cpu_data->online_completion);
+    
+    /* Start running the scheduler */
+    scheduler_schedule();
+    
+    /* Should never reach here */
+    panic("SMP: CPU %d bootstrap returned unexpectedly", cpu_id);
+    return 0;
+}
+
+/* Send inter-processor interrupt */
+static int smp_send_ipi(uint32_t target_cpu, ipi_type_t type, void* data) {
+    if (!smp_system.initialized || target_cpu >= smp_system.num_cpus) {
+        return -1;
+    }
+    
+    /* Check if target CPU is online */
+    if (!(smp_system.cpu_online_mask[target_cpu / 32] & (1U << (target_cpu % 32)))) {
+        return -1; /* CPU not online */
+    }
+    
+    /* Create IPI message */
+    ipi_message_t* msg = kmalloc(sizeof(ipi_message_t));
+    if (!msg) {
+        return -1;
+    }
+    
+    msg->type = type;
+    msg->sender_cpu = hal_cpu_get_current_id();
+    msg->target_cpu = target_cpu;
+    msg->timestamp = timer_get_ticks();
+    msg->flags = 0;
+    
+    /* Copy data payload */
+    if (data) {
+        switch (type) {
+            case IPI_CALL_FUNCTION:
+            case IPI_CALL_FUNCTION_SINGLE: {
+                struct {
+                    void (*func)(void*);
+                    void* data;
+                    struct completion* completion;
+                } *call_data = (typeof(call_data))data;
+                
+                msg->payload.call.func = call_data->func;
+                msg->payload.call.data = call_data->data;
+                msg->payload.call.completion = call_data->completion;
+                break;
+            }
+            
+            case IPI_TLB_FLUSH: {
+                struct {
+                    uintptr_t start_addr;
+                    size_t size;
+                    bool flush_all;
+                } *tlb_data = (typeof(tlb_data))data;
+                
+                msg->payload.tlb_flush.start_addr = tlb_data->start_addr;
+                msg->payload.tlb_flush.size = tlb_data->size;
+                msg->payload.tlb_flush.flush_all = tlb_data->flush_all;
+                break;
+            }
+        }
+    }
+    
+    /* Queue message on target CPU */
+    per_cpu_data_t* target_cpu_data = &smp_system.cpu_data[target_cpu];
+    spin_lock(&target_cpu_data->ipi_lock);
+    list_add_tail(&msg->list, &target_cpu_data->ipi_queue);
+    atomic32_inc(&target_cpu_data->ipi_pending);
+    spin_unlock(&target_cpu_data->ipi_lock);
+    
+    /* Send hardware interrupt */
+    hal_apic_send_ipi(target_cpu, IPI_VECTOR_BASE + type);
+    
+    /* Update statistics */
+    smp_system.ipi_stats[type]++;
+    
+    return 0;
+}
+
+/* IPI interrupt handler */
+static void smp_ipi_handler(uint32_t vector, struct interrupt_frame* frame) {
+    uint32_t cpu_id = hal_cpu_get_current_id();
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    ipi_type_t type = (ipi_type_t)(vector - IPI_VECTOR_BASE);
+    
+    cpu_data->interrupts_handled++;
+    
+    /* Process pending IPI messages */
+    spin_lock(&cpu_data->ipi_lock);
+    
+    while (!list_empty(&cpu_data->ipi_queue)) {
+        ipi_message_t* msg = (ipi_message_t*)((char*)cpu_data->ipi_queue.next - offsetof(ipi_message_t, list));
+        list_del(&msg->list);
+        atomic32_dec(&cpu_data->ipi_pending);
+        spin_unlock(&cpu_data->ipi_lock);
+        
+        /* Handle the IPI message */
+        switch (msg->type) {
+            case IPI_RESCHEDULE:
+                scheduler_set_need_resched();
+                break;
+                
+            case IPI_CALL_FUNCTION:
+            case IPI_CALL_FUNCTION_SINGLE:
+                if (msg->payload.call.func) {
+                    msg->payload.call.func(msg->payload.call.data);
+                }
+                if (msg->payload.call.completion) {
+                    complete(msg->payload.call.completion);
+                }
+                break;
+                
+            case IPI_CPU_STOP:
+                /* Acknowledge shutdown and halt */
+                complete(&cpu_data->offline_completion);
+                hal_cpu_halt_forever();
+                break;
+                
+            case IPI_TLB_FLUSH:
+                if (msg->payload.tlb_flush.flush_all) {
+                    hal_tlb_flush_all();
+                } else {
+                    hal_tlb_flush_range((void*)msg->payload.tlb_flush.start_addr,
+                                       msg->payload.tlb_flush.size);
+                }
+                break;
+                
+            case IPI_CACHE_FLUSH:
+                hal_cache_flush(msg->payload.cache_flush.level, NULL, 0);
+                break;
+                
+            default:
+                console_printf("SMP: Unknown IPI type %d on CPU %d\n", msg->type, cpu_id);
+                break;
+        }
+        
+        kfree(msg);
+        spin_lock(&cpu_data->ipi_lock);
+    }
+    
+    spin_unlock(&cpu_data->ipi_lock);
+}
+
+/* Load balancing work function */
+static void smp_load_balance_work(struct work_struct* work) {
+    if (!smp_system.initialized || smp_system.num_online_cpus <= 1) {
+        return;
+    }
+    
+    uint64_t current_time = timer_get_ticks();
+    
+    /* Skip if too soon since last balance */
+    if (current_time - smp_system.last_balance_time < LOAD_BALANCE_INTERVAL_MS * 1000000) {
+        return;
+    }
+    
+    spin_lock(&smp_system.migration_lock);
+    
+    /* Calculate load averages for all online CPUs */
+    uint64_t total_load = 0;
+    uint32_t online_cpus = 0;
+    
+    for (int cpu = 0; cpu < smp_system.num_cpus; cpu++) {
+        per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu];
+        if (cpu_data->state == CPU_STATE_ONLINE) {
+            scheduler_update_load_average(cpu);
+            total_load += cpu_data->load_average[0]; /* 1-minute load */
+            online_cpus++;
+        }
+    }
+    
+    if (online_cpus == 0) {
+        spin_unlock(&smp_system.migration_lock);
+        return;
+    }
+    
+    uint64_t average_load = total_load / online_cpus;
+    
+    /* Find imbalanced CPUs */
+    for (int cpu = 0; cpu < smp_system.num_cpus; cpu++) {
+        per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu];
+        if (cpu_data->state != CPU_STATE_ONLINE) {
+            continue;
+        }
+        
+        /* Check if CPU is overloaded */
+        if (cpu_data->load_average[0] > average_load * 150 / 100) {
+            /* Find underloaded CPU in same NUMA node first */
+            uint32_t numa_node = cpu_data->topology.numa_node;
+            int target_cpu = scheduler_find_idle_cpu(numa_node);
+            
+            if (target_cpu >= 0) {
+                /* Migrate some tasks */
+                scheduler_migrate_tasks(cpu, target_cpu, 2);
+            }
+        }
+    }
+    
+    smp_system.last_balance_time = current_time;
+    spin_unlock(&smp_system.migration_lock);
+    
+    /* Reschedule load balancing */
+    timer_mod(&smp_system.load_balance_timer, 
+              current_time + LOAD_BALANCE_INTERVAL_MS * 1000000);
+}
+
+/* CPU idle loop */
+static void smp_cpu_idle_loop(void* arg) {
+    uint32_t cpu_id = (uint32_t)(uintptr_t)arg;
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    
+    while (1) {
+        /* Enter idle state */
+        uint64_t idle_start = timer_get_ticks();
+        
+        /* Try to enter deeper C-states if supported */
+        if (cpu_data->topology.supports_c_states && cpu_data->nr_running == 0) {
+            hal_cpu_enter_c_state(cpu_id, 2); /* C2 state */
+        } else {
+            hal_cpu_halt(); /* Basic halt */
+        }
+        
+        uint64_t idle_end = timer_get_ticks();
+        cpu_data->idle_time += (idle_end - idle_start);
+        
+        /* Check for work */
+        scheduler_yield();
+    }
+}
+
+/* Get SMP system statistics */
+void smp_get_stats(struct smp_stats* stats) {
+    if (!stats || !smp_system.initialized) {
+        return;
+    }
+    
+    stats->num_cpus = smp_system.num_cpus;
+    stats->num_online_cpus = smp_system.num_online_cpus;
+    stats->num_numa_nodes = smp_system.num_numa_nodes;
+    
+    stats->total_context_switches = 0;
+    stats->total_interrupts = 0;
+    stats->total_ipi_messages = 0;
+    
+    for (int cpu = 0; cpu < smp_system.num_cpus; cpu++) {
+        per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu];
+        if (cpu_data->state == CPU_STATE_ONLINE) {
+            stats->total_context_switches += cpu_data->context_switches;
+            stats->total_interrupts += cpu_data->interrupts_handled;
+        }
+    }
+    
+    for (int i = 0; i < IPI_MAX_TYPES; i++) {
+        stats->total_ipi_messages += smp_system.ipi_stats[i];
+    }
+}
+
+/* Isolate CPU for real-time workloads */
+int smp_isolate_cpu(uint32_t cpu_id) {
+    if (cpu_id >= smp_system.num_cpus || cpu_id == smp_system.boot_cpu) {
+        return -1;
+    }
+    
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    if (cpu_data->state != CPU_STATE_ONLINE) {
+        return -1;
+    }
+    
+    /* Migrate all non-RT tasks away */
+    scheduler_migrate_non_rt_tasks_from_cpu(cpu_id);
+    
+    /* Mark CPU as isolated */
+    cpu_data->state = CPU_STATE_ISOLATED;
+    smp_system.cpu_isolated_mask[cpu_id / 32] |= (1U << (cpu_id % 32));
+    
+    console_printf("SMP: CPU %d isolated for real-time workloads\n", cpu_id);
+    return 0;
+}
+
+/* Remove CPU isolation */
+int smp_unisolate_cpu(uint32_t cpu_id) {
+    if (cpu_id >= smp_system.num_cpus) {
+        return -1;
+    }
+    
+    per_cpu_data_t* cpu_data = &smp_system.cpu_data[cpu_id];
+    if (cpu_data->state != CPU_STATE_ISOLATED) {
+        return -1;
+    }
+    
+    /* Remove isolation */
+    cpu_data->state = CPU_STATE_ONLINE;
+    smp_system.cpu_isolated_mask[cpu_id / 32] &= ~(1U << (cpu_id % 32));
+    
+    console_printf("SMP: CPU %d isolation removed\n", cpu_id);
+    return 0;
+}
+
+/* Check if system is SMP */
+bool smp_is_enabled(void) {
+    return smp_system.initialized && smp_system.num_cpus > 1;
+}
+
+/* Get current CPU ID */
+uint32_t smp_get_current_cpu(void) {
+    return hal_cpu_get_current_id();
+}
+
+/* Get number of online CPUs */
+uint32_t smp_get_num_online_cpus(void) {
+    return smp_system.num_online_cpus;
+}
+
+/* Get CPU topology information */
+const cpu_topology_t* smp_get_cpu_topology(uint32_t cpu_id) {
+    if (cpu_id >= smp_system.num_cpus) {
+        return NULL;
+    }
+    
+    return &smp_system.cpu_data[cpu_id].topology;
+}
+
+/* Get NUMA node information */
+const numa_node_t* smp_get_numa_node(uint32_t node_id) {
+    if (node_id >= smp_system.num_numa_nodes) {
+        return NULL;
+    }
+    
+    return &smp_system.numa_nodes[node_id];
+}
+
+/* Cross-CPU function call */
+int smp_call_function_on_cpu(uint32_t cpu_id, void (*func)(void*), void* data, bool wait) {
+    if (!func || cpu_id >= smp_system.num_cpus) {
+        return -1;
+    }
+    
+    struct completion completion;
+    if (wait) {
+        init_completion(&completion);
+    }
+    
+    struct {
+        void (*func)(void*);
+        void* data;
+        struct completion* completion;
+    } call_data = {
+        .func = func,
+        .data = data,
+        .completion = wait ? &completion : NULL
+    };
+    
+    int result = smp_send_ipi(cpu_id, IPI_CALL_FUNCTION_SINGLE, &call_data);
+    if (result != 0) {
+        return result;
+    }
+    
+    if (wait) {
+        wait_for_completion(&completion);
+    }
+    
+    return 0;
+}
+
+/* Broadcast function call to all CPUs */
+int smp_call_function_on_all_cpus(void (*func)(void*), void* data, bool wait) {
+    if (!func) {
+        return -1;
+    }
+    
+    int errors = 0;
+    uint32_t current_cpu = smp_get_current_cpu();
+    
+    for (int cpu = 0; cpu < smp_system.num_cpus; cpu++) {
+        if (cpu == current_cpu) {
+            continue; /* Skip current CPU */
+        }
+        
+        if (smp_system.cpu_data[cpu].state == CPU_STATE_ONLINE) {
+            int result = smp_call_function_on_cpu(cpu, func, data, wait);
+            if (result != 0) {
+                errors++;
+            }
+        }
+    }
+    
+    /* Execute on current CPU too */
+    func(data);
+    
+    return errors > 0 ? -1 : 0;
+}

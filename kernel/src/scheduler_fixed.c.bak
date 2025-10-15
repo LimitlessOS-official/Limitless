@@ -1,0 +1,421 @@
+/*
+ * Process and Thread Scheduler for LimitlessOS
+ * Priority-based preemptive scheduler with proper integration
+ */
+
+#include "kernel.h"
+#include "hal.h"
+
+/* Thread states */
+typedef enum {
+    THREAD_NEW = 0,
+    THREAD_RUNNABLE,
+    THREAD_RUNNING, 
+    THREAD_BLOCKED,
+    THREAD_SLEEPING,
+    THREAD_ZOMBIE,
+} thread_state_t;
+
+/* Thread priority levels */
+#define THREAD_PRIO_HIGH   0
+#define THREAD_PRIO_NORMAL 1
+#define THREAD_PRIO_LOW    2
+#define THREAD_PRIO_IDLE   3
+#define THREAD_PRIO_MAX    THREAD_PRIO_IDLE
+
+/* Using arch_context_t from HAL header */
+
+/* Process structure */
+typedef struct process {
+    u32 pid;
+    char name[64];
+    u32 uid;
+    u32 gid;
+    void* page_directory;
+    struct process* parent;
+    struct process* next;
+} process_t;
+
+/* Thread structure */
+typedef struct thread {
+    u32 tid;
+    u32 pid;
+    u32 affinity_cpu;
+    
+    int priority;
+    u64 vruntime;
+    
+    thread_state_t state;
+    u32 ticks_used;
+    u8 need_resched;
+    u8 on_rq;
+    
+    struct thread* rq_next;
+    struct thread* rq_prev;
+    
+    arch_context_t* arch_ctx;
+    void* kstack_base;
+    size_t kstack_size;
+    
+    process_t* proc;       /* Owning process */
+    void* entry_arg;
+    
+    struct thread* next;   /* Global thread list */
+} thread_t;
+
+/* Scheduler constants */
+#define TIMESLICE_TICKS 10
+#define MAX_THREADS 256
+#define STACK_SIZE 8192
+
+/* Global scheduler state */
+static thread_t* g_thread_list = NULL;
+static thread_t* g_current_thread = NULL;
+static thread_t* g_idle_thread = NULL;
+static u32 g_next_tid = 1;
+static u32 g_thread_count = 0;
+static u64 g_scheduler_ticks = 0;
+
+/* Simple runqueue (single CPU for now) */
+typedef struct runqueue {
+    thread_t* head;
+    u32 count;
+} runqueue_t;
+
+static runqueue_t g_runqueue = {0};
+
+/* Process list */
+static process_t* g_process_list = NULL;
+static u32 g_next_pid = 1;
+
+/* Create new process */
+static process_t* create_process(const char* name) {
+    process_t* proc = (process_t*)kalloc(sizeof(process_t));
+    if (!proc) return NULL;
+    
+    memset(proc, 0, sizeof(process_t));
+    proc->pid = g_next_pid++;
+    
+    if (name) {
+        strncpy(proc->name, name, sizeof(proc->name) - 1);
+        proc->name[sizeof(proc->name) - 1] = '\0';
+    }
+    
+    proc->uid = 0;
+    proc->gid = 0;
+    proc->page_directory = NULL;  /* Would set up page directory */
+    proc->parent = NULL;
+    
+    /* Add to process list */
+    proc->next = g_process_list;
+    g_process_list = proc;
+    
+    return proc;
+}
+
+/* Add thread to runqueue */
+static void runqueue_add(thread_t* thread) {
+    if (!thread || thread->on_rq) return;
+    
+    thread->state = THREAD_RUNNABLE;
+    thread->on_rq = 1;
+    
+    if (!g_runqueue.head) {
+        g_runqueue.head = thread;
+        thread->rq_next = thread->rq_prev = thread;
+    } else {
+        thread_t* head = g_runqueue.head;
+        thread_t* tail = head->rq_prev;
+        
+        thread->rq_next = head;
+        thread->rq_prev = tail;
+        head->rq_prev = thread;
+        tail->rq_next = thread;
+    }
+    
+    g_runqueue.count++;
+}
+
+/* Remove thread from runqueue */
+static void runqueue_remove(thread_t* thread) {
+    if (!thread || !thread->on_rq) return;
+    
+    thread->on_rq = 0;
+    
+    if (g_runqueue.count == 1) {
+        g_runqueue.head = NULL;
+    } else {
+        thread->rq_prev->rq_next = thread->rq_next;
+        thread->rq_next->rq_prev = thread->rq_prev;
+        
+        if (g_runqueue.head == thread) {
+            g_runqueue.head = thread->rq_next;
+        }
+    }
+    
+    thread->rq_next = thread->rq_prev = NULL;
+    g_runqueue.count--;
+}
+
+/* Find next thread to run */
+static thread_t* pick_next_thread(void) {
+    if (!g_runqueue.head || g_runqueue.count == 0) {
+        return g_idle_thread;
+    }
+    
+    thread_t* best = NULL;
+    thread_t* current = g_runqueue.head;
+    int best_priority = THREAD_PRIO_MAX + 1;
+    
+    /* Simple priority-based scheduling */
+    for (u32 i = 0; i < g_runqueue.count; i++) {
+        if (current->state == THREAD_RUNNABLE && current->priority < best_priority) {
+            best = current;
+            best_priority = current->priority;
+        }
+        current = current->rq_next;
+    }
+    
+    return best ? best : g_idle_thread;
+}
+
+/* Switch to new thread context */
+static void context_switch(thread_t* prev, thread_t* next) {
+    if (!next) return;
+    
+    /* Save current context (simplified) */
+    if (prev && prev->arch_ctx) {
+        /* Would save registers here */
+    }
+    
+    /* Load new context */
+    if (next->arch_ctx) {
+        /* Would restore registers here */
+    }
+    
+    g_current_thread = next;
+    if (next != g_idle_thread) {
+        next->state = THREAD_RUNNING;
+    }
+}
+
+/* Core scheduler function */
+void scheduler_schedule(void) {
+    thread_t* prev = g_current_thread;
+    thread_t* next = pick_next_thread();
+    
+    if (next && next != prev) {
+        /* Update previous thread state */
+        if (prev && prev != g_idle_thread && prev->state == THREAD_RUNNING) {
+            prev->state = THREAD_RUNNABLE;
+        }
+        
+        context_switch(prev, next);
+    }
+}
+
+/* Scheduler tick (called from timer interrupt) */
+void scheduler_tick(void) {
+    g_scheduler_ticks++;
+    
+    if (g_current_thread && g_current_thread != g_idle_thread) {
+        g_current_thread->ticks_used++;
+        g_current_thread->vruntime++;
+        
+        /* Check if time slice expired */
+        if (g_current_thread->ticks_used >= TIMESLICE_TICKS) {
+            g_current_thread->ticks_used = 0;
+            g_current_thread->need_resched = 1;
+        }
+        
+        /* Reschedule if needed */
+        if (g_current_thread->need_resched) {
+            g_current_thread->need_resched = 0;
+            scheduler_schedule();
+        }
+    }
+}
+
+/* Yield CPU voluntarily */
+void scheduler_yield(void) {
+    if (g_current_thread) {
+        g_current_thread->need_resched = 1;
+    }
+    scheduler_schedule();
+}
+
+/* Create kernel thread */
+int scheduler_create_kthread(thread_t** out_thread, void (*entry)(void*), void* arg, 
+                            void* stack_base, size_t stack_size, u32 affinity_cpu) {
+    if (!out_thread || !entry) return -1;
+    
+    thread_t* thread = (thread_t*)kalloc(sizeof(thread_t));
+    if (!thread) return -1;
+    
+    memset(thread, 0, sizeof(thread_t));
+    
+    /* Initialize thread */
+    thread->tid = g_next_tid++;
+    thread->pid = 0;  /* Kernel threads have pid 0 */
+    thread->affinity_cpu = affinity_cpu;
+    thread->priority = THREAD_PRIO_NORMAL;
+    thread->state = THREAD_NEW;
+    thread->ticks_used = 0;
+    thread->need_resched = 0;
+    thread->on_rq = 0;
+    thread->vruntime = 0;
+    thread->entry_arg = arg;
+    
+    /* Allocate stack if not provided */
+    if (!stack_base) {
+        stack_base = kalloc(STACK_SIZE);
+        if (!stack_base) {
+            kfree(thread);
+            return -1;
+        }
+        stack_size = STACK_SIZE;
+    }
+    
+    thread->kstack_base = stack_base;
+    thread->kstack_size = stack_size;
+    
+    /* Set up architecture context */
+    thread->arch_ctx = (arch_context_t*)kalloc(sizeof(arch_context_t));
+    if (!thread->arch_ctx) {
+        kfree(stack_base);
+        kfree(thread);
+        return -1;
+    }
+    
+    memset(thread->arch_ctx, 0, sizeof(arch_context_t));
+    thread->arch_ctx->rsp = (u64)stack_base + stack_size - 16;
+    thread->arch_ctx->rip = (u64)entry;
+    
+    /* Create process for thread if it doesn't exist */
+    if (!thread->proc) {
+        thread->proc = create_process("kthread");
+        if (thread->proc) {
+            thread->pid = thread->proc->pid;
+        }
+    }
+    
+    /* Add to global thread list */
+    thread->next = g_thread_list;
+    g_thread_list = thread;
+    g_thread_count++;
+    
+    *out_thread = thread;
+    
+    /* Add to runqueue */
+    runqueue_add(thread);
+    
+    return 0;
+}
+
+/* Idle thread function */
+static void idle_thread_func(void* arg) {
+    (void)arg;
+    
+    while (1) {
+        hal_cpu_halt();
+        /* CPU will resume on interrupt */
+        scheduler_yield();
+    }
+}
+
+/* Initialize scheduler */
+void scheduler_init(void) {
+    /* Initialize runqueue */
+    memset(&g_runqueue, 0, sizeof(g_runqueue));
+    
+    /* Create idle thread */
+    thread_t* idle = NULL;
+    if (scheduler_create_kthread(&idle, idle_thread_func, NULL, NULL, 0, 0) == 0) {
+        idle->priority = THREAD_PRIO_IDLE;
+        idle->state = THREAD_RUNNABLE;
+        runqueue_remove(idle);  /* Remove from normal runqueue */
+        g_idle_thread = idle;
+    }
+    
+    /* Set up timer for scheduler ticks */
+    hal_timer_set_periodic(100);  /* 100 Hz */
+}
+
+/* Get current thread */
+thread_t* thread_current(void) {
+    return g_current_thread;
+}
+
+/* Set current thread */
+void thread_set_current(thread_t* t) {
+    g_current_thread = t;
+}
+
+/* Add thread to scheduler */
+void scheduler_enqueue(thread_t* t) {
+    if (t && !t->on_rq) {
+        runqueue_add(t);
+    }
+}
+
+/* Remove thread from scheduler */
+void scheduler_dequeue(thread_t* t) {
+    if (t && t->on_rq) {
+        runqueue_remove(t);
+    }
+}
+
+/* Wake sleeping thread */
+void scheduler_wake(thread_t* t) {
+    if (!t) return;
+    
+    if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
+        runqueue_add(t);
+    }
+}
+
+/* Put thread to sleep */
+void scheduler_sleep(thread_t* t) {
+    if (!t) return;
+    
+    runqueue_remove(t);
+    t->state = THREAD_SLEEPING;
+    
+    if (t == g_current_thread) {
+        scheduler_schedule();
+    }
+}
+
+/* Block thread */
+void scheduler_block(thread_t* t) {
+    if (!t) return;
+    
+    runqueue_remove(t);
+    t->state = THREAD_BLOCKED;
+    
+    if (t == g_current_thread) {
+        scheduler_schedule();
+    }
+}
+
+/* Create idle thread */
+int scheduler_create_idle_thread(void) {
+    return (g_idle_thread != NULL) ? 0 : -1;
+}
+
+/* Start multitasking */
+int scheduler_start_multitasking(void) {
+    if (g_idle_thread) {
+        g_current_thread = g_idle_thread;
+        g_idle_thread->state = THREAD_RUNNING;
+        return 0;
+    }
+    return -1;
+}
+
+/* Get scheduler statistics */
+void scheduler_get_stats(u32* total_threads, u32* runnable_threads, u64* total_ticks) {
+    if (total_threads) *total_threads = g_thread_count;
+    if (runnable_threads) *runnable_threads = g_runqueue.count;
+    if (total_ticks) *total_ticks = g_scheduler_ticks;
+}

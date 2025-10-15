@@ -1,0 +1,937 @@
+/*
+ * LimitlessOS Advanced Virtual Memory Manager
+ * Production-ready VMM with paging, swapping, mmap, NUMA optimization
+ * Includes AI-powered memory prediction and compression
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "kernel/include/memory.h"
+#include "kernel/include/page.h"
+#include "kernel/include/vma.h"
+#include "kernel/include/swap.h"
+#include "kernel/include/numa.h"
+#include "kernel/include/ai_memory.h"
+
+// Global VMM structures
+struct vm_manager vmm;
+struct swap_manager swap_mgr;
+struct numa_memory_manager numa_mgr;
+struct ai_memory_predictor ai_mem_predictor;
+
+// Page frame structure
+struct page {
+    unsigned long flags;                // Page flags (locked, dirty, etc.)
+    atomic_t _refcount;                // Page reference count
+    atomic_t _mapcount;                // Page map count
+    
+    union {
+        struct {                       // Anonymous pages
+            struct anon_vma *anon_vma; // Anonymous VMA
+            pgoff_t index;             // Page index
+        };
+        struct {                       // File-backed pages  
+            struct address_space *mapping; // File mapping
+            pgoff_t index;             // File offset
+        };
+        struct {                       // Slab pages
+            struct kmem_cache *slab_cache; // Slab cache
+            void *freelist;            // Free object list
+        };
+        struct {                       // Page table pages
+            unsigned long pmd_huge_pte; // PMD huge page table
+        };
+    };
+    
+    struct list_head lru;              // LRU list
+    
+#ifdef CONFIG_NUMA
+    int nid;                           // NUMA node ID
+#endif
+    
+#ifdef CONFIG_LIMITLESS_AI
+    struct ai_page_profile *ai_profile; // AI usage prediction
+#endif
+    
+    // Memory compaction
+    struct list_head buddy_list;       // Buddy allocator list
+    unsigned int order;                // Allocation order
+    
+    // Memory cgroup accounting
+    struct mem_cgroup *mem_cgroup;     // Memory cgroup
+};
+
+// Virtual Memory Area structure
+struct vm_area_struct {
+    unsigned long vm_start;            // Start address
+    unsigned long vm_end;              // End address
+    
+    struct vm_area_struct *vm_next;    // Next VMA in list
+    struct vm_area_struct *vm_prev;    // Previous VMA in list
+    
+    struct rb_node vm_rb;              // Red-black tree node
+    
+    unsigned long rb_subtree_gap;      // Gap in subtree
+    
+    struct mm_struct *vm_mm;           // Memory descriptor
+    pgprot_t vm_page_prot;             // Access permissions
+    unsigned long vm_flags;            // VMA flags
+    
+    // Shared memory support
+    struct {
+        struct rb_node rb;             // Shared VMA tree node
+        unsigned long rb_subtree_last; // Last address in subtree
+    } shared;
+    
+    struct list_head anon_vma_chain;   // Anonymous VMA chain
+    struct anon_vma *anon_vma;         // Anonymous VMA
+    
+    const struct vm_operations_struct *vm_ops; // VMA operations
+    
+    unsigned long vm_pgoff;            // File offset in pages
+    struct file *vm_file;              // Mapped file
+    void *vm_private_data;             // Private data
+    
+    atomic_long_t swap_readahead_info; // Swap readahead info
+    
+#ifndef CONFIG_MMU
+    struct vm_region *vm_region;       // NOMMU VMA region
+    unsigned long vm_top;              // Region top address
+#endif
+    
+#ifdef CONFIG_LIMITLESS_AI
+    struct ai_vma_profile *ai_profile; // AI access pattern prediction
+#endif
+};
+
+// Memory descriptor (per-process)  
+struct mm_struct {
+    struct vm_area_struct *mmap;       // VMA list head
+    struct rb_root mm_rb;              // VMA red-black tree
+    u32 vmacache_seqnum;               // VMA cache sequence number
+    
+#ifdef CONFIG_MMU
+    unsigned long (*get_unmapped_area)(struct file *filp,
+                                      unsigned long addr,
+                                      unsigned long len,
+                                      unsigned long pgoff,
+                                      unsigned long flags);
+#endif
+    
+    unsigned long mmap_base;           // mmap base address
+    unsigned long mmap_legacy_base;    // Legacy mmap base
+    unsigned long task_size;           // Task virtual address limit
+    unsigned long highest_vm_end;      // Highest VMA end address
+    
+    pgd_t *pgd;                        // Page global directory
+    
+    atomic_t mm_users;                 // Address space users count
+    atomic_t mm_count;                 // Primary reference count
+    
+    atomic_long_t nr_ptes;             // Page table pages count
+    atomic_long_t nr_pmds;             // PMD pages count
+    
+    int map_count;                     // VMA count
+    
+    spinlock_t page_table_lock;        // Page table lock
+    struct rw_semaphore mmap_sem;      // VMA semaphore
+    
+    struct list_head mmlist;           // List of all mm_structs
+    
+    // Memory statistics
+    unsigned long hiwater_rss;         // High-water RSS
+    unsigned long hiwater_vm;          // High-water virtual memory
+    unsigned long total_vm;            // Total mapped pages
+    unsigned long locked_vm;           // Locked pages
+    unsigned long pinned_vm;           // Pinned pages
+    unsigned long data_vm;             // Data segment pages
+    unsigned long exec_vm;             // Executable pages
+    unsigned long stack_vm;            // Stack pages
+    
+    unsigned long def_flags;           // Default VMA flags
+    
+    // Core dump support
+    struct core_state *core_state;     // Core dump state
+    
+    // Swap management
+    spinlock_t arg_lock;               // Arguments lock
+    unsigned long start_code;          // Code segment start
+    unsigned long end_code;            // Code segment end
+    unsigned long start_data;          // Data segment start
+    unsigned long end_data;            // Data segment end
+    unsigned long start_brk;           // Heap start
+    unsigned long brk;                 // Current heap end
+    unsigned long start_stack;         // Stack start
+    
+    unsigned long arg_start;           // Arguments start
+    unsigned long arg_end;             // Arguments end
+    unsigned long env_start;           // Environment start
+    unsigned long env_end;             // Environment end
+    
+    unsigned long saved_auxv[AT_VECTOR_SIZE]; // Saved auxiliary vector
+    
+    // Memory policy (NUMA)
+    struct mempolicy *mempolicy;       // NUMA memory policy
+    short il_next;                     // Interleave next node
+    short pref_node_fork;              // Preferred node for fork
+    
+#ifdef CONFIG_NUMA
+    struct mmu_notifier_mm *mmu_notifier_mm; // MMU notifier
+#endif
+    
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_HUGETLBFS)
+    pgtable_t pmd_huge_pte;            // Huge page PMD table
+#endif
+    
+#ifdef CONFIG_CPUMASK_OFFSTACK
+    struct cpumask cpumask_allocation; // CPU mask allocation
+#endif
+    
+    // Asynchronous I/O
+    struct kioctx_table __rcu *ioctx_table;
+    spinlock_t ioctx_lock;
+    
+    // User namespaces
+    struct user_namespace *user_ns;    // User namespace
+    
+    // Memory compression
+    atomic_long_t compressed_pages;    // Compressed pages count
+    
+#ifdef CONFIG_LIMITLESS_AI
+    struct ai_mm_profile *ai_profile;  // AI memory usage profile
+#endif
+    
+    // Architecture-specific MMU context
+    mm_context_t context;
+};
+
+// Page fault handling
+vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+                           unsigned int flags) {
+    vm_fault_t ret;
+    
+    __set_current_state(TASK_RUNNING);
+    
+    count_vm_event(PGFAULT);
+    count_memcg_event_mm(vma->vm_mm, PGFAULT);
+    
+    // Check if AI can predict and prefetch
+    if (vmm.ai_enabled) {
+        ai_predict_and_prefetch(vma, address, flags);
+    }
+    
+    ret = __handle_mm_fault(vma, address, flags);
+    
+    if (flags & FAULT_FLAG_USER) {
+        mem_cgroup_oom_synchronize(false);
+    }
+    
+    // AI learning from fault patterns
+    if (vmm.ai_enabled) {
+        ai_learn_from_fault(vma, address, flags, ret);
+    }
+    
+    return ret;
+}
+
+static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+                                   unsigned long address, unsigned int flags) {
+    struct mm_struct *mm = vma->vm_mm;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    
+    if (!arch_vma_access_permitted(vma, flags & FAULT_FLAG_WRITE,
+                                  flags & FAULT_FLAG_INSTRUCTION,
+                                  flags & FAULT_FLAG_REMOTE))
+        return VM_FAULT_SIGSEGV;
+    
+    // Walk page tables
+    pgd = pgd_offset(mm, address);
+    p4d = p4d_alloc(mm, pgd, address);
+    if (!p4d)
+        return VM_FAULT_OOM;
+    
+    pud = pud_alloc(mm, p4d, address);
+    if (!pud)
+        return VM_FAULT_OOM;
+    
+    pmd = pmd_alloc(mm, pud, address);
+    if (!pmd)
+        return VM_FAULT_OOM;
+    
+    // Check for huge pages
+    if (pmd_none(*pmd) && transparent_hugepage_enabled(vma)) {
+        vm_fault_t ret = create_huge_pmd(mm, vma, address, pmd, flags);
+        if (!(ret & VM_FAULT_FALLBACK))
+            return ret;
+    } else {
+        pmd_t orig_pmd = *pmd;
+        
+        barrier();
+        if (unlikely(is_swap_pmd(orig_pmd))) {
+            VM_BUG_ON(thp_migration_supported() &&
+                     !is_pmd_migration_entry(orig_pmd));
+            if (is_pmd_migration_entry(orig_pmd))
+                pmd_migration_entry_wait(mm, pmd);
+            return 0;
+        }
+        if (pmd_trans_huge(orig_pmd) || pmd_devmap(orig_pmd)) {
+            if (pmd_protnone(orig_pmd) && vma_is_accessible(vma))
+                return do_huge_pmd_numa_page(mm, vma, address, pmd, flags);
+            
+            if ((flags & FAULT_FLAG_WRITE) && !can_change_pmd_writable(vma, address, orig_pmd))
+                return do_huge_pmd_wp_page(mm, vma, address, pmd, orig_pmd);
+            
+            return 0;
+        }
+    }
+    
+    // Handle regular pages
+    return handle_pte_fault(mm, vma, address, pte, pmd, flags);
+}
+
+// Handle PTE-level faults
+static vm_fault_t handle_pte_fault(struct mm_struct *mm,
+                                  struct vm_area_struct *vma,
+                                  unsigned long address,
+                                  pte_t *pte, pmd_t *pmd,
+                                  unsigned int flags) {
+    pte_t entry;
+    
+    if (unlikely(pmd_none(*pmd))) {
+        pte = pte_alloc_map(mm, pmd, address);
+        if (!pte)
+            return VM_FAULT_OOM;
+        
+        if (vma_is_anonymous(vma))
+            return do_anonymous_page(mm, vma, address, pte, pmd, flags);
+        else
+            return do_fault(mm, vma, address, pte, pmd, flags);
+    }
+    
+    pte = pte_offset_map(pmd, address);
+    entry = *pte;
+    
+    if (!pte_present(entry)) {
+        if (pte_none(entry)) {
+            if (vma_is_anonymous(vma))
+                return do_anonymous_page(mm, vma, address, pte, pmd, flags);
+            else
+                return do_fault(mm, vma, address, pte, pmd, flags);
+        }
+        
+        return do_swap_page(mm, vma, address, pte, pmd, flags, entry);
+    }
+    
+    if (pte_protnone(entry) && vma_is_accessible(vma))
+        return do_numa_page(mm, vma, address, entry, pte, pmd);
+    
+    ptl = pte_lockptr(mm, pmd);
+    spin_lock(ptl);
+    entry = *pte;
+    if (unlikely(!pte_same(*pte, entry)))
+        goto unlock;
+    
+    if (flags & FAULT_FLAG_WRITE) {
+        if (!pte_write(entry))
+            return do_wp_page(mm, vma, address, pte, pmd, ptl, entry);
+        entry = pte_mkdirty(entry);
+    }
+    
+    entry = pte_mkyoung(entry);
+    if (ptep_set_access_flags(vma, address, pte, entry, flags & FAULT_FLAG_WRITE)) {
+        update_mmu_cache(vma, address, pte);
+    } else {
+        if (flags & FAULT_FLAG_WRITE)
+            flush_tlb_fix_spurious_fault(vma, address);
+    }
+    
+unlock:
+    pte_unmap_unlock(pte, ptl);
+    return 0;
+}
+
+// Anonymous page allocation
+static vm_fault_t do_anonymous_page(struct mm_struct *mm,
+                                   struct vm_area_struct *vma,
+                                   unsigned long address,
+                                   pte_t *page_table, pmd_t *pmd,
+                                   unsigned int flags) {
+    struct page *page;
+    vm_fault_t ret = 0;
+    pte_t entry;
+    spinlock_t *ptl;
+    
+    // Check stack guard page
+    if (vma->vm_flags & VM_GROWSDOWN) {
+        if (expand_downwards(vma, address))
+            return VM_FAULT_SIGSEGV;
+    }
+    
+    // Use zero page for read faults
+    if (!(flags & FAULT_FLAG_WRITE) && !mm_forbids_zeropage(mm)) {
+        entry = pte_mkspecial(pfn_pte(my_zero_pfn(address),
+                                     vma->vm_page_prot));
+        page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
+        if (!pte_none(*page_table))
+            goto unlock;
+        ret = check_stable_address_space(mm);
+        if (ret)
+            goto unlock;
+        
+        goto setpte;
+    }
+    
+    // Allocate new page
+    page = alloc_zeroed_user_highpage_movable(vma, address);
+    if (!page)
+        return VM_FAULT_OOM;
+    
+    // NUMA placement optimization
+    if (numa_mgr.enabled) {
+        int target_node = numa_get_preferred_node(vma, address);
+        if (page_to_nid(page) != target_node) {
+            struct page *new_page = alloc_pages_node(target_node,
+                                                    GFP_HIGHUSER_MOVABLE, 0);
+            if (new_page) {
+                copy_user_page(page_address(new_page), page_address(page),
+                              address, vma);
+                __free_page(page);
+                page = new_page;
+            }
+        }
+    }
+    
+    // AI memory tracking
+    if (vmm.ai_enabled) {
+        ai_track_page_allocation(page, vma, address);
+    }
+    
+    if (mem_cgroup_charge(page, mm, GFP_KERNEL))
+        goto oom_free_page;
+    
+    cgroup_throttle_swaprate(page, GFP_KERNEL);
+    
+    entry = mk_pte(page, vma->vm_page_prot);
+    if (vma->vm_flags & VM_WRITE)
+        entry = pte_mkwrite(pte_mkdirty(entry));
+    
+    page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
+    if (!pte_none(*page_table))
+        goto release;
+    
+    ret = check_stable_address_space(mm);
+    if (ret)
+        goto release;
+    
+    inc_mm_counter_fast(mm, MM_ANONPAGES);
+    page_add_new_anon_rmap(page, vma, address, false);
+    lru_cache_add_active_or_unevictable(page, vma);
+    
+setpte:
+    set_pte_at(mm, address, page_table, entry);
+    
+    update_mmu_cache(vma, address, page_table);
+    
+unlock:
+    pte_unmap_unlock(page_table, ptl);
+    return ret;
+    
+release:
+    mem_cgroup_cancel_charge(page, mm, false);
+    put_page(page);
+    goto unlock;
+    
+oom_free_page:
+    put_page(page);
+    return VM_FAULT_OOM;
+}
+
+// Swap page handling
+static vm_fault_t do_swap_page(struct mm_struct *mm,
+                              struct vm_area_struct *vma,
+                              unsigned long address, pte_t *page_table,
+                              pmd_t *pmd, unsigned int flags, pte_t orig_pte) {
+    struct page *page, *swapcache;
+    swp_entry_t entry;
+    pte_t pte;
+    int locked;
+    int exclusive = 0;
+    vm_fault_t ret = 0;
+    
+    ret = pte_unmap_same(mm, pmd, page_table, orig_pte);
+    if (ret)
+        return ret;
+    
+    entry = pte_to_swp_entry(orig_pte);
+    if (unlikely(non_swap_entry(entry))) {
+        if (is_migration_entry(entry)) {
+            migration_entry_wait(mm, pmd, address);
+        } else if (is_device_private_entry(entry)) {
+            return device_private_entry_fault(vma, address, entry, flags, pmd);
+        } else if (is_hwpoison_entry(entry)) {
+            ret = VM_FAULT_HWPOISON;
+        } else {
+            print_bad_pte(vma, address, orig_pte, NULL);
+            ret = VM_FAULT_SIGBUS;
+        }
+        goto out;
+    }
+    
+    // AI-guided swap readahead
+    if (vmm.ai_enabled) {
+        ai_optimize_swap_readahead(entry, vma, address);
+    }
+    
+    delayacct_set_flag(DELAYACCT_PF_SWAPIN);
+    page = lookup_swap_cache(entry, vma, address);
+    swapcache = page;
+    
+    if (!page) {
+        struct swap_info_struct *si = swp_swap_info(entry);
+        
+        if (si->flags & SWP_SYNCHRONOUS_IO &&
+            __swap_count(entry) == 1) {
+            page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, address);
+            if (page) {
+                __SetPageLocked(page);
+                __SetPageSwapBacked(page);
+                set_page_private(page, entry.val);
+                lru_cache_add_anon(page);
+                swap_readpage(page, true);
+            }
+        } else {
+            page = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE,
+                                   vma, address);
+            swapcache = page;
+        }
+        
+        if (!page) {
+            page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
+            if (likely(pte_same(*page_table, orig_pte)))
+                ret = VM_FAULT_OOM;
+            delayacct_clear_flag(DELAYACCT_PF_SWAPIN);
+            goto unlock;
+        }
+        
+        wait_on_page_locked(page);
+    }
+    
+    // Memory cgroup charging
+    if (mem_cgroup_charge(page, mm, GFP_KERNEL)) {
+        ret = VM_FAULT_OOM;
+        goto out_page;
+    }
+    
+    cgroup_throttle_swaprate(page, GFP_KERNEL);
+    
+    locked = lock_page_or_retry(page, mm, flags);
+    
+    delayacct_clear_flag(DELAYACCT_PF_SWAPIN);
+    if (!locked) {
+        ret |= VM_FAULT_RETRY;
+        goto out_release;
+    }
+    
+    // Verify swap entry is still valid
+    page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
+    if (unlikely(!pte_same(*page_table, orig_pte)))
+        goto out_nomap;
+    
+    if (unlikely(!PageUptodate(page))) {
+        ret = VM_FAULT_SIGBUS;
+        goto out_nomap;
+    }
+    
+    // Install new PTE
+    inc_mm_counter_fast(mm, MM_ANONPAGES);
+    dec_mm_counter_fast(mm, MM_SWAPENTS);
+    pte = mk_pte(page, vma->vm_page_prot);
+    if ((flags & FAULT_FLAG_WRITE) && reuse_swap_page(page, NULL)) {
+        pte = maybe_mkwrite(pte_mkdirty(pte), vma);
+        flags &= ~FAULT_FLAG_WRITE;
+        ret |= VM_FAULT_WRITE;
+        exclusive = RMAP_EXCLUSIVE;
+    }
+    flush_icache_page(vma, page);
+    if (pte_swp_soft_dirty(orig_pte))
+        pte = pte_mksoft_dirty(pte);
+    set_pte_at(mm, address, page_table, pte);
+    arch_do_swap_page(mm, vma, address, pte, orig_pte);
+    orig_pte = pte;
+    
+    do_page_add_anon_rmap(page, vma, address, exclusive);
+    mem_cgroup_commit_charge(page, memcg, true, false);
+    activate_page(page);
+    
+    swap_free(entry);
+    if (mem_cgroup_swap_full(page) ||
+        (vma->vm_flags & VM_LOCKED) || PageMlocked(page))
+        try_to_free_swap(page);
+    
+    unlock_page(page);
+    if (page != swapcache && swapcache) {
+        unlock_page(swapcache);
+        put_page(swapcache);
+    }
+    
+    if (flags & FAULT_FLAG_WRITE) {
+        ret |= do_wp_page(mm, vma, address, page_table, pmd, ptl, orig_pte);
+        if (ret & VM_FAULT_ERROR)
+            ret &= VM_FAULT_ERROR;
+        goto out;
+    }
+    
+    update_mmu_cache(vma, address, page_table);
+unlock:
+    pte_unmap_unlock(page_table, ptl);
+out:
+    return ret;
+    
+out_nomap:
+    mem_cgroup_cancel_charge(page, memcg, false);
+    pte_unmap_unlock(page_table, ptl);
+out_page:
+    unlock_page(page);
+out_release:
+    put_page(page);
+    if (page != swapcache) {
+        unlock_page(swapcache);
+        put_page(swapcache);
+    }
+    return ret;
+}
+
+// Memory mapping (mmap) implementation
+unsigned long do_mmap(struct file *file, unsigned long addr,
+                      unsigned long len, unsigned long prot,
+                      unsigned long flags, vm_flags_t vm_flags,
+                      unsigned long pgoff, unsigned long *populate,
+                      struct list_head *uf) {
+    struct mm_struct *mm = current->mm;
+    int pkey = 0;
+    
+    *populate = 0;
+    
+    if (!len)
+        return -EINVAL;
+    
+    if (!(flags & MAP_FIXED))
+        addr = round_hint_to_min(addr);
+    
+    len = PAGE_ALIGN(len);
+    if (!len)
+        return -ENOMEM;
+    
+    if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+        if (!(file && path_noexec(&file->f_path)))
+            prot |= PROT_EXEC;
+    
+    // Apply memory policy
+    if (flags & MAP_LOCKED)
+        if (!can_do_mlock())
+            return -EPERM;
+    
+    if (mlock_future_check(mm, vm_flags, len))
+        return -EAGAIN;
+    
+    if (file) {
+        struct inode *inode = file_inode(file);
+        
+        if (!file_mmap_ok(file, inode, pgoff, len))
+            return -EOVERFLOW;
+        
+        switch (flags & MAP_TYPE) {
+        case MAP_SHARED:
+            if ((prot & PROT_WRITE) && !(file->f_mode & FMODE_WRITE))
+                return -EACCES;
+            
+            if (IS_APPEND(inode) && (file->f_mode & FMODE_WRITE))
+                return -EACCES;
+            
+            if (locks_verify_locked(file))
+                return -EAGAIN;
+            
+            vm_flags |= VM_SHARED | VM_MAYSHARE;
+            if (!(file->f_mode & FMODE_WRITE))
+                vm_flags &= ~(VM_MAYWRITE | VM_SHARED);
+            
+            fallthrough;
+        case MAP_PRIVATE:
+            if (!(file->f_mode & FMODE_READ))
+                return -EACCES;
+            if (path_noexec(&file->f_path)) {
+                if (vm_flags & VM_EXEC)
+                    return -EPERM;
+                vm_flags &= ~VM_MAYEXEC;
+            }
+            
+            if (!file->f_op->mmap)
+                return -ENODEV;
+            if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
+                return -EINVAL;
+            break;
+            
+        default:
+            return -EINVAL;
+        }
+    } else {
+        switch (flags & MAP_TYPE) {
+        case MAP_SHARED:
+            if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
+                return -EINVAL;
+            pgoff = 0;
+            break;
+        case MAP_PRIVATE:
+            pgoff = addr >> PAGE_SHIFT;
+            break;
+        default:
+            return -EINVAL;
+        }
+    }
+    
+    // AI memory mapping optimization
+    if (vmm.ai_enabled) {
+        addr = ai_optimize_mmap_placement(file, addr, len, prot, flags, pgoff);
+    }
+    
+    addr = mmap_region(file, addr, len, vm_flags, pgoff, uf);
+    if (!IS_ERR_VALUE(addr) && ((vm_flags & VM_LOCKED) || 
+                                (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
+        *populate = len;
+    
+    return addr;
+}
+
+// NUMA-aware memory allocation
+struct page *alloc_pages_vma(gfp_t gfp, int order,
+                            struct vm_area_struct *vma, unsigned long addr,
+                            int node, bool hugepage) {
+    struct mempolicy *pol;
+    struct page *page;
+    int preferred_nid;
+    nodemask_t *nmask;
+    
+    pol = get_vma_policy(vma, addr);
+    
+    if (pol->mode == MPOL_INTERLEAVE) {
+        unsigned nid;
+        
+        nid = interleave_nid(pol, vma, addr, PAGE_SHIFT + order);
+        mpol_cond_put(pol);
+        page = alloc_page_interleave(gfp, order, nid);
+        goto out;
+    }
+    
+    if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage)) {
+        int hpage_node = node;
+        
+        if (pol->mode != MPOL_BIND)
+            hpage_node = numa_node_id();
+        
+        nmask = policy_nodemask(gfp, pol);
+        if (!nmask || node_isset(hpage_node, *nmask)) {
+            mpol_cond_put(pol);
+            page = __alloc_pages_node(hpage_node,
+                                     gfp | __GFP_THISNODE, order);
+            goto out;
+        }
+    }
+    
+    nmask = policy_nodemask(gfp, pol);
+    preferred_nid = policy_node(gfp, pol, node);
+    page = __alloc_pages_nodemask(gfp, order, preferred_nid, nmask);
+    mpol_cond_put(pol);
+    
+out:
+    // AI tracking for memory allocation patterns
+    if (vmm.ai_enabled && page) {
+        ai_track_numa_allocation(page, vma, addr, node);
+    }
+    
+    return page;
+}
+
+// AI-powered memory prediction and optimization
+static void ai_predict_and_prefetch(struct vm_area_struct *vma,
+                                   unsigned long address, unsigned int flags) {
+    struct ai_memory_predictor *predictor = &ai_mem_predictor;
+    
+    if (!predictor->enabled)
+        return;
+    
+    // Predict access patterns
+    struct ai_access_pattern pattern = ai_analyze_access_pattern(vma, address);
+    
+    // Sequential access pattern detected
+    if (pattern.type == AI_PATTERN_SEQUENTIAL) {
+        unsigned long prefetch_start = address + PAGE_SIZE;
+        unsigned long prefetch_end = min(prefetch_start + (pattern.stride * 8),
+                                        vma->vm_end);
+        
+        // Prefetch next few pages
+        for (unsigned long addr = prefetch_start; addr < prefetch_end; 
+             addr += PAGE_SIZE) {
+            if (ai_should_prefetch_page(vma, addr)) {
+                force_page_cache_readahead(vma->vm_file->f_mapping,
+                                          vma->vm_file,
+                                          addr >> PAGE_SHIFT, 1);
+            }
+        }
+    }
+    
+    // Random access pattern - optimize TLB usage
+    else if (pattern.type == AI_PATTERN_RANDOM) {
+        // Use huge pages if beneficial
+        if (ai_should_use_hugepages(vma, address)) {
+            khugepaged_enter_vma_merge(vma, vma->vm_flags);
+        }
+    }
+    
+    // Update prediction statistics
+    predictor->predictions_made++;
+}
+
+static void ai_learn_from_fault(struct vm_area_struct *vma,
+                               unsigned long address, unsigned int flags,
+                               vm_fault_t result) {
+    struct ai_memory_predictor *predictor = &ai_mem_predictor;
+    
+    if (!predictor->enabled)
+        return;
+    
+    // Learn from successful predictions
+    if (result == 0) { // Success
+        predictor->successful_predictions++;
+        
+        // Update access pattern model
+        ai_update_access_model(vma, address, flags);
+        
+        // Update prefetch accuracy
+        if (ai_was_prefetched(vma, address)) {
+            predictor->prefetch_hits++;
+        }
+    } else {
+        // Learn from failed predictions
+        ai_adjust_prediction_model(vma, address, flags, result);
+    }
+    
+    // Periodically retrain model
+    if (predictor->predictions_made % 10000 == 0) {
+        ai_retrain_memory_model(predictor);
+    }
+}
+
+// Swap management with AI optimization
+static void ai_optimize_swap_readahead(swp_entry_t entry,
+                                      struct vm_area_struct *vma,
+                                      unsigned long address) {
+    struct ai_swap_predictor *predictor = &swap_mgr.ai_predictor;
+    
+    if (!predictor->enabled)
+        return;
+    
+    // Predict swap access patterns
+    int readahead_pages = ai_predict_swap_readahead_size(entry, vma, address);
+    
+    if (readahead_pages > 1) {
+        swap_cluster_readahead(entry, GFP_HIGHUSER_MOVABLE, vma, address,
+                              readahead_pages);
+        predictor->readahead_requests++;
+    }
+}
+
+// Memory compression integration
+static int compress_page(struct page *page) {
+    void *src, *dst;
+    int ret;
+    
+    if (!vmm.compression_enabled)
+        return -1;
+    
+    src = kmap_atomic(page);
+    dst = vmm.compression_buffer;
+    
+    ret = lz4_compress_default(src, dst, PAGE_SIZE, PAGE_SIZE, 
+                              vmm.compression_workspace);
+    
+    kunmap_atomic(src);
+    
+    if (ret > 0 && ret < PAGE_SIZE) {
+        // Compression successful
+        return ret;
+    }
+    
+    return -1; // Compression failed or not beneficial
+}
+
+// VMM initialization
+int __init vm_manager_init(void) {
+    int ret;
+    
+    // Initialize main VMM structure
+    memset(&vmm, 0, sizeof(vmm));
+    
+    // Initialize page allocator
+    ret = page_allocator_init();
+    if (ret)
+        return ret;
+    
+    // Initialize swap manager
+    ret = swap_manager_init(&swap_mgr);
+    if (ret)
+        return ret;
+    
+    // Initialize NUMA manager
+    if (CONFIG_NUMA) {
+        ret = numa_manager_init(&numa_mgr);
+        if (ret)
+            pr_warn("NUMA memory management disabled\n");
+    }
+    
+    // Initialize AI predictor
+    if (CONFIG_LIMITLESS_AI) {
+        ret = ai_memory_predictor_init(&ai_mem_predictor);
+        if (ret) {
+            pr_warn("AI memory optimization disabled\n");
+            vmm.ai_enabled = false;
+        } else {
+            vmm.ai_enabled = true;
+            pr_info("AI memory optimization enabled\n");
+        }
+    }
+    
+    // Initialize memory compression
+    if (CONFIG_ZRAM || CONFIG_ZSWAP) {
+        ret = memory_compression_init(&vmm);
+        if (ret) {
+            pr_warn("Memory compression disabled\n");
+            vmm.compression_enabled = false;
+        } else {
+            vmm.compression_enabled = true;
+            pr_info("Memory compression enabled\n");
+        }
+    }
+    
+    pr_info("LimitlessOS Virtual Memory Manager initialized\n");
+    return 0;
+}
+
+// VMM cleanup
+void vm_manager_cleanup(void) {
+    if (vmm.compression_enabled)
+        memory_compression_cleanup(&vmm);
+    
+    if (vmm.ai_enabled)
+        ai_memory_predictor_cleanup(&ai_mem_predictor);
+    
+    if (numa_mgr.enabled)
+        numa_manager_cleanup(&numa_mgr);
+    
+    swap_manager_cleanup(&swap_mgr);
+    page_allocator_cleanup();
+}

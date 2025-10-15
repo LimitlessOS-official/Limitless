@@ -1,0 +1,99 @@
+#include "kernel.h"
+#include "idt.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "pci.h"
+#include "vfs.h"
+#include "net/net.h"
+#include "net/dhcp.h"
+#include "net/filter.h"
+#include "auth.h"
+#include "update.h"
+#include "policy.h"
+
+/* From Phase 6 earlier work */
+void virtio_phase6_init(void);
+
+/* FS registration */
+int ext4_register(void);
+int fat32_register(void);
+/* Optional tmpfs if present */
+int tmpfs_register(void) __attribute__((weak));
+
+/* PCI init/scan (assumed implemented elsewhere) */
+void pci_init(void);
+void pci_enumerate(void (*cb)(const pci_device_t*, void*), void* user);
+
+static void register_filesystems(void) {
+    ext4_register();
+    fat32_register();
+    if (tmpfs_register) tmpfs_register();
+}
+
+/*
+ Kernel entry: ensure the initialization order:
+ 1. PMM/VMM and IDT
+ 2. PCI bus and enumerate
+ 3. virtio_phase6_init() to probe virtio-blk and virtio-net
+ 4. VFS and filesystems (ext4, fat32, tmpfs), mount root, mount /tmp
+ 5. Exec PID1 (/sbin/init)
+*/
+void kmain(void) {
+    KLOG_INFO("boot", "LimitlessOS kernel start (Phase 6)");
+
+    /* 1. Memory and interrupts */
+    pmm_init();
+    vmm_init();
+    idt_init();
+
+    /* 2. PCI bus */
+    pci_init();
+    /* Drivers use pci_enumerate internally for their probe routines */
+
+    /* 3. VirtIO drivers (blk/net) */
+    virtio_phase6_init();
+
+    /* Initialize network stack (ARP/IPv4/UDP/TCP, loopback) */
+    net_init();
+
+    /* Enable firewall: default DROP for inbound/outbound in Phase 3 */
+    nf_init();
+    nf_set_default_policy(0, NF_DROP);
+    nf_set_default_policy(1, NF_DROP);
+
+    /* Network: try DHCP on first registered non-loopback interface */
+    extern net_if_t* net_if_first(void) __attribute__((weak));
+    if (net_if_first) {
+        net_if_t* nif = net_if_first();
+        if (nif) {
+            u32 ip=0, mask=0, gw=0;
+            int drc = dhcpv4_acquire(nif, &ip, &mask, &gw, 5000);
+            if (drc==0) {
+                KLOG_INFO("dhcp", "acquired %u.%u.%u.%u",
+                    (unsigned)(net_ntohl(ip)>>24)&255,
+                    (unsigned)(net_ntohl(ip)>>16)&255,
+                    (unsigned)(net_ntohl(ip)>>8)&255,
+                    (unsigned)(net_ntohl(ip))&255);
+            } else {
+                KLOG_WARN("dhcp", "failed (%d), using default if configured", drc);
+            }
+        }
+    }
+
+    /* 4. VFS and filesystems */
+    register_filesystems();
+
+    /* Mount root from virtio-blk 'vda' and launch init */
+    int rc = vfs_phase6_bootstrap_mount_and_exec();
+    if (rc != 0) {
+    KLOG_ERROR("boot", "could not mount/exec init (%d)", rc);
+        for(;;) { __asm__ __volatile__("hlt"); }
+    }
+
+    /* After root mount, load and apply policy, then initialize update system */
+    policy_init();
+    update_init();
+
+    /* kmain should not return after launching init */
+    for(;;) { __asm__ __volatile__("hlt"); }
+}

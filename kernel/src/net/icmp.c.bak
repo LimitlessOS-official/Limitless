@@ -1,0 +1,163 @@
+#include "kernel.h"
+#include "net/net.h"
+
+static u16 csum16(const u8* d, u32 len) {
+    u32 s = 0;
+    while (len > 1) { s += ((u16)d[0] << 8) | d[1]; d += 2; len -= 2; }
+    if (len) s += ((u16)*d) << 8;
+    while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
+    return (u16)~s;
+}
+
+/* ICMP socket queue */
+typedef struct {
+    u8  buf[1500];
+    u32 len;
+    u32 src_ip_be;
+    int valid;
+} icmp_msg_t;
+typedef struct {
+    icmp_msg_t q[8];
+    u32 rd, wr;
+} icmp_queue_t;
+
+#define MAX_ICMP_SOCK 4
+static icmp_queue_t g_icmp_socks[MAX_ICMP_SOCK];
+
+int icmp_socket_open(void) {
+    for (int i=0;i<MAX_ICMP_SOCK;i++) {
+        /* one icmp socket per entry */
+        if (g_icmp_socks[i].q[0].valid == 0 && g_icmp_socks[i].rd == g_icmp_socks[i].wr) {
+            return i + 1; /* 1-based handle to differ from 0 invalid */
+        }
+    }
+    return K_ENOSPC;
+}
+
+int icmp_sendto(int sid, const void* data, u32 len, u32 dst_ip_be) {
+    (void)sid;
+    net_if_t* nif = NULL;
+    extern net_if_t* net_get_default_if(void) __attribute__((weak));
+    if (net_get_default_if) {
+        nif = net_get_default_if();
+    } else {
+        extern net_if_t* _net_first_if(void);
+        nif = _net_first_if();
+    }
+    if (!nif) return K_ENOMEM;
+    /* Payload is full ICMP header+data from user */
+    return ipv4_send_packet(nif, 1, dst_ip_be, data, (u16)len);
+}
+
+int icmp_recvfrom(int sid, void* buf, u32 len, u32* src_ip_be) {
+    if (sid <= 0 || sid > MAX_ICMP_SOCK) return K_EBADF;
+    icmp_queue_t* q = &g_icmp_socks[sid-1];
+    /* Block until available */
+    for (;;) {
+        if (q->rd != q->wr && q->q[q->rd % 8].valid) break;
+        net_pump();
+        __asm__ __volatile__("pause");
+    }
+    icmp_msg_t* m = &q->q[q->rd++ % 8];
+    u32 n = (len < m->len) ? len : m->len;
+    k_memcpy(buf, m->buf, n);
+    if (src_ip_be) *src_ip_be = m->src_ip_be;
+    m->valid = 0;
+    return (int)n;
+}
+
+/* Enhanced ICMP input handler with proper echo reply support */
+void icmp_input(net_if_t* nif, ipv4_addr_t src_ip, ipv4_addr_t dst_ip, const void* data, size_t len) {
+    if (!data || len < 8) return;
+    
+    const uint8_t* pkt = (const uint8_t*)data;
+    uint8_t type = pkt[0];
+    uint8_t code = pkt[1];
+    
+    /* Handle ICMP Echo Request (ping) */
+    if (type == 8 && code == 0) {
+        /* Create echo reply */
+        uint8_t reply[1500];
+        if (len > sizeof(reply)) return;
+        
+        k_memcpy(reply, pkt, len);
+        reply[0] = 0; /* Echo Reply type */
+        reply[1] = 0; /* Code 0 */
+        reply[2] = reply[3] = 0; /* Clear checksum */
+        
+        /* Calculate new checksum */
+        uint16_t new_checksum = csum16(reply, len);
+        reply[2] = (uint8_t)(new_checksum >> 8);
+        reply[3] = (uint8_t)(new_checksum & 0xFF);
+        
+        /* Send reply back to source */
+        uint32_t src_ip_be;
+        k_memcpy(&src_ip_be, &src_ip, sizeof(uint32_t));
+        ipv4_send_packet(nif, IP_PROTO_ICMP, src_ip_be, reply, len);
+    }
+    
+    /* Deliver to ICMP sockets */
+    for (int i = 0; i < MAX_ICMP_SOCK; i++) {
+        icmp_queue_t* q = &g_icmp_socks[i];
+        icmp_msg_t* m = &q->q[q->wr % 8];
+        if (!m->valid) {
+            uint32_t n = len;
+            if (n > sizeof(m->buf)) n = sizeof(m->buf);
+            
+            k_memcpy(m->buf, pkt, n);
+            m->len = n;
+            k_memcpy(&m->src_ip_be, &src_ip, sizeof(uint32_t));
+            m->valid = 1;
+            q->wr++;
+            break;
+        }
+    }
+}
+
+/* Initialize ICMP subsystem */
+void icmp_init(void) {
+    k_memset(g_icmp_socks, 0, sizeof(g_icmp_socks));
+}
+
+/* ICMP echo request (ping) API */
+status_t icmp_send_echo_request(const ipv4_addr_t* dst_ip, uint16_t id, uint16_t seq) {
+    if (!dst_ip) return STATUS_ERROR;
+    
+    /* Get default network interface */
+    net_if_t* nif = _net_first_if();
+    if (!nif) return STATUS_ERROR;
+    
+    /* Create ICMP echo request packet */
+    struct {
+        uint8_t type;
+        uint8_t code;
+        uint16_t checksum;
+        uint16_t id;
+        uint16_t sequence;
+    } PACKED echo_req = {
+        .type = 8,        /* Echo Request */
+        .code = 0,
+        .checksum = 0,
+        .id = __builtin_bswap16(id),
+        .sequence = __builtin_bswap16(seq)
+    };
+    
+    /* Calculate checksum */
+    echo_req.checksum = csum16((const uint8_t*)&echo_req, sizeof(echo_req));
+    
+    /* Send via IPv4 */
+    uint32_t dst_ip_be;
+    k_memcpy(&dst_ip_be, dst_ip, sizeof(uint32_t));
+    
+    int result = ipv4_send_packet(nif, IP_PROTO_ICMP, dst_ip_be, &echo_req, sizeof(echo_req));
+    return (result == 0) ? STATUS_OK : STATUS_ERROR;
+}
+
+/* Internal helper for net_core to access default interface */
+net_if_t* _net_first_if(void) {
+    extern net_if_t* _net_list_head(void);
+    (void)_net_list_head;
+    /* We don't maintain a list; piggyback on net_if_register's static array */
+    extern net_if_t* _net_get_if0(void);
+    return _net_get_if0();
+}

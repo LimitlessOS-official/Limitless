@@ -1,0 +1,743 @@
+/*
+ * cgroups.c - LimitlessOS Control Groups Implementation
+ * 
+ * Provides resource limiting, accounting, and process isolation
+ * Compatible with cgroups v1 interface for container support.
+ */
+
+#include <kernel/cgroups.h>
+#include <kernel/process.h>
+#include <kernel/pmm.h>
+#include <kernel/timer.h>
+#include <kernel/vfs.h>
+#include <kernel/klog.h>
+#include <kernel/string.h>
+
+#define MAX_CGROUPS 512
+#define MAX_CGROUP_PATH 256
+#define MAX_CGROUP_TASKS 1024
+#define CGROUP_NAME_MAX 64
+
+/* Cgroup subsystem types */
+typedef enum {
+    CGROUP_MEMORY = 1,
+    CGROUP_CPU = 2,
+    CGROUP_CPUSET = 4,
+    CGROUP_BLKIO = 8,
+    CGROUP_DEVICES = 16,
+    CGROUP_FREEZER = 32,
+    CGROUP_NET_CLS = 64,
+    CGROUP_PIDS = 128
+} cgroup_subsys_t;
+
+/* Memory controller */
+typedef struct cgroup_memory {
+    uint64_t limit;                   /* Memory limit in bytes */
+    uint64_t usage;                   /* Current usage */
+    uint64_t max_usage;               /* Peak usage */
+    uint64_t soft_limit;              /* Soft limit for reclaim */
+    uint32_t oom_kill_disable;        /* Disable OOM killer */
+    uint32_t swappiness;              /* Swap tendency (0-100) */
+    struct {
+        uint64_t cache;               /* Page cache */
+        uint64_t rss;                 /* Anonymous memory */
+        uint64_t mapped_file;         /* Memory-mapped files */
+        uint64_t swap;                /* Swap usage */
+        uint64_t inactive_anon;       /* Inactive anonymous pages */
+        uint64_t active_anon;         /* Active anonymous pages */
+        uint64_t inactive_file;       /* Inactive file pages */
+        uint64_t active_file;         /* Active file pages */
+    } stats;
+    spinlock_t lock;
+} cgroup_memory_t;
+
+/* CPU controller */
+typedef struct cgroup_cpu {
+    uint64_t shares;                  /* CPU shares (default 1024) */
+    uint64_t cfs_quota_us;           /* CFS bandwidth quota */
+    uint64_t cfs_period_us;          /* CFS bandwidth period */
+    uint64_t rt_runtime_us;          /* RT bandwidth quota */
+    uint64_t rt_period_us;           /* RT bandwidth period */
+    struct {
+        uint64_t user_time;           /* User CPU time */
+        uint64_t system_time;         /* System CPU time */
+        uint64_t usage;               /* Total CPU usage */
+        uint32_t nr_periods;          /* Number of periods */
+        uint32_t nr_throttled;        /* Number of throttled periods */
+        uint64_t throttled_time;      /* Total throttled time */
+    } stats;
+    spinlock_t lock;
+} cgroup_cpu_t;
+
+/* CPUSET controller */
+typedef struct cgroup_cpuset {
+    cpu_set_t cpus;                   /* Allowed CPUs */
+    node_set_t mems;                  /* Allowed memory nodes */
+    uint32_t cpu_exclusive;           /* Exclusive CPU access */
+    uint32_t mem_exclusive;           /* Exclusive memory access */
+    uint32_t mem_hardwall;            /* Memory allocation hardwall */
+    uint32_t memory_migrate;          /* Migrate memory on CPU change */
+    uint32_t sched_load_balance;      /* Enable load balancing */
+    int32_t sched_relax_domain_level; /* Load balancing domain */
+    spinlock_t lock;
+} cgroup_cpuset_t;
+
+/* Block I/O controller */
+typedef struct cgroup_blkio {
+    uint32_t weight;                  /* I/O weight (100-1000) */
+    struct {
+        uint64_t read_bytes;          /* Bytes read */
+        uint64_t write_bytes;         /* Bytes written */
+        uint64_t read_ios;            /* Read operations */
+        uint64_t write_ios;           /* Write operations */
+        uint64_t sync_ios;            /* Synchronous I/O */
+        uint64_t async_ios;           /* Asynchronous I/O */
+    } stats;
+    spinlock_t lock;
+} cgroup_blkio_t;
+
+/* Device controller */
+typedef struct cgroup_device_rule {
+    char type;                        /* 'c' (char), 'b' (block), 'a' (all) */
+    uint32_t major;                   /* Major device number */
+    uint32_t minor;                   /* Minor device number */
+    char permissions[4];              /* 'r', 'w', 'm' permissions */
+    struct cgroup_device_rule* next;
+} cgroup_device_rule_t;
+
+typedef struct cgroup_devices {
+    cgroup_device_rule_t* allow_list; /* Allowed devices */
+    cgroup_device_rule_t* deny_list;  /* Denied devices */
+    uint32_t behavior;                /* Default behavior */
+    spinlock_t lock;
+} cgroup_devices_t;
+
+/* PIDs controller */
+typedef struct cgroup_pids {
+    uint64_t max;                     /* Maximum PIDs */
+    uint64_t current;                 /* Current PID count */
+    spinlock_t lock;
+} cgroup_pids_t;
+
+/* Main cgroup structure */
+typedef struct cgroup {
+    uint32_t id;
+    char name[CGROUP_NAME_MAX];
+    char path[MAX_CGROUP_PATH];
+    struct cgroup* parent;
+    struct cgroup* children;
+    struct cgroup* sibling;
+    
+    uint32_t enabled_subsystems;      /* Bitmask of enabled subsystems */
+    
+    /* Process management */
+    pid_t tasks[MAX_CGROUP_TASKS];
+    uint32_t task_count;
+    
+    /* Subsystem controllers */
+    cgroup_memory_t memory;
+    cgroup_cpu_t cpu;
+    cgroup_cpuset_t cpuset;
+    cgroup_blkio_t blkio;
+    cgroup_devices_t devices;
+    cgroup_pids_t pids;
+    
+    /* Reference counting and state */
+    uint32_t ref_count;
+    uint32_t flags;
+    spinlock_t lock;
+} cgroup_t;
+
+/* Global cgroup manager */
+static struct {
+    cgroup_t cgroups[MAX_CGROUPS];
+    uint32_t cgroup_count;
+    uint32_t next_id;
+    cgroup_t* root_cgroup;
+    vfs_dentry_t* cgroup_root;        /* /sys/fs/cgroup mount point */
+    spinlock_t global_lock;
+} cgroup_manager;
+
+/* Function prototypes */
+static cgroup_t* create_cgroup(const char* name, cgroup_t* parent);
+static status_t destroy_cgroup(cgroup_t* cgroup);
+static status_t add_task_to_cgroup(cgroup_t* cgroup, pid_t pid);
+static status_t remove_task_from_cgroup(cgroup_t* cgroup, pid_t pid);
+static status_t check_memory_limit(cgroup_t* cgroup, uint64_t requested);
+static void update_cpu_stats(cgroup_t* cgroup, uint64_t user_time, uint64_t sys_time);
+
+/* Initialize cgroups subsystem */
+status_t cgroups_init(void) {
+    KLOG_INFO("CGROUPS", "Initializing cgroups subsystem");
+    
+    spin_lock_init(&cgroup_manager.global_lock);
+    cgroup_manager.cgroup_count = 0;
+    cgroup_manager.next_id = 1;
+    
+    /* Create root cgroup */
+    cgroup_manager.root_cgroup = create_cgroup("", NULL);
+    if (!cgroup_manager.root_cgroup) {
+        KLOG_ERROR("CGROUPS", "Failed to create root cgroup");
+        return STATUS_NO_MEMORY;
+    }
+    
+    /* Enable all subsystems on root cgroup */
+    cgroup_manager.root_cgroup->enabled_subsystems = CGROUP_MEMORY | CGROUP_CPU | 
+                                                    CGROUP_CPUSET | CGROUP_BLKIO |
+                                                    CGROUP_DEVICES | CGROUP_PIDS;
+    
+    /* Initialize root cgroup defaults */
+    cgroup_manager.root_cgroup->memory.limit = UINT64_MAX;
+    cgroup_manager.root_cgroup->cpu.shares = 1024;
+    cgroup_manager.root_cgroup->cpu.cfs_period_us = 100000; /* 100ms */
+    cgroup_manager.root_cgroup->cpu.cfs_quota_us = -1;      /* No limit */
+    cgroup_manager.root_cgroup->blkio.weight = 500;
+    cgroup_manager.root_cgroup->pids.max = UINT64_MAX;
+    
+    /* Mount cgroups filesystem */
+    status_t status = vfs_mount(NULL, "/sys/fs/cgroup", "cgroup", 0, NULL);
+    if (status != STATUS_OK) {
+        KLOG_WARN("CGROUPS", "Failed to mount cgroups filesystem: %d", status);
+    }
+    
+    KLOG_INFO("CGROUPS", "Cgroups subsystem initialized");
+    return STATUS_OK;
+}
+
+/* Create new cgroup */
+static cgroup_t* create_cgroup(const char* name, cgroup_t* parent) {
+    spin_lock(&cgroup_manager.global_lock);
+    
+    if (cgroup_manager.cgroup_count >= MAX_CGROUPS) {
+        spin_unlock(&cgroup_manager.global_lock);
+        return NULL;
+    }
+    
+    cgroup_t* cgroup = &cgroup_manager.cgroups[cgroup_manager.cgroup_count++];
+    memset(cgroup, 0, sizeof(cgroup_t));
+    
+    cgroup->id = cgroup_manager.next_id++;
+    strncpy(cgroup->name, name, CGROUP_NAME_MAX - 1);
+    cgroup->parent = parent;
+    cgroup->ref_count = 1;
+    spin_lock_init(&cgroup->lock);
+    
+    /* Build path */
+    if (parent && parent->path[0]) {
+        snprintf(cgroup->path, MAX_CGROUP_PATH, "%s/%s", parent->path, name);
+    } else {
+        strncpy(cgroup->path, name, MAX_CGROUP_PATH - 1);
+    }
+    
+    /* Add to parent's children list */
+    if (parent) {
+        spin_lock(&parent->lock);
+        cgroup->sibling = parent->children;
+        parent->children = cgroup;
+        spin_unlock(&parent->lock);
+    }
+    
+    /* Initialize subsystem defaults */
+    cgroup->memory.limit = parent ? parent->memory.limit : UINT64_MAX;
+    cgroup->memory.swappiness = 60;
+    spin_lock_init(&cgroup->memory.lock);
+    
+    cgroup->cpu.shares = 1024;
+    cgroup->cpu.cfs_period_us = 100000;
+    cgroup->cpu.cfs_quota_us = -1;
+    spin_lock_init(&cgroup->cpu.lock);
+    
+    cgroup->blkio.weight = 500;
+    spin_lock_init(&cgroup->blkio.lock);
+    
+    cgroup->pids.max = parent ? parent->pids.max : UINT64_MAX;
+    spin_lock_init(&cgroup->pids.lock);
+    
+    spin_lock_init(&cgroup->devices.lock);
+    spin_lock_init(&cgroup->cpuset.lock);
+    
+    spin_unlock(&cgroup_manager.global_lock);
+    
+    KLOG_DEBUG("CGROUPS", "Created cgroup %s (id %u)", cgroup->path, cgroup->id);
+    return cgroup;
+}
+
+/* Create cgroup by path */
+cgroup_t* cgroup_create(const char* path) {
+    if (!path || path[0] != '/') {
+        return NULL;
+    }
+    
+    /* Parse path components */
+    char path_copy[MAX_CGROUP_PATH];
+    strncpy(path_copy, path, MAX_CGROUP_PATH - 1);
+    path_copy[MAX_CGROUP_PATH - 1] = '\0';
+    
+    cgroup_t* current = cgroup_manager.root_cgroup;
+    char* token = strtok(path_copy + 1, "/"); /* Skip leading / */
+    
+    while (token) {
+        /* Look for existing child */
+        cgroup_t* child = NULL;
+        spin_lock(&current->lock);
+        
+        for (child = current->children; child; child = child->sibling) {
+            if (strcmp(child->name, token) == 0) {
+                break;
+            }
+        }
+        
+        spin_unlock(&current->lock);
+        
+        /* Create if not found */
+        if (!child) {
+            child = create_cgroup(token, current);
+            if (!child) {
+                return NULL;
+            }
+        }
+        
+        current = child;
+        token = strtok(NULL, "/");
+    }
+    
+    return current;
+}
+
+/* Find cgroup by path */
+cgroup_t* cgroup_find(const char* path) {
+    if (!path) {
+        return NULL;
+    }
+    
+    if (strcmp(path, "/") == 0) {
+        return cgroup_manager.root_cgroup;
+    }
+    
+    char path_copy[MAX_CGROUP_PATH];
+    strncpy(path_copy, path, MAX_CGROUP_PATH - 1);
+    path_copy[MAX_CGROUP_PATH - 1] = '\0';
+    
+    cgroup_t* current = cgroup_manager.root_cgroup;
+    char* token = strtok(path_copy + 1, "/");
+    
+    while (token && current) {
+        cgroup_t* child = NULL;
+        spin_lock(&current->lock);
+        
+        for (child = current->children; child; child = child->sibling) {
+            if (strcmp(child->name, token) == 0) {
+                break;
+            }
+        }
+        
+        spin_unlock(&current->lock);
+        current = child;
+        token = strtok(NULL, "/");
+    }
+    
+    return current;
+}
+
+/* Add task to cgroup */
+static status_t add_task_to_cgroup(cgroup_t* cgroup, pid_t pid) {
+    spin_lock(&cgroup->lock);
+    
+    if (cgroup->task_count >= MAX_CGROUP_TASKS) {
+        spin_unlock(&cgroup->lock);
+        return STATUS_LIMIT_EXCEEDED;
+    }
+    
+    /* Check if already in cgroup */
+    for (uint32_t i = 0; i < cgroup->task_count; i++) {
+        if (cgroup->tasks[i] == pid) {
+            spin_unlock(&cgroup->lock);
+            return STATUS_OK; /* Already there */
+        }
+    }
+    
+    /* Check PID limit */
+    if (cgroup->enabled_subsystems & CGROUP_PIDS) {
+        spin_lock(&cgroup->pids.lock);
+        if (cgroup->pids.current >= cgroup->pids.max) {
+            spin_unlock(&cgroup->pids.lock);
+            spin_unlock(&cgroup->lock);
+            return STATUS_LIMIT_EXCEEDED;
+        }
+        cgroup->pids.current++;
+        spin_unlock(&cgroup->pids.lock);
+    }
+    
+    cgroup->tasks[cgroup->task_count++] = pid;
+    spin_unlock(&cgroup->lock);
+    
+    /* Update process cgroup pointer */
+    process_t* process = process_find_by_pid(pid);
+    if (process) {
+        process->cgroup = cgroup;
+    }
+    
+    KLOG_DEBUG("CGROUPS", "Added task %d to cgroup %s", pid, cgroup->path);
+    return STATUS_OK;
+}
+
+/* Remove task from cgroup */
+static status_t remove_task_from_cgroup(cgroup_t* cgroup, pid_t pid) {
+    spin_lock(&cgroup->lock);
+    
+    for (uint32_t i = 0; i < cgroup->task_count; i++) {
+        if (cgroup->tasks[i] == pid) {
+            /* Remove from array */
+            memmove(&cgroup->tasks[i], &cgroup->tasks[i + 1],
+                   (cgroup->task_count - i - 1) * sizeof(pid_t));
+            cgroup->task_count--;
+            
+            /* Update PID count */
+            if (cgroup->enabled_subsystems & CGROUP_PIDS) {
+                spin_lock(&cgroup->pids.lock);
+                if (cgroup->pids.current > 0) {
+                    cgroup->pids.current--;
+                }
+                spin_unlock(&cgroup->pids.lock);
+            }
+            
+            break;
+        }
+    }
+    
+    spin_unlock(&cgroup->lock);
+    
+    KLOG_DEBUG("CGROUPS", "Removed task %d from cgroup %s", pid, cgroup->path);
+    return STATUS_OK;
+}
+
+/* Move task to cgroup */
+status_t cgroup_attach_task(cgroup_t* cgroup, pid_t pid) {
+    if (!cgroup) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    process_t* process = process_find_by_pid(pid);
+    if (!process) {
+        return STATUS_NOT_FOUND;
+    }
+    
+    /* Remove from current cgroup */
+    if (process->cgroup) {
+        remove_task_from_cgroup(process->cgroup, pid);
+    }
+    
+    /* Add to new cgroup */
+    return add_task_to_cgroup(cgroup, pid);
+}
+
+/* Check memory allocation against limits */
+static status_t check_memory_limit(cgroup_t* cgroup, uint64_t requested) {
+    if (!(cgroup->enabled_subsystems & CGROUP_MEMORY)) {
+        return STATUS_OK;
+    }
+    
+    spin_lock(&cgroup->memory.lock);
+    
+    uint64_t new_usage = cgroup->memory.usage + requested;
+    if (new_usage > cgroup->memory.limit) {
+        spin_unlock(&cgroup->memory.lock);
+        return STATUS_NO_MEMORY;
+    }
+    
+    cgroup->memory.usage = new_usage;
+    if (new_usage > cgroup->memory.max_usage) {
+        cgroup->memory.max_usage = new_usage;
+    }
+    
+    spin_unlock(&cgroup->memory.lock);
+    return STATUS_OK;
+}
+
+/* Update memory usage */
+void cgroup_update_memory_usage(cgroup_t* cgroup, int64_t delta) {
+    if (!cgroup || !(cgroup->enabled_subsystems & CGROUP_MEMORY)) {
+        return;
+    }
+    
+    spin_lock(&cgroup->memory.lock);
+    
+    if (delta > 0) {
+        cgroup->memory.usage += delta;
+        if (cgroup->memory.usage > cgroup->memory.max_usage) {
+            cgroup->memory.max_usage = cgroup->memory.usage;
+        }
+    } else {
+        uint64_t abs_delta = -delta;
+        if (cgroup->memory.usage > abs_delta) {
+            cgroup->memory.usage -= abs_delta;
+        } else {
+            cgroup->memory.usage = 0;
+        }
+    }
+    
+    spin_unlock(&cgroup->memory.lock);
+}
+
+/* Set memory limit */
+status_t cgroup_set_memory_limit(cgroup_t* cgroup, uint64_t limit) {
+    if (!cgroup) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&cgroup->memory.lock);
+    
+    /* Check if current usage exceeds new limit */
+    if (cgroup->memory.usage > limit) {
+        spin_unlock(&cgroup->memory.lock);
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    cgroup->memory.limit = limit;
+    cgroup->enabled_subsystems |= CGROUP_MEMORY;
+    
+    spin_unlock(&cgroup->memory.lock);
+    
+    KLOG_DEBUG("CGROUPS", "Set memory limit to %lu bytes for cgroup %s", 
+               limit, cgroup->path);
+    
+    return STATUS_OK;
+}
+
+/* Set CPU shares */
+status_t cgroup_set_cpu_shares(cgroup_t* cgroup, uint64_t shares) {
+    if (!cgroup || shares == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&cgroup->cpu.lock);
+    cgroup->cpu.shares = shares;
+    cgroup->enabled_subsystems |= CGROUP_CPU;
+    spin_unlock(&cgroup->cpu.lock);
+    
+    KLOG_DEBUG("CGROUPS", "Set CPU shares to %lu for cgroup %s", 
+               shares, cgroup->path);
+    
+    return STATUS_OK;
+}
+
+/* Set CPU quota */
+status_t cgroup_set_cpu_quota(cgroup_t* cgroup, uint64_t quota_us, uint64_t period_us) {
+    if (!cgroup || period_us == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&cgroup->cpu.lock);
+    cgroup->cpu.cfs_quota_us = quota_us;
+    cgroup->cpu.cfs_period_us = period_us;
+    cgroup->enabled_subsystems |= CGROUP_CPU;
+    spin_unlock(&cgroup->cpu.lock);
+    
+    KLOG_DEBUG("CGROUPS", "Set CPU quota %lu/%lu us for cgroup %s", 
+               quota_us, period_us, cgroup->path);
+    
+    return STATUS_OK;
+}
+
+/* Set PIDs limit */
+status_t cgroup_set_pids_max(cgroup_t* cgroup, uint64_t max_pids) {
+    if (!cgroup) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&cgroup->pids.lock);
+    
+    /* Check if current usage exceeds new limit */
+    if (cgroup->pids.current > max_pids) {
+        spin_unlock(&cgroup->pids.lock);
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    cgroup->pids.max = max_pids;
+    cgroup->enabled_subsystems |= CGROUP_PIDS;
+    
+    spin_unlock(&cgroup->pids.lock);
+    
+    KLOG_DEBUG("CGROUPS", "Set PIDs max to %lu for cgroup %s", 
+               max_pids, cgroup->path);
+    
+    return STATUS_OK;
+}
+
+/* Update CPU statistics */
+static void update_cpu_stats(cgroup_t* cgroup, uint64_t user_time, uint64_t sys_time) {
+    if (!(cgroup->enabled_subsystems & CGROUP_CPU)) {
+        return;
+    }
+    
+    spin_lock(&cgroup->cpu.lock);
+    cgroup->cpu.stats.user_time += user_time;
+    cgroup->cpu.stats.system_time += sys_time;
+    cgroup->cpu.stats.usage += user_time + sys_time;
+    spin_unlock(&cgroup->cpu.lock);
+}
+
+/* Charge memory allocation to cgroup */
+status_t cgroup_charge_memory(process_t* process, uint64_t size) {
+    if (!process || !process->cgroup) {
+        return STATUS_OK; /* No cgroup, allow allocation */
+    }
+    
+    cgroup_t* cgroup = process->cgroup;
+    return check_memory_limit(cgroup, size);
+}
+
+/* CPU throttling check */
+bool cgroup_should_throttle_cpu(process_t* process) {
+    if (!process || !process->cgroup) {
+        return false;
+    }
+    
+    cgroup_t* cgroup = process->cgroup;
+    if (!(cgroup->enabled_subsystems & CGROUP_CPU)) {
+        return false;
+    }
+    
+    spin_lock(&cgroup->cpu.lock);
+    
+    /* Check CFS quota */
+    if (cgroup->cpu.cfs_quota_us != (uint64_t)-1) {
+        uint64_t current_time = timer_get_ticks_us();
+        uint64_t period_start = (current_time / cgroup->cpu.cfs_period_us) * cgroup->cpu.cfs_period_us;
+        uint64_t period_usage = cgroup->cpu.stats.usage - 
+                               (cgroup->cpu.stats.usage % cgroup->cpu.cfs_period_us);
+        
+        if (period_usage >= cgroup->cpu.cfs_quota_us) {
+            cgroup->cpu.stats.nr_throttled++;
+            spin_unlock(&cgroup->cpu.lock);
+            return true;
+        }
+    }
+    
+    spin_unlock(&cgroup->cpu.lock);
+    return false;
+}
+
+/* Get cgroup statistics */
+status_t cgroup_get_memory_stats(cgroup_t* cgroup, cgroup_memory_stats_t* stats) {
+    if (!cgroup || !stats) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&cgroup->memory.lock);
+    stats->usage = cgroup->memory.usage;
+    stats->max_usage = cgroup->memory.max_usage;
+    stats->limit = cgroup->memory.limit;
+    stats->cache = cgroup->memory.stats.cache;
+    stats->rss = cgroup->memory.stats.rss;
+    stats->swap = cgroup->memory.stats.swap;
+    spin_unlock(&cgroup->memory.lock);
+    
+    return STATUS_OK;
+}
+
+status_t cgroup_get_cpu_stats(cgroup_t* cgroup, cgroup_cpu_stats_t* stats) {
+    if (!cgroup || !stats) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&cgroup->cpu.lock);
+    stats->usage = cgroup->cpu.stats.usage;
+    stats->user_time = cgroup->cpu.stats.user_time;
+    stats->system_time = cgroup->cpu.stats.system_time;
+    stats->nr_periods = cgroup->cpu.stats.nr_periods;
+    stats->nr_throttled = cgroup->cpu.stats.nr_throttled;
+    stats->throttled_time = cgroup->cpu.stats.throttled_time;
+    spin_unlock(&cgroup->cpu.lock);
+    
+    return STATUS_OK;
+}
+
+/* Reference counting */
+void cgroup_get(cgroup_t* cgroup) {
+    if (cgroup) {
+        __sync_fetch_and_add(&cgroup->ref_count, 1);
+    }
+}
+
+void cgroup_put(cgroup_t* cgroup) {
+    if (cgroup && __sync_sub_and_fetch(&cgroup->ref_count, 1) == 0) {
+        destroy_cgroup(cgroup);
+    }
+}
+
+/* Destroy cgroup */
+static status_t destroy_cgroup(cgroup_t* cgroup) {
+    if (!cgroup) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Cannot destroy if has tasks */
+    if (cgroup->task_count > 0) {
+        return STATUS_BUSY;
+    }
+    
+    /* Remove from parent's children list */
+    if (cgroup->parent) {
+        spin_lock(&cgroup->parent->lock);
+        
+        if (cgroup->parent->children == cgroup) {
+            cgroup->parent->children = cgroup->sibling;
+        } else {
+            cgroup_t* prev = cgroup->parent->children;
+            while (prev && prev->sibling != cgroup) {
+                prev = prev->sibling;
+            }
+            if (prev) {
+                prev->sibling = cgroup->sibling;
+            }
+        }
+        
+        spin_unlock(&cgroup->parent->lock);
+    }
+    
+    KLOG_DEBUG("CGROUPS", "Destroyed cgroup %s", cgroup->path);
+    
+    /* Clear the cgroup entry */
+    memset(cgroup, 0, sizeof(cgroup_t));
+    
+    return STATUS_OK;
+}
+
+/* Container helper functions */
+status_t container_setup_cgroups(container_t* container, const container_limits_t* limits) {
+    if (!container || !limits) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Create container cgroup */
+    char cgroup_path[MAX_CGROUP_PATH];
+    snprintf(cgroup_path, sizeof(cgroup_path), "/containers/%s", container->name);
+    
+    cgroup_t* cgroup = cgroup_create(cgroup_path);
+    if (!cgroup) {
+        return STATUS_NO_MEMORY;
+    }
+    
+    /* Apply limits */
+    if (limits->memory_limit > 0) {
+        cgroup_set_memory_limit(cgroup, limits->memory_limit);
+    }
+    
+    if (limits->cpu_shares > 0) {
+        cgroup_set_cpu_shares(cgroup, limits->cpu_shares);
+    }
+    
+    if (limits->cpu_quota_us > 0) {
+        cgroup_set_cpu_quota(cgroup, limits->cpu_quota_us, limits->cpu_period_us);
+    }
+    
+    if (limits->pids_max > 0) {
+        cgroup_set_pids_max(cgroup, limits->pids_max);
+    }
+    
+    container->cgroup = cgroup;
+    
+    KLOG_INFO("CGROUPS", "Set up cgroups for container %s", container->name);
+    return STATUS_OK;
+}

@@ -1,0 +1,268 @@
+/*
+ * Network Device Driver
+ * Basic Ethernet (E1000) and WiFi support
+ */
+
+#include "kernel.h"
+
+/* Ethernet Frame Structure */
+typedef struct ethernet_frame {
+    u8 dest_mac[6];
+    u8 src_mac[6];
+    u16 ethertype;
+    u8 payload[1500];  /* Maximum Ethernet payload */
+} __attribute__((packed)) ethernet_frame_t;
+
+/* Network Device Types */
+typedef enum {
+    NET_TYPE_UNKNOWN = 0,
+    NET_TYPE_ETHERNET,
+    NET_TYPE_WIFI,
+    NET_TYPE_LOOPBACK
+} network_type_t;
+
+/* Network Device Structure */
+typedef struct network_device {
+    u32 device_id;
+    network_type_t type;
+    u8 mac_address[6];
+    char name[16];
+    u32 mtu;              /* Maximum Transmission Unit */
+    u32 speed_mbps;       /* Link speed in Mbps */
+    bool link_up;
+    void* driver_data;
+    struct network_device* next;
+} network_device_t;
+
+/* Global network device list */
+static network_device_t* g_network_devices = NULL;
+static u32 g_network_device_count = 0;
+static u32 g_next_device_id = 1;
+
+/* Add network device to global list */
+static void network_add_device(network_type_t type, const u8* mac, const char* name,
+                              u32 mtu, u32 speed_mbps, void* driver_data) {
+    network_device_t* dev = (network_device_t*)kalloc(sizeof(network_device_t));
+    if (!dev) return;
+    
+    dev->device_id = g_next_device_id++;
+    dev->type = type;
+    dev->mtu = mtu;
+    dev->speed_mbps = speed_mbps;
+    dev->link_up = true;  /* Assume link is up initially */
+    dev->driver_data = driver_data;
+    dev->next = g_network_devices;
+    
+    /* Copy MAC address */
+    if (mac) {
+        for (int i = 0; i < 6; i++) {
+            dev->mac_address[i] = mac[i];
+        }
+    } else {
+        /* Generate virtual MAC address */
+        dev->mac_address[0] = 0x02;  /* Locally administered */
+        dev->mac_address[1] = 0x00;
+        dev->mac_address[2] = 0x4C;  /* LimitlessOS OUI */
+        dev->mac_address[3] = 0x49;
+        dev->mac_address[4] = 0x4D;
+        dev->mac_address[5] = (u8)dev->device_id;
+    }
+    
+    /* Copy device name */
+    if (name) {
+        for (int i = 0; i < 15 && name[i]; i++) {
+            dev->name[i] = name[i];
+        }
+        dev->name[15] = '\0';
+    } else {
+        k_snprintf(dev->name, sizeof(dev->name), "net%u", dev->device_id);
+    }
+    
+    g_network_devices = dev;
+    g_network_device_count++;
+}
+
+/* Intel E1000 Controller Data */
+typedef struct e1000_controller {
+    void* mmio_base;
+    u32 irq;
+    u8 mac_address[6];
+} e1000_controller_t;
+
+/* Initialize E1000 Ethernet controller */
+static void e1000_init_controller(void* pci_dev) {
+    e1000_controller_t* ctrl = (e1000_controller_t*)kalloc(sizeof(e1000_controller_t));
+    if (!ctrl) return;
+    
+    /* In real implementation, would map MMIO and read MAC from EEPROM */
+    ctrl->mmio_base = (void*)0xFEBE0000;  /* Example MMIO address */
+    ctrl->irq = 10;
+    
+    /* Simulate reading MAC address from EEPROM */
+    ctrl->mac_address[0] = 0x52;
+    ctrl->mac_address[1] = 0x54;
+    ctrl->mac_address[2] = 0x00;
+    ctrl->mac_address[3] = 0x12;
+    ctrl->mac_address[4] = 0x34;
+    ctrl->mac_address[5] = 0x56;
+    
+    /* Add Ethernet device */
+    network_add_device(NET_TYPE_ETHERNET,
+                      ctrl->mac_address,
+                      "eth0",
+                      1500,      /* Standard Ethernet MTU */
+                      1000,      /* 1 Gbps */
+                      ctrl);
+}
+
+/* WiFi Controller Data */
+typedef struct wifi_controller {
+    void* mmio_base;
+    u32 irq;
+    char ssid[33];         /* Connected SSID */
+    bool connected;
+} wifi_controller_t;
+
+/* Initialize WiFi controller */
+static void wifi_init_controller(void* pci_dev) {
+    wifi_controller_t* ctrl = (wifi_controller_t*)kalloc(sizeof(wifi_controller_t));
+    if (!ctrl) return;
+    
+    /* In real implementation, would initialize WiFi hardware */
+    ctrl->mmio_base = (void*)0xFEBF0000;  /* Example MMIO address */
+    ctrl->irq = 11;
+    strcpy(ctrl->ssid, "LimitlessOS-WiFi");
+    ctrl->connected = false;
+    
+    /* Add WiFi device */
+    network_add_device(NET_TYPE_WIFI,
+                      NULL,      /* MAC will be auto-generated */
+                      "wlan0",
+                      1500,      /* Standard MTU */
+                      300,       /* 300 Mbps (802.11n) */
+                      ctrl);
+}
+
+/* Initialize loopback device */
+static void network_init_loopback(void) {
+    u8 loopback_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    
+    network_add_device(NET_TYPE_LOOPBACK,
+                      loopback_mac,
+                      "lo",
+                      65536,     /* Large MTU for loopback */
+                      0,         /* No physical speed limit */
+                      NULL);
+}
+
+/* Initialize network subsystem */
+void network_init(void) {
+    /* Initialize loopback device first */
+    network_init_loopback();
+    
+    /* Find and initialize Ethernet controllers */
+    /* In real implementation would use PCI enumeration */
+    e1000_init_controller(NULL);
+    
+    /* Find and initialize WiFi controllers */
+    wifi_init_controller(NULL);
+}
+
+/* Send Ethernet frame */
+int network_send_frame(u32 device_id, const void* frame_data, u32 frame_size) {
+    network_device_t* dev = g_network_devices;
+    
+    /* Find device */
+    while (dev) {
+        if (dev->device_id == device_id) break;
+        dev = dev->next;
+    }
+    
+    if (!dev) return -1;  /* Device not found */
+    if (!dev->link_up) return -2;  /* Link is down */
+    if (frame_size > dev->mtu + 14) return -3;  /* Frame too large */
+    
+    /* Simulate successful transmission */
+    /* In real implementation would program NIC to send frame */
+    (void)frame_data;  /* Suppress unused parameter warning */
+    
+    return 0;  /* Success */
+}
+
+/* Receive Ethernet frame (polling mode for simplicity) */
+int network_receive_frame(u32 device_id, void* buffer, u32 buffer_size, u32* received_size) {
+    network_device_t* dev = g_network_devices;
+    
+    /* Find device */
+    while (dev) {
+        if (dev->device_id == device_id) break;
+        dev = dev->next;
+    }
+    
+    if (!dev) return -1;  /* Device not found */
+    if (!dev->link_up) return -2;  /* Link is down */
+    
+    /* Simulate no frame available */
+    /* In real implementation would check RX ring buffer */
+    *received_size = 0;
+    return 0;  /* No frame available */
+}
+
+/* Set device link state */
+int network_set_link_state(u32 device_id, bool link_up) {
+    network_device_t* dev = g_network_devices;
+    
+    while (dev) {
+        if (dev->device_id == device_id) {
+            dev->link_up = link_up;
+            return 0;
+        }
+        dev = dev->next;
+    }
+    
+    return -1;  /* Device not found */
+}
+
+/* Get network device count */
+u32 network_get_device_count(void) {
+    return g_network_device_count;
+}
+
+/* Get device info */
+network_device_t* network_get_device_info(u32 device_id) {
+    network_device_t* dev = g_network_devices;
+    
+    while (dev) {
+        if (dev->device_id == device_id) {
+            return dev;
+        }
+        dev = dev->next;
+    }
+    
+    return NULL;
+}
+
+/* List all network devices */
+void network_list_devices(void) {
+    network_device_t* dev = g_network_devices;
+    u32 count = 0;
+    
+    while (dev && count < 10) {  /* Limit output */
+        const char* type_name;
+        switch (dev->type) {
+            case NET_TYPE_ETHERNET: type_name = "Ethernet"; break;
+            case NET_TYPE_WIFI: type_name = "WiFi"; break;
+            case NET_TYPE_LOOPBACK: type_name = "Loopback"; break;
+            default: type_name = "Unknown"; break;
+        }
+        
+        /* In real kernel, would use kprintf to display:
+         * Device: %s (%s), MAC: %02x:%02x:%02x:%02x:%02x:%02x, 
+         * Speed: %u Mbps, Link: %s
+         */
+        (void)type_name;  /* Suppress unused warning */
+        
+        dev = dev->next;
+        count++;
+    }
+}

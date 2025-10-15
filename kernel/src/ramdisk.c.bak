@@ -1,0 +1,128 @@
+#include "kernel.h"
+#include "block.h"
+#include "log.h"
+
+/*
+ * RAM Disk Block Device
+ * Creates virtual block devices in memory for testing filesystem implementations
+ */
+
+typedef struct {
+    void* data;
+    size_t size;
+    u32 sector_size;
+} ramdisk_dev_t;
+
+static int ramdisk_read(block_dev_t* dev, blk_io_t* io) {
+    ramdisk_dev_t* rd = (ramdisk_dev_t*)dev->drv;
+    if (!rd || !io->buf) return K_EINVAL;
+    
+    u64 offset = io->lba * dev->sector_sz;
+    size_t length = io->count * dev->sector_sz;
+    
+    if (offset + length > rd->size) {
+        return K_EINVAL;
+    }
+    
+    k_memcpy(io->buf, (char*)rd->data + offset, length);
+    return 0;
+}
+
+static int ramdisk_write(block_dev_t* dev, const blk_io_t* io) {
+    ramdisk_dev_t* rd = (ramdisk_dev_t*)dev->drv;
+    if (!rd || !io->buf) return K_EINVAL;
+    
+    u64 offset = io->lba * dev->sector_sz;
+    size_t length = io->count * dev->sector_sz;
+    
+    if (offset + length > rd->size) {
+        return K_EINVAL;
+    }
+    
+    k_memcpy((char*)rd->data + offset, io->buf, length);
+    return 0;
+}
+
+static u32 ramdisk_sector_size(block_dev_t* dev) {
+    return dev->sector_sz;
+}
+
+static u64 ramdisk_capacity_sectors(block_dev_t* dev) {
+    ramdisk_dev_t* rd = (ramdisk_dev_t*)dev->drv;
+    if (!rd) return 0;
+    return rd->size / dev->sector_sz;
+}
+
+static void ramdisk_flush(block_dev_t* dev) {
+    /* No-op for RAM disk */
+    (void)dev;
+}
+
+block_dev_t* ramdisk_create(const char* name, size_t size_mb) {
+    if (!name || size_mb == 0) return NULL;
+    
+    size_t size = size_mb * 1024 * 1024;
+    
+    /* Allocate device structure */
+    block_dev_t* bdev = (block_dev_t*)vmm_kmalloc(sizeof(block_dev_t), 64);
+    if (!bdev) return NULL;
+    
+    /* Allocate ramdisk private data */
+    ramdisk_dev_t* rd = (ramdisk_dev_t*)vmm_kmalloc(sizeof(ramdisk_dev_t), 64);
+    if (!rd) {
+        vmm_kfree(bdev, sizeof(block_dev_t));
+        return NULL;
+    }
+    
+    /* Allocate disk data */
+    rd->data = vmm_kmalloc(size, 4096);  /* Page-aligned */
+    if (!rd->data) {
+        vmm_kfree(rd, sizeof(ramdisk_dev_t));
+        vmm_kfree(bdev, sizeof(block_dev_t));
+        return NULL;
+    }
+    
+    rd->size = size;
+    rd->sector_size = 512;
+    
+    /* Clear the disk */
+    k_memset(rd->data, 0, size);
+    
+    /* Initialize block device */
+    k_strncpy(bdev->name, name, sizeof(bdev->name) - 1);
+    bdev->name[sizeof(bdev->name) - 1] = '\0';
+    bdev->drv = rd;
+    bdev->sector_sz = 512;
+    bdev->sectors = size / 512;
+    
+    bdev->ops.read = ramdisk_read;
+    bdev->ops.write = ramdisk_write;
+    bdev->ops.sector_size = ramdisk_sector_size;
+    bdev->ops.capacity_sectors = ramdisk_capacity_sectors;
+    bdev->ops.flush = ramdisk_flush;
+    
+    /* Register the device */
+    if (block_register(bdev) != 0) {
+        vmm_kfree(rd->data, size);
+        vmm_kfree(rd, sizeof(ramdisk_dev_t));
+        vmm_kfree(bdev, sizeof(block_dev_t));
+        return NULL;
+    }
+    
+    KLOG_INFO("ramdisk", "created %s: %zu MB", name, size_mb);
+    return bdev;
+}
+
+void ramdisk_destroy(block_dev_t* bdev) {
+    if (!bdev) return;
+    
+    ramdisk_dev_t* rd = (ramdisk_dev_t*)bdev->drv;
+    if (rd) {
+        if (rd->data) {
+            vmm_kfree(rd->data, rd->size);
+        }
+        vmm_kfree(rd, sizeof(ramdisk_dev_t));
+    }
+    
+    vmm_kfree(bdev, sizeof(block_dev_t));
+}

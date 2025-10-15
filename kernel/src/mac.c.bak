@@ -1,0 +1,712 @@
+#include "mac.h"
+#include "log.h"
+#include "kernel.h"
+#include "process.h"
+#include "vfs.h"
+#include "syscalls.h"
+
+/* Global MAC context */
+static mac_context_t g_mac_context;
+static mac_policy_rule_t g_policy_rules[1024];
+static uint32_t g_rule_count = 0;
+static uint64_t g_next_rule_id = 1;
+static mac_role_t g_roles[256];
+static uint32_t g_role_count = 0;
+static uint32_t g_next_role_id = 1;
+
+/* Process security contexts */
+static mac_subject_t g_process_contexts[MAX_PROCESSES];
+
+/* Statistics */
+static uint64_t g_access_checks = 0;
+static uint64_t g_access_denials = 0;
+static uint64_t g_access_audits = 0;
+
+/* Built-in security labels */
+static const mac_label_t UNCLASSIFIED_LABEL = {
+    .label = "unclassified",
+    .level = MAC_LEVEL_UNCLASSIFIED,
+    .categories = 0,
+    .compartments = 0,
+    .integrity_high = false,
+    .owner_uid = 0,
+    .group_gid = 0
+};
+
+static const mac_label_t SYSTEM_HIGH_LABEL = {
+    .label = "system_high",
+    .level = MAC_LEVEL_TOP_SECRET,
+    .categories = 0xFFFFFFFF,
+    .compartments = 0xFFFFFFFF,
+    .integrity_high = true,
+    .owner_uid = 0,
+    .group_gid = 0
+};
+
+/* Helper functions */
+static bool category_subset(uint32_t subset, uint32_t superset) {
+    return (subset & superset) == subset;
+}
+
+static bool has_capability(const mac_subject_t* subject, uint32_t capability) {
+    return (subject->process_capabilities & capability) != 0;
+}
+
+static mac_role_t* find_role_by_id(uint32_t role_id) {
+    for (uint32_t i = 0; i < g_role_count; i++) {
+        if (g_roles[i].role_id == role_id) {
+            return &g_roles[i];
+        }
+    }
+    return NULL;
+}
+
+status_t mac_init(void) {
+    spinlock_init(&g_mac_context.policy_lock);
+    
+    /* Initialize default MAC context */
+    g_mac_context.mls_enabled = true;
+    g_mac_context.mcs_enabled = true;
+    g_mac_context.rbac_enabled = true;
+    g_mac_context.type_enforcement_enabled = false;
+    g_mac_context.permissive_mode = false;
+    g_mac_context.active_policies = 0x07; /* MLS, MCS, RBAC */
+    
+    /* Clear all contexts */
+    k_memset(g_process_contexts, 0, sizeof(g_process_contexts));
+    k_memset(g_policy_rules, 0, sizeof(g_policy_rules));
+    k_memset(g_roles, 0, sizeof(g_roles));
+    
+    /* Create default roles */
+    mac_role_t admin_role = {
+        .name = "admin",
+        .role_id = 0, /* Will be assigned */
+        .authorized_categories = 0xFFFFFFFF,
+        .authorized_compartments = 0xFFFFFFFF,
+        .max_clearance = MAC_LEVEL_TOP_SECRET,
+        .capabilities = 0xFFFFFFFF,
+        .can_sudo = true,
+        .system_role = true
+    };
+    
+    uint32_t admin_role_id;
+    mac_create_role("admin", &admin_role, &admin_role_id);
+    
+    mac_role_t user_role = {
+        .name = "user",
+        .role_id = 0,
+        .authorized_categories = 0x00000001, /* Basic user category */
+        .authorized_compartments = 0x00000001,
+        .max_clearance = MAC_LEVEL_CONFIDENTIAL,
+        .capabilities = 0x00000FFF, /* Basic capabilities */
+        .can_sudo = false,
+        .system_role = true
+    };
+    
+    uint32_t user_role_id;
+    mac_create_role("user", &user_role, &user_role_id);
+    
+    /* Add default policy rules */
+    mac_policy_rule_t default_rule = {
+        .type = MAC_POLICY_MLS,
+        .ace = {
+            .subject_label = UNCLASSIFIED_LABEL,
+            .object_label = UNCLASSIFIED_LABEL,
+            .allowed_access = MAC_ACCESS_READ | MAC_ACCESS_WRITE | MAC_ACCESS_EXECUTE,
+            .explicit_deny = false,
+            .conditions = 0
+        },
+        .active = true,
+        .rule_id = 0, /* Will be assigned */
+        .description = "Default unclassified access rule"
+    };
+    
+    uint64_t rule_id;
+    mac_add_policy_rule(&default_rule, &rule_id);
+    
+    log_info("[MAC] Mandatory Access Control subsystem initialized");
+    return STATUS_OK;
+}
+
+status_t mac_shutdown(void) {
+    /* Clean up MAC subsystem */
+    g_rule_count = 0;
+    g_role_count = 0;
+    g_next_rule_id = 1;
+    g_next_role_id = 1;
+    
+    log_info("[MAC] MAC subsystem shutdown");
+    return STATUS_OK;
+}
+
+status_t mac_get_subject_context(pid_t pid, mac_subject_t* out_subject) {
+    if (pid >= MAX_PROCESSES || !out_subject) return STATUS_INVALID;
+    
+    spin_lock(&g_mac_context.policy_lock);
+    *out_subject = g_process_contexts[pid];
+    spin_unlock(&g_mac_context.policy_lock);
+    
+    return STATUS_OK;
+}
+
+status_t mac_set_subject_context(pid_t pid, const mac_subject_t* subject) {
+    if (pid >= MAX_PROCESSES || !subject) return STATUS_INVALID;
+    
+    spin_lock(&g_mac_context.policy_lock);
+    g_process_contexts[pid] = *subject;
+    spin_unlock(&g_mac_context.policy_lock);
+    
+    return STATUS_OK;
+}
+
+status_t mac_create_subject_context(const process_t* process, mac_subject_t* out_subject) {
+    if (!process || !out_subject) return STATUS_INVALID;
+    
+    k_memset(out_subject, 0, sizeof(*out_subject));
+    
+    /* Set basic context from process */
+    out_subject->effective_uid = process->uid;
+    out_subject->effective_gid = process->gid;
+    out_subject->clearance = MAC_LEVEL_UNCLASSIFIED;
+    out_subject->authorized_categories = 0x00000001; /* Basic category */
+    out_subject->authorized_compartments = 0x00000001;
+    out_subject->trusted = (process->uid == 0); /* Root is trusted */
+    out_subject->process_capabilities = 0x00000FFF; /* Basic capabilities */
+    
+    /* Add default unclassified label */
+    out_subject->labels[0] = UNCLASSIFIED_LABEL;
+    out_subject->labels[0].owner_uid = process->uid;
+    out_subject->labels[0].group_gid = process->gid;
+    out_subject->label_count = 1;
+    
+    /* Upgrade clearance for root */
+    if (process->uid == 0) {
+        out_subject->clearance = MAC_LEVEL_TOP_SECRET;
+        out_subject->authorized_categories = 0xFFFFFFFF;
+        out_subject->authorized_compartments = 0xFFFFFFFF;
+        out_subject->process_capabilities = 0xFFFFFFFF;
+    }
+    
+    return STATUS_OK;
+}
+
+status_t mac_get_object_context(const char* path, mac_object_t* out_object) {
+    if (!path || !out_object) return STATUS_INVALID;
+    
+    /* Look up VFS node */
+    vfs_node_t* node = vfs_lookup(path);
+    if (!node) return STATUS_NOTFOUND;
+    
+    return mac_create_object_context(node, out_object);
+}
+
+status_t mac_set_object_context(const char* path, const mac_object_t* object) {
+    if (!path || !object) return STATUS_INVALID;
+    
+    /* In a full implementation, this would store the security context
+     * as extended attributes on the filesystem */
+    
+    /* Placeholder: log the operation */
+    log_debug("[MAC] Set object context for %s (level=%d)", path, object->classification);
+    
+    return STATUS_OK;
+}
+
+status_t mac_create_object_context(const vfs_node_t* node, mac_object_t* out_object) {
+    if (!node || !out_object) return STATUS_INVALID;
+    
+    k_memset(out_object, 0, sizeof(*out_object));
+    
+    /* Set basic context from VFS node */
+    out_object->owner_uid = node->uid;
+    out_object->owner_gid = node->gid;
+    out_object->mode = node->mode;
+    out_object->classification = MAC_LEVEL_UNCLASSIFIED;
+    out_object->required_categories = 0;
+    out_object->required_compartments = 0;
+    out_object->integrity_required = false;
+    
+    /* Add default unclassified label */
+    out_object->labels[0] = UNCLASSIFIED_LABEL;
+    out_object->labels[0].owner_uid = node->uid;
+    out_object->labels[0].group_gid = node->gid;
+    out_object->label_count = 1;
+    
+    /* Special handling for system files */
+    if (node->uid == 0 || k_strstr(node->name, "sys") || k_strstr(node->name, "boot")) {
+        out_object->classification = MAC_LEVEL_SECRET;
+        out_object->integrity_required = true;
+        out_object->labels[0] = SYSTEM_HIGH_LABEL;
+        out_object->labels[0].owner_uid = 0;
+        out_object->labels[0].group_gid = 0;
+    }
+    
+    return STATUS_OK;
+}
+
+static bool mls_check(const mac_subject_t* subject, const mac_object_t* object, mac_access_t access) {
+    if (!g_mac_context.mls_enabled) return true;
+    
+    /* Multi-Level Security rules:
+     * - No read up: subject clearance >= object classification
+     * - No write down: subject clearance <= object classification (for write)
+     */
+    
+    if (access & (MAC_ACCESS_READ | MAC_ACCESS_EXECUTE)) {
+        if (subject->clearance < object->classification) {
+            return false;
+        }
+    }
+    
+    if (access & (MAC_ACCESS_WRITE | MAC_ACCESS_DELETE | MAC_ACCESS_APPEND)) {
+        /* Write access requires domination relationship */
+        if (subject->clearance != object->classification) {
+            /* Allow trusted subjects to write across levels */
+            if (!subject->trusted) {
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+static bool mcs_check(const mac_subject_t* subject, const mac_object_t* object, mac_access_t access) {
+    if (!g_mac_context.mcs_enabled) return true;
+    
+    /* Multi-Category Security rules:
+     * - Subject must have all required categories/compartments
+     */
+    
+    if (!category_subset(object->required_categories, subject->authorized_categories)) {
+        return false;
+    }
+    
+    if (!category_subset(object->required_compartments, subject->authorized_compartments)) {
+        return false;
+    }
+    
+    return true;
+}
+
+static bool rbac_check(const mac_subject_t* subject, const mac_object_t* object, mac_access_t access) {
+    if (!g_mac_context.rbac_enabled) return true;
+    
+    /* Role-Based Access Control:
+     * - Check if subject has required capabilities for the access type
+     */
+    
+    uint32_t required_caps = 0;
+    
+    if (access & MAC_ACCESS_READ) required_caps |= 0x01;
+    if (access & MAC_ACCESS_WRITE) required_caps |= 0x02;
+    if (access & MAC_ACCESS_EXECUTE) required_caps |= 0x04;
+    if (access & MAC_ACCESS_DELETE) required_caps |= 0x08;
+    if (access & MAC_ACCESS_ADMIN) required_caps |= 0x10;
+    
+    return category_subset(required_caps, subject->process_capabilities);
+}
+
+static bool dac_check(const mac_subject_t* subject, const mac_object_t* object, mac_access_t access) {
+    /* Discretionary Access Control (traditional Unix permissions) */
+    
+    uint16_t mode = object->mode;
+    uint32_t subject_uid = subject->effective_uid;
+    uint32_t subject_gid = subject->effective_gid;
+    
+    /* Root bypass */
+    if (subject_uid == 0) return true;
+    
+    /* Owner permissions */
+    if (subject_uid == object->owner_uid) {
+        uint16_t owner_perms = (mode >> 6) & 0x07;
+        if (access & MAC_ACCESS_READ && !(owner_perms & 0x04)) return false;
+        if (access & MAC_ACCESS_WRITE && !(owner_perms & 0x02)) return false;
+        if (access & MAC_ACCESS_EXECUTE && !(owner_perms & 0x01)) return false;
+        return true;
+    }
+    
+    /* Group permissions */
+    if (subject_gid == object->owner_gid) {
+        uint16_t group_perms = (mode >> 3) & 0x07;
+        if (access & MAC_ACCESS_READ && !(group_perms & 0x04)) return false;
+        if (access & MAC_ACCESS_WRITE && !(group_perms & 0x02)) return false;
+        if (access & MAC_ACCESS_EXECUTE && !(group_perms & 0x01)) return false;
+        return true;
+    }
+    
+    /* Other permissions */
+    uint16_t other_perms = mode & 0x07;
+    if (access & MAC_ACCESS_READ && !(other_perms & 0x04)) return false;
+    if (access & MAC_ACCESS_WRITE && !(other_perms & 0x02)) return false;
+    if (access & MAC_ACCESS_EXECUTE && !(other_perms & 0x01)) return false;
+    
+    return true;
+}
+
+mac_decision_t mac_check_access(const mac_subject_t* subject, const mac_object_t* object, mac_access_t access) {
+    if (!subject || !object) return MAC_DECISION_DENY;
+    
+    atomic_add(&g_access_checks, 1);
+    
+    /* Run all enabled policy checks */
+    bool allowed = true;
+    
+    /* Discretionary Access Control (always enabled) */
+    if (!dac_check(subject, object, access)) {
+        allowed = false;
+    }
+    
+    /* Mandatory Access Control checks */
+    if (allowed && !mls_check(subject, object, access)) {
+        allowed = false;
+    }
+    
+    if (allowed && !mcs_check(subject, object, access)) {
+        allowed = false;
+    }
+    
+    if (allowed && !rbac_check(subject, object, access)) {
+        allowed = false;
+    }
+    
+    /* Check explicit policy rules */
+    spin_lock(&g_mac_context.policy_lock);
+    for (uint32_t i = 0; i < g_rule_count; i++) {
+        if (!g_policy_rules[i].active) continue;
+        
+        mac_ace_t* ace = &g_policy_rules[i].ace;
+        
+        /* Check if rule applies to this subject/object pair */
+        bool subject_match = (k_strcmp(subject->labels[0].label, ace->subject_label.label) == 0);
+        bool object_match = (k_strcmp(object->labels[0].label, ace->object_label.label) == 0);
+        
+        if (subject_match && object_match) {
+            if (ace->explicit_deny) {
+                allowed = false;
+                break;
+            } else if ((ace->allowed_access & access) == access) {
+                /* Rule explicitly allows this access */
+                allowed = true;
+            }
+        }
+    }
+    spin_unlock(&g_mac_context.policy_lock);
+    
+    mac_decision_t decision;
+    if (g_mac_context.permissive_mode) {
+        decision = allowed ? MAC_DECISION_ALLOW : MAC_DECISION_AUDIT;
+        if (!allowed) atomic_add(&g_access_audits, 1);
+    } else {
+        decision = allowed ? MAC_DECISION_ALLOW : MAC_DECISION_DENY;
+        if (!allowed) atomic_add(&g_access_denials, 1);
+    }
+    
+    return decision;
+}
+
+status_t mac_check_file_access(pid_t pid, const char* path, mac_access_t access, bool* allowed) {
+    if (pid >= MAX_PROCESSES || !path || !allowed) return STATUS_INVALID;
+    
+    mac_subject_t subject;
+    mac_object_t object;
+    
+    status_t result = mac_get_subject_context(pid, &subject);
+    if (result != STATUS_OK) return result;
+    
+    result = mac_get_object_context(path, &object);
+    if (result != STATUS_OK) return result;
+    
+    mac_decision_t decision = mac_check_access(&subject, &object, access);
+    *allowed = (decision == MAC_DECISION_ALLOW);
+    
+    /* Audit the access */
+    mac_audit_access(&subject, &object, access, decision);
+    
+    return STATUS_OK;
+}
+
+status_t mac_check_process_access(pid_t subject_pid, pid_t object_pid, mac_access_t access, bool* allowed) {
+    if (subject_pid >= MAX_PROCESSES || object_pid >= MAX_PROCESSES || !allowed) {
+        return STATUS_INVALID;
+    }
+    
+    mac_subject_t subject;
+    status_t result = mac_get_subject_context(subject_pid, &subject);
+    if (result != STATUS_OK) return result;
+    
+    /* Create object context from target process */
+    mac_object_t object;
+    k_memset(&object, 0, sizeof(object));
+    
+    mac_subject_t target_subject;
+    result = mac_get_subject_context(object_pid, &target_subject);
+    if (result != STATUS_OK) return result;
+    
+    /* Use target process's security context as object context */
+    object.labels[0] = target_subject.labels[0];
+    object.label_count = 1;
+    object.classification = target_subject.clearance;
+    object.owner_uid = target_subject.effective_uid;
+    object.owner_gid = target_subject.effective_gid;
+    object.mode = 0644; /* Default process permissions */
+    
+    mac_decision_t decision = mac_check_access(&subject, &object, access);
+    *allowed = (decision == MAC_DECISION_ALLOW);
+    
+    return STATUS_OK;
+}
+
+status_t mac_check_network_access(pid_t pid, uint32_t remote_addr, uint16_t port, bool* allowed) {
+    if (pid >= MAX_PROCESSES || !allowed) return STATUS_INVALID;
+    
+    mac_subject_t subject;
+    status_t result = mac_get_subject_context(pid, &subject);
+    if (result != STATUS_OK) return result;
+    
+    /* Create network object context */
+    mac_object_t object;
+    k_memset(&object, 0, sizeof(object));
+    
+    /* Classify network connections by port */
+    if (port < 1024) {
+        object.classification = MAC_LEVEL_CONFIDENTIAL; /* Privileged ports */
+        object.labels[0] = SYSTEM_HIGH_LABEL;
+    } else {
+        object.classification = MAC_LEVEL_UNCLASSIFIED;
+        object.labels[0] = UNCLASSIFIED_LABEL;
+    }
+    object.label_count = 1;
+    object.owner_uid = 0;
+    object.owner_gid = 0;
+    object.mode = 0666;
+    
+    mac_decision_t decision = mac_check_access(&subject, &object, MAC_ACCESS_READ | MAC_ACCESS_WRITE);
+    *allowed = (decision == MAC_DECISION_ALLOW);
+    
+    return STATUS_OK;
+}
+
+status_t mac_parse_label(const char* label_str, mac_label_t* out_label) {
+    if (!label_str || !out_label) return STATUS_INVALID;
+    
+    k_memset(out_label, 0, sizeof(*out_label));
+    
+    /* Simple label parsing: "level:categories:compartments" */
+    char* colon1 = k_strchr(label_str, ':');
+    if (!colon1) {
+        /* Just a simple label name */
+        k_strlcpy(out_label->label, label_str, sizeof(out_label->label));
+        out_label->level = MAC_LEVEL_UNCLASSIFIED;
+        return STATUS_OK;
+    }
+    
+    /* Extract level */
+    size_t label_len = colon1 - label_str;
+    if (label_len >= sizeof(out_label->label)) label_len = sizeof(out_label->label) - 1;
+    k_memcpy(out_label->label, label_str, label_len);
+    out_label->label[label_len] = '\0';
+    
+    /* Parse level */
+    char* level_str = colon1 + 1;
+    char* colon2 = k_strchr(level_str, ':');
+    if (colon2) *colon2 = '\0';
+    
+    if (k_strcmp(level_str, "unclassified") == 0) {
+        out_label->level = MAC_LEVEL_UNCLASSIFIED;
+    } else if (k_strcmp(level_str, "confidential") == 0) {
+        out_label->level = MAC_LEVEL_CONFIDENTIAL;
+    } else if (k_strcmp(level_str, "secret") == 0) {
+        out_label->level = MAC_LEVEL_SECRET;
+    } else if (k_strcmp(level_str, "top_secret") == 0) {
+        out_label->level = MAC_LEVEL_TOP_SECRET;
+    }
+    
+    /* Parse categories and compartments */
+    if (colon2) {
+        out_label->categories = k_strtoul(colon2 + 1, NULL, 16);
+        char* colon3 = k_strchr(colon2 + 1, ':');
+        if (colon3) {
+            out_label->compartments = k_strtoul(colon3 + 1, NULL, 16);
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+status_t mac_format_label(const mac_label_t* label, char* out_str, size_t max_len) {
+    if (!label || !out_str) return STATUS_INVALID;
+    
+    const char* level_str;
+    switch (label->level) {
+        case MAC_LEVEL_UNCLASSIFIED: level_str = "unclassified"; break;
+        case MAC_LEVEL_CONFIDENTIAL: level_str = "confidential"; break;
+        case MAC_LEVEL_SECRET: level_str = "secret"; break;
+        case MAC_LEVEL_TOP_SECRET: level_str = "top_secret"; break;
+        default: level_str = "unknown"; break;
+    }
+    
+    k_snprintf(out_str, max_len, "%s:%s:%x:%x",
+               label->label, level_str, label->categories, label->compartments);
+    
+    return STATUS_OK;
+}
+
+status_t mac_compare_labels(const mac_label_t* label1, const mac_label_t* label2, int* result) {
+    if (!label1 || !label2 || !result) return STATUS_INVALID;
+    
+    /* Compare security levels first */
+    if (label1->level < label2->level) {
+        *result = -1;
+    } else if (label1->level > label2->level) {
+        *result = 1;
+    } else {
+        /* Same level, compare categories */
+        if (label1->categories < label2->categories) {
+            *result = -1;
+        } else if (label1->categories > label2->categories) {
+            *result = 1;
+        } else {
+            *result = 0;
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+bool mac_label_dominates(const mac_label_t* high, const mac_label_t* low) {
+    if (!high || !low) return false;
+    
+    /* High label dominates low label if:
+     * - High level >= low level
+     * - High categories include all low categories
+     * - High compartments include all low compartments
+     */
+    
+    return (high->level >= low->level &&
+            category_subset(low->categories, high->categories) &&
+            category_subset(low->compartments, high->compartments));
+}
+
+status_t mac_add_policy_rule(const mac_policy_rule_t* rule, uint64_t* out_rule_id) {
+    if (!rule) return STATUS_INVALID;
+    
+    spin_lock(&g_mac_context.policy_lock);
+    
+    if (g_rule_count >= sizeof(g_policy_rules) / sizeof(g_policy_rules[0])) {
+        spin_unlock(&g_mac_context.policy_lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    g_policy_rules[g_rule_count] = *rule;
+    g_policy_rules[g_rule_count].rule_id = g_next_rule_id++;
+    
+    if (out_rule_id) *out_rule_id = g_policy_rules[g_rule_count].rule_id;
+    g_rule_count++;
+    
+    spin_unlock(&g_mac_context.policy_lock);
+    return STATUS_OK;
+}
+
+status_t mac_remove_policy_rule(uint64_t rule_id) {
+    spin_lock(&g_mac_context.policy_lock);
+    
+    for (uint32_t i = 0; i < g_rule_count; i++) {
+        if (g_policy_rules[i].rule_id == rule_id) {
+            /* Move last rule to this position */
+            g_policy_rules[i] = g_policy_rules[g_rule_count - 1];
+            g_rule_count--;
+            spin_unlock(&g_mac_context.policy_lock);
+            return STATUS_OK;
+        }
+    }
+    
+    spin_unlock(&g_mac_context.policy_lock);
+    return STATUS_NOTFOUND;
+}
+
+status_t mac_create_role(const char* name, const mac_role_t* role, uint32_t* out_role_id) {
+    if (!name || !role) return STATUS_INVALID;
+    
+    spin_lock(&g_mac_context.policy_lock);
+    
+    if (g_role_count >= sizeof(g_roles) / sizeof(g_roles[0])) {
+        spin_unlock(&g_mac_context.policy_lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    g_roles[g_role_count] = *role;
+    g_roles[g_role_count].role_id = g_next_role_id++;
+    k_strlcpy(g_roles[g_role_count].name, name, sizeof(g_roles[g_role_count].name));
+    
+    if (out_role_id) *out_role_id = g_roles[g_role_count].role_id;
+    g_role_count++;
+    
+    spin_unlock(&g_mac_context.policy_lock);
+    return STATUS_OK;
+}
+
+/* Integration hooks */
+status_t mac_process_create_hook(const process_t* parent, process_t* child) {
+    if (!parent || !child) return STATUS_INVALID;
+    
+    /* Create security context for child process */
+    mac_subject_t parent_context, child_context;
+    status_t result = mac_get_subject_context(parent->pid, &parent_context);
+    if (result != STATUS_OK) {
+        /* Parent has no context, create default */
+        result = mac_create_subject_context(parent, &parent_context);
+        if (result != STATUS_OK) return result;
+        mac_set_subject_context(parent->pid, &parent_context);
+    }
+    
+    /* Child inherits parent's context but with own UID/GID */
+    child_context = parent_context;
+    child_context.effective_uid = child->uid;
+    child_context.effective_gid = child->gid;
+    
+    /* Update label ownership */
+    for (uint8_t i = 0; i < child_context.label_count; i++) {
+        child_context.labels[i].owner_uid = child->uid;
+        child_context.labels[i].group_gid = child->gid;
+    }
+    
+    return mac_set_subject_context(child->pid, &child_context);
+}
+
+status_t mac_file_open_hook(pid_t pid, const char* path, uint32_t flags, bool* allowed) {
+    if (!path || !allowed) return STATUS_INVALID;
+    
+    mac_access_t access = 0;
+    if (flags & O_RDONLY || flags & O_RDWR) access |= MAC_ACCESS_READ;
+    if (flags & O_WRONLY || flags & O_RDWR) access |= MAC_ACCESS_WRITE;
+    if (flags & O_APPEND) access |= MAC_ACCESS_APPEND;
+    if (flags & O_TRUNC) access |= MAC_ACCESS_WRITE;
+    
+    return mac_check_file_access(pid, path, access, allowed);
+}
+
+status_t mac_audit_access(const mac_subject_t* subject, const mac_object_t* object,
+                         mac_access_t access, mac_decision_t decision) {
+    /* In a full implementation, this would write to an audit log */
+    if (decision == MAC_DECISION_DENY || decision == MAC_DECISION_AUDIT) {
+        log_warn("[MAC] Access %s: subject=%s object=%s access=0x%x",
+                (decision == MAC_DECISION_DENY) ? "DENIED" : "AUDITED",
+                subject->labels[0].label, object->labels[0].label, access);
+    }
+    return STATUS_OK;
+}
+
+status_t mac_get_enforcement_stats(uint64_t* checks, uint64_t* denials, uint64_t* audits) {
+    if (checks) *checks = g_access_checks;
+    if (denials) *denials = g_access_denials;
+    if (audits) *audits = g_access_audits;
+    return STATUS_OK;
+}
+
+status_t mac_reset_enforcement_stats(void) {
+    g_access_checks = 0;
+    g_access_denials = 0;
+    g_access_audits = 0;
+    return STATUS_OK;
+}

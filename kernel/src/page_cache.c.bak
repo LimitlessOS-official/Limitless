@@ -1,0 +1,112 @@
+#include "page_cache.h"
+#include "kernel.h"
+#include "vmm.h"
+#include "microkernel.h" // for pmm_alloc_page
+
+#define PC_HASH_BITS 10
+#define PC_HASH_SIZE (1u << PC_HASH_BITS)
+#define PC_HASH_MASK (PC_HASH_SIZE - 1u)
+
+typedef struct pc_state {
+    page_cache_page_t* hash[PC_HASH_SIZE];
+    page_cache_page_t* lru_head;
+    page_cache_page_t* lru_tail;
+    size_t page_count;
+    size_t max_pages;
+    struct page_cache_stats stats;
+} pc_state_t;
+
+static pc_state_t g_pc;
+
+static u64 pc_hash_key(vnode_t* vn, u64 index){ return ((u64)(uintptr_t)vn >> 4) ^ index; }
+static page_cache_page_t* pc_lookup(vnode_t* vn, u64 index){ u64 h=pc_hash_key(vn,index)&PC_HASH_MASK; page_cache_page_t* p=g_pc.hash[h]; while(p){ if(p->vnode==vn && p->index==index) return p; p=p->hnext;} return NULL; }
+static void pc_lru_remove(page_cache_page_t* pg){ if(pg->lru_prev) pg->lru_prev->lru_next=pg->lru_next; else g_pc.lru_head=pg->lru_next; if(pg->lru_next) pg->lru_next->lru_prev=pg->lru_prev; else g_pc.lru_tail=pg->lru_prev; pg->lru_prev=pg->lru_next=NULL; }
+static void pc_lru_push_tail(page_cache_page_t* pg){ pg->lru_prev=g_pc.lru_tail; pg->lru_next=NULL; if(g_pc.lru_tail) g_pc.lru_tail->lru_next=pg; else g_pc.lru_head=pg; g_pc.lru_tail=pg; }
+static void pc_hash_insert(page_cache_page_t* pg){ u64 h=pc_hash_key(pg->vnode,pg->index)&PC_HASH_MASK; pg->hnext=g_pc.hash[h]; g_pc.hash[h]=pg; }
+
+void page_cache_init(size_t max_pages){ k_memset(&g_pc,0,sizeof(g_pc)); g_pc.max_pages = max_pages?max_pages:1024; }
+
+phys_addr_t page_cache_alloc_phys(void){ return pmm_alloc_page(); }
+
+int page_cache_get(vnode_t* vn, u64 index, page_cache_page_t** out_pg, bool* newly_loaded){ if(!vn||!out_pg) return K_EINVAL; g_pc.stats.lookups++; page_cache_page_t* pg=pc_lookup(vn,index); if(pg){ g_pc.stats.hits++; pg->refcnt++; if(!(pg->flags & PAGE_CACHE_LOCKED)){ pc_lru_remove(pg); pc_lru_push_tail(pg);} if(newly_loaded) *newly_loaded=false; *out_pg=pg; return 0; }
+    /* Miss: allocate */
+    phys_addr_t pa = page_cache_alloc_phys(); if(!pa) return K_ENOMEM;
+    pg = (page_cache_page_t*)vmm_kmalloc(sizeof(page_cache_page_t), 64); if(!pg){ /* free page? omitted for now */ return K_ENOMEM; }
+    k_memset(pg,0,sizeof(*pg)); pg->vnode=vn; pg->index=index; pg->pa=pa; pg->refcnt=1; pg->flags=PAGE_CACHE_PRESENT|PAGE_CACHE_LOCKED;
+    pc_hash_insert(pg); pc_lru_push_tail(pg); g_pc.page_count++; g_pc.stats.loads++;
+    /* Load from underlying FS via vnode read op if present */
+    if(vn->ops && vn->ops->read && vn->type==VNODE_FILE){ char tmp[PAGE_SIZE]; long rd=vn->ops->read(vn,index*PAGE_SIZE,tmp,PAGE_SIZE); if(rd>0){ /* copy into mapped page memory (assumes direct map) */ k_memcpy((void*)(uintptr_t)(pg->pa), tmp, (size_t)rd); if(rd < (long)PAGE_SIZE){ /* zero remainder */ k_memset((void*)(uintptr_t)(pg->pa+rd),0,PAGE_SIZE-rd);} } else { /* zero page on error/EOF */ k_memset((void*)(uintptr_t)(pg->pa),0,PAGE_SIZE);} }
+    pg->flags &= ~PAGE_CACHE_LOCKED; if(newly_loaded) *newly_loaded=true; *out_pg=pg;
+    return 0; }
+
+void page_cache_release(page_cache_page_t* pg){ if(!pg) return; if(pg->refcnt>0) pg->refcnt--; if(pg->refcnt==0){ /* eligible for eviction later */ } }
+
+void page_cache_mark_dirty(page_cache_page_t* pg){ if(pg) pg->flags |= PAGE_CACHE_DIRTY; }
+
+static int pc_flush_page(page_cache_page_t* pg){ if(!pg || !(pg->flags & PAGE_CACHE_DIRTY)) return 0; vnode_t* vn=pg->vnode; if(!vn||!vn->ops||!vn->ops->write) return K_ENOTSUP; /* write back one page */ long wr = vn->ops->write(vn, pg->index*PAGE_SIZE, (const void*)(uintptr_t)pg->pa, PAGE_SIZE); if(wr<0) return (int)wr; pg->flags &= ~PAGE_CACHE_DIRTY; g_pc.stats.flushes++; return 0; }
+
+int page_cache_flush_vnode(vnode_t* vn){ page_cache_page_t* p=g_pc.lru_head; while(p){ if(p->vnode==vn) { pc_flush_page(p); } p=p->lru_next; } return 0; }
+
+int page_cache_sync_all(void){ page_cache_page_t* p=g_pc.lru_head; while(p){ pc_flush_page(p); p=p->lru_next; } return 0; }
+
+size_t page_cache_evict_some(size_t target){ size_t ev=0; page_cache_page_t* p=g_pc.lru_head; while(p && ev<target && g_pc.page_count>g_pc.max_pages){ page_cache_page_t* next=p->lru_next; if(p->refcnt==0 && !(p->flags & PAGE_CACHE_DIRTY)){ /* unlink */ pc_lru_remove(p); /* remove from hash */ u64 h=pc_hash_key(p->vnode,p->index)&PC_HASH_MASK; page_cache_page_t** cur=&g_pc.hash[h]; while(*cur){ if(*cur==p){ *cur=(*cur)->hnext; break;} cur=&(*cur)->hnext;} vmm_kfree(p,sizeof(*p)); g_pc.page_count--; g_pc.stats.evictions++; ev++; } p=next; } return ev; }
+
+const struct page_cache_stats* page_cache_get_stats(void){ return &g_pc.stats; }
+
+/* Map a cached page into an address space at VA (simple wrapper) */
+int page_cache_map_into(vmm_aspace_t* as, vnode_t* vn, u64 file_off, virt_addr_t va, int prot, bool writable){
+    u64 index = file_off / PAGE_SIZE; page_cache_page_t* pg; bool nl=false; int rc=page_cache_get(vn,index,&pg,&nl); if(rc!=0) return rc; pte_flags_t flags = PTE_PRESENT|PTE_USER; if(writable && (prot & 0x2)) flags|=PTE_WRITABLE; else flags|=PTE_NX; int mr = vmm_map(as, va, pg->pa, PAGE_SIZE, flags); page_cache_release(pg); return mr; }
+int page_cache_remap_writable(vmm_aspace_t* as, vnode_t* vn, u64 file_off, virt_addr_t va, int prot){
+    u64 index = file_off / PAGE_SIZE; page_cache_page_t* pg; bool nl=false; int rc=page_cache_get(vn,index,&pg,&nl); if(rc!=0) return rc; pte_flags_t flags = PTE_PRESENT|PTE_USER; if(prot & 0x2) flags|=PTE_WRITABLE; int mr = vmm_map(as, va, pg->pa, PAGE_SIZE, flags); page_cache_mark_dirty(pg); page_cache_release(pg); return mr; }
+
+int page_cache_debug_lookup(vnode_t* vn, u64 file_off, page_cache_page_info_t* out){
+    if(!vn || !out) return K_EINVAL;
+    u64 index = file_off / PAGE_SIZE;
+    page_cache_page_t* pg = pc_lookup(vn,index);
+    if(!pg){ out->present=0; out->index=index; out->pa=0; out->refcnt=0; out->flags=0; return 0; }
+    out->present=1; out->index=index; out->pa=pg->pa; out->refcnt=pg->refcnt; out->flags=pg->flags; return 0;
+}
+
+size_t page_cache_debug_range(vnode_t* vn, u64 file_off, u64 length, page_cache_page_info_t* out_array, size_t max_entries, u32 flags_filter){
+    if(!vn || !out_array || max_entries==0) return 0;
+    u64 start_index = file_off / PAGE_SIZE;
+    u64 end_off = file_off + length;
+    u64 end_index = (end_off + PAGE_SIZE -1)/PAGE_SIZE;
+    size_t written=0;
+    /* Iterate LRU list (covers all cached pages) and collect those in range */
+    for(page_cache_page_t* p=g_pc.lru_head; p && written<max_entries; p=p->lru_next){
+        if(p->vnode != vn) continue;
+        if(p->index < start_index || p->index >= end_index) continue;
+        if(flags_filter && ( (p->flags & flags_filter) != flags_filter)) continue;
+        out_array[written].present=1;
+        out_array[written].index=p->index;
+        out_array[written].pa=p->pa;
+        out_array[written].refcnt=p->refcnt;
+        out_array[written].flags=p->flags;
+        written++;
+    }
+    return written;
+}
+
+/* ---------------- Self-test Harness ---------------- */
+/* Test file read/write helpers moved to file scope */
+typedef struct pc_test_file { vnode_t vn; char data[8192]; } pc_test_file_t;
+static long pc_test_read(struct vnode* vn, u64 off, void* buf, size_t len){ pc_test_file_t* f=(pc_test_file_t*)vn; if(off>=sizeof(f->data)) return 0; if(off+len>sizeof(f->data)) len = sizeof(f->data)-(size_t)off; k_memcpy(buf,f->data+off,len); return (long)len; }
+static long pc_test_write(struct vnode* vn, u64 off, const void* buf, size_t len){ pc_test_file_t* f=(pc_test_file_t*)vn; if(off+len>sizeof(f->data)) len = sizeof(f->data)-(size_t)off; k_memcpy(f->data+off,buf,len); if(off+len>f->vn.size) f->vn.size=off+len; return (long)len; }
+static vnode_ops_t pc_test_ops = { .read=pc_test_read, .write=pc_test_write, .readdir=NULL, .lookup=NULL, .release=NULL };
+
+int page_cache_selftest(void){
+    pc_test_file_t file; k_memset(&file,0,sizeof(file)); file.vn.type=VNODE_FILE; file.vn.ops=&pc_test_ops; file.vn.size=sizeof(file.data); /* preset content */
+    for(size_t i=0;i<sizeof(file.data);i++) file.data[i]=(char)(i & 0xFF);
+    /* Reset cache stats and init with small limit */
+    page_cache_init(64);
+    const size_t TEST_READ_TOTAL = 4096; char buf[4096];
+    /* First pass: expect loads */
+    u64 off=0; while(off<TEST_READ_TOTAL){ page_cache_page_t* pg; bool newload=false; int rc=page_cache_get(&file.vn, off/PAGE_SIZE, &pg,&newload); if(rc!=0) return rc; if(!pg) return -1; /* copy partial */ u64 in_page=off % PAGE_SIZE; u64 to_copy = PAGE_SIZE - in_page; if(off+to_copy>TEST_READ_TOTAL) to_copy=TEST_READ_TOTAL-off; k_memcpy(buf+off, (void*)(uintptr_t)(pg->pa+in_page), (size_t)to_copy); page_cache_release(pg); off += to_copy; }
+    /* Second pass same pages: expect hits */
+    off=0; while(off<TEST_READ_TOTAL){ page_cache_page_t* pg; bool nl=false; int rc=page_cache_get(&file.vn, off/PAGE_SIZE, &pg,&nl); if(rc!=0) return rc; if(nl) return -2; page_cache_release(pg); off += PAGE_SIZE; }
+    const struct page_cache_stats* st = page_cache_get_stats(); if(st->hits == 0 || st->loads == 0) return -3; /* sanity */
+    /* Write modification and flush */
+    page_cache_page_t* wpg; bool nl=false; if(page_cache_get(&file.vn,1,&wpg,&nl)!=0) return -4; k_memset((void*)(uintptr_t)wpg->pa, 0xAB, PAGE_SIZE); page_cache_mark_dirty(wpg); page_cache_release(wpg); if(page_cache_flush_vnode(&file.vn)!=0) return -5; /* underlying data should reflect */
+    if(file.data[PAGE_SIZE] != (char)0xAB) return -6; /* first byte of page 1 changed */
+    return 0; }

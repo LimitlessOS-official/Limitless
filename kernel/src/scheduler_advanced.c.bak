@@ -1,0 +1,968 @@
+/*
+ * LimitlessOS Advanced Process Scheduler with AI Integration
+ * Completely Fair Scheduler (CFS) with AI workload analysis, real-time support,
+ * NUMA-aware load balancing, power-aware scheduling, and intelligent process migration
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+// Scheduling policies
+#define SCHED_NORMAL         0   // CFS
+#define SCHED_FIFO          1   // Real-time FIFO
+#define SCHED_RR            2   // Real-time round-robin
+#define SCHED_BATCH         3   // Batch processes
+#define SCHED_IDLE          5   // Idle priority
+#define SCHED_DEADLINE      6   // Deadline scheduling
+
+// Process states
+#define TASK_RUNNING        0
+#define TASK_INTERRUPTIBLE  1
+#define TASK_UNINTERRUPTIBLE 2
+#define TASK_ZOMBIE         4
+#define TASK_STOPPED        8
+#define TASK_SWAPPING       16
+
+// CPU affinity
+#define CPU_MASK_ALL        0xFFFFFFFFFFFFFFFFULL
+#define MAX_CPUS            64
+
+// AI workload prediction types
+#define WORKLOAD_CPU_BOUND     0
+#define WORKLOAD_IO_BOUND      1
+#define WORKLOAD_INTERACTIVE   2
+#define WORKLOAD_BATCH         3
+#define WORKLOAD_REALTIME      4
+#define WORKLOAD_MIXED         5
+
+// Power states for power-aware scheduling
+#define CPU_POWER_ACTIVE       0
+#define CPU_POWER_IDLE         1
+#define CPU_POWER_SLEEP        2
+#define CPU_POWER_DEEP_SLEEP   3
+
+// Red-Black tree node for CFS runqueue
+struct rb_node {
+    uint64_t key;               // vruntime for CFS
+    struct task *task;
+    struct rb_node *left;
+    struct rb_node *right;
+    struct rb_node *parent;
+    uint8_t color;              // 0 = black, 1 = red
+};
+
+// CFS scheduling entity
+struct sched_entity {
+    uint64_t vruntime;          // Virtual runtime
+    uint64_t exec_start;        // Execution start time
+    uint64_t sum_exec_runtime;  // Total execution time
+    uint64_t prev_sum_exec_runtime;
+    
+    struct rb_node run_node;    // RB tree node
+    bool on_rq;                 // On runqueue flag
+    
+    // CFS statistics
+    uint64_t wait_start;
+    uint64_t sleep_start;
+    uint64_t block_start;
+    uint64_t sleep_max;
+    uint64_t block_max;
+    uint64_t exec_max;
+    uint64_t slice_max;
+    uint64_t wait_max;
+    uint64_t wait_sum;
+    uint64_t wait_count;
+    
+    // Load tracking
+    uint32_t load_weight;
+    uint32_t load_avg_contrib;
+    
+    // NUMA affinity
+    uint8_t numa_preferred_node;
+    uint32_t numa_faults[8];    // Faults per NUMA node
+    uint64_t numa_scan_period;
+};
+
+// Real-time scheduling entity
+struct sched_rt_entity {
+    struct list_head run_list;
+    uint32_t time_slice;        // For SCHED_RR
+    uint32_t runtime;           // Runtime used in current period
+    uint64_t deadline;          // For deadline scheduling
+    uint64_t period;            // Period for deadline scheduling
+};
+
+// Deadline scheduling entity
+struct sched_dl_entity {
+    struct rb_node dl_node;
+    uint64_t deadline;          // Absolute deadline
+    uint64_t runtime;           // Remaining runtime
+    uint64_t period;            // Period
+    uint64_t dl_deadline;       // Relative deadline
+    uint64_t dl_period;         // Period
+    uint64_t dl_runtime;        // Runtime
+    
+    uint32_t flags;
+    bool dl_throttled;          // Throttled due to overrun
+    bool dl_new;                // New task
+    bool dl_boosted;            // Priority inheritance
+};
+
+// AI workload analysis
+struct workload_analysis {
+    uint8_t predicted_type;     // WORKLOAD_* constants
+    float cpu_intensity;        // 0.0 to 1.0
+    float io_intensity;         // 0.0 to 1.0
+    float memory_intensity;     // 0.0 to 1.0
+    float interactive_score;    // 0.0 to 1.0
+    
+    // Historical data
+    uint64_t cpu_cycles_used;
+    uint64_t io_operations;
+    uint64_t memory_accesses;
+    uint64_t context_switches;
+    
+    // Prediction confidence
+    float prediction_confidence;
+    uint32_t samples_collected;
+    
+    // Learning data
+    float feature_weights[16];
+    float neural_hidden[8];
+    float neural_output[4];
+};
+
+// Process/Task structure
+struct task {
+    uint32_t pid;               // Process ID
+    uint32_t tgid;              // Thread group ID
+    uint32_t ppid;              // Parent process ID
+    
+    char name[16];              // Process name
+    uint32_t state;             // Task state
+    uint32_t policy;            // Scheduling policy
+    int32_t priority;           // Static priority (-20 to 19)
+    int32_t nice;               // Nice value
+    
+    // Scheduling entities
+    struct sched_entity se;     // CFS entity
+    struct sched_rt_entity rt;  // RT entity
+    struct sched_dl_entity dl;  // Deadline entity
+    
+    // CPU affinity
+    uint64_t cpu_allowed;       // CPU affinity mask
+    uint32_t cpu;               // Current CPU
+    uint32_t prev_cpu;          // Previous CPU
+    uint32_t migration_disabled; // Migration disable count
+    
+    // Memory management
+    struct vmm_context *mm;     // Memory context
+    uint64_t rss;               // Resident set size
+    uint64_t virtual_size;      // Virtual memory size
+    
+    // File descriptors
+    struct files_struct *files;
+    
+    // Signal handling
+    struct sighand_struct *sighand;
+    
+    // Time tracking
+    uint64_t start_time;        // Task creation time
+    uint64_t real_start_time;   // Real time start
+    uint64_t utime;             // User time
+    uint64_t stime;             // System time
+    uint64_t gtime;             // Guest time
+    
+    // AI workload analysis
+    struct workload_analysis workload;
+    
+    // Power management
+    uint32_t power_preference;  // Performance vs power preference
+    bool power_sensitive;       // Sensitive to power state changes
+    
+    // Statistics
+    uint64_t voluntary_ctxt_switches;
+    uint64_t nonvoluntary_ctxt_switches;
+    uint64_t min_flt;           // Minor page faults
+    uint64_t maj_flt;           // Major page faults
+    
+    // Task relationships
+    struct task *parent;
+    struct list_head children;
+    struct list_head sibling;
+    
+    // List linkage
+    struct list_head tasks;     // Global task list
+    struct hlist_node pid_hash; // PID hash table
+    
+    // Synchronization
+    spinlock_t pi_lock;         // Priority inheritance lock
+    
+} __attribute__((aligned(64)));
+
+// Per-CPU runqueue
+struct cfs_rq {
+    uint32_t nr_running;        // Number of runnable tasks
+    uint64_t min_vruntime;      // Minimum vruntime
+    uint64_t exec_clock;        // Execution clock
+    
+    struct rb_node *leftmost;   // Leftmost (next to run) task
+    struct rb_root tasks_timeline; // RB tree root
+    
+    // Load tracking
+    uint32_t load_weight;
+    uint32_t runnable_weight;
+    uint32_t h_load;            // Hierarchical load
+    
+    // Statistics
+    uint64_t exec_runtime;
+    uint64_t wait_runtime;
+    uint32_t nr_spread_over;
+    
+    // Throttling (for cgroups)
+    uint64_t throttled_runtime;
+    uint64_t throttled_time;
+    bool throttled;
+};
+
+struct rt_rq {
+    struct list_head active;    // Active RT tasks
+    uint32_t rt_nr_running;     // Number of RT tasks
+    uint32_t rr_nr_running;     // Number of RR tasks
+    
+    // RT bandwidth control
+    uint64_t rt_runtime;
+    uint64_t rt_period;
+    uint64_t rt_time;
+    bool rt_throttled;
+    
+    // Highest priority task
+    struct task *highest_prio_task;
+    uint32_t highest_prio;
+};
+
+struct dl_rq {
+    struct rb_root dl_root;     // Deadline RB tree
+    struct rb_node *leftmost;   // Earliest deadline task
+    
+    uint32_t dl_nr_running;     // Number of deadline tasks
+    uint64_t earliest_dl;       // Earliest deadline
+    
+    // Bandwidth control
+    uint64_t dl_runtime;
+    uint64_t dl_period;
+    uint64_t dl_bw;             // Bandwidth
+};
+
+// Per-CPU scheduler data
+struct rq {
+    spinlock_t lock;
+    
+    uint32_t nr_running;        // Total runnable tasks
+    uint32_t nr_switches;       // Context switches count
+    uint32_t nr_uninterruptible; // Uninterruptible tasks
+    
+    struct task *curr;          // Currently running task
+    struct task *idle;          // Idle task
+    struct task *stop;          // Stop task (highest priority)
+    
+    // Scheduling classes
+    struct cfs_rq cfs;          // CFS runqueue
+    struct rt_rq rt;            // RT runqueue
+    struct dl_rq dl;            // Deadline runqueue
+    
+    // Load balancing
+    uint32_t cpu_load[5];       // CPU load averages
+    uint64_t last_load_update;  // Last load update time
+    uint32_t active_balance;    // Active balancing flag
+    uint32_t push_cpu;          // CPU to push tasks to
+    
+    // Migration
+    struct task *migration_head; // Migration queue head
+    struct task *migration_tail; // Migration queue tail
+    
+    // Power management
+    uint8_t power_state;        // Current power state
+    uint32_t power_efficiency;  // Power efficiency score
+    uint64_t idle_stamp;        // Idle entry time
+    uint64_t avg_idle;          // Average idle time
+    
+    // AI optimization
+    struct {
+        uint32_t workload_type_prediction[6]; // Prediction counts per type
+        float load_prediction_accuracy;
+        uint64_t migration_predictions;
+        uint64_t migration_accuracy;
+        float neural_weights[32];    // Simplified neural network
+    } ai_stats;
+    
+    // NUMA
+    uint8_t numa_node;
+    uint32_t numa_migrations;
+    
+    // Clock
+    uint64_t clock;
+    uint64_t clock_task;
+    
+} __attribute__((aligned(64)));
+
+// Global scheduler state
+struct scheduler {
+    // Per-CPU runqueues
+    struct rq cpu_rq[MAX_CPUS];
+    uint32_t nr_cpus;
+    
+    // Global task management
+    struct task *init_task;     // Init process
+    struct list_head task_list; // All tasks
+    struct hlist_head pid_hash[1024]; // PID hash table
+    uint32_t next_pid;
+    
+    // Load balancing
+    uint64_t next_balance;      // Next load balance time
+    uint32_t balance_interval;  // Load balance interval
+    
+    // AI scheduler optimization
+    struct {
+        bool enabled;
+        uint32_t model_version;
+        float accuracy_score;
+        
+        // Neural network for workload prediction
+        float input_weights[32][16];
+        float hidden_weights[16][8];
+        float output_weights[8][6];  // 6 workload types
+        
+        // Migration prediction network
+        float migration_weights[16][8];
+        float migration_output[8][1];
+        
+        // Statistics
+        uint64_t predictions_made;
+        uint64_t predictions_correct;
+        uint64_t optimal_migrations;
+        uint64_t suboptimal_migrations;
+        
+    } ai_engine;
+    
+    // Power-aware scheduling
+    struct {
+        bool enabled;
+        uint32_t power_policy;      // Performance vs power preference
+        uint64_t power_budget;      // Available power budget
+        uint64_t power_consumed;    // Current power consumption
+        
+        // CPU power states
+        uint8_t cpu_power_states[MAX_CPUS];
+        uint64_t cpu_idle_time[MAX_CPUS];
+        uint32_t cpu_frequencies[MAX_CPUS];
+        
+    } power_mgmt;
+    
+    // Global statistics
+    struct {
+        uint64_t total_forks;
+        uint64_t total_context_switches;
+        uint64_t total_migrations;
+        uint64_t total_load_balances;
+        uint64_t ai_optimizations;
+    } stats;
+    
+    rwlock_t tasklist_lock;
+    
+} scheduler;
+
+// CFS weight table (nice values -20 to 19)
+static const uint32_t prio_to_weight[40] = {
+    88761, 71755, 56483, 46273, 36291,  // -20 to -16
+    29154, 23254, 18705, 14949, 11916,  // -15 to -11
+    9548, 7620, 6100, 4904, 3906,       // -10 to -6
+    3121, 2501, 1991, 1586, 1277,       // -5 to -1
+    1024, 820, 655, 526, 423,           // 0 to 4
+    335, 272, 215, 172, 137,            // 5 to 9
+    110, 87, 70, 56, 45,                // 10 to 14
+    36, 29, 23, 18, 15                  // 15 to 19
+};
+
+// AI workload prediction
+static uint8_t ai_predict_workload_type(struct task *task) {
+    if (!scheduler.ai_engine.enabled) {
+        return WORKLOAD_MIXED; // Default fallback
+    }
+    
+    // Prepare input features
+    float inputs[16] = {
+        (float)task->workload.cpu_cycles_used / 1000000.0f,
+        (float)task->workload.io_operations / 1000.0f,
+        (float)task->workload.memory_accesses / 10000.0f,
+        (float)task->workload.context_switches / 100.0f,
+        (float)task->se.sum_exec_runtime / 1000000.0f,
+        (float)task->se.wait_sum / 1000000.0f,
+        (float)task->voluntary_ctxt_switches / 100.0f,
+        (float)task->nonvoluntary_ctxt_switches / 100.0f,
+        (float)task->min_flt / 1000.0f,
+        (float)task->maj_flt / 100.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f  // Additional features
+    };
+    
+    // Forward pass through neural network
+    float hidden[8] = {0};
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 16; j++) {
+            hidden[i] += inputs[j] * scheduler.ai_engine.input_weights[j][i];
+        }
+        // ReLU activation
+        if (hidden[i] < 0) hidden[i] = 0;
+    }
+    
+    float outputs[6] = {0};  // 6 workload types
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < 8; j++) {
+            outputs[i] += hidden[j] * scheduler.ai_engine.output_weights[j][i];
+        }
+    }
+    
+    // Find highest scoring workload type
+    uint8_t best_type = 0;
+    float best_score = outputs[0];
+    
+    for (int i = 1; i < 6; i++) {
+        if (outputs[i] > best_score) {
+            best_score = outputs[i];
+            best_type = i;
+        }
+    }
+    
+    task->workload.prediction_confidence = best_score;
+    scheduler.ai_engine.predictions_made++;
+    
+    return best_type;
+}
+
+// AI-based CPU selection for task migration
+static uint32_t ai_select_target_cpu(struct task *task, uint64_t cpu_loads[]) {
+    if (!scheduler.ai_engine.enabled) {
+        // Simple load-based selection
+        uint32_t best_cpu = 0;
+        uint64_t min_load = cpu_loads[0];
+        
+        for (uint32_t cpu = 1; cpu < scheduler.nr_cpus; cpu++) {
+            if (cpu_loads[cpu] < min_load && (task->cpu_allowed & (1ULL << cpu))) {
+                min_load = cpu_loads[cpu];
+                best_cpu = cpu;
+            }
+        }
+        return best_cpu;
+    }
+    
+    // AI-based selection
+    float inputs[8] = {
+        (float)task->workload.predicted_type / 6.0f,
+        task->workload.cpu_intensity,
+        task->workload.io_intensity,
+        task->workload.interactive_score,
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+    
+    // Add normalized CPU loads (first 4 CPUs)
+    for (int i = 0; i < 4 && i < scheduler.nr_cpus; i++) {
+        inputs[i + 4] = (float)cpu_loads[i] / 1000.0f;
+    }
+    
+    float hidden[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 8; j++) {
+            hidden[i] += inputs[j] * scheduler.ai_engine.migration_weights[j][i];
+        }
+        if (hidden[i] < 0) hidden[i] = 0;
+    }
+    
+    float cpu_score = 0;
+    for (int i = 0; i < 4; i++) {
+        cpu_score += hidden[i] * scheduler.ai_engine.migration_output[i][0];
+    }
+    
+    // Convert score to CPU selection
+    cpu_score = 1.0f / (1.0f + expf(-cpu_score)); // Sigmoid
+    uint32_t selected_cpu = (uint32_t)(cpu_score * scheduler.nr_cpus);
+    
+    if (selected_cpu >= scheduler.nr_cpus) {
+        selected_cpu = scheduler.nr_cpus - 1;
+    }
+    
+    // Ensure CPU is allowed for this task
+    if (!(task->cpu_allowed & (1ULL << selected_cpu))) {
+        // Fall back to simple selection
+        for (uint32_t cpu = 0; cpu < scheduler.nr_cpus; cpu++) {
+            if (task->cpu_allowed & (1ULL << cpu)) {
+                selected_cpu = cpu;
+                break;
+            }
+        }
+    }
+    
+    return selected_cpu;
+}
+
+// CFS Red-Black tree operations
+static void rb_insert_task(struct rb_root *root, struct task *task) {
+    struct rb_node **link = &root->rb_node;
+    struct rb_node *parent = NULL;
+    struct sched_entity *se = &task->se;
+    bool leftmost = true;
+    
+    while (*link) {
+        parent = *link;
+        struct task *entry = container_of(parent, struct task, se.run_node);
+        
+        if (se->vruntime < entry->se.vruntime) {
+            link = &parent->rb_left;
+        } else {
+            link = &parent->rb_right;
+            leftmost = false;
+        }
+    }
+    
+    se->run_node.parent = parent;
+    se->run_node.left = NULL;
+    se->run_node.right = NULL;
+    se->run_node.color = 1; // Red
+    
+    *link = &se->run_node;
+    
+    // Fix Red-Black tree properties (simplified)
+    // In production, this would be a complete RB tree implementation
+}
+
+static void rb_remove_task(struct rb_root *root, struct task *task) {
+    // Simplified RB tree removal
+    // In production, this would maintain RB tree properties
+    struct sched_entity *se = &task->se;
+    
+    if (se->run_node.left && se->run_node.right) {
+        // Node with two children - find successor
+        struct rb_node *successor = se->run_node.right;
+        while (successor->rb_left) {
+            successor = successor->rb_left;
+        }
+        
+        // Replace with successor (simplified)
+        se->run_node.key = successor->key;
+    }
+    
+    se->on_rq = false;
+}
+
+// CFS scheduler operations
+static void update_curr_cfs(struct cfs_rq *cfs_rq, struct task *curr) {
+    uint64_t now = get_timestamp();
+    uint64_t delta_exec = now - curr->se.exec_start;
+    
+    curr->se.exec_start = now;
+    curr->se.sum_exec_runtime += delta_exec;
+    
+    // Update vruntime
+    uint64_t delta_exec_weighted = (delta_exec * 1024) / curr->se.load_weight;
+    curr->se.vruntime += delta_exec_weighted;
+    
+    // Update CFS runqueue minimum vruntime
+    if (curr->se.vruntime < cfs_rq->min_vruntime) {
+        cfs_rq->min_vruntime = curr->se.vruntime;
+    }
+}
+
+static struct task *pick_next_task_cfs(struct cfs_rq *cfs_rq) {
+    if (!cfs_rq->leftmost) {
+        return NULL;
+    }
+    
+    struct task *next = container_of(cfs_rq->leftmost, struct task, se.run_node);
+    
+    // Remove from runqueue
+    rb_remove_task(&cfs_rq->tasks_timeline, next);
+    cfs_rq->nr_running--;
+    
+    // Update leftmost
+    if (cfs_rq->tasks_timeline.rb_node) {
+        struct rb_node *leftmost = cfs_rq->tasks_timeline.rb_node;
+        while (leftmost->rb_left) {
+            leftmost = leftmost->rb_left;
+        }
+        cfs_rq->leftmost = leftmost;
+    } else {
+        cfs_rq->leftmost = NULL;
+    }
+    
+    next->se.exec_start = get_timestamp();
+    return next;
+}
+
+static void enqueue_task_cfs(struct rq *rq, struct task *task, int flags) {
+    struct cfs_rq *cfs_rq = &rq->cfs;
+    struct sched_entity *se = &task->se;
+    
+    if (!se->on_rq) {
+        // Place task with appropriate vruntime
+        se->vruntime = max(se->vruntime, cfs_rq->min_vruntime);
+        
+        // Insert into RB tree
+        rb_insert_task(&cfs_rq->tasks_timeline, task);
+        cfs_rq->nr_running++;
+        rq->nr_running++;
+        
+        se->on_rq = true;
+        
+        // Update leftmost if this task has smaller vruntime
+        if (!cfs_rq->leftmost || se->vruntime < 
+            container_of(cfs_rq->leftmost, struct task, se.run_node)->se.vruntime) {
+            cfs_rq->leftmost = &se->run_node;
+        }
+    }
+}
+
+static void dequeue_task_cfs(struct rq *rq, struct task *task, int flags) {
+    struct cfs_rq *cfs_rq = &rq->cfs;
+    
+    if (task->se.on_rq) {
+        rb_remove_task(&cfs_rq->tasks_timeline, task);
+        cfs_rq->nr_running--;
+        rq->nr_running--;
+        task->se.on_rq = false;
+    }
+}
+
+// Real-time scheduler operations
+static struct task *pick_next_task_rt(struct rt_rq *rt_rq) {
+    if (list_empty(&rt_rq->active)) {
+        return NULL;
+    }
+    
+    // Return highest priority RT task
+    return rt_rq->highest_prio_task;
+}
+
+// Main scheduler - pick next task to run
+static struct task *pick_next_task(struct rq *rq) {
+    struct task *next;
+    
+    // Check stop task (highest priority)
+    if (rq->stop && rq->stop->state == TASK_RUNNING) {
+        return rq->stop;
+    }
+    
+    // Check deadline tasks
+    if (rq->dl.dl_nr_running > 0) {
+        if (rq->dl.leftmost) {
+            next = container_of(rq->dl.leftmost, struct task, dl.dl_node);
+            if (next->dl.deadline <= get_timestamp()) {
+                return next;
+            }
+        }
+    }
+    
+    // Check real-time tasks
+    if (rq->rt.rt_nr_running > 0) {
+        next = pick_next_task_rt(&rq->rt);
+        if (next) {
+            return next;
+        }
+    }
+    
+    // Check CFS tasks
+    if (rq->cfs.nr_running > 0) {
+        next = pick_next_task_cfs(&rq->cfs);
+        if (next) {
+            return next;
+        }
+    }
+    
+    // Return idle task
+    return rq->idle;
+}
+
+// Context switching
+void schedule(void) {
+    uint32_t cpu = get_current_cpu_id();
+    struct rq *rq = &scheduler.cpu_rq[cpu];
+    struct task *prev = rq->curr;
+    struct task *next;
+    
+    spin_lock(&rq->lock);
+    
+    // Update current task statistics
+    if (prev->policy == SCHED_NORMAL) {
+        update_curr_cfs(&rq->cfs, prev);
+    }
+    
+    // Update AI workload analysis
+    if (scheduler.ai_engine.enabled) {
+        prev->workload.predicted_type = ai_predict_workload_type(prev);
+        
+        // Update workload statistics
+        uint64_t runtime_delta = get_timestamp() - prev->se.exec_start;
+        prev->workload.cpu_cycles_used += runtime_delta;
+        prev->workload.samples_collected++;
+    }
+    
+    // Pick next task
+    next = pick_next_task(rq);
+    
+    if (next != prev) {
+        // Context switch needed
+        rq->curr = next;
+        rq->nr_switches++;
+        scheduler.stats.total_context_switches++;
+        
+        if (next->state == TASK_RUNNING) {
+            next->nonvoluntary_ctxt_switches++;
+        } else {
+            prev->voluntary_ctxt_switches++;
+        }
+        
+        // Update power management
+        if (scheduler.power_mgmt.enabled) {
+            update_cpu_power_state(cpu, next);
+        }
+        
+        spin_unlock(&rq->lock);
+        
+        // Perform actual context switch
+        context_switch(prev, next);
+    } else {
+        spin_unlock(&rq->lock);
+    }
+}
+
+// Load balancing
+static void load_balance(uint32_t cpu) {
+    struct rq *rq = &scheduler.cpu_rq[cpu];
+    struct rq *busiest_rq = NULL;
+    uint32_t max_load = 0;
+    
+    // Find busiest runqueue
+    for (uint32_t i = 0; i < scheduler.nr_cpus; i++) {
+        if (i == cpu) continue;
+        
+        struct rq *other_rq = &scheduler.cpu_rq[i];
+        uint32_t load = other_rq->nr_running;
+        
+        if (load > max_load && load > rq->nr_running + 1) {
+            max_load = load;
+            busiest_rq = other_rq;
+        }
+    }
+    
+    if (!busiest_rq) return;
+    
+    // Try to migrate a task from busiest runqueue
+    spin_lock(&busiest_rq->lock);
+    
+    if (busiest_rq->cfs.nr_running > 1) {
+        // Find a suitable task to migrate
+        struct rb_node *node = busiest_rq->cfs.tasks_timeline.rb_node;
+        
+        while (node) {
+            struct task *task = container_of(node, struct task, se.run_node);
+            
+            if (task->cpu_allowed & (1ULL << cpu) && !task->migration_disabled) {
+                // AI-based migration decision
+                uint64_t cpu_loads[MAX_CPUS];
+                for (uint32_t i = 0; i < scheduler.nr_cpus; i++) {
+                    cpu_loads[i] = scheduler.cpu_rq[i].nr_running;
+                }
+                
+                uint32_t optimal_cpu = ai_select_target_cpu(task, cpu_loads);
+                
+                if (optimal_cpu == cpu) {
+                    // Migrate this task
+                    dequeue_task_cfs(busiest_rq, task, 0);
+                    
+                    spin_unlock(&busiest_rq->lock);
+                    spin_lock(&rq->lock);
+                    
+                    task->cpu = cpu;
+                    enqueue_task_cfs(rq, task, 0);
+                    
+                    spin_unlock(&rq->lock);
+                    
+                    scheduler.stats.total_migrations++;
+                    kprintf("SCHED: Migrated task %s (PID %u) from CPU %u to CPU %u\n",
+                            task->name, task->pid, busiest_rq - scheduler.cpu_rq, cpu);
+                    return;
+                }
+            }
+            
+            node = rb_next(node);
+        }
+    }
+    
+    spin_unlock(&busiest_rq->lock);
+}
+
+// Power-aware scheduling
+static void update_cpu_power_state(uint32_t cpu, struct task *next_task) {
+    struct rq *rq = &scheduler.cpu_rq[cpu];
+    
+    if (next_task == rq->idle) {
+        // CPU going idle
+        rq->power_state = CPU_POWER_IDLE;
+        scheduler.power_mgmt.cpu_idle_time[cpu] = get_timestamp();
+        
+        // Consider deeper sleep states for power-sensitive workloads
+        if (scheduler.power_mgmt.power_policy > 0 && rq->nr_running == 0) {
+            rq->power_state = CPU_POWER_SLEEP;
+        }
+    } else {
+        // CPU becoming active
+        if (rq->power_state != CPU_POWER_ACTIVE) {
+            uint64_t idle_time = get_timestamp() - scheduler.power_mgmt.cpu_idle_time[cpu];
+            rq->avg_idle = (rq->avg_idle * 7 + idle_time) / 8;
+        }
+        
+        rq->power_state = CPU_POWER_ACTIVE;
+        
+        // Adjust CPU frequency based on workload prediction
+        if (next_task->workload.predicted_type == WORKLOAD_CPU_BOUND) {
+            // Boost frequency for CPU-bound tasks
+            scheduler.power_mgmt.cpu_frequencies[cpu] = 
+                min(scheduler.power_mgmt.cpu_frequencies[cpu] * 110 / 100, 3000); // Max 3GHz
+        } else if (next_task->power_sensitive) {
+            // Lower frequency for power-sensitive tasks
+            scheduler.power_mgmt.cpu_frequencies[cpu] = 
+                max(scheduler.power_mgmt.cpu_frequencies[cpu] * 90 / 100, 800); // Min 800MHz
+        }
+    }
+}
+
+// Process creation
+struct task *create_task(const char *name, void (*entry_point)(void), uint32_t flags) {
+    struct task *task = kmalloc(sizeof(struct task));
+    if (!task) return NULL;
+    
+    memset(task, 0, sizeof(struct task));
+    
+    // Basic task setup
+    task->pid = __atomic_fetch_add(&scheduler.next_pid, 1, __ATOMIC_SEQ_CST);
+    strncpy(task->name, name, sizeof(task->name) - 1);
+    task->state = TASK_RUNNING;
+    task->policy = SCHED_NORMAL;
+    task->priority = 0;
+    task->nice = 0;
+    
+    // CPU affinity (all CPUs by default)
+    task->cpu_allowed = (1ULL << scheduler.nr_cpus) - 1;
+    task->cpu = get_current_cpu_id();
+    
+    // Initialize scheduling entity
+    task->se.vruntime = 0;
+    task->se.exec_start = get_timestamp();
+    task->se.load_weight = prio_to_weight[20]; // Nice 0 weight
+    task->se.on_rq = false;
+    
+    // Initialize workload analysis
+    task->workload.predicted_type = WORKLOAD_MIXED;
+    task->workload.prediction_confidence = 0.5f;
+    
+    // Allocate memory context
+    task->mm = create_vmm_context();
+    if (!task->mm) {
+        kfree(task);
+        return NULL;
+    }
+    
+    // Initialize time tracking
+    task->start_time = get_timestamp();
+    task->real_start_time = get_realtime();
+    
+    // Add to global task list
+    write_lock(&scheduler.tasklist_lock);
+    list_add_tail(&task->tasks, &scheduler.task_list);
+    
+    // Add to PID hash table
+    uint32_t hash = task->pid % 1024;
+    hlist_add_head(&task->pid_hash, &scheduler.pid_hash[hash]);
+    
+    write_unlock(&scheduler.tasklist_lock);
+    
+    scheduler.stats.total_forks++;
+    
+    kprintf("SCHED: Created task %s (PID %u)\n", name, task->pid);
+    return task;
+}
+
+// Main scheduler initialization
+int scheduler_init(void) {
+    kprintf("SCHED: Initializing advanced scheduler with AI integration\n");
+    
+    memset(&scheduler, 0, sizeof(scheduler));
+    scheduler.nr_cpus = get_cpu_count();
+    scheduler.next_pid = 1;
+    scheduler.balance_interval = 1000; // 1ms
+    
+    // Initialize task list
+    INIT_LIST_HEAD(&scheduler.task_list);
+    rwlock_init(&scheduler.tasklist_lock);
+    
+    // Initialize PID hash table
+    for (int i = 0; i < 1024; i++) {
+        INIT_HLIST_HEAD(&scheduler.pid_hash[i]);
+    }
+    
+    // Initialize per-CPU runqueues
+    for (uint32_t cpu = 0; cpu < scheduler.nr_cpus; cpu++) {
+        struct rq *rq = &scheduler.cpu_rq[cpu];
+        
+        spin_lock_init(&rq->lock);
+        rq->nr_running = 0;
+        rq->cpu_load[0] = 0;
+        rq->numa_node = cpu / 4; // Simplified NUMA mapping
+        
+        // Initialize CFS runqueue
+        rq->cfs.tasks_timeline.rb_node = NULL;
+        rq->cfs.leftmost = NULL;
+        rq->cfs.nr_running = 0;
+        rq->cfs.min_vruntime = 0;
+        
+        // Initialize RT runqueue
+        INIT_LIST_HEAD(&rq->rt.active);
+        rq->rt.rt_nr_running = 0;
+        
+        // Initialize DL runqueue
+        rq->dl.dl_root.rb_node = NULL;
+        rq->dl.leftmost = NULL;
+        rq->dl.dl_nr_running = 0;
+        
+        // Power management
+        scheduler.power_mgmt.cpu_power_states[cpu] = CPU_POWER_ACTIVE;
+        scheduler.power_mgmt.cpu_frequencies[cpu] = 2000; // 2GHz default
+    }
+    
+    // Initialize AI engine
+    scheduler.ai_engine.enabled = true;
+    scheduler.ai_engine.model_version = 1;
+    scheduler.ai_engine.accuracy_score = 0.5f;
+    
+    // Initialize neural network weights
+    for (int i = 0; i < 16; i++) {
+        for (int j = 0; j < 8; j++) {
+            scheduler.ai_engine.input_weights[i][j] = ((float)(i + j) / 50.0f) - 0.3f;
+            if (i < 8 && j < 6) {
+                scheduler.ai_engine.output_weights[i][j] = ((float)(i - j) / 20.0f);
+            }
+            if (j < 4) {
+                scheduler.ai_engine.migration_weights[i][j] = ((float)(i * j) / 30.0f) - 0.2f;
+            }
+        }
+    }
+    
+    // Initialize power management
+    scheduler.power_mgmt.enabled = true;
+    scheduler.power_mgmt.power_policy = 1; // Balanced
+    scheduler.power_mgmt.power_budget = 45000; // 45W typical laptop TDP
+    
+    kprintf("SCHED: Advanced scheduler initialized for %u CPUs\n", scheduler.nr_cpus);
+    kprintf("SCHED: AI workload prediction enabled, power-aware scheduling enabled\n");
+    
+    return 0;
+}

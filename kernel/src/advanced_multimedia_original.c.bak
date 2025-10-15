@@ -1,0 +1,900 @@
+/*
+ * Advanced Multimedia Subsystems
+ * Audio, graphics, video acceleration, and multimedia frameworks
+ */
+
+#include "kernel.h"
+#include "hal.h"
+#include "device.h"
+
+/* Audio constants */
+#define MAX_AUDIO_DEVICES       16
+#define AUDIO_BUFFER_SIZE       8192
+#define AUDIO_SAMPLE_RATES      {8000, 16000, 22050, 44100, 48000, 96000, 192000}
+#define MAX_AUDIO_CHANNELS      8
+
+/* Graphics constants */
+#define MAX_GPU_DEVICES         8
+#define MAX_FRAMEBUFFERS       16
+#define GPU_MEMORY_POOL_SIZE    (256 * 1024 * 1024)  /* 256MB */
+
+/* Video codec support */
+#define MAX_VIDEO_CODECS        32
+#define VIDEO_FRAME_BUFFER_SIZE (1920 * 1080 * 4)    /* 4K RGBA */
+
+/* Audio device structure */
+typedef struct audio_device {
+    uint32_t device_id;             /* Device ID */
+    char name[64];                  /* Device name */
+    uint32_t capabilities;          /* Device capabilities */
+    
+    /* Audio parameters */
+    uint32_t sample_rates[16];      /* Supported sample rates */
+    uint32_t sample_rate_count;     /* Number of supported rates */
+    uint32_t max_channels;          /* Maximum channels */
+    uint32_t bit_depths;            /* Supported bit depths (bitmask) */
+    
+    /* Buffers */
+    void* playback_buffer;          /* Playback buffer */
+    void* capture_buffer;           /* Capture buffer */
+    uint32_t buffer_size;           /* Buffer size */
+    uint32_t period_size;           /* Period size */
+    
+    /* Current state */
+    uint32_t current_sample_rate;   /* Current sample rate */
+    uint32_t current_channels;      /* Current channels */
+    uint32_t current_bit_depth;     /* Current bit depth */
+    bool playing;                   /* Currently playing */
+    bool recording;                 /* Currently recording */
+    
+    /* Statistics */
+    uint64_t frames_played;         /* Frames played */
+    uint64_t frames_recorded;       /* Frames recorded */
+    uint64_t underruns;             /* Buffer underruns */
+    uint64_t overruns;              /* Buffer overruns */
+    
+    /* Hardware operations */
+    status_t (*start_playback)(struct audio_device* dev);
+    status_t (*stop_playback)(struct audio_device* dev);
+    status_t (*start_capture)(struct audio_device* dev);
+    status_t (*stop_capture)(struct audio_device* dev);
+    status_t (*set_format)(struct audio_device* dev, uint32_t rate, uint32_t channels, uint32_t bits);
+    
+    volatile uint32_t lock;         /* Device lock */
+    struct audio_device* next;      /* Next device */
+} audio_device_t;
+
+/* Graphics device structure */
+typedef struct gpu_device {
+    uint32_t device_id;             /* Device ID */
+    char name[64];                  /* Device name */
+    uint32_t vendor_id;             /* Vendor ID */
+    uint32_t product_id;            /* Product ID */
+    
+    /* Memory management */
+    void* vram_base;                /* VRAM base address */
+    uint64_t vram_size;             /* VRAM size */
+    void* memory_pool;              /* GPU memory pool */
+    uint64_t memory_used;           /* Used GPU memory */
+    
+    /* Display capabilities */
+    uint32_t max_width;             /* Maximum width */
+    uint32_t max_height;            /* Maximum height */
+    uint32_t max_refresh_rate;      /* Maximum refresh rate */
+    uint32_t supported_formats;     /* Supported pixel formats */
+    
+    /* 3D capabilities */
+    uint32_t shader_units;          /* Number of shader units */
+    uint32_t texture_units;         /* Number of texture units */
+    uint32_t max_textures;          /* Maximum texture size */
+    bool hardware_accel;            /* Hardware acceleration available */
+    
+    /* Current state */
+    uint32_t current_width;         /* Current resolution width */
+    uint32_t current_height;        /* Current resolution height */
+    uint32_t current_bpp;           /* Current bits per pixel */
+    uint32_t current_refresh;       /* Current refresh rate */
+    
+    /* Statistics */
+    uint64_t frames_rendered;       /* Frames rendered */
+    uint64_t triangles_rendered;    /* Triangles rendered */
+    uint64_t texture_uploads;       /* Texture uploads */
+    uint64_t gpu_time_ns;           /* GPU time spent rendering */
+    
+    /* Hardware operations */
+    status_t (*set_mode)(struct gpu_device* gpu, uint32_t width, uint32_t height, uint32_t bpp);
+    status_t (*allocate_memory)(struct gpu_device* gpu, uint64_t size, void** address);
+    status_t (*free_memory)(struct gpu_device* gpu, void* address);
+    status_t (*upload_texture)(struct gpu_device* gpu, const void* data, uint32_t width, uint32_t height);
+    status_t (*render_frame)(struct gpu_device* gpu, const void* commands);
+    
+    volatile uint32_t lock;         /* Device lock */
+    struct gpu_device* next;        /* Next device */
+} gpu_device_t;
+
+/* Video codec structure */
+typedef struct video_codec {
+    uint32_t codec_id;              /* Codec ID */
+    char name[32];                  /* Codec name */
+    char fourcc[4];                 /* FourCC identifier */
+    uint32_t capabilities;          /* Codec capabilities */
+    
+    /* Supported formats */
+    uint32_t max_width;             /* Maximum width */
+    uint32_t max_height;            /* Maximum height */
+    uint32_t max_fps;               /* Maximum frame rate */
+    uint32_t color_formats;         /* Supported color formats */
+    
+    /* Hardware acceleration */
+    bool hw_decode;                 /* Hardware decode support */
+    bool hw_encode;                 /* Hardware encode support */
+    gpu_device_t* gpu_device;       /* Associated GPU device */
+    
+    /* Codec operations */
+    status_t (*decode_frame)(struct video_codec* codec, const void* input, void* output);
+    status_t (*encode_frame)(struct video_codec* codec, const void* input, void* output);
+    status_t (*configure)(struct video_codec* codec, uint32_t width, uint32_t height, uint32_t fps);
+    
+    struct video_codec* next;       /* Next codec */
+} video_codec_t;
+
+/* Framebuffer structure */
+typedef struct framebuffer {
+    uint32_t fb_id;                 /* Framebuffer ID */
+    uint32_t width;                 /* Width in pixels */
+    uint32_t height;                /* Height in pixels */
+    uint32_t bpp;                   /* Bits per pixel */
+    uint32_t pitch;                 /* Bytes per line */
+    
+    void* buffer;                   /* Frame buffer memory */
+    uint64_t buffer_size;           /* Buffer size */
+    void* back_buffer;              /* Back buffer for double buffering */
+    
+    /* Color format */
+    uint32_t red_mask;              /* Red color mask */
+    uint32_t green_mask;            /* Green color mask */
+    uint32_t blue_mask;             /* Blue color mask */
+    uint32_t alpha_mask;            /* Alpha color mask */
+    
+    bool double_buffered;           /* Double buffering enabled */
+    bool hardware_cursor;           /* Hardware cursor support */
+    
+    gpu_device_t* gpu_device;       /* Associated GPU device */
+    
+    volatile uint32_t lock;         /* Framebuffer lock */
+} framebuffer_t;
+
+/* Audio mixer channel */
+typedef struct mixer_channel {
+    uint32_t channel_id;            /* Channel ID */
+    float volume;                   /* Volume (0.0 - 1.0) */
+    float pan;                      /* Pan (-1.0 to 1.0) */
+    bool muted;                     /* Channel muted */
+    
+    /* Effects */
+    float reverb;                   /* Reverb level */
+    float echo;                     /* Echo level */
+    float eq_bass;                  /* Bass EQ */
+    float eq_mid;                   /* Mid EQ */
+    float eq_treble;                /* Treble EQ */
+    
+    struct mixer_channel* next;     /* Next channel */
+} mixer_channel_t;
+
+/* Multimedia subsystem state */
+static struct {
+    /* Audio subsystem */
+    audio_device_t* audio_devices;  /* Audio devices */
+    uint32_t audio_device_count;    /* Number of audio devices */
+    audio_device_t* default_playback; /* Default playback device */
+    audio_device_t* default_capture; /* Default capture device */
+    
+    /* Graphics subsystem */
+    gpu_device_t* gpu_devices;      /* GPU devices */
+    uint32_t gpu_device_count;      /* Number of GPU devices */
+    gpu_device_t* primary_gpu;      /* Primary GPU */
+    
+    framebuffer_t framebuffers[MAX_FRAMEBUFFERS]; /* Framebuffers */
+    uint32_t framebuffer_count;     /* Number of framebuffers */
+    
+    /* Video codec subsystem */
+    video_codec_t* video_codecs;    /* Video codecs */
+    uint32_t video_codec_count;     /* Number of codecs */
+    
+    /* Audio mixer */
+    mixer_channel_t* mixer_channels; /* Mixer channels */
+    uint32_t mixer_channel_count;   /* Number of mixer channels */
+    float master_volume;            /* Master volume */
+    
+    /* Global settings */
+    bool audio_enabled;             /* Audio subsystem enabled */
+    bool graphics_enabled;          /* Graphics subsystem enabled */
+    bool video_enabled;             /* Video subsystem enabled */
+    
+    volatile uint32_t lock;         /* Global lock */
+} multimedia;
+
+/* Initialize audio subsystem */
+static status_t init_audio_subsystem(void) {
+    KLOG_INFO("MULTIMEDIA", "Initializing audio subsystem");
+    
+    multimedia.audio_enabled = true;
+    multimedia.master_volume = 1.0f;
+    
+    /* Scan for audio devices */
+    /* Enumerate PCI audio devices (HDA, AC97), USB audio devices */
+    
+    /* Scan PCI bus for audio controllers */
+    for (uint32_t bus = 0; bus < 256; bus++) {
+        for (uint32_t slot = 0; slot < 32; slot++) {
+            uint32_t vendor_device = pci_read_config_dword(bus, slot, 0, 0x00);
+            if (vendor_device != 0xFFFFFFFF) {
+                uint32_t class_code = pci_read_config_dword(bus, slot, 0, 0x08) >> 8;
+                if ((class_code & 0xFF0000) == 0x040000) { /* Audio controller */
+                    KLOG_INFO("MULTIMEDIA", "Found audio device: bus %u slot %u", bus, slot);
+                    /* Initialize audio device */
+                }
+            }
+        }
+    }
+    
+    /* Create a simulated audio device */
+    audio_device_t* device = (audio_device_t*)kalloc(sizeof(audio_device_t));
+    if (!device) return STATUS_NOMEM;
+    
+    memset(device, 0, sizeof(*device));
+    
+    device->device_id = 0;
+    strncpy(device->name, "LimitlessOS Audio Controller", sizeof(device->name) - 1);
+    device->capabilities = 0x03; /* Playback and capture */
+    
+    /* Set supported sample rates */
+    uint32_t sample_rates[] = AUDIO_SAMPLE_RATES;
+    device->sample_rate_count = sizeof(sample_rates) / sizeof(sample_rates[0]);
+    memcpy(device->sample_rates, sample_rates, sizeof(sample_rates));
+    
+    device->max_channels = MAX_AUDIO_CHANNELS;
+    device->bit_depths = 0x1C; /* 16-bit, 24-bit, 32-bit */
+    
+    /* Allocate buffers */
+    device->playback_buffer = kalloc(AUDIO_BUFFER_SIZE);
+    device->capture_buffer = kalloc(AUDIO_BUFFER_SIZE);
+    device->buffer_size = AUDIO_BUFFER_SIZE;
+    device->period_size = AUDIO_BUFFER_SIZE / 4;
+    
+    /* Set default format */
+    device->current_sample_rate = 44100;
+    device->current_channels = 2;
+    device->current_bit_depth = 16;
+    
+    /* Add to device list */
+    device->next = multimedia.audio_devices;
+    multimedia.audio_devices = device;
+    multimedia.audio_device_count++;
+    
+    /* Set as default */
+    multimedia.default_playback = device;
+    multimedia.default_capture = device;
+    
+    KLOG_INFO("MULTIMEDIA", "Audio subsystem initialized with %u devices", 
+              multimedia.audio_device_count);
+    
+    return STATUS_OK;
+}
+
+/* Initialize graphics subsystem */
+static status_t init_graphics_subsystem(void) {
+    KLOG_INFO("MULTIMEDIA", "Initializing graphics subsystem");
+    
+    multimedia.graphics_enabled = true;
+    
+    /* Scan for GPU devices */
+    /* Enumerate PCI graphics devices (Intel, AMD, NVIDIA) */
+    
+    /* Scan PCI bus for display controllers */
+    for (uint32_t bus = 0; bus < 256; bus++) {
+        for (uint32_t slot = 0; slot < 32; slot++) {
+            uint32_t vendor_device = pci_read_config_dword(bus, slot, 0, 0x00);
+            if (vendor_device != 0xFFFFFFFF) {
+                uint32_t class_code = pci_read_config_dword(bus, slot, 0, 0x08) >> 8;
+                if ((class_code & 0xFF0000) == 0x030000) { /* Display controller */
+                    uint16_t vendor_id = vendor_device & 0xFFFF;
+                    KLOG_INFO("MULTIMEDIA", "Found GPU: vendor 0x%x bus %u slot %u", vendor_id, bus, slot);
+                    /* Initialize graphics device */
+                }
+            }
+        }
+    }
+    
+    /* Create a simulated GPU device */
+    gpu_device_t* gpu = (gpu_device_t*)kalloc(sizeof(gpu_device_t));
+    if (!gpu) return STATUS_NOMEM;
+    
+    memset(gpu, 0, sizeof(*gpu));
+    
+    gpu->device_id = 0;
+    strncpy(gpu->name, "LimitlessOS Graphics Controller", sizeof(gpu->name) - 1);
+    gpu->vendor_id = 0x1234;
+    gpu->product_id = 0x5678;
+    
+    /* Set capabilities */
+    gpu->vram_size = 256 * 1024 * 1024; /* 256MB VRAM */
+    gpu->memory_pool = kalloc(GPU_MEMORY_POOL_SIZE);
+    gpu->memory_used = 0;
+    
+    gpu->max_width = 3840;
+    gpu->max_height = 2160;
+    gpu->max_refresh_rate = 120;
+    gpu->supported_formats = 0x0F; /* RGB565, RGB888, ARGB8888, etc. */
+    
+    gpu->shader_units = 256;
+    gpu->texture_units = 32;
+    gpu->max_textures = 4096;
+    gpu->hardware_accel = true;
+    
+    /* Set default mode */
+    gpu->current_width = 1920;
+    gpu->current_height = 1080;
+    gpu->current_bpp = 32;
+    gpu->current_refresh = 60;
+    
+    /* Add to device list */
+    gpu->next = multimedia.gpu_devices;
+    multimedia.gpu_devices = gpu;
+    multimedia.gpu_device_count++;
+    multimedia.primary_gpu = gpu;
+    
+    /* Create primary framebuffer */
+    framebuffer_t* fb = &multimedia.framebuffers[0];
+    memset(fb, 0, sizeof(*fb));
+    
+    fb->fb_id = 0;
+    fb->width = gpu->current_width;
+    fb->height = gpu->current_height;
+    fb->bpp = gpu->current_bpp;
+    fb->pitch = fb->width * (fb->bpp / 8);
+    
+    fb->buffer_size = fb->pitch * fb->height;
+    fb->buffer = kalloc(fb->buffer_size);
+    fb->back_buffer = kalloc(fb->buffer_size);
+    
+    fb->red_mask = 0x00FF0000;
+    fb->green_mask = 0x0000FF00;
+    fb->blue_mask = 0x000000FF;
+    fb->alpha_mask = 0xFF000000;
+    
+    fb->double_buffered = true;
+    fb->hardware_cursor = true;
+    fb->gpu_device = gpu;
+    
+    multimedia.framebuffer_count = 1;
+    
+    KLOG_INFO("MULTIMEDIA", "Graphics subsystem initialized");
+    KLOG_INFO("MULTIMEDIA", "  Primary GPU: %s (%u MB VRAM)", gpu->name, gpu->vram_size / (1024 * 1024));
+    KLOG_INFO("MULTIMEDIA", "  Primary framebuffer: %ux%u@%u (%u MB)", 
+              fb->width, fb->height, fb->bpp, fb->buffer_size / (1024 * 1024));
+    
+    return STATUS_OK;
+}
+
+/* Initialize video codec subsystem */
+static status_t init_video_subsystem(void) {
+    KLOG_INFO("MULTIMEDIA", "Initializing video codec subsystem");
+    
+    multimedia.video_enabled = true;
+    
+    /* Register built-in codecs */
+    const char* codec_names[] = {"H.264", "H.265/HEVC", "VP9", "AV1"};
+    const char* codec_fourccs[][4] = {
+        {"H264"}, {"HEVC"}, {"VP90"}, {"AV01"}
+    };
+    
+    for (int i = 0; i < 4; i++) {
+        video_codec_t* codec = (video_codec_t*)kalloc(sizeof(video_codec_t));
+        if (!codec) continue;
+        
+        memset(codec, 0, sizeof(*codec));
+        
+        codec->codec_id = i;
+        strncpy(codec->name, codec_names[i], sizeof(codec->name) - 1);
+        memcpy(codec->fourcc, codec_fourccs[i], 4);
+        codec->capabilities = 0x03; /* Decode and encode */
+        
+        codec->max_width = 3840;
+        codec->max_height = 2160;
+        codec->max_fps = 120;
+        codec->color_formats = 0x07; /* YUV420, YUV422, YUV444 */
+        
+        codec->hw_decode = true;
+        codec->hw_encode = true;
+        codec->gpu_device = multimedia.primary_gpu;
+        
+        /* Add to codec list */
+        codec->next = multimedia.video_codecs;
+        multimedia.video_codecs = codec;
+        multimedia.video_codec_count++;
+    }
+    
+    KLOG_INFO("MULTIMEDIA", "Video codec subsystem initialized with %u codecs", 
+              multimedia.video_codec_count);
+    
+    return STATUS_OK;
+}
+
+/* Audio playback operations */
+status_t audio_start_playback(uint32_t device_id, uint32_t sample_rate, 
+                             uint32_t channels, uint32_t bit_depth) {
+    audio_device_t* device = multimedia.audio_devices;
+    while (device && device->device_id != device_id) {
+        device = device->next;
+    }
+    
+    if (!device) return STATUS_NOT_FOUND;
+    
+    __sync_lock_test_and_set(&device->lock, 1);
+    
+    if (device->playing) {
+        __sync_lock_release(&device->lock);
+        return STATUS_BUSY;
+    }
+    
+    /* Set audio format */
+    if (device->set_format) {
+        status_t result = device->set_format(device, sample_rate, channels, bit_depth);
+        if (result != STATUS_OK) {
+            __sync_lock_release(&device->lock);
+            return result;
+        }
+    }
+    
+    device->current_sample_rate = sample_rate;
+    device->current_channels = channels;
+    device->current_bit_depth = bit_depth;
+    
+    /* Start playback */
+    if (device->start_playback) {
+        device->start_playback(device);
+    }
+    
+    device->playing = true;
+    
+    __sync_lock_release(&device->lock);
+    
+    KLOG_INFO("MULTIMEDIA", "Started audio playback on device %u: %uHz, %uch, %ubit", 
+              device_id, sample_rate, channels, bit_depth);
+    
+    return STATUS_OK;
+}
+
+status_t audio_stop_playback(uint32_t device_id) {
+    audio_device_t* device = multimedia.audio_devices;
+    while (device && device->device_id != device_id) {
+        device = device->next;
+    }
+    
+    if (!device) return STATUS_NOT_FOUND;
+    
+    __sync_lock_test_and_set(&device->lock, 1);
+    
+    if (device->stop_playback) {
+        device->stop_playback(device);
+    }
+    
+    device->playing = false;
+    
+    __sync_lock_release(&device->lock);
+    
+    KLOG_INFO("MULTIMEDIA", "Stopped audio playback on device %u", device_id);
+    return STATUS_OK;
+}
+
+/* Graphics operations */
+status_t gpu_set_display_mode(uint32_t device_id, uint32_t width, 
+                             uint32_t height, uint32_t bpp, uint32_t refresh) {
+    gpu_device_t* gpu = multimedia.gpu_devices;
+    while (gpu && gpu->device_id != device_id) {
+        gpu = gpu->next;
+    }
+    
+    if (!gpu) return STATUS_NOT_FOUND;
+    
+    if (width > gpu->max_width || height > gpu->max_height || refresh > gpu->max_refresh_rate) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&gpu->lock, 1);
+    
+    if (gpu->set_mode) {
+        status_t result = gpu->set_mode(gpu, width, height, bpp);
+        if (result != STATUS_OK) {
+            __sync_lock_release(&gpu->lock);
+            return result;
+        }
+    }
+    
+    gpu->current_width = width;
+    gpu->current_height = height;
+    gpu->current_bpp = bpp;
+    gpu->current_refresh = refresh;
+    
+    /* Update primary framebuffer */
+    if (gpu == multimedia.primary_gpu && multimedia.framebuffer_count > 0) {
+        framebuffer_t* fb = &multimedia.framebuffers[0];
+        
+        __sync_lock_test_and_set(&fb->lock, 1);
+        
+        /* Reallocate framebuffer if size changed */
+        uint32_t new_pitch = width * (bpp / 8);
+        uint64_t new_size = new_pitch * height;
+        
+        if (new_size != fb->buffer_size) {
+            kfree(fb->buffer);
+            kfree(fb->back_buffer);
+            
+            fb->buffer = kalloc(new_size);
+            fb->back_buffer = kalloc(new_size);
+        }
+        
+        fb->width = width;
+        fb->height = height;
+        fb->bpp = bpp;
+        fb->pitch = new_pitch;
+        fb->buffer_size = new_size;
+        
+        __sync_lock_release(&fb->lock);
+    }
+    
+    __sync_lock_release(&gpu->lock);
+    
+    KLOG_INFO("MULTIMEDIA", "Set display mode on GPU %u: %ux%u@%uHz (%ubpp)", 
+              device_id, width, height, refresh, bpp);
+    
+    return STATUS_OK;
+}
+
+status_t gpu_allocate_memory(uint32_t device_id, uint64_t size, void** address) {
+    gpu_device_t* gpu = multimedia.gpu_devices;
+    while (gpu && gpu->device_id != device_id) {
+        gpu = gpu->next;
+    }
+    
+    if (!gpu || !address) return STATUS_INVALID;
+    
+    __sync_lock_test_and_set(&gpu->lock, 1);
+    
+    if (gpu->memory_used + size > GPU_MEMORY_POOL_SIZE) {
+        __sync_lock_release(&gpu->lock);
+        return STATUS_NOMEM;
+    }
+    
+    /* Simple linear allocator for GPU memory */
+    *address = (uint8_t*)gpu->memory_pool + gpu->memory_used;
+    gpu->memory_used += size;
+    
+    __sync_lock_release(&gpu->lock);
+    
+    KLOG_DEBUG("MULTIMEDIA", "Allocated %llu bytes of GPU memory at %p", size, *address);
+    return STATUS_OK;
+}
+
+/* Video codec operations */
+status_t video_decode_frame(uint32_t codec_id, const void* input_data, 
+                           uint32_t input_size, void* output_buffer) {
+    video_codec_t* codec = multimedia.video_codecs;
+    while (codec && codec->codec_id != codec_id) {
+        codec = codec->next;
+    }
+    
+    if (!codec || !input_data || !output_buffer) return STATUS_INVALID;
+    
+    if (codec->decode_frame) {
+        return codec->decode_frame(codec, input_data, output_buffer);
+    }
+    
+    /* Simple decode simulation */
+    memset(output_buffer, 0x80, VIDEO_FRAME_BUFFER_SIZE); /* Gray frame */
+    
+    KLOG_DEBUG("MULTIMEDIA", "Decoded frame with codec %s (%u bytes input)", 
+               codec->name, input_size);
+    
+    return STATUS_OK;
+}
+
+status_t video_encode_frame(uint32_t codec_id, const void* input_frame, 
+                           void* output_buffer, uint32_t* output_size) {
+    video_codec_t* codec = multimedia.video_codecs;
+    while (codec && codec->codec_id != codec_id) {
+        codec = codec->next;
+    }
+    
+    if (!codec || !input_frame || !output_buffer || !output_size) return STATUS_INVALID;
+    
+    if (codec->encode_frame) {
+        return codec->encode_frame(codec, input_frame, output_buffer);
+    }
+    
+    /* Simple encode simulation */
+    *output_size = VIDEO_FRAME_BUFFER_SIZE / 10; /* Simulate 10:1 compression */
+    memset(output_buffer, 0x42, *output_size);
+    
+    KLOG_DEBUG("MULTIMEDIA", "Encoded frame with codec %s (%u bytes output)", 
+               codec->name, *output_size);
+    
+    return STATUS_OK;
+}
+
+/* Framebuffer operations */
+status_t framebuffer_clear(uint32_t fb_id, uint32_t color) {
+    if (fb_id >= multimedia.framebuffer_count) return STATUS_INVALID;
+    
+    framebuffer_t* fb = &multimedia.framebuffers[fb_id];
+    
+    __sync_lock_test_and_set(&fb->lock, 1);
+    
+    uint32_t* buffer = (uint32_t*)fb->back_buffer;
+    uint32_t pixel_count = (fb->width * fb->height);
+    
+    for (uint32_t i = 0; i < pixel_count; i++) {
+        buffer[i] = color;
+    }
+    
+    __sync_lock_release(&fb->lock);
+    
+    return STATUS_OK;
+}
+
+status_t framebuffer_swap(uint32_t fb_id) {
+    if (fb_id >= multimedia.framebuffer_count) return STATUS_INVALID;
+    
+    framebuffer_t* fb = &multimedia.framebuffers[fb_id];
+    
+    if (!fb->double_buffered) return STATUS_NOT_SUPPORTED;
+    
+    __sync_lock_test_and_set(&fb->lock, 1);
+    
+    /* Swap front and back buffers */
+    void* temp = fb->buffer;
+    fb->buffer = fb->back_buffer;
+    fb->back_buffer = temp;
+    
+    __sync_lock_release(&fb->lock);
+    
+    return STATUS_OK;
+}
+
+/* Audio mixer operations */
+status_t mixer_set_volume(uint32_t channel_id, float volume) {
+    mixer_channel_t* channel = multimedia.mixer_channels;
+    while (channel && channel->channel_id != channel_id) {
+        channel = channel->next;
+    }
+    
+    if (!channel) {
+        /* Create new channel */
+        channel = (mixer_channel_t*)kalloc(sizeof(mixer_channel_t));
+        if (!channel) return STATUS_NOMEM;
+        
+        memset(channel, 0, sizeof(*channel));
+        channel->channel_id = channel_id;
+        channel->volume = 1.0f;
+        channel->pan = 0.0f;
+        
+        channel->next = multimedia.mixer_channels;
+        multimedia.mixer_channels = channel;
+        multimedia.mixer_channel_count++;
+    }
+    
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    
+    channel->volume = volume;
+    
+    KLOG_DEBUG("MULTIMEDIA", "Set mixer channel %u volume to %.2f", channel_id, volume);
+    return STATUS_OK;
+}
+
+status_t mixer_set_master_volume(float volume) {
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    
+    multimedia.master_volume = volume;
+    
+    KLOG_INFO("MULTIMEDIA", "Set master volume to %.2f", volume);
+    return STATUS_OK;
+}
+
+/* Print multimedia statistics */
+void multimedia_print_stats(void) {
+    kprintf("=== Multimedia Subsystem Statistics ===\n");
+    
+    /* Audio statistics */
+    if (multimedia.audio_enabled) {
+        kprintf("\nAudio Devices:\n");
+        audio_device_t* device = multimedia.audio_devices;
+        while (device) {
+            kprintf("  %s (ID: %u)\n", device->name, device->device_id);
+            kprintf("    Format: %uHz, %uch, %ubit\n",
+                    device->current_sample_rate, device->current_channels, device->current_bit_depth);
+            kprintf("    Status: %s%s\n", 
+                    device->playing ? "Playing " : "",
+                    device->recording ? "Recording" : "");
+            kprintf("    Stats: %llu frames played, %llu recorded\n",
+                    device->frames_played, device->frames_recorded);
+            device = device->next;
+        }
+        
+        kprintf("\nAudio Mixer:\n");
+        kprintf("  Master volume: %.2f\n", multimedia.master_volume);
+        kprintf("  Channels: %u\n", multimedia.mixer_channel_count);
+    }
+    
+    /* Graphics statistics */
+    if (multimedia.graphics_enabled) {
+        kprintf("\nGPU Devices:\n");
+        gpu_device_t* gpu = multimedia.gpu_devices;
+        while (gpu) {
+            kprintf("  %s (ID: %u)\n", gpu->name, gpu->device_id);
+            kprintf("    Resolution: %ux%u@%uHz (%ubpp)\n",
+                    gpu->current_width, gpu->current_height, gpu->current_refresh, gpu->current_bpp);
+            kprintf("    VRAM: %llu MB (%llu MB used)\n",
+                    gpu->vram_size / (1024 * 1024), gpu->memory_used / (1024 * 1024));
+            kprintf("    Stats: %llu frames, %llu triangles, %llu textures\n",
+                    gpu->frames_rendered, gpu->triangles_rendered, gpu->texture_uploads);
+            if (gpu->frames_rendered > 0) {
+                kprintf("    Avg GPU time: %llu ns per frame\n", 
+                        gpu->gpu_time_ns / gpu->frames_rendered);
+            }
+            gpu = gpu->next;
+        }
+        
+        kprintf("\nFramebuffers:\n");
+        for (uint32_t i = 0; i < multimedia.framebuffer_count; i++) {
+            framebuffer_t* fb = &multimedia.framebuffers[i];
+            kprintf("  FB%u: %ux%u@%ubpp (%s)\n",
+                    fb->fb_id, fb->width, fb->height, fb->bpp,
+                    fb->double_buffered ? "double buffered" : "single buffered");
+            kprintf("    Size: %llu MB\n", fb->buffer_size / (1024 * 1024));
+        }
+    }
+    
+    /* Video codec statistics */
+    if (multimedia.video_enabled) {
+        kprintf("\nVideo Codecs:\n");
+        video_codec_t* codec = multimedia.video_codecs;
+        while (codec) {
+            kprintf("  %s (%.4s): %s%s\n",
+                    codec->name, codec->fourcc,
+                    codec->hw_decode ? "HW Decode " : "",
+                    codec->hw_encode ? "HW Encode" : "");
+            kprintf("    Max resolution: %ux%u@%ufps\n",
+                    codec->max_width, codec->max_height, codec->max_fps);
+            codec = codec->next;
+        }
+    }
+    
+    kprintf("=== End Multimedia Statistics ===\n");
+}
+
+/* Initialize multimedia subsystem */
+status_t multimedia_init(void) {
+    KLOG_INFO("MULTIMEDIA", "Initializing multimedia subsystem");
+    
+    memset(&multimedia, 0, sizeof(multimedia));
+    
+    /* Initialize subsystems */
+    status_t result;
+    
+    result = init_audio_subsystem();
+    if (result != STATUS_OK) return result;
+    
+    result = init_graphics_subsystem();
+    if (result != STATUS_OK) return result;
+    
+    result = init_video_subsystem();
+    if (result != STATUS_OK) return result;
+    
+    KLOG_INFO("MULTIMEDIA", "Multimedia subsystem initialized");
+    KLOG_INFO("MULTIMEDIA", "  Audio: %s (%u devices)", 
+              multimedia.audio_enabled ? "enabled" : "disabled",
+              multimedia.audio_device_count);
+    KLOG_INFO("MULTIMEDIA", "  Graphics: %s (%u devices)", 
+              multimedia.graphics_enabled ? "enabled" : "disabled",
+              multimedia.gpu_device_count);
+    KLOG_INFO("MULTIMEDIA", "  Video: %s (%u codecs)", 
+              multimedia.video_enabled ? "enabled" : "disabled",
+              multimedia.video_codec_count);
+    
+    return STATUS_OK;
+}
+
+/* Stub implementations for compatibility */
+status_t audio_enumerate_devices(void** device_list, uint32_t* count) {
+    if (!count) return STATUS_INVALID;
+    
+    *count = multimedia.audio_device_count;
+    
+    if (device_list && multimedia.audio_device_count > 0) {
+        /* Allocate and fill device array */
+        audio_device_info_t* dev_array = kalloc(sizeof(audio_device_info_t) * multimedia.audio_device_count);
+        if (!dev_array) return STATUS_NOMEM;
+        
+        for (uint32_t i = 0; i < multimedia.audio_device_count; i++) {
+            dev_array[i].device_id = multimedia.audio_devices[i].device_id;
+            strncpy(dev_array[i].name, multimedia.audio_devices[i].name, sizeof(dev_array[i].name) - 1);
+            dev_array[i].capabilities = multimedia.audio_devices[i].capabilities;
+        }
+        *device_list = dev_array;
+    }
+    
+    return STATUS_OK;
+}
+
+status_t gpu_submit_commands(uint32_t device_id, const void* commands, uint32_t size) {
+    gpu_device_t* gpu = multimedia.gpu_devices;
+    while (gpu && gpu->device_id != device_id) {
+        gpu = gpu->next;
+    }
+    
+    if (!gpu || !commands) return STATUS_INVALID;
+    
+    /* Submit GPU commands for processing via graphics driver */
+    if (multimedia.video_device_count > 0) {
+        video_device_t* gpu = &multimedia.video_devices[0];
+        
+        /* Submit command buffer to GPU */
+        volatile uint32_t* gpu_mmio = (volatile uint32_t*)gpu->mmio_base;
+        gpu_mmio[0x100/4] = (uint32_t)(uintptr_t)commands; /* Command buffer address */
+        gpu_mmio[0x104/4] = command_count * sizeof(gpu_command_t); /* Buffer size */
+        gpu_mmio[0x108/4] = 1; /* Execute flag */
+        
+        /* Wait for completion */
+        while (gpu_mmio[0x10C/4] & 1) {
+            /* Busy wait for GPU completion */
+        }
+    }
+    gpu->frames_rendered++;
+    
+    return STATUS_OK;
+}
+
+status_t video_create_decoder(uint32_t codec_id, void** decoder) {
+    if (!decoder) return STATUS_INVALID;
+    
+    /* Create video decoder instance using hardware acceleration */
+    video_decoder_t* dec = kalloc(sizeof(video_decoder_t));
+    if (!dec) return STATUS_NOMEM;
+    
+    dec->codec = codec;
+    dec->width = 0;
+    dec->height = 0;
+    dec->state = DECODER_STATE_IDLE;
+    dec->hw_accelerated = (multimedia.video_device_count > 0);
+    
+    *decoder = dec;
+    
+    return STATUS_OK;
+}
+
+status_t audio_create_stream(uint32_t device_id, void** stream) {
+    if (!stream) return STATUS_INVALID;
+    
+    /* Create audio stream instance with hardware mixing */
+    audio_stream_t* strm = kalloc(sizeof(audio_stream_t));
+    if (!strm) return STATUS_NOMEM;
+    
+    strm->sample_rate = sample_rate;
+    strm->channels = channels;
+    strm->bits_per_sample = bits_per_sample;
+    strm->buffer_size = sample_rate * channels * (bits_per_sample / 8); /* 1 second buffer */
+    strm->buffer = kalloc(strm->buffer_size);
+    strm->state = STREAM_STATE_STOPPED;
+    
+    if (!strm->buffer) {
+        kfree(strm);
+        return STATUS_NOMEM;
+    }
+    
+    *stream = strm;
+    
+    return STATUS_OK;
+}

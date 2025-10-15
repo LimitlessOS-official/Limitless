@@ -1,0 +1,105 @@
+#include "kernel.h"
+#include "uapi/syscalls.h"
+#include "net/filter.h"
+
+typedef struct {
+    u8 used;
+    u8 direction; /* 0 in, 1 out */
+    u8 proto;     /* 0 any, else IPPROTO */
+    u8 action;    /* NF_DROP=0, NF_ACCEPT=1 */
+    u32 src_ip_be, src_mask_be;
+    u32 dst_ip_be, dst_mask_be;
+    u16 src_port_be, dst_port_be;
+} k_fw_rule_t;
+
+#define FW_MAX_RULES 64
+static k_fw_rule_t g_rules[FW_MAX_RULES];
+static spinlock_t g_fw_lock;
+static nf_verdict_t g_def_in = NF_DROP, g_def_out = NF_DROP;
+
+static int ip_match(u32 ip, u32 net, u32 mask){ if(mask==0) return 1; return (ip & mask) == (net & mask); }
+static int port_match(u16 p, u16 want){ return want==0 || p==want; }
+
+void fw_init_rules(void){ spinlock_init(&g_fw_lock); for(int i=0;i<FW_MAX_RULES;i++) g_rules[i].used=0; g_def_in = NF_DROP; g_def_out = NF_DROP; }
+
+/* Rule evaluation: returns 1 if a rule matched and sets *out; 0 if no match */
+int fw_apply_rules(const nf_packet_t* p, nf_verdict_t* out){
+    if (!p) return 0;
+    /* loopback always allowed (treated as implicit rule) */
+    if ((p->src_ip_be==0x7F000001u) && (p->dst_ip_be==0x7F000001u)) { if(out) *out = NF_ACCEPT; return 1; }
+    spin_lock(&g_fw_lock);
+    for (int i=0;i<FW_MAX_RULES;i++){
+        k_fw_rule_t* r = &g_rules[i]; if(!r->used) continue;
+        if (r->direction != p->direction) continue;
+        if (r->proto != 0 && r->proto != p->proto) continue;
+        if (!ip_match(p->src_ip_be, r->src_ip_be, r->src_mask_be)) continue;
+        if (!ip_match(p->dst_ip_be, r->dst_ip_be, r->dst_mask_be)) continue;
+        if (r->proto==6 || r->proto==17 || r->proto==0){
+            if (!port_match(p->src_port_be, r->src_port_be)) continue;
+            if (!port_match(p->dst_port_be, r->dst_port_be)) continue;
+        }
+        if (out) *out = (r->action?NF_ACCEPT:NF_DROP);
+        spin_unlock(&g_fw_lock);
+        return 1;
+    }
+    spin_unlock(&g_fw_lock);
+    return 0;
+}
+
+static long k_fw_add_rule(const u_fw_rule_t* ur){
+    if (!ur) return -K_EINVAL;
+    spin_lock(&g_fw_lock);
+    for (int i=0;i<FW_MAX_RULES;i++){
+        if (!g_rules[i].used){
+            k_fw_rule_t* r = &g_rules[i];
+            r->used=1; r->direction=ur->direction; r->proto=ur->proto; r->action=ur->action;
+            r->src_ip_be=ur->src_ip_be; r->src_mask_be=ur->src_mask_be;
+            r->dst_ip_be=ur->dst_ip_be; r->dst_mask_be=ur->dst_mask_be;
+            r->src_port_be=ur->src_port_be; r->dst_port_be=ur->dst_port_be;
+            spin_unlock(&g_fw_lock);
+            return 0;
+        }
+    }
+    spin_unlock(&g_fw_lock);
+    return -K_ENOSPC;
+}
+
+static long k_fw_del_rule(const u_fw_rule_t* ur){
+    if (!ur) return -K_EINVAL;
+    spin_lock(&g_fw_lock);
+    for (int i=0;i<FW_MAX_RULES;i++){
+        k_fw_rule_t* r=&g_rules[i]; if(!r->used) continue;
+        if (r->direction==ur->direction && r->proto==ur->proto &&
+            r->src_ip_be==ur->src_ip_be && r->src_mask_be==ur->src_mask_be &&
+            r->dst_ip_be==ur->dst_ip_be && r->dst_mask_be==ur->dst_mask_be &&
+            r->src_port_be==ur->src_port_be && r->dst_port_be==ur->dst_port_be &&
+            r->action==ur->action){ r->used=0; }
+    }
+    spin_unlock(&g_fw_lock);
+    return 0;
+}
+
+static long k_fw_list_rules(u_fw_rule_t* out, u64 cap){
+    if (!out && cap) return -K_EINVAL;
+    spin_lock(&g_fw_lock);
+    u64 n=0; for(int i=0;i<FW_MAX_RULES && n<cap;i++){ if(g_rules[i].used){ out[n].direction=g_rules[i].direction; out[n].proto=g_rules[i].proto; out[n].action=g_rules[i].action; out[n].src_ip_be=g_rules[i].src_ip_be; out[n].src_mask_be=g_rules[i].src_mask_be; out[n].dst_ip_be=g_rules[i].dst_ip_be; out[n].dst_mask_be=g_rules[i].dst_mask_be; out[n].src_port_be=g_rules[i].src_port_be; out[n].dst_port_be=g_rules[i].dst_port_be; n++; } }
+    spin_unlock(&g_fw_lock);
+    return (long)n;
+}
+
+static long k_fw_set_default(u8 direction, u8 verdict){
+    spin_lock(&g_fw_lock);
+    if (direction==0){ g_def_in = verdict?NF_ACCEPT:NF_DROP; nf_set_default_policy(0, g_def_in); }
+    else { g_def_out = verdict?NF_ACCEPT:NF_DROP; nf_set_default_policy(1, g_def_out); }
+    spin_unlock(&g_fw_lock);
+    return 0;
+}
+
+static long k_fw_get_default(u8* in, u8* out){ if(in) *in=(u8)g_def_in; if(out) *out=(u8)g_def_out; return 0; }
+
+/* Export wrappers for syscall layer */
+long ksys_fw_add_rule(const u_fw_rule_t* r){ return k_fw_add_rule(r); }
+long ksys_fw_del_rule(const u_fw_rule_t* r){ return k_fw_del_rule(r); }
+long ksys_fw_list_rules(u_fw_rule_t* out, u64 cap){ return k_fw_list_rules(out, cap); }
+long ksys_fw_set_default(u8 dir, u8 v){ return k_fw_set_default(dir, v); }
+long ksys_fw_get_default(u8* in, u8* out){ return k_fw_get_default(in,out); }

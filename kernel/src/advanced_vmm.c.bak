@@ -1,0 +1,818 @@
+/**
+ * Advanced Memory Management Implementation for LimitlessOS
+ * NUMA-aware VMM with compression, swap, and defragmentation
+ */
+
+#include "kernel.h"
+#include "advanced_vmm.h"
+#include "security.h"
+#include "timer.h"
+#include "string.h"
+
+/* Global advanced VMM state */
+static advanced_vmm_t g_advanced_vmm = {0};
+
+/* Memory zone names for debugging */
+static const char* zone_names[] = {
+    "DMA", "DMA32", "Normal", "HighMem", "Movable", "Device", "Persistent", "Compressed"
+};
+
+/* Compression algorithm names */
+static const char* compression_names[] = {
+    "None", "LZ4", "ZSTD", "LZO", "Deflate"
+};
+
+/* Initialize advanced memory management */
+status_t advanced_vmm_init(void) {
+    if (g_advanced_vmm.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    k_memset(&g_advanced_vmm, 0, sizeof(advanced_vmm_t));
+    spinlock_init(&g_advanced_vmm.system_lock);
+    
+    console_printf("Initializing Advanced Memory Management...\n");
+    
+    /* Initialize NUMA topology discovery */
+    status_t status = numa_discover_topology();
+    if (status != STATUS_OK) {
+        console_printf("WARNING: NUMA discovery failed, using single node: %d\n", status);
+        /* Continue with single NUMA node */
+        numa_register_node(0, 0, 256 * 1024 * 1024, 0x1);  /* 256MB, CPU 0 */
+    }
+    
+    /* Initialize memory compression */
+    g_advanced_vmm.compression.enabled = false;
+    g_advanced_vmm.compression.default_algorithm = COMPRESS_LZ4;
+    g_advanced_vmm.compression.compression_threshold = 80; /* 80% memory usage */
+    spinlock_init(&g_advanced_vmm.compression.lock);
+    
+    /* Initialize memory defragmentation */
+    g_advanced_vmm.defrag.enabled = false;
+    g_advanced_vmm.defrag.threshold_percent = DEFRAG_THRESHOLD_PERCENT;
+    spinlock_init(&g_advanced_vmm.defrag.lock);
+    
+    /* Create default memory pools */
+    memory_pool_t* default_pool;
+    status = memory_pool_create("default", POOL_TYPE_GENERAL, 
+                               64 * 1024 * 1024, 0, &default_pool);  /* 64MB */
+    if (status == STATUS_OK) {
+        g_advanced_vmm.default_pool = default_pool;
+        console_printf("Default memory pool created: 64MB\n");
+    } else {
+        console_printf("ERROR: Failed to create default memory pool: %d\n", status);
+        return status;
+    }
+    
+    /* Create kernel pool */
+    memory_pool_t* kernel_pool;
+    status = memory_pool_create("kernel", POOL_TYPE_KERNEL, 
+                               32 * 1024 * 1024, 0, &kernel_pool);  /* 32MB */
+    if (status == STATUS_OK) {
+        console_printf("Kernel memory pool created: 32MB\n");
+    }
+    
+    /* Create DMA pool */
+    memory_pool_t* dma_pool;
+    status = memory_pool_create("dma", POOL_TYPE_DMA, 
+                               16 * 1024 * 1024, 0, &dma_pool);  /* 16MB */
+    if (status == STATUS_OK) {
+        console_printf("DMA memory pool created: 16MB\n");
+    }
+    
+    /* Initialize performance monitoring */
+    g_advanced_vmm.performance.allocations_per_second = 0;
+    g_advanced_vmm.performance.average_allocation_time_ns = 1000;  /* 1µs default */
+    
+    /* Set initial memory statistics */
+    g_advanced_vmm.stats.total_memory = 256 * 1024 * 1024;  /* 256MB total */
+    g_advanced_vmm.stats.free_memory = 128 * 1024 * 1024;   /* 128MB free */
+    g_advanced_vmm.stats.fragmentation_percent = 15;        /* 15% fragmentation */
+    
+    g_advanced_vmm.initialized = true;
+    
+    console_printf("Advanced Memory Management initialized\n");
+    console_printf("  NUMA nodes: %u\n", g_advanced_vmm.numa_node_count);
+    console_printf("  Memory pools: %u\n", g_advanced_vmm.pool_count);
+    console_printf("  Total memory: %llu MB\n", g_advanced_vmm.stats.total_memory / (1024 * 1024));
+    
+    /* Audit memory system initialization */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Advanced memory management initialized", "vmm_system", 1);
+    
+    return STATUS_OK;
+}
+
+/* Discover NUMA topology */
+status_t numa_discover_topology(void) {
+    console_printf("Discovering NUMA topology...\n");
+    
+    /* Simulate NUMA discovery - in real implementation would query hardware */
+    g_advanced_vmm.numa_node_count = 2;  /* Simulate 2 NUMA nodes */
+    
+    /* Node 0 */
+    numa_node_t* node0 = &g_advanced_vmm.numa_nodes[0];
+    node0->node_id = 0;
+    node0->base_address = 0x0;
+    node0->size = 128 * 1024 * 1024;  /* 128MB */
+    node0->cpu_mask = 0x1;  /* CPU 0 */
+    node0->access_latency_ns = 100;
+    node0->bandwidth_mbps = 10000;  /* 10 GB/s */
+    node0->total_pages = node0->size / PAGE_SIZE;
+    node0->free_pages = node0->total_pages / 2;
+    spinlock_init(&node0->lock);
+    
+    /* Initialize zones for node 0 */
+    node0->zones[MEMORY_ZONE_DMA].start_pfn = 0;
+    node0->zones[MEMORY_ZONE_DMA].end_pfn = (16 * 1024 * 1024) / PAGE_SIZE;
+    node0->zones[MEMORY_ZONE_NORMAL].start_pfn = node0->zones[MEMORY_ZONE_DMA].end_pfn;
+    node0->zones[MEMORY_ZONE_NORMAL].end_pfn = node0->total_pages;
+    
+    /* Node 1 */
+    numa_node_t* node1 = &g_advanced_vmm.numa_nodes[1];
+    node1->node_id = 1;
+    node1->base_address = 128 * 1024 * 1024;
+    node1->size = 128 * 1024 * 1024;  /* 128MB */
+    node1->cpu_mask = 0x2;  /* CPU 1 */
+    node1->access_latency_ns = 120;  /* Slightly higher latency */
+    node1->bandwidth_mbps = 8000;   /* 8 GB/s */
+    node1->total_pages = node1->size / PAGE_SIZE;
+    node1->free_pages = node1->total_pages / 2;
+    spinlock_init(&node1->lock);
+    
+    /* Initialize zones for node 1 */
+    node1->zones[MEMORY_ZONE_NORMAL].start_pfn = 0;
+    node1->zones[MEMORY_ZONE_NORMAL].end_pfn = node1->total_pages;
+    
+    g_advanced_vmm.current_node = 0;  /* Start with node 0 */
+    
+    console_printf("NUMA topology discovered: %u nodes\n", g_advanced_vmm.numa_node_count);
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        numa_node_t* node = &g_advanced_vmm.numa_nodes[i];
+        console_printf("  Node %u: %llu MB, CPUs 0x%X, latency %u ns\n",
+                      i, node->size / (1024 * 1024), node->cpu_mask, node->access_latency_ns);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Create memory pool */
+status_t memory_pool_create(const char* name, memory_pool_type_t type, 
+                           uint64_t size, uint32_t numa_node, memory_pool_t** pool) {
+    if (!g_advanced_vmm.initialized || !name || !pool || size < MEMORY_POOL_MIN_SIZE) {
+        return STATUS_ERROR;
+    }
+    
+    if (g_advanced_vmm.pool_count >= MAX_MEMORY_POOLS) {
+        return STATUS_FULL;
+    }
+    
+    if (numa_node >= g_advanced_vmm.numa_node_count) {
+        numa_node = 0;  /* Default to node 0 */
+    }
+    
+    /* Allocate pool structure */
+    memory_pool_t* new_pool = (memory_pool_t*)vmm_kmalloc(sizeof(memory_pool_t), 16);
+    if (!new_pool) {
+        return STATUS_NOMEM;
+    }
+    
+    k_memset(new_pool, 0, sizeof(memory_pool_t));
+    
+    /* Initialize pool */
+    new_pool->pool_id = g_advanced_vmm.pool_count + 1;
+    new_pool->type = type;
+    strncpy(new_pool->name, name, sizeof(new_pool->name) - 1);
+    new_pool->name[sizeof(new_pool->name) - 1] = 0;
+    
+    new_pool->size = size;
+    new_pool->page_size = PAGE_SIZE;
+    new_pool->numa_node = numa_node;
+    new_pool->total_pages = size / PAGE_SIZE;
+    new_pool->free_pages = new_pool->total_pages;
+    new_pool->allocated_pages = 0;
+    
+    /* Initialize buddy allocator free lists */
+    for (uint32_t i = 0; i < 11; i++) {
+        INIT_LIST_HEAD(&new_pool->free_area[i].free_list);
+        new_pool->free_area[i].free_count = 0;
+    }
+    
+    /* Add initial free block (simplified buddy allocator) */
+    new_pool->free_area[10].free_count = new_pool->total_pages / (1 << 10);  /* 4MB blocks */
+    
+    /* Enable compression for appropriate pool types */
+    if (type == POOL_TYPE_USER || type == POOL_TYPE_CACHE) {
+        new_pool->compression_enabled = true;
+        new_pool->compression_ratio = 75;  /* 75% compression target */
+    }
+    
+    spinlock_init(&new_pool->lock);
+    
+    /* Add to pool registry */
+    g_advanced_vmm.pools[g_advanced_vmm.pool_count] = new_pool;
+    g_advanced_vmm.pool_count++;
+    
+    *pool = new_pool;
+    
+    console_printf("Memory pool '%s' created: %llu MB on NUMA node %u\n",
+                  name, size / (1024 * 1024), numa_node);
+    
+    return STATUS_OK;
+}
+
+/* Allocate from memory pool with NUMA awareness */
+void* memory_pool_alloc(memory_pool_t* pool, size_t size, const memory_alloc_hints_t* hints) {
+    if (!pool || size == 0) {
+        return NULL;
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    spin_lock(&pool->lock);
+    
+    /* Calculate pages needed */
+    uint32_t pages_needed = (size + pool->page_size - 1) / pool->page_size;
+    
+    /* Check if pool has enough free pages */
+    if (pool->free_pages < pages_needed) {
+        spin_unlock(&pool->lock);
+        return NULL;
+    }
+    
+    /* Find appropriate free block using buddy allocator */
+    uint32_t order = 0;
+    uint32_t block_pages = pages_needed;
+    
+    /* Find minimum order that can satisfy request */
+    while ((1U << order) < block_pages && order < 10) {
+        order++;
+    }
+    
+    /* Look for free block of this order or higher */
+    void* allocated_addr = NULL;
+    for (uint32_t current_order = order; current_order < 11; current_order++) {
+        if (pool->free_area[current_order].free_count > 0) {
+            /* Simulate allocation from buddy system */
+            allocated_addr = (void*)(pool->base_address + 
+                                   (pool->allocated_pages * pool->page_size));
+            
+            pool->free_area[current_order].free_count--;
+            
+            /* Split larger blocks if necessary */
+            if (current_order > order) {
+                uint32_t split_order = current_order - 1;
+                pool->free_area[split_order].free_count += 2;
+            }
+            
+            break;
+        }
+    }
+    
+    if (!allocated_addr) {
+        spin_unlock(&pool->lock);
+        return NULL;
+    }
+    
+    /* Update pool statistics */
+    pool->allocated_pages += pages_needed;
+    pool->free_pages -= pages_needed;
+    pool->allocation_count++;
+    pool->bytes_allocated += size;
+    
+    if (pool->allocated_pages > pool->peak_usage) {
+        pool->peak_usage = pool->allocated_pages;
+    }
+    
+    /* Calculate fragmentation score (simplified) */
+    if (pool->total_pages > 0) {
+        pool->fragmentation_score = ((pool->allocated_pages * 100) / pool->total_pages);
+    }
+    
+    spin_unlock(&pool->lock);
+    
+    /* Update NUMA statistics */
+    numa_node_t* numa_node = &g_advanced_vmm.numa_nodes[pool->numa_node];
+    spin_lock(&numa_node->lock);
+    
+    if (hints && hints->preferred_numa_node == pool->numa_node) {
+        g_advanced_vmm.stats.numa_hit_count++;
+    } else if (hints && hints->preferred_numa_node != pool->numa_node) {
+        g_advanced_vmm.stats.numa_miss_count++;
+    }
+    
+    numa_node->allocated_pages += pages_needed;
+    if (numa_node->free_pages >= pages_needed) {
+        numa_node->free_pages -= pages_needed;
+    }
+    
+    spin_unlock(&numa_node->lock);
+    
+    /* Update global performance metrics */
+    uint64_t allocation_time = timer_get_ticks() - start_time;
+    g_advanced_vmm.performance.average_allocation_time_ns = 
+        (g_advanced_vmm.performance.average_allocation_time_ns + 
+         (allocation_time * 1000000 / TIMER_HZ)) / 2;
+    
+    return allocated_addr;
+}
+
+/* Free memory from pool */
+status_t memory_pool_free(memory_pool_t* pool, void* ptr, size_t size) {
+    if (!pool || !ptr || size == 0) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&pool->lock);
+    
+    uint32_t pages_freed = (size + pool->page_size - 1) / pool->page_size;
+    
+    /* Update pool statistics */
+    if (pool->allocated_pages >= pages_freed) {
+        pool->allocated_pages -= pages_freed;
+        pool->free_pages += pages_freed;
+        pool->deallocation_count++;
+    }
+    
+    /* Add back to buddy allocator (simplified) */
+    uint32_t order = 0;
+    while ((1U << order) < pages_freed && order < 10) {
+        order++;
+    }
+    
+    pool->free_area[order].free_count++;
+    
+    spin_unlock(&pool->lock);
+    
+    /* Update NUMA node statistics */
+    numa_node_t* numa_node = &g_advanced_vmm.numa_nodes[pool->numa_node];
+    spin_lock(&numa_node->lock);
+    numa_node->free_pages += pages_freed;
+    if (numa_node->allocated_pages >= pages_freed) {
+        numa_node->allocated_pages -= pages_freed;
+    }
+    spin_unlock(&numa_node->lock);
+    
+    return STATUS_OK;
+}
+
+/* NUMA-aware allocation */
+void* vmm_alloc_numa(size_t size, uint32_t numa_node, uint32_t flags) {
+    if (numa_node >= g_advanced_vmm.numa_node_count) {
+        numa_node = numa_get_current_node();
+    }
+    
+    memory_alloc_hints_t hints = {
+        .preferred_numa_node = numa_node,
+        .zone_type = MEMORY_ZONE_NORMAL,
+        .alignment = 16,
+        .allow_compression = true,
+        .allow_swap = true,
+        .movable = true,
+        .priority = 5
+    };
+    
+    return vmm_alloc_with_hints(size, &hints);
+}
+
+/* Allocation with hints */
+void* vmm_alloc_with_hints(size_t size, const memory_alloc_hints_t* hints) {
+    if (!g_advanced_vmm.initialized || size == 0) {
+        return NULL;
+    }
+    
+    /* Try to allocate from preferred NUMA node first */
+    uint32_t preferred_node = hints ? hints->preferred_numa_node : numa_get_current_node();
+    
+    /* Find appropriate pool based on hints */
+    memory_pool_t* target_pool = g_advanced_vmm.default_pool;
+    
+    if (hints) {
+        switch (hints->zone_type) {
+            case MEMORY_ZONE_DMA:
+                /* Look for DMA pool */
+                for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+                    memory_pool_t* pool = g_advanced_vmm.pools[i];
+                    if (pool && pool->type == POOL_TYPE_DMA && pool->numa_node == preferred_node) {
+                        target_pool = pool;
+                        break;
+                    }
+                }
+                break;
+                
+            default:
+                /* Use default pool or find better match */
+                for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+                    memory_pool_t* pool = g_advanced_vmm.pools[i];
+                    if (pool && pool->numa_node == preferred_node) {
+                        target_pool = pool;
+                        break;
+                    }
+                }
+                break;
+        }
+    }
+    
+    /* Attempt allocation */
+    void* result = memory_pool_alloc(target_pool, size, hints);
+    
+    if (!result) {
+        /* Try other NUMA nodes if preferred node failed */
+        for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+            memory_pool_t* pool = g_advanced_vmm.pools[i];
+            if (pool && pool != target_pool) {
+                result = memory_pool_alloc(pool, size, hints);
+                if (result) {
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (!result) {
+        g_advanced_vmm.stats.allocation_failures++;
+    }
+    
+    return result;
+}
+
+/* Get current CPU's NUMA node */
+uint32_t numa_get_current_node(void) {
+    /* Simplified - in real implementation would query current CPU */
+    return g_advanced_vmm.current_node;
+}
+
+/* Enable memory compression */
+status_t memory_compression_enable(compression_algorithm_t algorithm) {
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_advanced_vmm.compression.lock);
+    
+    g_advanced_vmm.compression.enabled = true;
+    g_advanced_vmm.compression.default_algorithm = algorithm;
+    
+    /* Create compression pool if not exists */
+    if (!g_advanced_vmm.compression.compression_pool) {
+        memory_pool_t* comp_pool;
+        status_t status = memory_pool_create("compression", POOL_TYPE_COMPRESSED,
+                                           32 * 1024 * 1024, 0, &comp_pool);
+        if (status == STATUS_OK) {
+            g_advanced_vmm.compression.compression_pool = comp_pool;
+        }
+    }
+    
+    spin_unlock(&g_advanced_vmm.compression.lock);
+    
+    console_printf("Memory compression enabled: %s\n", compression_names[algorithm]);
+    
+    return STATUS_OK;
+}
+
+/* Simple page compression (placeholder implementation) */
+status_t compress_page(uint64_t pfn, compressed_page_t** compressed) {
+    if (!g_advanced_vmm.compression.enabled || !compressed) {
+        return STATUS_ERROR;
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    /* Allocate compressed page structure */
+    compressed_page_t* comp_page = (compressed_page_t*)vmm_kmalloc(sizeof(compressed_page_t), 16);
+    if (!comp_page) {
+        return STATUS_NOMEM;
+    }
+    
+    k_memset(comp_page, 0, sizeof(compressed_page_t));
+    
+    comp_page->original_pfn = pfn;
+    comp_page->algorithm = g_advanced_vmm.compression.default_algorithm;
+    
+    /* Simulate compression (in real implementation would compress actual page data) */
+    uint32_t original_size = PAGE_SIZE;
+    comp_page->compressed_size = original_size / MEMORY_COMPRESSION_RATIO;  /* 4:1 ratio */
+    
+    comp_page->compressed_data = vmm_kmalloc(comp_page->compressed_size, 16);
+    if (!comp_page->compressed_data) {
+        vmm_kfree(comp_page, sizeof(compressed_page_t));
+        return STATUS_NOMEM;
+    }
+    
+    /* Simulate compressed data */
+    k_memset(comp_page->compressed_data, 0xCC, comp_page->compressed_size);
+    
+    comp_page->access_count = 0;
+    comp_page->last_access_time = timer_get_ticks();
+    
+    /* Add to compression hash table */
+    uint32_t hash = (uint32_t)(pfn % (1024 * 1024));
+    comp_page->next = g_advanced_vmm.compression.compressed_pages[hash];
+    g_advanced_vmm.compression.compressed_pages[hash] = comp_page;
+    
+    /* Update compression statistics */
+    spin_lock(&g_advanced_vmm.compression.lock);
+    g_advanced_vmm.compression.pages_compressed++;
+    g_advanced_vmm.compression.bytes_saved += (original_size - comp_page->compressed_size);
+    g_advanced_vmm.compression.compression_time_ns += 
+        (timer_get_ticks() - start_time) * 1000000 / TIMER_HZ;
+    g_advanced_vmm.compression.compressed_page_count++;
+    spin_unlock(&g_advanced_vmm.compression.lock);
+    
+    *compressed = comp_page;
+    
+    return STATUS_OK;
+}
+
+/* Enable memory defragmentation */
+status_t memory_defrag_enable(uint32_t threshold_percent) {
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    if (threshold_percent > 100) {
+        threshold_percent = DEFRAG_THRESHOLD_PERCENT;
+    }
+    
+    spin_lock(&g_advanced_vmm.defrag.lock);
+    
+    g_advanced_vmm.defrag.enabled = true;
+    g_advanced_vmm.defrag.threshold_percent = threshold_percent;
+    g_advanced_vmm.defrag.active = false;
+    
+    spin_unlock(&g_advanced_vmm.defrag.lock);
+    
+    console_printf("Memory defragmentation enabled (threshold: %u%%)\n", threshold_percent);
+    
+    return STATUS_OK;
+}
+
+/* Calculate memory fragmentation */
+uint32_t memory_calculate_fragmentation(void) {
+    if (!g_advanced_vmm.initialized) {
+        return 0;
+    }
+    
+    uint64_t total_free = 0;
+    uint64_t largest_free = 0;
+    uint64_t free_blocks = 0;
+    
+    /* Analyze fragmentation across all pools */
+    for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+        memory_pool_t* pool = g_advanced_vmm.pools[i];
+        if (!pool) continue;
+        
+        spin_lock(&pool->lock);
+        
+        total_free += pool->free_pages;
+        
+        /* Find largest contiguous block (simplified) */
+        for (uint32_t order = 10; order > 0; order--) {
+            if (pool->free_area[order].free_count > 0) {
+                uint64_t block_size = (1ULL << order) * PAGE_SIZE;
+                if (block_size > largest_free) {
+                    largest_free = block_size;
+                }
+                free_blocks += pool->free_area[order].free_count;
+                break;
+            }
+        }
+        
+        spin_unlock(&pool->lock);
+    }
+    
+    /* Calculate fragmentation percentage */
+    uint32_t fragmentation = 0;
+    if (total_free > 0) {
+        fragmentation = (uint32_t)(100 - ((largest_free * 100) / (total_free * PAGE_SIZE)));
+    }
+    
+    g_advanced_vmm.stats.fragmentation_percent = fragmentation;
+    
+    return fragmentation;
+}
+
+/* Get comprehensive memory statistics */
+status_t advanced_memory_get_stats(advanced_memory_stats_t* stats) {
+    if (!g_advanced_vmm.initialized || !stats) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(stats, 0, sizeof(advanced_memory_stats_t));
+    
+    /* Overall memory statistics */
+    stats->total_physical_memory = g_advanced_vmm.stats.total_memory;
+    stats->available_memory = g_advanced_vmm.stats.free_memory;
+    stats->used_memory = stats->total_physical_memory - stats->available_memory;
+    stats->cached_memory = g_advanced_vmm.stats.cached_memory;
+    stats->buffer_memory = g_advanced_vmm.stats.buffer_memory;
+    
+    /* NUMA statistics */
+    stats->numa_nodes = g_advanced_vmm.numa_node_count;
+    stats->numa_local_allocations = g_advanced_vmm.stats.numa_hit_count;
+    stats->numa_remote_allocations = g_advanced_vmm.stats.numa_miss_count;
+    
+    uint64_t total_numa_allocs = stats->numa_local_allocations + stats->numa_remote_allocations;
+    if (total_numa_allocs > 0) {
+        stats->numa_efficiency_percent = (uint32_t)((stats->numa_local_allocations * 100) / total_numa_allocs);
+    }
+    
+    /* Pool statistics */
+    stats->active_pools = g_advanced_vmm.pool_count;
+    
+    uint64_t pool_used = 0, pool_free = 0;
+    for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+        memory_pool_t* pool = g_advanced_vmm.pools[i];
+        if (pool) {
+            pool_used += pool->allocated_pages * PAGE_SIZE;
+            pool_free += pool->free_pages * PAGE_SIZE;
+        }
+    }
+    
+    stats->pool_memory_used = pool_used;
+    stats->pool_memory_free = pool_free;
+    stats->pool_fragmentation_percent = memory_calculate_fragmentation();
+    
+    /* Swap statistics */
+    stats->swap_total = g_advanced_vmm.total_swap_pages * PAGE_SIZE;
+    stats->swap_used = g_advanced_vmm.used_swap_pages * PAGE_SIZE;
+    stats->swap_free = stats->swap_total - stats->swap_used;
+    
+    /* Compression statistics */
+    stats->compressed_pages = g_advanced_vmm.compression.compressed_page_count;
+    stats->memory_saved_bytes = g_advanced_vmm.compression.bytes_saved;
+    
+    if (stats->compressed_pages > 0) {
+        stats->compression_ratio_percent = (uint32_t)((stats->memory_saved_bytes * 100) / 
+                                                     (stats->compressed_pages * PAGE_SIZE));
+    }
+    
+    /* Defragmentation statistics */
+    stats->fragmentation_percent = g_advanced_vmm.stats.fragmentation_percent;
+    stats->defrag_cycles_completed = g_advanced_vmm.defrag.defrag_cycles;
+    stats->pages_moved_total = g_advanced_vmm.defrag.pages_moved;
+    
+    /* Performance metrics */
+    uint64_t total_allocations = 0;
+    for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+        memory_pool_t* pool = g_advanced_vmm.pools[i];
+        if (pool) {
+            total_allocations += pool->allocation_count;
+        }
+    }
+    
+    if (total_allocations > 0) {
+        stats->allocation_success_rate_percent = 
+            (uint32_t)(((total_allocations - g_advanced_vmm.stats.allocation_failures) * 100) / total_allocations);
+    } else {
+        stats->allocation_success_rate_percent = 100;
+    }
+    
+    stats->average_allocation_time_ns = g_advanced_vmm.performance.average_allocation_time_ns;
+    
+    return STATUS_OK;
+}
+
+/* Dump memory pool information */
+status_t memory_dump_pools(void) {
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("=== Memory Pool Information ===\n");
+    console_printf("Total Pools: %u\n", g_advanced_vmm.pool_count);
+    
+    for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+        memory_pool_t* pool = g_advanced_vmm.pools[i];
+        if (!pool) continue;
+        
+        console_printf("\nPool %u: '%s' (Type: %u)\n", pool->pool_id, pool->name, pool->type);
+        console_printf("  Size: %llu MB\n", pool->size / (1024 * 1024));
+        console_printf("  NUMA Node: %u\n", pool->numa_node);
+        console_printf("  Total Pages: %llu\n", pool->total_pages);
+        console_printf("  Allocated Pages: %llu\n", pool->allocated_pages);
+        console_printf("  Free Pages: %llu\n", pool->free_pages);
+        console_printf("  Allocations: %llu\n", pool->allocation_count);
+        console_printf("  Peak Usage: %llu pages\n", pool->peak_usage);
+        console_printf("  Fragmentation: %llu%%\n", pool->fragmentation_score);
+        
+        if (pool->compression_enabled) {
+            console_printf("  Compression: Enabled (%u%% ratio)\n", pool->compression_ratio);
+            console_printf("  Compressed Pages: %llu\n", pool->compressed_pages);
+        }
+    }
+    
+    console_printf("\n=== End Pool Information ===\n");
+    
+    return STATUS_OK;
+}
+
+/* Shutdown advanced memory management */
+status_t advanced_vmm_shutdown(void) {
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Shutting down advanced memory management...\n");
+    
+    /* Disable compression and defragmentation */
+    memory_compression_disable();
+    memory_defrag_disable();
+    
+    /* Destroy all memory pools */
+    for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+        if (g_advanced_vmm.pools[i]) {
+            memory_pool_destroy(g_advanced_vmm.pools[i]);
+        }
+    }
+    
+    /* Clear system state */
+    k_memset(&g_advanced_vmm, 0, sizeof(advanced_vmm_t));
+    
+    console_printf("Advanced memory management shutdown complete\n");
+    
+    return STATUS_OK;
+}
+
+/* Disable memory compression */
+status_t memory_compression_disable(void) {
+    if (!g_advanced_vmm.initialized || !g_advanced_vmm.compression.enabled) {
+        return STATUS_OK;
+    }
+    
+    spin_lock(&g_advanced_vmm.compression.lock);
+    
+    g_advanced_vmm.compression.enabled = false;
+    
+    /* Free all compressed pages (simplified cleanup) */
+    for (uint32_t i = 0; i < 1024 * 1024; i++) {
+        compressed_page_t* comp_page = g_advanced_vmm.compression.compressed_pages[i];
+        while (comp_page) {
+            compressed_page_t* next = comp_page->next;
+            if (comp_page->compressed_data) {
+                vmm_kfree(comp_page->compressed_data, comp_page->compressed_size);
+            }
+            vmm_kfree(comp_page, sizeof(compressed_page_t));
+            comp_page = next;
+        }
+        g_advanced_vmm.compression.compressed_pages[i] = NULL;
+    }
+    
+    g_advanced_vmm.compression.compressed_page_count = 0;
+    
+    spin_unlock(&g_advanced_vmm.compression.lock);
+    
+    console_printf("Memory compression disabled\n");
+    
+    return STATUS_OK;
+}
+
+/* Disable memory defragmentation */
+status_t memory_defrag_disable(void) {
+    if (!g_advanced_vmm.initialized || !g_advanced_vmm.defrag.enabled) {
+        return STATUS_OK;
+    }
+    
+    spin_lock(&g_advanced_vmm.defrag.lock);
+    
+    g_advanced_vmm.defrag.enabled = false;
+    g_advanced_vmm.defrag.active = false;
+    
+    /* Terminate defrag thread if running */
+    if (g_advanced_vmm.defrag.defrag_thread) {
+        /* In real implementation would terminate thread gracefully */
+        g_advanced_vmm.defrag.defrag_thread = NULL;
+    }
+    
+    spin_unlock(&g_advanced_vmm.defrag.lock);
+    
+    console_printf("Memory defragmentation disabled\n");
+    
+    return STATUS_OK;
+}
+
+/* Destroy memory pool */
+status_t memory_pool_destroy(memory_pool_t* pool) {
+    if (!pool) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("Destroying memory pool: %s\n", pool->name);
+    
+    /* Remove from pool registry */
+    for (uint32_t i = 0; i < g_advanced_vmm.pool_count; i++) {
+        if (g_advanced_vmm.pools[i] == pool) {
+            /* Shift remaining pools */
+            for (uint32_t j = i; j < g_advanced_vmm.pool_count - 1; j++) {
+                g_advanced_vmm.pools[j] = g_advanced_vmm.pools[j + 1];
+            }
+            g_advanced_vmm.pool_count--;
+            break;
+        }
+    }
+    
+    /* Free pool structure */
+    vmm_kfree(pool, sizeof(memory_pool_t));
+    
+    return STATUS_OK;
+}

@@ -1,0 +1,17 @@
+#include "kernel.h"
+#include "pci.h"
+
+/* Intel e1000e (PCIe) stub */
+
+static void e1000e_probe_cb(const pci_device_t* dev, void* user) {
+    (void)user;
+    if (dev->class_code == 0x02 && dev->subclass == 0x00 && dev->prog_if == 0x00) {
+        /* Same class/subclass; distinguish by device_id in real driver */
+        kprintf("e1000e NIC candidate at %02x:%02x.%x (vid=%04x did=%04x)\n",
+                dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);
+    }
+}
+
+void e1000e_init(void) {
+    pci_enumerate(e1000e_probe_cb, NULL);
+}

@@ -1,0 +1,464 @@
+/*
+ * memory_hardening.c - LimitlessOS Memory Protection & Hardening
+ * 
+ * Comprehensive memory security including W^X enforcement, KASLR,
+ * guard pages, slab poisoning, and stack canaries.
+ */
+
+#include "kernel.h"
+#include "vmm.h"
+#include "process.h"
+#include "random.h"
+
+#define KASLR_ENTROPY_BITS      28          /* 256MB randomization */
+#define STACK_CANARY_MAGIC      0xDEADBEEF  /* Stack canary value */
+#define SLAB_POISON_FREE        0x5A        /* Free slab poison */
+#define SLAB_POISON_ALLOC       0xA5        /* Allocated slab poison */
+#define GUARD_PAGE_SIZE         PAGE_SIZE
+#define MAX_STACK_CANARIES      1024
+
+/* Memory hardening configuration */
+typedef struct memory_hardening_config {
+    bool wx_enforcement;        /* W^X enforcement enabled */
+    bool kaslr_enabled;         /* KASLR enabled */
+    bool stack_canaries;        /* Stack canaries enabled */
+    bool guard_pages;           /* Guard pages enabled */
+    bool slab_poisoning;        /* Slab poisoning enabled */
+    bool smep_enabled;          /* SMEP (Supervisor Mode Execution Prevention) */
+    bool smap_enabled;          /* SMAP (Supervisor Mode Access Prevention) */
+    bool dep_enabled;           /* Data Execution Prevention */
+    
+    /* KASLR settings */
+    u64 kaslr_base;            /* Base address for KASLR */
+    u64 kaslr_range;           /* KASLR randomization range */
+    
+    /* Stack canary settings */
+    u64 canary_value;          /* Current canary value */
+    u32 canary_rotation_count; /* Canary rotation counter */
+    
+} memory_hardening_config_t;
+
+/* Stack canary entry */
+typedef struct stack_canary {
+    u64 canary_value;          /* Canary value for this stack */
+    virt_addr_t stack_base;    /* Base of stack */
+    virt_addr_t canary_addr;   /* Address of canary in stack */
+    thread_t* thread;          /* Thread owning this stack */
+    
+} stack_canary_t;
+
+/* W^X violation record */
+typedef struct wx_violation {
+    virt_addr_t addr;          /* Violating address */
+    u32 attempted_prot;        /* Attempted protection */
+    u32 current_prot;          /* Current protection */
+    pid_t pid;                 /* Process ID */
+    u64 timestamp;             /* When violation occurred */
+    
+} wx_violation_t;
+
+/* Global hardening state */
+static struct {
+    bool initialized;
+    memory_hardening_config_t config;
+    
+    /* Stack canaries */
+    stack_canary_t canaries[MAX_STACK_CANARIES];
+    u32 canary_count;
+    spinlock_t canary_lock;
+    
+    /* W^X violation tracking */
+    wx_violation_t violations[64];
+    u32 violation_count;
+    spinlock_t violation_lock;
+    
+    /* Statistics */
+    u64 wx_violations;
+    u64 canary_violations;
+    u64 guard_page_hits;
+    u64 kaslr_randomizations;
+    
+} g_hardening = {0};
+
+/* Function prototypes */
+static int enforce_wx_protection(vmm_aspace_t* aspace, virt_addr_t addr, u32 prot);
+static u64 generate_kaslr_offset(void);
+static u64 generate_stack_canary(void);
+static int install_stack_canary(thread_t* thread, virt_addr_t stack_base);
+static int check_stack_canary(thread_t* thread);
+static void poison_slab(void* ptr, size_t size, u8 poison_value);
+static bool check_slab_poison(void* ptr, size_t size, u8 poison_value);
+static int create_guard_page(vmm_aspace_t* aspace, virt_addr_t addr);
+static void record_wx_violation(virt_addr_t addr, u32 attempted_prot, u32 current_prot);
+
+/* Initialize memory hardening */
+int memory_hardening_init(void) {
+    if (g_hardening.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing memory hardening subsystem\n");
+    
+    memset(&g_hardening, 0, sizeof(g_hardening));
+    
+    /* Configure hardening features */
+    g_hardening.config.wx_enforcement = true;
+    g_hardening.config.kaslr_enabled = true;
+    g_hardening.config.stack_canaries = true;
+    g_hardening.config.guard_pages = true;
+    g_hardening.config.slab_poisoning = true;
+    g_hardening.config.dep_enabled = true;
+    
+    /* Check CPU features */
+    /* TODO: Check for SMEP/SMAP support */
+    g_hardening.config.smep_enabled = false;
+    g_hardening.config.smap_enabled = false;
+    
+    /* Initialize KASLR */
+    g_hardening.config.kaslr_base = 0x40000000;  /* 1GB base */
+    g_hardening.config.kaslr_range = 1ULL << KASLR_ENTROPY_BITS;
+    
+    /* Generate initial canary value */
+    g_hardening.config.canary_value = generate_stack_canary();
+    
+    /* Initialize locks */
+    spinlock_init(&g_hardening.canary_lock);
+    spinlock_init(&g_hardening.violation_lock);
+    
+    g_hardening.initialized = true;
+    
+    printf("Memory hardening enabled:\n");
+    printf("  W^X enforcement: %s\n", g_hardening.config.wx_enforcement ? "yes" : "no");
+    printf("  KASLR: %s (range: %luMB)\n", 
+           g_hardening.config.kaslr_enabled ? "yes" : "no",
+           g_hardening.config.kaslr_range / (1024 * 1024));
+    printf("  Stack canaries: %s\n", g_hardening.config.stack_canaries ? "yes" : "no");
+    printf("  Guard pages: %s\n", g_hardening.config.guard_pages ? "yes" : "no");
+    printf("  Slab poisoning: %s\n", g_hardening.config.slab_poisoning ? "yes" : "no");
+    printf("  DEP/NX: %s\n", g_hardening.config.dep_enabled ? "yes" : "no");
+    
+    return 0;
+}
+
+/* Enforce W^X (Write XOR Execute) protection */
+int memory_wx_check(vmm_aspace_t* aspace, virt_addr_t addr, u32 new_prot) {
+    if (!g_hardening.config.wx_enforcement) {
+        return 0;  /* W^X disabled */
+    }
+    
+    /* Check if trying to make page both writable and executable */
+    if ((new_prot & PTE_WRITABLE) && !(new_prot & PTE_NX)) {
+        /* W^X violation */
+        record_wx_violation(addr, new_prot, 0);
+        return -1;
+    }
+    
+    return enforce_wx_protection(aspace, addr, new_prot);
+}
+
+/* Generate KASLR randomized address */
+virt_addr_t memory_kaslr_randomize(virt_addr_t base_addr, size_t size) {
+    if (!g_hardening.config.kaslr_enabled) {
+        return base_addr;
+    }
+    
+    u64 offset = generate_kaslr_offset();
+    virt_addr_t randomized = g_hardening.config.kaslr_base + offset;
+    
+    /* Ensure we don't overflow */
+    if (randomized + size > g_hardening.config.kaslr_base + g_hardening.config.kaslr_range) {
+        randomized = g_hardening.config.kaslr_base;
+    }
+    
+    g_hardening.kaslr_randomizations++;
+    return randomized;
+}
+
+/* Set up stack canary for thread */
+int memory_setup_stack_canary(thread_t* thread, virt_addr_t stack_base, size_t stack_size) {
+    if (!g_hardening.config.stack_canaries) {
+        return 0;
+    }
+    
+    return install_stack_canary(thread, stack_base);
+}
+
+/* Check stack canary integrity */
+int memory_check_stack_canary(thread_t* thread) {
+    if (!g_hardening.config.stack_canaries) {
+        return 0;
+    }
+    
+    return check_stack_canary(thread);
+}
+
+/* Poison allocated slab */
+void memory_slab_poison_alloc(void* ptr, size_t size) {
+    if (g_hardening.config.slab_poisoning && ptr && size > 0) {
+        poison_slab(ptr, size, SLAB_POISON_ALLOC);
+    }
+}
+
+/* Poison freed slab */
+void memory_slab_poison_free(void* ptr, size_t size) {
+    if (g_hardening.config.slab_poisoning && ptr && size > 0) {
+        poison_slab(ptr, size, SLAB_POISON_FREE);
+    }
+}
+
+/* Check slab poison integrity */
+bool memory_slab_check_poison(void* ptr, size_t size) {
+    if (!g_hardening.config.slab_poisoning) {
+        return true;
+    }
+    
+    return check_slab_poison(ptr, size, SLAB_POISON_FREE);
+}
+
+/* Create guard page */
+int memory_create_guard_page(vmm_aspace_t* aspace, virt_addr_t addr) {
+    if (!g_hardening.config.guard_pages) {
+        return 0;
+    }
+    
+    return create_guard_page(aspace, addr);
+}
+
+/* Handle guard page access */
+void memory_handle_guard_page_access(virt_addr_t addr, u32 error_code) {
+    g_hardening.guard_page_hits++;
+    
+    printf("Guard page access at 0x%lx (error: 0x%x)\n", addr, error_code);
+    
+    /* Send SIGSEGV to current process */
+    process_t* current = process_current();
+    if (current) {
+        signal_send(current, SIGSEGV);
+    }
+}
+
+/* Rotate stack canary values */
+void memory_rotate_canaries(void) {
+    if (!g_hardening.config.stack_canaries) {
+        return;
+    }
+    
+    spin_lock(&g_hardening.canary_lock);
+    
+    /* Generate new canary value */
+    u64 new_canary = generate_stack_canary();
+    g_hardening.config.canary_value = new_canary;
+    g_hardening.config.canary_rotation_count++;
+    
+    /* Update existing canaries */
+    for (u32 i = 0; i < g_hardening.canary_count; i++) {
+        stack_canary_t* canary = &g_hardening.canaries[i];
+        if (canary->thread && canary->canary_addr) {
+            /* Update canary in stack */
+            *(u64*)canary->canary_addr = new_canary;
+            canary->canary_value = new_canary;
+        }
+    }
+    
+    spin_unlock(&g_hardening.canary_lock);
+    
+    printf("Rotated stack canaries (count: %u)\n", g_hardening.config.canary_rotation_count);
+}
+
+/* Internal functions */
+static int enforce_wx_protection(vmm_aspace_t* aspace, virt_addr_t addr, u32 prot) {
+    /* Get current page protection */
+    paddr_t phys;
+    if (vmm_get_physical(aspace, addr, &phys) != 0) {
+        return 0;  /* Page not mapped */
+    }
+    
+    /* TODO: Get current page table entry protection */
+    u32 current_prot = 0;  /* Would read from page table */
+    
+    /* Enforce W^X rule */
+    if ((prot & PTE_WRITABLE) && !(prot & PTE_NX)) {
+        g_hardening.wx_violations++;
+        return -1;
+    }
+    
+    /* Additional DEP enforcement */
+    if (g_hardening.config.dep_enabled) {
+        /* Data pages should have NX bit set */
+        if ((prot & PTE_WRITABLE) && !(prot & PTE_NX)) {
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
+static u64 generate_kaslr_offset(void) {
+    /* Generate cryptographically secure random offset */
+    u64 random_value = 0;
+    
+    /* TODO: Use hardware RNG or cryptographic PRNG */
+    random_value = timer_get_ticks() ^ (timer_get_ticks() << 16);
+    random_value ^= (uintptr_t)__builtin_return_address(0);
+    
+    /* Align to page boundary and limit to range */
+    random_value &= (g_hardening.config.kaslr_range - 1);
+    random_value &= PAGE_MASK;
+    
+    return random_value;
+}
+
+static u64 generate_stack_canary(void) {
+    u64 canary = STACK_CANARY_MAGIC;
+    
+    /* Mix in various entropy sources */
+    canary ^= timer_get_ticks();
+    canary ^= (uintptr_t)__builtin_return_address(0);
+    canary ^= g_hardening.config.canary_rotation_count;
+    
+    /* TODO: Use hardware RNG for better entropy */
+    
+    /* Ensure canary is not zero or easily guessable */
+    if (canary == 0 || canary == 0xFFFFFFFFFFFFFFFF) {
+        canary = STACK_CANARY_MAGIC;
+    }
+    
+    return canary;
+}
+
+static int install_stack_canary(thread_t* thread, virt_addr_t stack_base) {
+    if (g_hardening.canary_count >= MAX_STACK_CANARIES) {
+        return -1;  /* Too many canaries */
+    }
+    
+    spin_lock(&g_hardening.canary_lock);
+    
+    /* Find free canary slot */
+    u32 index = g_hardening.canary_count++;
+    stack_canary_t* canary = &g_hardening.canaries[index];
+    
+    canary->canary_value = g_hardening.config.canary_value;
+    canary->stack_base = stack_base;
+    canary->thread = thread;
+    
+    /* Place canary near end of stack (before return address) */
+    canary->canary_addr = stack_base - sizeof(u64) * 2;
+    
+    /* Write canary to stack */
+    *(u64*)canary->canary_addr = canary->canary_value;
+    
+    spin_unlock(&g_hardening.canary_lock);
+    
+    return 0;
+}
+
+static int check_stack_canary(thread_t* thread) {
+    spin_lock(&g_hardening.canary_lock);
+    
+    /* Find canary for this thread */
+    for (u32 i = 0; i < g_hardening.canary_count; i++) {
+        stack_canary_t* canary = &g_hardening.canaries[i];
+        
+        if (canary->thread == thread) {
+            /* Check canary value */
+            u64 current_value = *(u64*)canary->canary_addr;
+            
+            if (current_value != canary->canary_value) {
+                /* Canary violation detected */
+                g_hardening.canary_violations++;
+                spin_unlock(&g_hardening.canary_lock);
+                
+                printf("Stack canary violation in thread %u (expected: 0x%lx, found: 0x%lx)\n",
+                       thread->tid, canary->canary_value, current_value);
+                
+                /* Send SIGABRT to process */
+                process_t* proc = process_lookup(thread->pid);
+                if (proc) {
+                    signal_send(proc, SIGABRT);
+                }
+                
+                return -1;
+            }
+            
+            spin_unlock(&g_hardening.canary_lock);
+            return 0;
+        }
+    }
+    
+    spin_unlock(&g_hardening.canary_lock);
+    return 0;  /* No canary found (might be okay) */
+}
+
+static void poison_slab(void* ptr, size_t size, u8 poison_value) {
+    memset(ptr, poison_value, size);
+}
+
+static bool check_slab_poison(void* ptr, size_t size, u8 poison_value) {
+    u8* bytes = (u8*)ptr;
+    
+    for (size_t i = 0; i < size; i++) {
+        if (bytes[i] != poison_value) {
+            printf("Slab poison violation at offset %zu (expected: 0x%x, found: 0x%x)\n",
+                   i, poison_value, bytes[i]);
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+static int create_guard_page(vmm_aspace_t* aspace, virt_addr_t addr) {
+    /* Map page with no permissions (causes page fault on access) */
+    paddr_t guard_phys = pmm_alloc_page();
+    if (!guard_phys) {
+        return -1;
+    }
+    
+    /* Map with no read/write/execute permissions */
+    return vmm_map_page(aspace, addr, guard_phys, 0);
+}
+
+static void record_wx_violation(virt_addr_t addr, u32 attempted_prot, u32 current_prot) {
+    spin_lock(&g_hardening.violation_lock);
+    
+    if (g_hardening.violation_count < 64) {
+        wx_violation_t* violation = &g_hardening.violations[g_hardening.violation_count++];
+        
+        violation->addr = addr;
+        violation->attempted_prot = attempted_prot;
+        violation->current_prot = current_prot;
+        violation->timestamp = timer_get_ticks();
+        
+        process_t* current = process_current();
+        violation->pid = current ? current->pid : 0;
+    }
+    
+    spin_unlock(&g_hardening.violation_lock);
+    
+    printf("W^X violation: attempted to make page 0x%lx writable+executable\n", addr);
+}
+
+/* Get hardening statistics */
+void memory_hardening_get_stats(struct memory_hardening_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct memory_hardening_stats));
+    
+    stats->wx_violations = g_hardening.wx_violations;
+    stats->canary_violations = g_hardening.canary_violations;
+    stats->guard_page_hits = g_hardening.guard_page_hits;
+    stats->kaslr_randomizations = g_hardening.kaslr_randomizations;
+    stats->canary_count = g_hardening.canary_count;
+    stats->canary_rotations = g_hardening.config.canary_rotation_count;
+}
+
+/* Debugging */
+void memory_hardening_dump_stats(void) {
+    printf("Memory Hardening Statistics:\n");
+    printf("  W^X violations: %lu\n", g_hardening.wx_violations);
+    printf("  Stack canary violations: %lu\n", g_hardening.canary_violations);
+    printf("  Guard page hits: %lu\n", g_hardening.guard_page_hits);
+    printf("  KASLR randomizations: %lu\n", g_hardening.kaslr_randomizations);
+    printf("  Active canaries: %u\n", g_hardening.canary_count);
+    printf("  Canary rotations: %u\n", g_hardening.config.canary_rotation_count);
+}

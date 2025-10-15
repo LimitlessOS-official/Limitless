@@ -1,0 +1,6 @@
+#include "kernel.h"
+#include "vmm.h"
+/* Temporary stub for hal_arch_lookup_page until real arch paging walker exists.
+ * Returns -1 to indicate unsupported so clone will bail gracefully. */
+int hal_arch_lookup_page(void* arch_pml, virt_addr_t va, phys_addr_t* out_pa, pte_flags_t* out_flags) {
+    (void)arch_pml; (void)va; (void)out_pa; (void)out_flags; return -1; }

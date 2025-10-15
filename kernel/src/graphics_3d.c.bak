@@ -1,0 +1,318 @@
+/**
+ * 3D Graphics and GPU Acceleration for LimitlessOS
+ * Provides basic 3D rendering pipeline and hardware acceleration support
+ */
+
+#include "kernel.h"
+#include "graphics.h"
+#include "vmm.h"
+#include "string.h"
+#include <math.h>
+
+/* 3D Graphics State */
+static struct {
+    bool initialized;
+    matrix4x4_t view_matrix;
+    matrix4x4_t projection_matrix;
+    float camera_x, camera_y, camera_z;
+    float target_x, target_y, target_z;
+    uint32_t active_shader;
+    uint32_t frame_count;
+    uint32_t triangles_rendered;
+} g_3d_state = {0};
+
+/* Matrix operations */
+static void matrix4x4_identity(matrix4x4_t* m) {
+    k_memset(m, 0, sizeof(matrix4x4_t));
+    m->m[0][0] = m->m[1][1] = m->m[2][2] = m->m[3][3] = 1.0f;
+}
+
+static void matrix4x4_multiply(matrix4x4_t* result, const matrix4x4_t* a, const matrix4x4_t* b) {
+    matrix4x4_t temp;
+    
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            temp.m[i][j] = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                temp.m[i][j] += a->m[i][k] * b->m[k][j];
+            }
+        }
+    }
+    
+    *result = temp;
+}
+
+static void matrix4x4_perspective(matrix4x4_t* m, float fov, float aspect, float near_plane, float far_plane) {
+    k_memset(m, 0, sizeof(matrix4x4_t));
+    
+    float tan_half_fov = tanf(fov * 0.5f);
+    
+    m->m[0][0] = 1.0f / (aspect * tan_half_fov);
+    m->m[1][1] = 1.0f / tan_half_fov;
+    m->m[2][2] = -(far_plane + near_plane) / (far_plane - near_plane);
+    m->m[2][3] = -1.0f;
+    m->m[3][2] = -(2.0f * far_plane * near_plane) / (far_plane - near_plane);
+}
+
+static void matrix4x4_lookat(matrix4x4_t* m, float eye_x, float eye_y, float eye_z,
+                            float center_x, float center_y, float center_z,
+                            float up_x, float up_y, float up_z) {
+    /* Forward vector */
+    float fx = center_x - eye_x;
+    float fy = center_y - eye_y;
+    float fz = center_z - eye_z;
+    
+    /* Normalize forward */
+    float f_len = sqrtf(fx*fx + fy*fy + fz*fz);
+    fx /= f_len; fy /= f_len; fz /= f_len;
+    
+    /* Right vector = forward x up */
+    float rx = fy * up_z - fz * up_y;
+    float ry = fz * up_x - fx * up_z;
+    float rz = fx * up_y - fy * up_x;
+    
+    /* Normalize right */
+    float r_len = sqrtf(rx*rx + ry*ry + rz*rz);
+    rx /= r_len; ry /= r_len; rz /= r_len;
+    
+    /* Up vector = right x forward */
+    float ux = ry * fz - rz * fy;
+    float uy = rz * fx - rx * fz;
+    float uz = rx * fy - ry * fx;
+    
+    /* Build matrix */
+    k_memset(m, 0, sizeof(matrix4x4_t));
+    
+    m->m[0][0] = rx; m->m[0][1] = ry; m->m[0][2] = rz; m->m[0][3] = -(rx*eye_x + ry*eye_y + rz*eye_z);
+    m->m[1][0] = ux; m->m[1][1] = uy; m->m[1][2] = uz; m->m[1][3] = -(ux*eye_x + uy*eye_y + uz*eye_z);
+    m->m[2][0] = -fx; m->m[2][1] = -fy; m->m[2][2] = -fz; m->m[2][3] = (fx*eye_x + fy*eye_y + fz*eye_z);
+    m->m[3][0] = 0.0f; m->m[3][1] = 0.0f; m->m[3][2] = 0.0f; m->m[3][3] = 1.0f;
+}
+
+/* Initialize 3D graphics subsystem */
+status_t graphics_3d_init(void) {
+    if (g_3d_state.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    /* Initialize matrices */
+    matrix4x4_identity(&g_3d_state.view_matrix);
+    matrix4x4_identity(&g_3d_state.projection_matrix);
+    
+    /* Set default camera */
+    g_3d_state.camera_x = 0.0f;
+    g_3d_state.camera_y = 0.0f;
+    g_3d_state.camera_z = 5.0f;
+    g_3d_state.target_x = 0.0f;
+    g_3d_state.target_y = 0.0f;
+    g_3d_state.target_z = 0.0f;
+    
+    /* Set default perspective */
+    matrix4x4_perspective(&g_3d_state.projection_matrix, 45.0f * M_PI / 180.0f, 16.0f/9.0f, 0.1f, 1000.0f);
+    
+    /* Update view matrix */
+    matrix4x4_lookat(&g_3d_state.view_matrix, 
+                     g_3d_state.camera_x, g_3d_state.camera_y, g_3d_state.camera_z,
+                     g_3d_state.target_x, g_3d_state.target_y, g_3d_state.target_z,
+                     0.0f, 1.0f, 0.0f);
+    
+    g_3d_state.initialized = true;
+    
+    return STATUS_OK;
+}
+
+/* Create 3D mesh */
+uint32_t graphics_create_mesh(vertex_t* vertices, uint32_t vertex_count, uint32_t* indices, uint32_t index_count) {
+    if (!g_3d_state.initialized || !vertices || vertex_count == 0) {
+        return 0;
+    }
+    
+    /* Find free mesh slot (would need to access g_graphics from main graphics.c) */
+    /* This is a simplified implementation - in reality would integrate with main graphics system */
+    
+    /* Allocate mesh data */
+    size_t vertex_size = vertex_count * sizeof(vertex_t);
+    size_t index_size = index_count * sizeof(uint32_t);
+    
+    vertex_t* mesh_vertices = (vertex_t*)vmm_kmalloc(vertex_size, 16);
+    uint32_t* mesh_indices = (uint32_t*)vmm_kmalloc(index_size, 16);
+    
+    if (!mesh_vertices || !mesh_indices) {
+        if (mesh_vertices) vmm_kfree(mesh_vertices, vertex_size);
+        if (mesh_indices) vmm_kfree(mesh_indices, index_size);
+        return 0;
+    }
+    
+    /* Copy mesh data */
+    k_memcpy(mesh_vertices, vertices, vertex_size);
+    if (indices) {
+        k_memcpy(mesh_indices, indices, index_size);
+    }
+    
+    /* Return mesh ID (simplified - would actually store in mesh table) */
+    return 1;  /* Placeholder mesh ID */
+}
+
+/* Set camera position and target */
+status_t graphics_set_camera(float x, float y, float z, float target_x, float target_y, float target_z) {
+    if (!g_3d_state.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    g_3d_state.camera_x = x;
+    g_3d_state.camera_y = y;
+    g_3d_state.camera_z = z;
+    g_3d_state.target_x = target_x;
+    g_3d_state.target_y = target_y;
+    g_3d_state.target_z = target_z;
+    
+    /* Update view matrix */
+    matrix4x4_lookat(&g_3d_state.view_matrix, x, y, z, target_x, target_y, target_z, 0.0f, 1.0f, 0.0f);
+    
+    return STATUS_OK;
+}
+
+/* Set perspective projection */
+status_t graphics_set_perspective(float fov, float aspect, float near_plane, float far_plane) {
+    if (!g_3d_state.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    matrix4x4_perspective(&g_3d_state.projection_matrix, fov, aspect, near_plane, far_plane);
+    
+    return STATUS_OK;
+}
+
+/* Software 3D triangle rasterization */
+static void rasterize_triangle(uint32_t buffer_id, vertex_t* v1, vertex_t* v2, vertex_t* v3) {
+    /* This is a simplified software rasterizer */
+    /* In a real implementation, this would be handled by GPU hardware */
+    
+    /* Project vertices to screen space */
+    /* Apply model-view-projection transformation */
+    /* Perform perspective division */
+    /* Viewport transformation */
+    /* Triangle setup and rasterization */
+    
+    /* For now, just draw a simple wireframe triangle */
+    uint32_t color = v1->color;
+    
+    /* Convert 3D coordinates to 2D (simplified projection) */
+    uint32_t x1 = (uint32_t)(400 + v1->x * 100);
+    uint32_t y1 = (uint32_t)(300 + v1->y * 100);
+    uint32_t x2 = (uint32_t)(400 + v2->x * 100);
+    uint32_t y2 = (uint32_t)(300 + v2->y * 100);
+    uint32_t x3 = (uint32_t)(400 + v3->x * 100);
+    uint32_t y3 = (uint32_t)(300 + v3->y * 100);
+    
+    /* Draw triangle using 2D graphics functions */
+    graphics_draw_triangle(buffer_id, x1, y1, x2, y2, x3, y3, color, false);
+    
+    g_3d_state.triangles_rendered++;
+}
+
+/* Render 3D mesh */
+status_t graphics_render_mesh(uint32_t mesh_id, matrix4x4_t* model_matrix, matrix4x4_t* view_matrix, matrix4x4_t* projection_matrix) {
+    if (!g_3d_state.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    /* This is a placeholder implementation */
+    /* Real implementation would:
+     * 1. Transform vertices by model-view-projection matrix
+     * 2. Perform clipping and culling
+     * 3. Project to screen space
+     * 4. Rasterize triangles with proper depth testing
+     * 5. Apply texturing and lighting
+     */
+    
+    (void)mesh_id;
+    (void)model_matrix;
+    (void)view_matrix;
+    (void)projection_matrix;
+    
+    g_3d_state.frame_count++;
+    
+    return STATUS_OK;
+}
+
+/* GPU acceleration stubs */
+status_t graphics_gpu_init(void) {
+    /* Initialize GPU driver */
+    /* Detect GPU hardware */
+    /* Set up command buffers and memory management */
+    return STATUS_OK;
+}
+
+status_t graphics_gpu_create_shader(const char* vertex_shader, const char* fragment_shader, uint32_t* shader_id) {
+    if (!vertex_shader || !fragment_shader || !shader_id) {
+        return STATUS_ERROR;
+    }
+    
+    /* Compile vertex and fragment shaders */
+    /* Link shader program */
+    /* Return shader program ID */
+    
+    *shader_id = 1;  /* Placeholder */
+    return STATUS_OK;
+}
+
+status_t graphics_gpu_use_shader(uint32_t shader_id) {
+    g_3d_state.active_shader = shader_id;
+    return STATUS_OK;
+}
+
+/* Texture management stubs */
+uint32_t graphics_create_texture(uint32_t width, uint32_t height, uint32_t format, const void* data) {
+    if (width == 0 || height == 0) {
+        return 0;
+    }
+    
+    /* Allocate texture memory */
+    /* Upload texture data to GPU */
+    /* Return texture ID */
+    
+    (void)format;
+    (void)data;
+    
+    return 1;  /* Placeholder texture ID */
+}
+
+status_t graphics_bind_texture(uint32_t texture_id, uint32_t slot) {
+    /* Bind texture to shader texture unit */
+    (void)texture_id;
+    (void)slot;
+    
+    return STATUS_OK;
+}
+
+/* Performance monitoring */
+status_t graphics_get_performance_stats(uint32_t* frames_per_second, uint32_t* draw_calls, uint32_t* triangles_rendered) {
+    if (!frames_per_second || !draw_calls || !triangles_rendered) {
+        return STATUS_ERROR;
+    }
+    
+    *frames_per_second = 60;  /* Placeholder */
+    *draw_calls = g_3d_state.frame_count;
+    *triangles_rendered = g_3d_state.triangles_rendered;
+    
+    return STATUS_OK;
+}
+
+/* GPU information */
+status_t graphics_get_gpu_info(char* gpu_name, uint32_t* memory_size, uint32_t* compute_units) {
+    if (!gpu_name || !memory_size || !compute_units) {
+        return STATUS_ERROR;
+    }
+    
+    /* Query GPU hardware */
+    const char* default_name = "LimitlessOS Software Renderer";
+    for (int i = 0; i < 64 && default_name[i]; i++) {
+        gpu_name[i] = default_name[i];
+    }
+    
+    *memory_size = 512 * 1024 * 1024;  /* 512 MB placeholder */
+    *compute_units = 8;  /* 8 compute units placeholder */
+    
+    return STATUS_OK;
+}

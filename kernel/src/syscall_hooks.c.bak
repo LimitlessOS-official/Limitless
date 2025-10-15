@@ -1,0 +1,59 @@
+#include "syscall_hooks.h"
+#include "log.h"
+
+static syscall_pre_hook_t g_pre_hooks[SYSCALL_HOOK_MAX];
+static syscall_post_hook_t g_post_hooks[SYSCALL_HOOK_MAX];
+static syscall_hook_stats_t g_stats;
+
+int syscall_hook_register_pre(syscall_pre_hook_t fn) {
+    if (!fn) return K_EINVAL;
+    for (int i=0;i<SYSCALL_HOOK_MAX;i++) {
+        if (!g_pre_hooks[i]) { g_pre_hooks[i]=fn; return 0; }
+        if (g_pre_hooks[i]==fn) return 0; /* idempotent */
+    }
+    return K_ENOSPC;
+}
+
+int syscall_hook_register_post(syscall_post_hook_t fn) {
+    if (!fn) return K_EINVAL;
+    for (int i=0;i<SYSCALL_HOOK_MAX;i++) {
+        if (!g_post_hooks[i]) { g_post_hooks[i]=fn; return 0; }
+        if (g_post_hooks[i]==fn) return 0; 
+    }
+    return K_ENOSPC;
+}
+
+const syscall_hook_stats_t* syscall_hook_get_stats(void) { return &g_stats; }
+
+/* Expose arrays for diagnostics (read-only) */
+syscall_pre_hook_t* __syscall_get_pre_hooks(void){ return g_pre_hooks; }
+syscall_post_hook_t* __syscall_get_post_hooks(void){ return g_post_hooks; }
+
+/* Internal invocation helpers used by dispatcher wrapper */
+long __syscall_hooks_invoke_pre(u64 num, u64* a0,u64* a1,u64* a2,u64* a3,u64* a4,u64* a5) {
+    for (int i=0;i<SYSCALL_HOOK_MAX;i++) {
+        syscall_pre_hook_t fn = g_pre_hooks[i];
+        if (!fn) continue;
+        g_stats.pre_invocations++;
+        long rc = fn(num,a0,a1,a2,a3,a4,a5);
+        if (rc != 0) {
+            g_stats.pre_short_circuits++;
+            return rc; /* abort dispatch; rc returned directly */
+        }
+    }
+    return 0;
+}
+
+long __syscall_hooks_invoke_post(u64 num, long in_res, long* final_res) {
+    long out = in_res;
+    for (int i=0;i<SYSCALL_HOOK_MAX;i++) {
+        syscall_post_hook_t fn = g_post_hooks[i];
+        if (!fn) continue;
+        g_stats.post_invocations++;
+        int modified = 0; long candidate = out;
+        fn(num, out, &candidate, &modified);
+        if (modified) { out = candidate; g_stats.post_overrides++; }
+    }
+    *final_res = out;
+    return 0;
+}

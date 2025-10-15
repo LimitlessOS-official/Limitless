@@ -1,0 +1,923 @@
+/*/*/*
+
+ * Simple Process and Thread Scheduler for LimitlessOS
+
+ * Basic round-robin scheduler with SMP support * Simple Process and Thread Scheduler * Process and Thread Scheduler
+
+ */
+
+ * Basic round-robin scheduler with SMP support * Priority-based preemptive scheduler with SMP support
+
+#include "kernel.h"
+
+#include "scheduler.h" */ */
+
+
+
+/* Scheduler constants */
+
+#define TIMESLICE_TICKS 5
+
+#include "kernel.h"#include "kernel.h"
+
+typedef struct runqueue {
+
+    spinlock_t lock;#include "scheduler.h"#include "scheduler.h"
+
+    thread_t* head;       /* Circular doubly-linked list */
+
+    thread_t* current;    /* Currently running on this CPU */#include "process.h"
+
+    u32 thread_count;
+
+} runqueue_t;/* Scheduler constants */#include "interrupt.h"
+
+
+
+/* Global scheduler state */#define TIMESLICE_TICKS 5#include "vmm.h"
+
+static runqueue_t g_rq[KERNEL_MAX_CPUS];
+
+static thread_t* g_idle_threads[KERNEL_MAX_CPUS];#define MAX_THREADS 256#include "percpu.h"
+
+static u32 g_next_tid = 1;
+
+static u32 g_scheduler_initialized = 0;#include "signal.h"
+
+
+
+/* Initialize scheduler system *//* Thread structure enhancements */
+
+void scheduler_init(void) {
+
+    for (u32 cpu = 0; cpu < KERNEL_MAX_CPUS; cpu++) {typedef struct process {/* Legacy sched_* API block disabled: superseded by modern priority/vruntime scheduler below. */
+
+        spin_lock_init(&g_rq[cpu].lock);
+
+        g_rq[cpu].head = NULL;    pid_t pid;#if 0
+
+        g_rq[cpu].current = NULL;
+
+        g_rq[cpu].thread_count = 0;    char name[16];/* (legacy code removed) */
+
+        g_idle_threads[cpu] = NULL;
+
+    }    /* Process-specific data can be added here */#endif
+
+    
+
+    /* Set up periodic timer for scheduler ticks */} process_t;
+
+    hal_timer_set_periodic(100);  /* 100 Hz timer for scheduler ticks */
+
+    /*
+
+    g_scheduler_initialized = 1;
+
+}/* Enhanced thread structure with process reference */ * Modern per-CPU priority scheduler with vruntime fairness scaffolding.
+
+
+
+/* Get current thread */typedef struct enhanced_thread { * This replaces the legacy single circular runqueue logic above for the
+
+thread_t* thread_current(void) {
+
+    u32 cpu = hal_cpu_id();    thread_t base;        /* Base thread structure */ * scheduler_* API while leaving the older sched_* API untouched (to be
+
+    return g_rq[cpu].current;
+
+}    process_t* proc;      /* Reference to owning process */ * removed once callers are migrated).
+
+
+
+/* Set current thread */} enhanced_thread_t; */
+
+void thread_set_current(thread_t* t) {
+
+    u32 cpu = hal_cpu_id();
+
+    g_rq[cpu].current = t;
+
+}typedef struct runqueue {#define TIMESLICE_TICKS 5
+
+
+
+/* Add thread to runqueue */    spinlock_t lock;
+
+void scheduler_enqueue(thread_t* t) {
+
+    if (!t) return;    thread_t* head;       /* Circular doubly-linked list */typedef struct prio_queue {
+
+    
+
+    u32 cpu = t->affinity_cpu;    thread_t* current;    /* Currently running on this CPU */    thread_t* head; /* circular doubly-linked list */
+
+    if (cpu >= KERNEL_MAX_CPUS) cpu = 0;
+
+        u32 thread_count;} prio_queue_t;
+
+    spin_lock(&g_rq[cpu].lock);
+
+    } runqueue_t;
+
+    t->state = THREAD_RUNNABLE;
+
+    t->on_rq = 1;typedef struct runqueue {
+
+    
+
+    if (!g_rq[cpu].head) {/* Global scheduler state */    spinlock_t lock;
+
+        /* First thread */
+
+        g_rq[cpu].head = t;static runqueue_t g_rq[KERNEL_MAX_CPUS];    prio_queue_t prio[THREAD_PRIO_MAX + 1]; /* one list per priority */
+
+        t->rq_next = t;
+
+        t->rq_prev = t;static thread_t* g_idle_threads[KERNEL_MAX_CPUS];    thread_t* current; /* currently running on this CPU */
+
+    } else {
+
+        /* Insert at head */static u32 g_cpu_count = 1;} runqueue_t;
+
+        thread_t* old_head = g_rq[cpu].head;
+
+        thread_t* tail = old_head->rq_prev;static u32 g_next_tid = 1;
+
+        
+
+        t->rq_next = old_head;static u32 g_scheduler_initialized = 0;static runqueue_t g_rq[KERNEL_MAX_CPUS];
+
+        t->rq_prev = tail;
+
+        old_head->rq_prev = t;static u32 g_cpu_count = 1;
+
+        tail->rq_next = t;
+
+        /* Initialize scheduler system */percpu_sched_t g_percpu_sched[KERNEL_MAX_CPUS];
+
+        g_rq[cpu].head = t;
+
+    }void scheduler_init(void) {
+
+    
+
+    g_rq[cpu].thread_count++;    for (u32 cpu = 0; cpu < KERNEL_MAX_CPUS; cpu++) {/* Global current thread tracking */
+
+    spin_unlock(&g_rq[cpu].lock);
+
+}        spin_lock_init(&g_rq[cpu].lock);static thread_t* g_current_thread = NULL;
+
+
+
+/* Remove thread from runqueue */        g_rq[cpu].head = NULL;static spinlock_t g_current_lock;
+
+void scheduler_dequeue(thread_t* t) {
+
+    if (!t || !t->on_rq) return;        g_rq[cpu].current = NULL;
+
+    
+
+    u32 cpu = t->affinity_cpu;        g_rq[cpu].thread_count = 0;/* Get current thread */
+
+    if (cpu >= KERNEL_MAX_CPUS) cpu = 0;
+
+            g_idle_threads[cpu] = NULL;thread_t* thread_current(void) {
+
+    spin_lock(&g_rq[cpu].lock);
+
+        }    u32 cpu = hal_cpu_id();
+
+    if (g_rq[cpu].thread_count == 1) {
+
+        /* Last thread */        return g_rq[cpu].current;
+
+        g_rq[cpu].head = NULL;
+
+    } else {    /* Set up periodic timer for scheduler ticks */}
+
+        /* Remove from circular list */
+
+        t->rq_prev->rq_next = t->rq_next;    hal_timer_set_periodic(100);  /* 100 Hz timer for scheduler ticks */
+
+        t->rq_next->rq_prev = t->rq_prev;
+
+            /* Set current thread */
+
+        if (g_rq[cpu].head == t) {
+
+            g_rq[cpu].head = t->rq_next;    g_scheduler_initialized = 1;void thread_set_current(thread_t* t) {
+
+        }
+
+    }}    u32 cpu = hal_cpu_id();
+
+    
+
+    t->on_rq = 0;    g_rq[cpu].current = t;
+
+    t->rq_next = t->rq_prev = NULL;
+
+    g_rq[cpu].thread_count--;/* Get current thread */}
+
+    
+
+    spin_unlock(&g_rq[cpu].lock);thread_t* thread_current(void) {
+
+}
+
+    u32 cpu = hal_cpu_id();/* Priority weights (simple) for vruntime scaling */
+
+/* Schedule next thread to run */
+
+void scheduler_schedule(void) {    return g_rq[cpu].current;static const u32 prio_weight[] = { 1024, 512, 256, 64 }; /* HIGH..IDLE */
+
+    u32 cpu = hal_cpu_id();
+
+    thread_t* current = g_rq[cpu].current;}static const u32 BASE_WEIGHT = 1024; /* reference weight */
+
+    thread_t* next = NULL;
+
+    
+
+    spin_lock(&g_rq[cpu].lock);
+
+    /* Set current thread */static void prioq_push_locked(prio_queue_t* q, thread_t* t) {
+
+    /* Find next runnable thread */
+
+    if (g_rq[cpu].head && g_rq[cpu].thread_count > 0) {void thread_set_current(thread_t* t) {    if (!q->head) {
+
+        next = g_rq[cpu].head;
+
+            u32 cpu = hal_cpu_id();        q->head = t->rq_prev = t->rq_next = t;
+
+        /* Move to next in round-robin */
+
+        g_rq[cpu].head = next->rq_next;    g_rq[cpu].current = t;    } else {
+
+    } else {
+
+        /* No runnable threads, use idle thread */}        thread_t* h = q->head;
+
+        next = g_idle_threads[cpu];
+
+    }        t->rq_next = h;
+
+    
+
+    /* Switch context if needed *//* Add thread to runqueue */        t->rq_prev = h->rq_prev;
+
+    if (next && next != current) {
+
+        if (current) {void scheduler_enqueue(thread_t* t) {        h->rq_prev->rq_next = t;
+
+            current->state = (current->state == THREAD_RUNNING) ? THREAD_RUNNABLE : current->state;
+
+        }    if (!t) return;        h->rq_prev = t;
+
+        
+
+        if (next) {        }
+
+            next->state = THREAD_RUNNING;
+
+        }    u32 cpu = t->affinity_cpu;}
+
+        
+
+        g_rq[cpu].current = next;    if (cpu >= KERNEL_MAX_CPUS) cpu = 0;
+
+    }
+
+        static void prioq_remove_locked(prio_queue_t* q, thread_t* t) {
+
+    spin_unlock(&g_rq[cpu].lock);
+
+}    spin_lock(&g_rq[cpu].lock);    if (!t->rq_next || !t->rq_prev) return;
+
+
+
+/* Scheduler tick handler */        if (t->rq_next == t && t->rq_prev == t) {
+
+void scheduler_tick(void) {
+
+    u32 cpu = hal_cpu_id();    t->state = THREAD_RUNNABLE;        if (q->head == t) q->head = NULL;
+
+    thread_t* current = g_rq[cpu].current;
+
+        t->on_rq = 1;    } else {
+
+    if (current) {
+
+        current->ticks_used++;            t->rq_prev->rq_next = t->rq_next;
+
+        
+
+        /* Check if time slice expired */    if (!g_rq[cpu].head) {        t->rq_next->rq_prev = t->rq_prev;
+
+        if (current->ticks_used >= TIMESLICE_TICKS) {
+
+            current->ticks_used = 0;        /* First thread */        if (q->head == t) q->head = t->rq_next;
+
+            current->need_resched = 1;
+
+        }        g_rq[cpu].head = t;    }
+
+    }
+
+            t->rq_next = t;    t->rq_next = t->rq_prev = NULL;
+
+    /* Trigger reschedule if needed */
+
+    if (current && current->need_resched) {        t->rq_prev = t;}
+
+        current->need_resched = 0;
+
+        scheduler_schedule();    } else {
+
+    }
+
+}        /* Insert at head */static thread_t* rq_pick_next_locked(runqueue_t* rq) {
+
+
+
+/* Yield CPU voluntarily */        thread_t* old_head = g_rq[cpu].head;    /* Walk priorities from HIGH (0) to LOW (larger number). */
+
+void scheduler_yield(void) {
+
+    scheduler_schedule();        thread_t* tail = old_head->rq_prev;    for (int pr = THREAD_PRIO_HIGH; pr <= THREAD_PRIO_MAX; ++pr) {
+
+}
+
+                prio_queue_t* pq = &rq->prio[pr];
+
+/* Wake up a sleeping thread */
+
+void scheduler_wake(thread_t* t) {        t->rq_next = old_head;        if (!pq->head) continue;
+
+    if (!t) return;
+
+            t->rq_prev = tail;        thread_t* start = pq->head;
+
+    if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
+
+        scheduler_enqueue(t);        old_head->rq_prev = t;        thread_t* t = start;
+
+    }
+
+}        tail->rq_next = t;        thread_t* best = NULL;
+
+
+
+/* Put thread to sleep */                u64 best_vr = UINT64_MAX;
+
+void scheduler_sleep(thread_t* t) {
+
+    if (!t) return;        g_rq[cpu].head = t;        do {
+
+    
+
+    scheduler_dequeue(t);    }            if (t->state == THREAD_RUNNABLE) {
+
+    t->state = THREAD_SLEEPING;
+
+}                    if (t->vruntime < best_vr) { best_vr = t->vruntime; best = t; }
+
+
+
+/* Block a thread */    g_rq[cpu].thread_count++;            }
+
+void scheduler_block(thread_t* t) {
+
+    if (!t) return;    spin_unlock(&g_rq[cpu].lock);            t = t->rq_next;
+
+    
+
+    scheduler_dequeue(t);}        } while (t && t != start);
+
+    t->state = THREAD_BLOCKED;
+
+}        if (best) return best; /* choose lowest vruntime in this priority */
+
+
+
+/* Idle thread function *//* Remove thread from runqueue */    }
+
+static void idle_thread_func(void* arg) {
+
+    (void)arg;void scheduler_dequeue(thread_t* t) {    return NULL;
+
+    
+
+    while (1) {    if (!t || !t->on_rq) return;}
+
+        hal_cpu_halt();  /* Halt CPU until interrupt */
+
+    }    
+
+}
+
+    u32 cpu = t->affinity_cpu;void scheduler_init(void) {
+
+/* Create idle thread for a CPU */
+
+int scheduler_create_idle_thread(void) {    if (cpu >= KERNEL_MAX_CPUS) cpu = 0;    g_cpu_count = hal_cpu_count();
+
+    /* Simple idle thread creation - just mark as available */
+
+    static thread_t idle_thread = {        if (g_cpu_count == 0 || g_cpu_count > KERNEL_MAX_CPUS) g_cpu_count = 1;
+
+        .tid = 0,
+
+        .pid = 0,    spin_lock(&g_rq[cpu].lock);    
+
+        .affinity_cpu = 0,
+
+        .priority = THREAD_PRIO_IDLE,        spinlock_init(&g_current_lock);
+
+        .state = THREAD_RUNNABLE,
+
+        .ticks_used = 0,    if (g_rq[cpu].thread_count == 1) {    
+
+        .need_resched = 0,
+
+        .on_rq = 0        /* Last thread */    for (u32 i = 0; i < g_cpu_count; ++i) {
+
+    };
+
+            g_rq[cpu].head = NULL;        spinlock_init(&g_rq[i].lock);
+
+    g_idle_threads[0] = &idle_thread;
+
+    return 0;    } else {        for (int p = THREAD_PRIO_HIGH; p <= THREAD_PRIO_MAX; ++p) {
+
+}
+
+        /* Remove from circular list */            g_rq[i].prio[p].head = NULL;
+
+/* Create a kernel thread */
+
+int scheduler_create_kthread(thread_t** out_thread, void (*entry)(void*), void* arg,         t->rq_prev->rq_next = t->rq_next;        }
+
+                            void* stack_base, size_t stack_size, u32 affinity_cpu) {
+
+    if (!out_thread) return -1;        t->rq_next->rq_prev = t->rq_prev;        g_rq[i].current = NULL;
+
+    
+
+    /* Allocate thread structure */                g_percpu_sched[i].ticks = 0;
+
+    thread_t* t = (thread_t*)kalloc(sizeof(thread_t));
+
+    if (!t) return -1;        if (g_rq[cpu].head == t) {        g_percpu_sched[i].context_switch = 0;
+
+    
+
+    /* Initialize thread */            g_rq[cpu].head = t->rq_next;    }
+
+    t->tid = g_next_tid++;
+
+    t->pid = 0;  /* Kernel threads have pid 0 */        }    
+
+    t->affinity_cpu = affinity_cpu;
+
+    t->priority = THREAD_PRIO_NORMAL;    }    /* Set up timer for preemption */
+
+    t->state = THREAD_NEW;
+
+    t->ticks_used = 0;        hal_timer_set_periodic(100);  /* 100 Hz timer for scheduler ticks */
+
+    t->need_resched = 0;
+
+    t->on_rq = 0;    t->on_rq = 0;}
+
+    t->rq_next = t->rq_prev = NULL;
+
+    t->arch_ctx = NULL;    t->rq_next = t->rq_prev = NULL;
+
+    t->kstack_base = stack_base;
+
+    t->kstack_size = stack_size;    g_rq[cpu].thread_count--;/* Timer tick: account runtime, enforce timeslice */
+
+    t->entry_arg = arg;
+
+        void scheduler_tick(void) {
+
+    *out_thread = t;
+
+        spin_unlock(&g_rq[cpu].lock);    u32 cpu = hal_cpu_id();
+
+    /* Enqueue for scheduling */
+
+    scheduler_enqueue(t);}    runqueue_t* rq = &g_rq[cpu];
+
+    
+
+    return 0;    thread_t* cur = rq->current;
+
+}
+
+/* Schedule next thread to run */    if (!cur) return;
+
+/* Start multitasking */
+
+int scheduler_start_multitasking(void) {void scheduler_schedule(void) {    if (cur->state != THREAD_RUNNING) return;
+
+    if (!g_scheduler_initialized) {
+
+        return -1;    u32 cpu = hal_cpu_id();
+
+    }
+
+        thread_t* current = g_rq[cpu].current;    g_percpu_sched[cpu].ticks++;
+
+    /* Create idle thread */
+
+    scheduler_create_idle_thread();    thread_t* next = NULL;
+
+    
+
+    /* Start scheduling */        /* vruntime increment scaled inversely by weight */
+
+    scheduler_schedule();
+
+        spin_lock(&g_rq[cpu].lock);    u32 pr = (cur->priority < THREAD_PRIO_HIGH || cur->priority > THREAD_PRIO_MAX) ? THREAD_PRIO_NORMAL : cur->priority;
+
+    return 0;
+
+}        u32 w = prio_weight[pr];
+
+    /* Find next runnable thread */    if (w == 0) w = BASE_WEIGHT; /* safety */
+
+    if (g_rq[cpu].head && g_rq[cpu].thread_count > 0) {    /* Add scaled value (higher priority => larger weight => smaller vruntime advance) */
+
+        next = g_rq[cpu].head;    cur->vruntime += (BASE_WEIGHT / w);
+
+        
+
+        /* Move to next in round-robin */    if (++cur->ticks_used >= TIMESLICE_TICKS) {
+
+        g_rq[cpu].head = next->rq_next;        cur->need_resched = 1;
+
+    } else {        interrupt_request_reschedule();
+
+        /* No runnable threads, use idle thread */    }
+
+        next = g_idle_threads[cpu];}
+
+    }
+
+    void scheduler_enqueue(thread_t* t) {
+
+    /* Switch context if needed */    u32 cpu = t->affinity_cpu < g_cpu_count ? t->affinity_cpu : (t->affinity_cpu % g_cpu_count);
+
+    if (next && next != current) {    runqueue_t* rq = &g_rq[cpu];
+
+        if (current) {    spin_lock(&rq->lock);
+
+            current->state = (current->state == THREAD_RUNNING) ? THREAD_RUNNABLE : current->state;    if (t->priority < THREAD_PRIO_HIGH) t->priority = THREAD_PRIO_HIGH;
+
+        }    if (t->priority > THREAD_PRIO_MAX) t->priority = THREAD_PRIO_MAX;
+
+            if (t->state != THREAD_RUNNABLE) t->state = THREAD_RUNNABLE;
+
+        if (next) {    if (!t->on_rq) {
+
+            next->state = THREAD_RUNNING;        prioq_push_locked(&rq->prio[t->priority], t);
+
+        }        t->on_rq = 1;
+
+            }
+
+        g_rq[cpu].current = next;    spin_unlock(&rq->lock);
+
+    }}
+
+    
+
+    spin_unlock(&g_rq[cpu].lock);void scheduler_dequeue(thread_t* t) {
+
+}    u32 cpu = t->affinity_cpu < g_cpu_count ? t->affinity_cpu : (t->affinity_cpu % g_cpu_count);
+
+    runqueue_t* rq = &g_rq[cpu];
+
+/* Scheduler tick handler */    spin_lock(&rq->lock);
+
+void scheduler_tick(void) {    if (t->on_rq) {
+
+    u32 cpu = hal_cpu_id();        prioq_remove_locked(&rq->prio[t->priority], t);
+
+    thread_t* current = g_rq[cpu].current;        t->on_rq = 0;
+
+        }
+
+    if (current) {    spin_unlock(&rq->lock);
+
+        current->ticks_used++;}
+
+        
+
+        /* Check if time slice expired */void scheduler_yield(void) {
+
+        if (current->ticks_used >= TIMESLICE_TICKS) {    u32 cpu = hal_cpu_id();
+
+            current->ticks_used = 0;    runqueue_t* rq = &g_rq[cpu];
+
+            current->need_resched = 1;    spin_lock(&rq->lock);
+
+        }    thread_t* cur = rq->current;
+
+    }    if (cur && cur->state == THREAD_RUNNING) {
+
+            cur->need_resched = 1;
+
+    /* Trigger reschedule if needed */    }
+
+    if (current && current->need_resched) {    spin_unlock(&rq->lock);
+
+        current->need_resched = 0;    scheduler_schedule();
+
+        scheduler_schedule();}
+
+    }
+
+}void scheduler_schedule(void) {
+
+    hal_interrupt_disable();
+
+/* Yield CPU voluntarily */    u32 cpu = hal_cpu_id();
+
+void scheduler_yield(void) {    runqueue_t* rq = &g_rq[cpu];
+
+    scheduler_schedule();
+
+}    spin_lock(&rq->lock);
+
+    thread_t* cur = rq->current;
+
+/* Wake up a sleeping thread */    if (cur && cur->state == THREAD_RUNNING && cur->need_resched) {
+
+void scheduler_wake(thread_t* t) {        cur->need_resched = 0;
+
+    if (!t) return;        cur->ticks_used = 0;
+
+            cur->state = THREAD_RUNNABLE;
+
+    if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {        if (!cur->on_rq) {
+
+        scheduler_enqueue(t);            prioq_push_locked(&rq->prio[cur->priority], cur);
+
+    }            cur->on_rq = 1;
+
+}        }
+
+    }
+
+/* Put thread to sleep */
+
+void scheduler_sleep(thread_t* t) {    thread_t* next = rq_pick_next_locked(rq);
+
+    if (!t) return;    if (!next) {
+
+            if (cur) { /* keep running current */
+
+    scheduler_dequeue(t);            cur->state = THREAD_RUNNING;
+
+    t->state = THREAD_SLEEPING;            cur->need_resched = 0;
+
+}            spin_unlock(&rq->lock);
+
+            hal_interrupt_enable();
+
+/* Block a thread */            return;
+
+void scheduler_block(thread_t* t) {        }
+
+    if (!t) return;        spin_unlock(&rq->lock);
+
+            hal_interrupt_enable();
+
+    scheduler_dequeue(t);        return;
+
+    t->state = THREAD_BLOCKED;    }
+
+}
+
+    if (next->on_rq) {
+
+/* Idle thread function */        prioq_remove_locked(&rq->prio[next->priority], next);
+
+static void idle_thread_func(void* arg) {        next->on_rq = 0;
+
+    (void)arg;    }
+
+        next->state = THREAD_RUNNING;
+
+    while (1) {    thread_t* prev = cur;
+
+        hal_cpu_halt();  /* Halt CPU until interrupt */    rq->current = next;
+
+    }    spin_unlock(&rq->lock);
+
+}
+
+    if (prev != next) {
+
+/* Create idle thread for a CPU */        g_percpu_sched[cpu].context_switch++;
+
+int scheduler_create_idle_thread(void) {    }
+
+    /* Simple idle thread creation - just mark as available */
+
+    static thread_t idle_thread = {    if (prev == next) {
+
+        .tid = 0,        hal_interrupt_enable();
+
+        .pid = 0,        return;
+
+        .affinity_cpu = 0,    }
+
+        .priority = THREAD_PRIO_IDLE,
+
+        .state = THREAD_RUNNABLE,    struct arch_context** old_ctx = prev ? &prev->arch_ctx : NULL;
+
+        .ticks_used = 0,    struct arch_context* new_ctx = next->arch_ctx;
+
+        .need_resched = 0,    hal_arch_switch_context(old_ctx, new_ctx);
+
+        .on_rq = 0    
+
+    };    /* Deliver pending signals to the newly scheduled process */
+
+        if (next && next->proc) {
+
+    g_idle_threads[0] = &idle_thread;        signal_deliver_pending(next->proc);
+
+    return 0;    }
+
+}    
+
+    hal_interrupt_enable();
+
+/* Create a kernel thread */}
+
+int scheduler_create_kthread(thread_t** out_thread, void (*entry)(void*), void* arg, 
+
+                            void* stack_base, size_t stack_size, u32 affinity_cpu) {int scheduler_create_kthread(thread_t** out_thread, void (*entry)(void*), void* arg, void* stack_base, size_t stack_size, u32 affinity_cpu) {
+
+    if (!out_thread) return -1;    if (!out_thread || !entry || !stack_base || stack_size < 4096) return K_EINVAL;
+
+        thread_t* t = process_alloc_kernel_thread(entry, arg, stack_base, stack_size);
+
+    /* Allocate thread structure */    if (!t) return K_ENOMEM;
+
+    thread_t* t = (thread_t*)kalloc(sizeof(thread_t));    t->affinity_cpu = affinity_cpu % g_cpu_count;
+
+    if (!t) return -1;    t->state = THREAD_RUNNABLE;
+
+        t->ticks_used = 0;
+
+    /* Initialize thread */    t->need_resched = 0;
+
+    t->tid = g_next_tid++;    t->on_rq = 0;
+
+    t->pid = 0;  /* Kernel threads have pid 0 */    t->rq_next = t->rq_prev = NULL;
+
+    t->affinity_cpu = affinity_cpu;    /* default priority NORMAL if unset */
+
+    t->priority = THREAD_PRIO_NORMAL;    if (t->priority < THREAD_PRIO_HIGH || t->priority > THREAD_PRIO_MAX) t->priority = THREAD_PRIO_NORMAL;
+
+    t->state = THREAD_NEW;    scheduler_enqueue(t);
+
+    t->ticks_used = 0;    *out_thread = t;
+
+    t->need_resched = 0;    return K_OK;
+
+    t->on_rq = 0;}
+
+    t->rq_next = t->rq_prev = NULL;
+
+    t->arch_ctx = NULL;void scheduler_wake(thread_t* t) {
+
+    t->kstack_base = stack_base;    if (!t) return;
+
+    t->kstack_size = stack_size;    if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
+
+    t->entry_arg = arg;        t->state = THREAD_RUNNABLE;
+
+            scheduler_enqueue(t);
+
+    *out_thread = t;    }
+
+    }
+
+    /* Enqueue for scheduling */
+
+    scheduler_enqueue(t);/* Put current thread to sleep */
+
+    void scheduler_sleep(thread_t* t) {
+
+    return 0;    if (!t) return;
+
+}    
+
+    t->state = THREAD_SLEEPING;
+
+/* Start multitasking */    scheduler_dequeue(t);
+
+int scheduler_start_multitasking(void) {    scheduler_schedule();  /* Switch to next thread */
+
+    if (!g_scheduler_initialized) {}
+
+        return -1;
+
+    }/* Block current thread (for I/O, locks, etc.) */
+
+    void scheduler_block(thread_t* t) {
+
+    /* Create idle thread */    if (!t) return;
+
+    scheduler_create_idle_thread();    
+
+        t->state = THREAD_BLOCKED;
+
+    /* Start scheduling */    scheduler_dequeue(t);
+
+    scheduler_schedule();    scheduler_schedule();  /* Switch to next thread */
+
+    }
+
+    return 0;
+
+}/* Idle thread that runs when no other threads are runnable */
+static void idle_thread_func(void* arg) {
+    (void)arg;
+    
+    while (1) {
+        hal_cpu_halt();  /* Halt CPU until interrupt */
+        scheduler_yield();
+    }
+}
+
+/* Create system idle thread */
+int scheduler_create_idle_thread(void) {
+    /* Allocate stack for idle thread */
+    void* stack = vmm_kmalloc(8192, 16);
+    if (!stack) return K_ENOMEM;
+    
+    thread_t* idle = NULL;
+    int result = scheduler_create_kthread(&idle, idle_thread_func, NULL, stack, 8192, 0);
+    if (result != K_OK) {
+        vmm_kfree(stack, 8192);
+        return result;
+    }
+    
+    idle->priority = THREAD_PRIO_IDLE;
+    return K_OK;
+}
+
+/* Put current thread to sleep */
+void scheduler_sleep(thread_t* t) {
+    if (!t) return;
+    
+    t->state = THREAD_SLEEPING;
+    scheduler_dequeue(t);
+    scheduler_schedule();  /* Switch to next thread */
+}
+
+/* Block current thread (for I/O, locks, etc.) */
+void scheduler_block(thread_t* t) {
+    if (!t) return;
+    
+    t->state = THREAD_BLOCKED;
+    scheduler_dequeue(t);
+    scheduler_schedule();  /* Switch to next thread */
+}
+
+/* Idle thread that runs when no other threads are runnable */
+static void idle_thread_func(void* arg) {
+    (void)arg;
+    
+    while (1) {
+        hal_cpu_halt();  /* Halt CPU until interrupt */
+        scheduler_yield();
+    }
+}
+
+/* Create system idle thread */
+int scheduler_create_idle_thread(void) {
+    /* Allocate stack for idle thread */
+    void* stack = vmm_kmalloc(8192, 16);
+    if (!stack) return K_ENOMEM;
+    
+    thread_t* idle = NULL;
+    int result = scheduler_create_kthread(&idle, idle_thread_func, NULL, stack, 8192, 0);
+    if (result != K_OK) {
+        vmm_kfree(stack, 8192);
+        return result;
+    }
+    
+    idle->priority = THREAD_PRIO_IDLE;
+    return K_OK;
+}

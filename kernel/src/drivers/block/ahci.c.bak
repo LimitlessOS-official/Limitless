@@ -1,0 +1,56 @@
+#include "block.h"
+#include "kernel.h"
+#include "pci.h"
+#include "ahci.h"
+
+/* AHCI driver skeleton: detect and log. No real I/O in Phase 5 sample. */
+typedef struct {
+    pci_device_t pci;
+    /* TODO: map BAR, HBA registers, ports */
+} ahci_ctrl_t;
+
+typedef struct {
+    block_dev_t bdev;
+    ahci_ctrl_t* ctrl;
+    /* TODO: port registers, identify data, DMA buffers */
+} ahci_disk_t;
+
+static int ahci_read(block_dev_t* dev, blk_io_t* io) {
+    (void)dev; (void)io;
+    /* TODO: real DMA read using FIS and PRDT */
+    return K_ENOTSUP;
+}
+static int ahci_write(block_dev_t* dev, const blk_io_t* io) {
+    (void)dev; (void)io;
+    return K_ENOTSUP;
+}
+static u32 ahci_sector_size(block_dev_t* dev) { (void)dev; return 512; }
+static u64 ahci_capacity(block_dev_t* dev) { (void)dev; return 0; }
+static void ahci_flush(block_dev_t* dev) { (void)dev; }
+
+static void ahci_probe_cb(const pci_device_t* dev, void* user) {
+    (void)user;
+    /* Class 0x01 subclass 0x06 (SATA) prog-if 0x01 (AHCI) per PCI spec */
+    if (dev->class_code == 0x01 && dev->subclass == 0x06) {
+        kprintf("AHCI controller %02x:%02x.%x (vid=%04x did=%04x)\n",
+            dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);
+        /* TODO: map BAR5 (ABAR), reset HBA, enumerate ports, add disks */
+
+        /* Register a placeholder disk to exercise block stack */
+        static ahci_disk_t d0;
+        k_memset(&d0, 0, sizeof(d0));
+        k_strlcpy(d0.bdev.name, "sda", sizeof(d0.bdev.name));
+        d0.bdev.ops.read = ahci_read;
+        d0.bdev.ops.write = ahci_write;
+        d0.bdev.ops.sector_size = ahci_sector_size;
+        d0.bdev.ops.capacity_sectors = ahci_capacity;
+        d0.bdev.ops.flush = ahci_flush;
+        d0.bdev.sector_sz = 512;
+        d0.bdev.sectors = 0;
+        block_register(&d0.bdev);
+    }
+}
+
+void ahci_init(void) {
+    pci_enumerate(ahci_probe_cb, NULL);
+}

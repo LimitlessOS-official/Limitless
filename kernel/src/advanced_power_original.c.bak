@@ -1,0 +1,891 @@
+/*
+ * Advanced Power Management System
+ * ACPI, CPU frequency scaling, thermal control, and energy efficiency
+ */
+
+#include "kernel.h"
+#include "hal.h"
+#include "acpi.h"
+
+/* Power states */
+#define POWER_STATE_S0          0   /* Working */
+#define POWER_STATE_S1          1   /* Standby */
+#define POWER_STATE_S2          2   /* Suspend to RAM (unused) */
+#define POWER_STATE_S3          3   /* Suspend to RAM */
+#define POWER_STATE_S4          4   /* Hibernate */
+#define POWER_STATE_S5          5   /* Soft off */
+
+/* CPU power states (C-states) */
+#define CPU_CSTATE_C0           0   /* Active */
+#define CPU_CSTATE_C1           1   /* Halt */
+#define CPU_CSTATE_C2           2   /* Stop clock */
+#define CPU_CSTATE_C3           3   /* Sleep */
+#define CPU_CSTATE_C6           6   /* Deep power down */
+#define CPU_CSTATE_C7           7   /* Deeper power down */
+#define CPU_CSTATE_C8           8   /* Deepest power down */
+
+/* Performance states (P-states) */
+#define MAX_PSTATES             16
+#define MAX_THERMAL_ZONES       8
+#define MAX_COOLING_DEVICES     16
+
+/* Power management policies */
+#define POWER_POLICY_PERFORMANCE    0
+#define POWER_POLICY_BALANCED       1
+#define POWER_POLICY_POWERSAVE      2
+#define POWER_POLICY_CUSTOM         3
+
+/* Thermal thresholds */
+#define THERMAL_CRITICAL        100 /* Celsius */
+#define THERMAL_HOT             85  /* Celsius */
+#define THERMAL_PASSIVE         70  /* Celsius */
+#define THERMAL_ACTIVE          60  /* Celsius */
+
+/* CPU frequency scaling */
+typedef struct cpu_pstate {
+    uint32_t frequency_mhz;         /* Frequency in MHz */
+    uint32_t voltage_mv;            /* Voltage in millivolts */
+    uint32_t power_mw;              /* Power consumption in milliwatts */
+    uint32_t latency_us;            /* Transition latency in microseconds */
+    bool available;                 /* P-state available */
+} cpu_pstate_t;
+
+/* CPU power management */
+typedef struct cpu_power {
+    uint32_t cpu_id;                /* CPU ID */
+    uint32_t current_pstate;        /* Current P-state */
+    uint32_t max_pstate;            /* Maximum P-state */
+    uint32_t min_pstate;            /* Minimum P-state */
+    cpu_pstate_t pstates[MAX_PSTATES]; /* Available P-states */
+    uint32_t pstate_count;          /* Number of P-states */
+    
+    /* C-states */
+    uint32_t current_cstate;        /* Current C-state */
+    uint32_t deepest_cstate;        /* Deepest available C-state */
+    uint64_t cstate_residency[9];   /* C-state residency times */
+    
+    /* Statistics */
+    uint64_t pstate_transitions;    /* P-state transitions */
+    uint64_t cstate_entries;        /* C-state entries */
+    uint64_t idle_time_ns;          /* Total idle time */
+    uint64_t active_time_ns;        /* Total active time */
+    
+    volatile uint32_t lock;         /* CPU power lock */
+} cpu_power_t;
+
+/* Thermal zone */
+typedef struct thermal_zone {
+    uint32_t zone_id;               /* Zone ID */
+    char name[32];                  /* Zone name */
+    int32_t temperature;            /* Current temperature (Celsius) */
+    int32_t critical_temp;          /* Critical temperature */
+    int32_t hot_temp;               /* Hot temperature */
+    int32_t passive_temp;           /* Passive cooling temperature */
+    int32_t active_temp;            /* Active cooling temperature */
+    
+    /* Cooling policy */
+    uint32_t cooling_mode;          /* Cooling mode */
+    uint32_t polling_freq;          /* Polling frequency (ms) */
+    bool passive_cooling;           /* Passive cooling enabled */
+    bool active_cooling;            /* Active cooling enabled */
+    
+    /* Statistics */
+    int32_t min_temp;               /* Minimum recorded temperature */
+    int32_t max_temp;               /* Maximum recorded temperature */
+    uint64_t overheat_events;       /* Number of overheat events */
+    uint64_t last_update;           /* Last temperature update */
+    
+    volatile uint32_t lock;         /* Zone lock */
+} thermal_zone_t;
+
+/* Cooling device */
+typedef struct cooling_device {
+    uint32_t device_id;             /* Device ID */
+    char name[32];                  /* Device name */
+    uint32_t type;                  /* Cooling device type */
+    
+    /* Control */
+    uint32_t max_state;             /* Maximum cooling state */
+    uint32_t current_state;         /* Current cooling state */
+    uint32_t target_state;          /* Target cooling state */
+    
+    /* Operations */
+    status_t (*set_state)(struct cooling_device* dev, uint32_t state);
+    status_t (*get_state)(struct cooling_device* dev, uint32_t* state);
+    
+    /* Statistics */
+    uint64_t state_changes;         /* Number of state changes */
+    uint64_t total_runtime;         /* Total runtime */
+    
+    struct cooling_device* next;    /* Next device */
+} cooling_device_t;
+
+/* Battery information */
+typedef struct battery {
+    uint32_t battery_id;            /* Battery ID */
+    char model[32];                 /* Battery model */
+    bool present;                   /* Battery present */
+    bool charging;                  /* Currently charging */
+    
+    /* Capacity */
+    uint32_t design_capacity;       /* Design capacity (mWh) */
+    uint32_t full_capacity;         /* Full charge capacity (mWh) */
+    uint32_t remaining_capacity;    /* Remaining capacity (mWh) */
+    uint32_t charge_rate;           /* Charge/discharge rate (mW) */
+    
+    /* Status */
+    uint32_t voltage;               /* Current voltage (mV) */
+    uint32_t current;               /* Current (mA) */
+    uint32_t temperature;           /* Temperature (0.1K) */
+    uint32_t cycle_count;           /* Charge cycles */
+    
+    /* Time estimates */
+    uint32_t time_to_empty;         /* Time to empty (minutes) */
+    uint32_t time_to_full;          /* Time to full charge (minutes) */
+    
+    struct battery* next;           /* Next battery */
+} battery_t;
+
+/* Power management state */
+static struct {
+    /* System power state */
+    uint32_t system_state;          /* Current system power state */
+    uint32_t previous_state;        /* Previous power state */
+    uint32_t policy;                /* Power management policy */
+    bool acpi_available;            /* ACPI available */
+    
+    /* CPU power management */
+    cpu_power_t* cpu_power;         /* Per-CPU power state */
+    uint32_t cpu_count;             /* Number of CPUs */
+    
+    /* Thermal management */
+    thermal_zone_t thermal_zones[MAX_THERMAL_ZONES]; /* Thermal zones */
+    uint32_t thermal_zone_count;    /* Number of thermal zones */
+    cooling_device_t* cooling_devices; /* Cooling devices */
+    uint32_t cooling_device_count;  /* Number of cooling devices */
+    
+    /* Battery management */
+    battery_t* batteries;           /* Battery list */
+    uint32_t battery_count;         /* Number of batteries */
+    bool ac_online;                 /* AC adapter connected */
+    
+    /* Global settings */
+    bool cpu_freq_scaling;          /* CPU frequency scaling enabled */
+    bool aggressive_pm;             /* Aggressive power management */
+    uint32_t suspend_timeout;       /* Auto-suspend timeout (seconds) */
+    
+    /* Statistics */
+    uint64_t suspend_count;         /* Number of suspends */
+    uint64_t hibernate_count;       /* Number of hibernations */
+    uint64_t total_suspend_time;    /* Total time in suspend */
+    uint64_t wake_events;           /* Number of wake events */
+    
+    volatile uint32_t lock;         /* Global power management lock */
+} power_mgmt;
+
+/* Initialize CPU power management */
+static status_t init_cpu_power_management(void) {
+    power_mgmt.cpu_count = hal_cpu_get_count();
+    
+    power_mgmt.cpu_power = (cpu_power_t*)kalloc(sizeof(cpu_power_t) * power_mgmt.cpu_count);
+    if (!power_mgmt.cpu_power) return STATUS_NOMEM;
+    
+    for (uint32_t i = 0; i < power_mgmt.cpu_count; i++) {
+        cpu_power_t* cpu = &power_mgmt.cpu_power[i];
+        memset(cpu, 0, sizeof(*cpu));
+        
+        cpu->cpu_id = i;
+        cpu->current_pstate = 0;
+        cpu->current_cstate = CPU_CSTATE_C0;
+        cpu->deepest_cstate = CPU_CSTATE_C3; /* Conservative default */
+        
+        /* Initialize P-states (simulated) */
+        cpu->pstate_count = 4;
+        cpu->max_pstate = 0; /* Highest performance */
+        cpu->min_pstate = 3; /* Lowest performance */
+        
+        /* P0: Maximum performance */
+        cpu->pstates[0].frequency_mhz = 3200;
+        cpu->pstates[0].voltage_mv = 1200;
+        cpu->pstates[0].power_mw = 65000;
+        cpu->pstates[0].latency_us = 10;
+        cpu->pstates[0].available = true;
+        
+        /* P1: High performance */
+        cpu->pstates[1].frequency_mhz = 2400;
+        cpu->pstates[1].voltage_mv = 1100;
+        cpu->pstates[1].power_mw = 45000;
+        cpu->pstates[1].latency_us = 50;
+        cpu->pstates[1].available = true;
+        
+        /* P2: Balanced */
+        cpu->pstates[2].frequency_mhz = 1600;
+        cpu->pstates[2].voltage_mv = 1000;
+        cpu->pstates[2].power_mw = 25000;
+        cpu->pstates[2].latency_us = 100;
+        cpu->pstates[2].available = true;
+        
+        /* P3: Power save */
+        cpu->pstates[3].frequency_mhz = 800;
+        cpu->pstates[3].voltage_mv = 900;
+        cpu->pstates[3].power_mw = 12000;
+        cpu->pstates[3].latency_us = 200;
+        cpu->pstates[3].available = true;
+    }
+    
+    power_mgmt.cpu_freq_scaling = true;
+    
+    KLOG_INFO("POWER", "CPU power management initialized for %u CPUs", power_mgmt.cpu_count);
+    return STATUS_OK;
+}
+
+/* Initialize thermal management */
+static status_t init_thermal_management(void) {
+    /* Create CPU thermal zone */
+    thermal_zone_t* cpu_zone = &power_mgmt.thermal_zones[0];
+    memset(cpu_zone, 0, sizeof(*cpu_zone));
+    
+    cpu_zone->zone_id = 0;
+    strncpy(cpu_zone->name, "CPU", sizeof(cpu_zone->name) - 1);
+    cpu_zone->temperature = 45; /* Current temp */
+    cpu_zone->critical_temp = THERMAL_CRITICAL;
+    cpu_zone->hot_temp = THERMAL_HOT;
+    cpu_zone->passive_temp = THERMAL_PASSIVE;
+    cpu_zone->active_temp = THERMAL_ACTIVE;
+    
+    cpu_zone->cooling_mode = 0; /* Active cooling */
+    cpu_zone->polling_freq = 1000; /* 1 second */
+    cpu_zone->passive_cooling = true;
+    cpu_zone->active_cooling = true;
+    
+    cpu_zone->min_temp = cpu_zone->temperature;
+    cpu_zone->max_temp = cpu_zone->temperature;
+    cpu_zone->last_update = hal_timer_get_timestamp_ns();
+    
+    power_mgmt.thermal_zone_count = 1;
+    
+    /* Create CPU fan cooling device */
+    cooling_device_t* cpu_fan = (cooling_device_t*)kalloc(sizeof(cooling_device_t));
+    if (!cpu_fan) return STATUS_NOMEM;
+    
+    memset(cpu_fan, 0, sizeof(*cpu_fan));
+    cpu_fan->device_id = 0;
+    strncpy(cpu_fan->name, "CPU Fan", sizeof(cpu_fan->name) - 1);
+    cpu_fan->type = 0; /* Fan */
+    cpu_fan->max_state = 10; /* 10 speed levels */
+    cpu_fan->current_state = 3; /* Medium speed */
+    cpu_fan->target_state = 3;
+    
+    cpu_fan->next = power_mgmt.cooling_devices;
+    power_mgmt.cooling_devices = cpu_fan;
+    power_mgmt.cooling_device_count++;
+    
+    KLOG_INFO("POWER", "Thermal management initialized: %u zones, %u cooling devices",
+              power_mgmt.thermal_zone_count, power_mgmt.cooling_device_count);
+    
+    return STATUS_OK;
+}
+
+/* Initialize battery management */
+static status_t init_battery_management(void) {
+    /* Create a simulated battery */
+    battery_t* battery = (battery_t*)kalloc(sizeof(battery_t));
+    if (!battery) return STATUS_NOMEM;
+    
+    memset(battery, 0, sizeof(*battery));
+    
+    battery->battery_id = 0;
+    strncpy(battery->model, "LimitlessOS Battery", sizeof(battery->model) - 1);
+    battery->present = true;
+    battery->charging = false;
+    
+    battery->design_capacity = 50000; /* 50 Wh */
+    battery->full_capacity = 48000;   /* Slightly degraded */
+    battery->remaining_capacity = 36000; /* 75% charge */
+    battery->charge_rate = 0; /* Not charging */
+    
+    battery->voltage = 11100; /* 11.1V */
+    battery->current = 0;     /* No current flow */
+    battery->temperature = 2980; /* 25°C (298K) */
+    battery->cycle_count = 125;
+    
+    /* Calculate time estimates */
+    if (battery->charge_rate > 0) {
+        /* Charging */
+        battery->time_to_full = ((battery->full_capacity - battery->remaining_capacity) * 60) / battery->charge_rate;
+        battery->time_to_empty = 0;
+    } else if (battery->charge_rate < 0) {
+        /* Discharging */
+        battery->time_to_empty = (battery->remaining_capacity * 60) / (-battery->charge_rate);
+        battery->time_to_full = 0;
+    } else {
+        /* No charge/discharge */
+        battery->time_to_empty = 480; /* Estimate 8 hours */
+        battery->time_to_full = 0;
+    }
+    
+    battery->next = power_mgmt.batteries;
+    power_mgmt.batteries = battery;
+    power_mgmt.battery_count++;
+    
+    power_mgmt.ac_online = true; /* AC adapter connected */
+    
+    KLOG_INFO("POWER", "Battery management initialized: %u batteries", power_mgmt.battery_count);
+    return STATUS_OK;
+}
+
+/* Set CPU frequency */
+status_t cpu_set_frequency(uint32_t cpu_id, uint32_t pstate) {
+    if (cpu_id >= power_mgmt.cpu_count || !power_mgmt.cpu_freq_scaling) {
+        return STATUS_INVALID;
+    }
+    
+    cpu_power_t* cpu = &power_mgmt.cpu_power[cpu_id];
+    
+    if (pstate >= cpu->pstate_count || !cpu->pstates[pstate].available) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&cpu->lock, 1);
+    
+    uint32_t old_pstate = cpu->current_pstate;
+    cpu->current_pstate = pstate;
+    cpu->pstate_transitions++;
+    
+    /* Actually change CPU frequency via MSRs or ACPI P-states */
+    
+    /* Method 1: Intel SpeedStep via MSRs */
+    if (power_mgr.cpu_vendor == CPU_VENDOR_INTEL) {
+        /* Use IA32_PERF_CTL MSR to set frequency */
+        uint64_t perf_ctl = __rdmsr(0x199); /* IA32_PERF_CTL */
+        perf_ctl = (perf_ctl & ~0xFFFFULL) | ((freq_mhz / 100) << 8);
+        __wrmsr(0x199, perf_ctl);
+    }
+    
+    /* Method 2: AMD PowerNow via MSRs */
+    else if (power_mgr.cpu_vendor == CPU_VENDOR_AMD) {
+        /* Use FIDVID_CTL MSR for frequency scaling */
+        uint64_t fidvid = __rdmsr(0xC0010041); /* FIDVID_CTL */
+        fidvid = (fidvid & ~0xFFULL) | ((freq_mhz / 200) << 0);
+        __wrmsr(0xC0010041, fidvid);
+    }
+    
+    /* Method 3: ACPI P-states */
+    else {
+        /* Use ACPI _PSS and _PCT methods for generic frequency control */
+        acpi_evaluate_integer("_PCT", &freq_mhz);
+    }
+    
+    __sync_lock_release(&cpu->lock);
+    
+    KLOG_DEBUG("POWER", "CPU %u frequency changed: P%u -> P%u (%u MHz)", 
+               cpu_id, old_pstate, pstate, cpu->pstates[pstate].frequency_mhz);
+    
+    return STATUS_OK;
+}
+
+/* Get CPU frequency */
+uint32_t cpu_get_frequency(uint32_t cpu_id) {
+    if (cpu_id >= power_mgmt.cpu_count) return 0;
+    
+    cpu_power_t* cpu = &power_mgmt.cpu_power[cpu_id];
+    return cpu->pstates[cpu->current_pstate].frequency_mhz;
+}
+
+/* Set power management policy */
+status_t power_set_policy(uint32_t policy) {
+    if (policy > POWER_POLICY_CUSTOM) return STATUS_INVALID;
+    
+    __sync_lock_test_and_set(&power_mgmt.lock, 1);
+    
+    power_mgmt.policy = policy;
+    
+    /* Apply policy to all CPUs */
+    for (uint32_t i = 0; i < power_mgmt.cpu_count; i++) {
+        cpu_power_t* cpu = &power_mgmt.cpu_power[i];
+        
+        switch (policy) {
+            case POWER_POLICY_PERFORMANCE:
+                cpu_set_frequency(i, cpu->max_pstate); /* Maximum performance */
+                cpu->deepest_cstate = CPU_CSTATE_C1; /* Minimal idle */
+                break;
+                
+            case POWER_POLICY_BALANCED:
+                cpu_set_frequency(i, 1); /* Medium performance */
+                cpu->deepest_cstate = CPU_CSTATE_C3; /* Moderate idle */
+                break;
+                
+            case POWER_POLICY_POWERSAVE:
+                cpu_set_frequency(i, cpu->min_pstate); /* Minimum performance */
+                cpu->deepest_cstate = CPU_CSTATE_C6; /* Deep idle */
+                break;
+        }
+    }
+    
+    __sync_lock_release(&power_mgmt.lock);
+    
+    const char* policy_names[] = {"Performance", "Balanced", "Power Save", "Custom"};
+    KLOG_INFO("POWER", "Power policy set to %s", policy_names[policy]);
+    
+    return STATUS_OK;
+}
+
+/* Update thermal zone temperature */
+static void update_thermal_zones(void) {
+    for (uint32_t i = 0; i < power_mgmt.thermal_zone_count; i++) {
+        thermal_zone_t* zone = &power_mgmt.thermal_zones[i];
+        
+        __sync_lock_test_and_set(&zone->lock, 1);
+        
+        /* Simulate temperature reading */
+        int32_t old_temp = zone->temperature;
+        
+        /* Add some random variation */
+        zone->temperature += (int32_t)(hal_timer_get_timestamp_ns() % 5) - 2;
+        
+        /* Clamp temperature to reasonable range */
+        if (zone->temperature < 30) zone->temperature = 30;
+        if (zone->temperature > 95) zone->temperature = 95;
+        
+        /* Update min/max */
+        if (zone->temperature < zone->min_temp) zone->min_temp = zone->temperature;
+        if (zone->temperature > zone->max_temp) zone->max_temp = zone->temperature;
+        
+        zone->last_update = hal_timer_get_timestamp_ns();
+        
+        /* Check thermal thresholds */
+        if (zone->temperature >= zone->critical_temp) {
+            KLOG_CRITICAL("POWER", "Thermal zone %s critical: %d°C", zone->name, zone->temperature);
+            /* Emergency shutdown - immediate power off */
+            KLOG_CRITICAL("POWER", "Emergency shutdown due to critical temperature!");
+            
+            /* Attempt ACPI power off first */
+            acpi_power_off();
+            
+            /* Fallback: APM power off */
+            outw(0xB004, 0x2000); /* APM disconnect */
+            outw(0xB004, 0x3F00); /* APM power off */
+            
+            /* Last resort: triple fault to reset */
+            __asm__ volatile("cli; hlt");
+        } else if (zone->temperature >= zone->hot_temp) {
+            KLOG_WARNING("POWER", "Thermal zone %s hot: %d°C", zone->name, zone->temperature);
+            zone->overheat_events++;
+            
+            /* Throttle CPUs */
+            if (zone->zone_id == 0) { /* CPU zone */
+                for (uint32_t cpu = 0; cpu < power_mgmt.cpu_count; cpu++) {
+                    cpu_power_t* cpu_power = &power_mgmt.cpu_power[cpu];
+                    if (cpu_power->current_pstate < cpu_power->min_pstate) {
+                        cpu_set_frequency(cpu, cpu_power->current_pstate + 1);
+                    }
+                }
+            }
+        } else if (zone->temperature >= zone->passive_temp && zone->passive_cooling) {
+            /* Increase fan speed */
+            cooling_device_t* fan = power_mgmt.cooling_devices;
+            while (fan) {
+                if (fan->current_state < fan->max_state) {
+                    fan->target_state = fan->current_state + 1;
+                }
+                fan = fan->next;
+            }
+        }
+        
+        __sync_lock_release(&zone->lock);
+    }
+}
+
+/* Update cooling devices */
+static void update_cooling_devices(void) {
+    cooling_device_t* device = power_mgmt.cooling_devices;
+    
+    while (device) {
+        if (device->current_state != device->target_state) {
+            if (device->set_state) {
+                device->set_state(device, device->target_state);
+            }
+            
+            device->current_state = device->target_state;
+            device->state_changes++;
+            
+            KLOG_DEBUG("POWER", "Cooling device %s state changed to %u", 
+                       device->name, device->current_state);
+        }
+        
+        device->total_runtime++;
+        device = device->next;
+    }
+}
+
+/* Update battery information */
+static void update_battery_info(void) {
+    battery_t* battery = power_mgmt.batteries;
+    
+    while (battery) {
+        if (battery->present) {
+            /* Simulate battery discharge/charge */
+            if (power_mgmt.ac_online) {
+                /* AC connected - charging or maintaining */
+                if (battery->remaining_capacity < battery->full_capacity) {
+                    battery->charging = true;
+                    battery->charge_rate = 15000; /* 15W charging */
+                    battery->remaining_capacity += 100; /* Simulate charge increment */
+                    
+                    if (battery->remaining_capacity > battery->full_capacity) {
+                        battery->remaining_capacity = battery->full_capacity;
+                        battery->charging = false;
+                        battery->charge_rate = 0;
+                    }
+                }
+            } else {
+                /* AC disconnected - discharging */
+                battery->charging = false;
+                battery->charge_rate = -8000; /* 8W discharge */
+                
+                if (battery->remaining_capacity > 0) {
+                    battery->remaining_capacity -= 50; /* Simulate discharge */
+                } else {
+                    battery->remaining_capacity = 0;
+                }
+            }
+            
+            /* Update time estimates */
+            if (battery->charge_rate > 0) {
+                battery->time_to_full = ((battery->full_capacity - battery->remaining_capacity) * 60) / battery->charge_rate;
+                battery->time_to_empty = 0;
+            } else if (battery->charge_rate < 0) {
+                battery->time_to_empty = (battery->remaining_capacity * 60) / (-battery->charge_rate);
+                battery->time_to_full = 0;
+            }
+        }
+        
+        battery = battery->next;
+    }
+}
+
+/* Suspend system to RAM */
+status_t power_suspend_to_ram(void) {
+    KLOG_INFO("POWER", "Suspending system to RAM (S3)");
+    
+    __sync_lock_test_and_set(&power_mgmt.lock, 1);
+    
+    power_mgmt.previous_state = power_mgmt.system_state;
+    power_mgmt.system_state = POWER_STATE_S3;
+    
+    uint64_t suspend_start = hal_timer_get_timestamp_ns();
+    
+    /* Save system state */
+    /* Save CPU context, device states, etc. */
+    
+    /* Save processor state */
+    power_mgmt.suspend_context.cr0 = __read_cr0();
+    power_mgmt.suspend_context.cr3 = __read_cr3();
+    power_mgmt.suspend_context.cr4 = __read_cr4();
+    
+    /* Save GDT/IDT */
+    __sgdt(&power_mgmt.suspend_context.gdt);
+    __sidt(&power_mgmt.suspend_context.idt);
+    
+    /* Put devices into low power mode */
+    /* Suspend devices via device manager */
+    device_manager_suspend_all();
+    
+    /* Suspend PCI devices to D3 state */
+    for (uint32_t i = 0; i < power_mgmt.device_count; i++) {
+        power_device_t* dev = &power_mgmt.devices[i];
+        if (dev && dev->type == POWER_DEVICE_PCI) {
+            pci_set_power_state(dev->pci_bus, dev->pci_slot, 3); /* D3 state */
+        }
+    }
+    
+    /* Put CPUs into deep sleep */
+    for (uint32_t i = 0; i < power_mgmt.cpu_count; i++) {
+        cpu_power_t* cpu = &power_mgmt.cpu_power[i];
+        cpu->current_cstate = CPU_CSTATE_C6;
+    }
+    
+    /* Simulate suspend time */
+    hal_timer_delay_ms(100); /* Brief delay to simulate suspend */
+    
+    power_mgmt.suspend_count++;
+    
+    __sync_lock_release(&power_mgmt.lock);
+    
+    KLOG_INFO("POWER", "System suspended to RAM");
+    return STATUS_OK;
+}
+
+/* Resume system from suspend */
+status_t power_resume_from_suspend(void) {
+    KLOG_INFO("POWER", "Resuming system from suspend");
+    
+    __sync_lock_test_and_set(&power_mgmt.lock, 1);
+    
+    uint64_t resume_start = hal_timer_get_timestamp_ns();
+    
+    /* Restore CPU states */
+    for (uint32_t i = 0; i < power_mgmt.cpu_count; i++) {
+        cpu_power_t* cpu = &power_mgmt.cpu_power[i];
+        cpu->current_cstate = CPU_CSTATE_C0;
+    }
+    
+    /* Resume devices */
+    /* Resume PCI devices from D3 to D0 state */
+    for (uint32_t i = 0; i < power_mgmt.device_count; i++) {
+        power_device_t* dev = &power_mgmt.devices[i];
+        if (dev && dev->type == POWER_DEVICE_PCI) {
+            pci_set_power_state(dev->pci_bus, dev->pci_slot, 0); /* D0 state */
+        }
+    }
+    
+    /* Resume devices via device manager */
+    device_manager_resume_all();
+    
+    /* Restore system state */
+    /* Restore CPU context, etc. */
+    __write_cr0(power_mgmt.suspend_context.cr0);
+    __write_cr3(power_mgmt.suspend_context.cr3);
+    __write_cr4(power_mgmt.suspend_context.cr4);
+    
+    /* Restore GDT/IDT */
+    __lgdt(&power_mgmt.suspend_context.gdt);
+    __lidt(&power_mgmt.suspend_context.idt);
+    
+    power_mgmt.system_state = power_mgmt.previous_state;
+    power_mgmt.wake_events++;
+    
+    uint64_t resume_time = hal_timer_get_timestamp_ns() - resume_start;
+    power_mgmt.total_suspend_time += resume_time;
+    
+    __sync_lock_release(&power_mgmt.lock);
+    
+    KLOG_INFO("POWER", "System resumed from suspend (resume time: %llu ms)", 
+              resume_time / 1000000);
+    
+    return STATUS_OK;
+}
+
+/* Hibernate system to disk */
+status_t power_hibernate_to_disk(void) {
+    KLOG_INFO("POWER", "Hibernating system to disk (S4)");
+    
+    __sync_lock_test_and_set(&power_mgmt.lock, 1);
+    
+    power_mgmt.previous_state = power_mgmt.system_state;
+    power_mgmt.system_state = POWER_STATE_S4;
+    
+    /* Save system image to disk */
+    /* Save memory image to hibernation file */
+    
+    /* Open hibernation file on storage device */
+    int hiber_fd = sys_open("/hibernate.img", 2 | 0x40); /* O_RDWR | O_CREAT */
+    if (hiber_fd < 0) {
+        KLOG_ERROR("POWER", "Failed to create hibernation file");
+        return STATUS_IO_ERROR;
+    }
+    
+    /* Calculate total memory to save */
+    uint64_t total_memory = pmm_get_total_memory();
+    uint64_t used_memory = pmm_get_used_memory();
+    
+    KLOG_INFO("POWER", "Saving %llu MB to hibernation file", used_memory / (1024*1024));
+    
+    /* Save memory pages in chunks */
+    uint8_t* buffer = kalloc(64 * 1024); /* 64KB buffer */
+    if (buffer) {
+        for (uint64_t addr = 0; addr < total_memory; addr += 64 * 1024) {
+            if (pmm_is_memory_used(addr)) {
+                memcpy(buffer, (void*)addr, 64 * 1024);
+                sys_write(hiber_fd, buffer, 64 * 1024);
+            }
+        }
+        kfree(buffer);
+    }
+    
+    sys_close(hiber_fd);
+    
+    power_mgmt.hibernate_count++;
+    
+    __sync_lock_release(&power_mgmt.lock);
+    
+    KLOG_INFO("POWER", "System hibernated to disk");
+    return STATUS_OK;
+}
+
+/* Power management periodic update */
+void power_mgmt_update(void) {
+    static uint64_t last_update = 0;
+    uint64_t current_time = hal_timer_get_timestamp_ns();
+    
+    /* Update every second */
+    if (current_time - last_update < 1000000000ULL) return;
+    
+    last_update = current_time;
+    
+    update_thermal_zones();
+    update_cooling_devices();
+    update_battery_info();
+}
+
+/* Print power management statistics */
+void power_print_stats(void) {
+    kprintf("=== Power Management Statistics ===\n");
+    
+    kprintf("\nSystem Power:\n");
+    const char* state_names[] = {"S0 (Working)", "S1 (Standby)", "S2", "S3 (Suspend)", "S4 (Hibernate)", "S5 (Off)"};
+    kprintf("  Current state: %s\n", state_names[power_mgmt.system_state]);
+    
+    const char* policy_names[] = {"Performance", "Balanced", "Power Save", "Custom"};
+    kprintf("  Power policy: %s\n", policy_names[power_mgmt.policy]);
+    kprintf("  Suspend count: %llu\n", power_mgmt.suspend_count);
+    kprintf("  Hibernate count: %llu\n", power_mgmt.hibernate_count);
+    kprintf("  Wake events: %llu\n", power_mgmt.wake_events);
+    
+    kprintf("\nCPU Power Management:\n");
+    for (uint32_t i = 0; i < power_mgmt.cpu_count; i++) {
+        cpu_power_t* cpu = &power_mgmt.cpu_power[i];
+        kprintf("  CPU %u: P%u (%u MHz), C%u\n", 
+                cpu->cpu_id, cpu->current_pstate,
+                cpu->pstates[cpu->current_pstate].frequency_mhz,
+                cpu->current_cstate);
+        kprintf("    P-state transitions: %llu\n", cpu->pstate_transitions);
+        kprintf("    C-state entries: %llu\n", cpu->cstate_entries);
+    }
+    
+    kprintf("\nThermal Management:\n");
+    for (uint32_t i = 0; i < power_mgmt.thermal_zone_count; i++) {
+        thermal_zone_t* zone = &power_mgmt.thermal_zones[i];
+        kprintf("  %s: %d°C (min: %d°C, max: %d°C)\n",
+                zone->name, zone->temperature, zone->min_temp, zone->max_temp);
+        kprintf("    Overheat events: %llu\n", zone->overheat_events);
+    }
+    
+    cooling_device_t* device = power_mgmt.cooling_devices;
+    while (device) {
+        kprintf("  %s: state %u/%u (%llu changes)\n",
+                device->name, device->current_state, device->max_state,
+                device->state_changes);
+        device = device->next;
+    }
+    
+    kprintf("\nBattery Management:\n");
+    kprintf("  AC adapter: %s\n", power_mgmt.ac_online ? "Online" : "Offline");
+    
+    battery_t* battery = power_mgmt.batteries;
+    while (battery) {
+        if (battery->present) {
+            uint32_t charge_percent = (battery->remaining_capacity * 100) / battery->full_capacity;
+            kprintf("  %s: %u%% (%s)\n", 
+                    battery->model, charge_percent,
+                    battery->charging ? "Charging" : "Discharging");
+            kprintf("    Capacity: %u/%u mWh\n", 
+                    battery->remaining_capacity, battery->full_capacity);
+            kprintf("    Voltage: %u.%03u V\n", 
+                    battery->voltage / 1000, battery->voltage % 1000);
+            kprintf("    Cycles: %u\n", battery->cycle_count);
+            
+            if (battery->time_to_empty > 0) {
+                kprintf("    Time to empty: %u:%02u\n", 
+                        battery->time_to_empty / 60, battery->time_to_empty % 60);
+            }
+            if (battery->time_to_full > 0) {
+                kprintf("    Time to full: %u:%02u\n", 
+                        battery->time_to_full / 60, battery->time_to_full % 60);
+            }
+        }
+        battery = battery->next;
+    }
+    
+    kprintf("=== End Power Management Statistics ===\n");
+}
+
+/* Initialize power management */
+status_t power_management_init(void) {
+    KLOG_INFO("POWER", "Initializing power management subsystem");
+    
+    memset(&power_mgmt, 0, sizeof(power_mgmt));
+    
+    power_mgmt.system_state = POWER_STATE_S0;
+    power_mgmt.policy = POWER_POLICY_BALANCED;
+    power_mgmt.acpi_available = true; /* Assume ACPI is available */
+    power_mgmt.suspend_timeout = 300; /* 5 minutes */
+    
+    /* Initialize subsystems */
+    status_t result;
+    
+    result = init_cpu_power_management();
+    if (result != STATUS_OK) return result;
+    
+    result = init_thermal_management();
+    if (result != STATUS_OK) return result;
+    
+    result = init_battery_management();
+    if (result != STATUS_OK) return result;
+    
+    /* Set default power policy */
+    power_set_policy(POWER_POLICY_BALANCED);
+    
+    KLOG_INFO("POWER", "Power management subsystem initialized");
+    KLOG_INFO("POWER", "  CPUs: %u", power_mgmt.cpu_count);
+    KLOG_INFO("POWER", "  Thermal zones: %u", power_mgmt.thermal_zone_count);
+    KLOG_INFO("POWER", "  Cooling devices: %u", power_mgmt.cooling_device_count);
+    KLOG_INFO("POWER", "  Batteries: %u", power_mgmt.battery_count);
+    
+    return STATUS_OK;
+}
+
+/* Stub implementations for compatibility */
+status_t acpi_enter_sleep_state(uint32_t state) {
+    switch (state) {
+        case POWER_STATE_S3:
+            return power_suspend_to_ram();
+        case POWER_STATE_S4:
+            return power_hibernate_to_disk();
+        default:
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
+status_t thermal_get_temperature(uint32_t zone_id, int32_t* temperature) {
+    if (zone_id >= power_mgmt.thermal_zone_count || !temperature) {
+        return STATUS_INVALID;
+    }
+    
+    *temperature = power_mgmt.thermal_zones[zone_id].temperature;
+    return STATUS_OK;
+}
+
+status_t battery_get_status(uint32_t battery_id, void* status) {
+    battery_t* battery = power_mgmt.batteries;
+    while (battery && battery->battery_id != battery_id) {
+        battery = battery->next;
+    }
+    
+    if (!battery || !status) return STATUS_INVALID;
+    
+    /* Fill battery status structure via ACPI battery methods */
+    
+    /* Query ACPI _BST (Battery Status) method */
+    uint32_t bst_package[4];
+    if (acpi_evaluate_package("_BST", bst_package, 4) == STATUS_OK) {
+        status->state = bst_package[0]; /* Battery state */
+        status->present_rate = bst_package[1]; /* Present discharge rate */
+        status->remaining_capacity = bst_package[2]; /* Remaining capacity */
+        status->present_voltage = bst_package[3]; /* Present voltage */
+    } else {
+        /* Fallback values if ACPI unavailable */
+        status->state = BATTERY_STATE_DISCHARGING;
+        status->present_rate = 2500; /* 2.5W */
+        status->remaining_capacity = 45000; /* 45 Wh */
+        status->present_voltage = 11100; /* 11.1V */
+    }
+    
+    /* Calculate percentage */
+    if (status->design_capacity > 0) {
+        status->percentage = (status->remaining_capacity * 100) / status->design_capacity;
+    } else {
+        status->percentage = 50; /* Default 50% */
+    }
+    return STATUS_OK;
+}

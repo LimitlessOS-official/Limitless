@@ -1,0 +1,381 @@
+/*
+ * Enhanced Process Manager Implementation
+ * Advanced process lifecycle with thread pools, IPC, resource monitoring
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "fd.h"
+#include "signal.h"
+#include "vmm.h"
+#include "scheduler.h"
+#include "ipc.h"
+#include "timer.h"
+
+#define MAX_THREADS (MAX_PROCS * 8)
+#define MAX_WORK_QUEUE_SIZE 1024
+
+/* Work queue item for thread pools */
+typedef struct work_item {
+    void (*work_func)(void*);
+    void* arg;
+    struct work_item* next;
+} work_item_t;
+
+/* Work queue structure */
+typedef struct work_queue {
+    work_item_t* head;
+    work_item_t* tail;
+    uint32_t size;
+    uint32_t max_size;
+    spinlock_t lock;
+    struct wait_queue* workers;
+} work_queue_t;
+
+static spinlock_t g_pid_lock;
+static pid_t g_next_pid = 1;
+
+static spinlock_t g_tid_lock;
+static tid_t g_next_tid = 1;
+
+/* Simple global tables (Phase 1) */
+static process_t* g_proc_table[MAX_PROCS];
+static thread_t*  g_thread_table[MAX_THREADS];
+
+static int alloc_pid_locked(void) {
+    for (int i = 0; i < MAX_PROCS; ++i) {
+        pid_t candidate = g_next_pid++;
+        if (g_next_pid >= (pid_t)(MAX_PROCS * 4)) g_next_pid = 1;
+        int idx = candidate % MAX_PROCS;
+        if (!g_proc_table[idx]) return candidate;
+    }
+    return -1;
+}
+
+static int alloc_tid_locked(void) {
+    for (int i = 0; i < MAX_THREADS; ++i) {
+        tid_t candidate = g_next_tid++;
+        if (g_next_tid >= (tid_t)(MAX_THREADS * 4)) g_next_tid = 1;
+        int idx = candidate % MAX_THREADS;
+        if (!g_thread_table[idx]) return candidate;
+    }
+    return -1;
+}
+
+/* Enhanced process management state */
+static struct {
+    uint64_t total_processes_created;
+    uint64_t total_threads_created;
+    uint64_t context_switches;
+    uint64_t total_cpu_time;
+    spinlock_t stats_lock;
+} g_process_stats = {0};
+
+void process_init(void) {
+    spinlock_init(&g_pid_lock);
+    spinlock_init(&g_tid_lock);
+    spinlock_init(&g_process_stats.stats_lock);
+    k_memset(g_proc_table, 0, sizeof(g_proc_table));
+    k_memset(g_thread_table, 0, sizeof(g_thread_table));
+    
+    /* Initialize IPC system */
+    ipc_init();
+    
+    /* VFS already initialized - just ensure directories exist */
+    extern void vfs_init_dirs(void);
+    vfs_init_dirs();
+}
+
+/* Create a new process with a new address space */
+int process_create(process_t** out, uid_t uid, gid_t gid, const char* name) {
+
+    if (!out) return K_EINVAL;
+    process_t* p = (process_t*)vmm_kmalloc(sizeof(process_t), 64);
+    if (!p) return K_ENOMEM;
+    k_memset(p, 0, sizeof(*p));
+    p->uid = uid;
+    p->gid = gid;
+    p->umask = 0022; /* standard default */
+    if (name) {
+        size_t n = k_strlen(name);
+        if (n >= sizeof(p->name)) n = sizeof(p->name) - 1;
+        for (size_t i=0;i<n;i++) p->name[i]=name[i]; p->name[n]='\0';
+    }
+
+    p->as = vmm_create_aspace();
+    if (!p->as) { vmm_kfree(p, sizeof(*p)); return K_ENOMEM; }
+
+    /* Allocate and initialize fd table */
+    p->fdtab = (struct fd_table*)vmm_kmalloc(sizeof(struct fd_table), 32);
+    if (!p->fdtab) { vmm_destroy_aspace(p->as); vmm_kfree(p, sizeof(*p)); return K_ENOMEM; }
+    fd_table_init(p->fdtab);
+
+    /* Allocate and initialize signal state */
+    p->sigstate = (struct signal_state*)vmm_kmalloc(sizeof(struct signal_state), 32);
+    if (!p->sigstate) { vmm_destroy_aspace(p->as); vmm_kfree(p->fdtab, sizeof(struct fd_table)); vmm_kfree(p, sizeof(*p)); return K_ENOMEM; }
+    signal_init(p->sigstate);
+
+    spin_lock(&g_pid_lock);
+    int pid = alloc_pid_locked();
+    if (pid < 0) { spin_unlock(&g_pid_lock); vmm_destroy_aspace(p->as); vmm_kfree(p, sizeof(*p)); return K_EBUSY; }
+    p->pid = (pid_t)pid;
+    g_proc_table[p->pid % MAX_PROCS] = p;
+    spin_unlock(&g_pid_lock);
+
+    *out = p;
+    return K_OK;
+}
+
+/* Advanced process creation with security and resource limits */
+status_t process_create_advanced(process_t** out, const char* name, const char* cmdline, 
+                                security_context_t* security, resource_limits_t* limits) {
+    if (!out || !name) return STATUS_ERROR;
+    
+    process_t* p = (process_t*)vmm_kmalloc(sizeof(process_t), 64);
+    if (!p) return STATUS_NOMEM;
+    k_memset(p, 0, sizeof(*p));
+    
+    /* Initialize basic process info */
+    strncpy(p->name, name, sizeof(p->name) - 1);
+    if (cmdline) {
+        strncpy(p->cmdline, cmdline, sizeof(p->cmdline) - 1);
+    }
+    
+    /* Set security context */\n    if (security) {\n        p->security = *security;\n    } else {\n        /* Default security context */\n        p->security.uid = p->security.euid = p->security.suid = 1000;\n        p->security.gid = p->security.egid = p->security.sgid = 1000;\n        p->security.capabilities = 0;\n        p->security.is_privileged = false;\n        p->security.can_exec_setuid = false;\n    }\n    \n    /* Set resource limits */\n    if (limits) {\n        p->limits = *limits;\n    } else {\n        /* Default resource limits */\n        p->limits.max_memory = 512 * 1024 * 1024;  /* 512 MB */\n        p->limits.max_cpu_time = 3600 * 1000000;   /* 1 hour */\n        p->limits.max_open_files = 1024;\n        p->limits.max_threads = 256;\n        p->limits.max_processes = 32;\n    }\n    \n    /* Initialize process state */\n    p->state = PROC_STATE_NEW;\n    p->priority = PROC_PRIO_NORMAL;\n    p->nice_value = 0;\n    p->start_time = timer_get_ticks();\n    p->cpu_affinity = 0xFFFFFFFF;  /* All CPUs */\n    \n    /* Create address space */\n    p->as = vmm_create_aspace();\n    if (!p->as) {\n        vmm_kfree(p, sizeof(*p));\n        return STATUS_NOMEM;\n    }\n    \n    /* Initialize file descriptor table */\n    p->fdtab = (struct fd_table*)vmm_kmalloc(sizeof(struct fd_table), 32);\n    if (!p->fdtab) {\n        vmm_destroy_aspace(p->as);\n        vmm_kfree(p, sizeof(*p));\n        return STATUS_NOMEM;\n    }\n    fd_table_init(p->fdtab);\n    \n    /* Initialize signal state */\n    p->sigstate = (struct signal_state*)vmm_kmalloc(sizeof(struct signal_state), 32);\n    if (!p->sigstate) {\n        vmm_kfree(p->fdtab, sizeof(struct fd_table));\n        vmm_destroy_aspace(p->as);\n        vmm_kfree(p, sizeof(*p));\n        return STATUS_NOMEM;\n    }\n    signal_init(p->sigstate);\n    \n    /* Allocate PID */\n    spin_lock(&g_pid_lock);\n    int pid = alloc_pid_locked();\n    if (pid < 0) {\n        spin_unlock(&g_pid_lock);\n        vmm_kfree(p->sigstate, sizeof(struct signal_state));\n        vmm_kfree(p->fdtab, sizeof(struct fd_table));\n        vmm_destroy_aspace(p->as);\n        vmm_kfree(p, sizeof(*p));\n        return STATUS_ERROR;\n    }\n    p->pid = (pid_t)pid;\n    g_proc_table[p->pid % MAX_PROCS] = p;\n    \n    /* Update statistics */\n    spin_lock(&g_process_stats.stats_lock);\n    g_process_stats.total_processes_created++;\n    spin_unlock(&g_process_stats.stats_lock);\n    \n    spin_unlock(&g_pid_lock);\n    \n    /* Initialize process lock */\n    spinlock_init(&p->lock);\n    \n    *out = p;\n    return STATUS_OK;\n}\n\n/* Destroy process (must be zombie, all threads gone) */
+int process_destroy(process_t* p) {
+    if (!p) return K_EINVAL;
+    spin_lock(&g_pid_lock);
+    if (g_proc_table[p->pid % MAX_PROCS] == p) g_proc_table[p->pid % MAX_PROCS] = NULL;
+    spin_unlock(&g_pid_lock);
+
+    if (p->as) vmm_destroy_aspace(p->as);
+    if (p->fdtab) vmm_kfree(p->fdtab, sizeof(struct fd_table));
+    if (p->sigstate) {
+        signal_cleanup(p->sigstate);
+        vmm_kfree(p->sigstate, sizeof(struct signal_state));
+    }
+    vmm_kfree(p, sizeof(*p));
+    return K_OK;
+}
+
+/* Allocate a kernel thread bound to this process (kernel-only in Phase 1) */
+thread_t* process_alloc_kernel_thread(void (*entry)(void*), void* arg, void* stack_base, size_t stack_size) {
+    process_t* kp = process_get_kernel();
+    if (!kp) return NULL;
+
+    thread_t* t = (thread_t*)vmm_kmalloc(sizeof(thread_t), 64);
+    if (!t) return NULL;
+    k_memset(t, 0, sizeof(*t));
+
+    spin_lock(&g_tid_lock);
+    int tid = alloc_tid_locked();
+    if (tid < 0) { spin_unlock(&g_tid_lock); vmm_kfree(t, sizeof(*t)); return NULL; }
+    t->tid = (tid_t)tid;
+    g_thread_table[t->tid % MAX_THREADS] = t;
+    spin_unlock(&g_tid_lock);
+
+    t->pid = kp->pid;
+    t->state = THREAD_NEW;
+    t->entry_arg = arg;
+    t->kstack_base = stack_base;
+    t->kstack_size = stack_size;
+
+    /* Prepare arch context for kernel thread start */
+    hal_arch_prepare_kthread(&t->arch_ctx, entry, arg, (u8*)stack_base + stack_size);
+
+    return t;
+}
+
+thread_t* process_thread_lookup(tid_t tid) {
+    return g_thread_table[tid % MAX_THREADS];
+}
+
+process_t* process_lookup(pid_t pid) {
+    return g_proc_table[pid % MAX_PROCS];
+}
+
+/* Kernel process singleton */
+static process_t* g_kernel_proc = NULL;
+
+process_t* process_get_kernel(void) {
+    if (!g_kernel_proc) {
+        process_t* p = NULL;
+        if (process_create(&p, 0, 0, "kernel") == K_OK) {
+            g_kernel_proc = p;
+        }
+    }
+    return g_kernel_proc;
+}
+
+/* Fork: COW clone address space and duplicate metadata */
+int process_fork(process_t* parent, process_t** child_out) {
+    if (!parent || !child_out) return K_EINVAL;
+    process_t* child = NULL;
+    int rc = process_create(&child, parent->uid, parent->gid, parent->name);
+    if (rc != K_OK) return rc;
+    /* Destroy freshly created (empty) address space and replace with clone? Simpler: reuse created as */
+    if (!child->as || !parent->as) { process_destroy(child); return K_EFAULT; }
+    rc = vmm_clone_address_space_cow((vmm_aspace_t*)child->as, (vmm_aspace_t*)parent->as);
+    if (rc != 0) { process_destroy(child); return rc; }
+    child->umask = parent->umask;
+
+    /* Duplicate fd table (shallow copy, increment refcnts) */
+    for (int i = 0; i < MAX_FD; ++i) {
+        if (parent->fdtab->entries[i].refcnt > 0) {
+            child->fdtab->entries[i] = parent->fdtab->entries[i];
+            child->fdtab->entries[i].refcnt++;
+        }
+    }
+
+    /* Copy signal state (pending signals not inherited, handlers and mask are) */
+    for (int i = 0; i < NSIG; ++i) {
+        child->sigstate->actions[i] = parent->sigstate->actions[i];
+    }
+    child->sigstate->blocked = parent->sigstate->blocked;
+    child->sigstate->pending = 0;
+
+    *child_out = child;
+    return K_OK;
+}
+
+/* Current process tracking - simplified for single-threaded kernel */
+static process_t* g_current_process = NULL;
+
+process_t* process_current(void) {
+    if (!g_current_process) {
+        g_current_process = process_get_kernel();
+    }
+    return g_current_process;
+}
+
+void process_set_current(process_t* p) {
+    g_current_process = p;
+}
+
+/* Create user process */
+process_t* process_create_user(const char* name) {
+    process_t* p = NULL;
+    if (process_create(&p, 1000, 1000, name) == K_OK) {
+        return p;
+    }
+    return NULL;
+}
+
+/* Thread creation */
+thread_t* thread_create_user(process_t* proc, vaddr_t entry, vaddr_t sp) {
+    if (!proc) return NULL;
+    
+    thread_t* t = (thread_t*)vmm_kmalloc(sizeof(thread_t), 64);
+    if (!t) return NULL;
+    k_memset(t, 0, sizeof(*t));
+
+    spin_lock(&g_tid_lock);
+    int tid = alloc_tid_locked();
+    if (tid < 0) { 
+        spin_unlock(&g_tid_lock); 
+        vmm_kfree(t, sizeof(*t)); 
+        return NULL; 
+    }
+    t->tid = (tid_t)tid;
+    g_thread_table[t->tid % MAX_THREADS] = t;
+    spin_unlock(&g_tid_lock);
+
+    t->pid = proc->pid;
+    t->state = THREAD_NEW;
+    
+    /* Set up user thread context */
+    if (t->arch_ctx) {
+        /* Simplified - just set entry and stack pointer */
+        (void)entry;
+        (void)sp;
+    }
+
+    return t;
+}
+
+/* Process yield (real implementation) */
+int process_yield(void) {
+    /* Yield current process to scheduler */
+    scheduler_yield();
+    return K_OK;
+}
+
+/* Process exit implementation */
+void process_exit(process_t* proc, int exit_code) {
+    if (!proc) return;
+    
+    /* Set exit status */
+    proc->exit_code = exit_code;
+    proc->state = PROC_STATE_ZOMBIE;
+    
+    /* TODO: Signal parent process with SIGCHLD */
+    
+    /* Remove from scheduler */
+    /* Note: This would normally involve cleaning up all threads */
+    
+    /* For now, just schedule next process */
+    scheduler_schedule();
+}
+
+/* Wake up a process for signal delivery */
+void process_wakeup(process_t* proc) {
+    if (!proc) return;
+    
+    /* If process is sleeping, wake it up to handle signals */
+    if (proc->state == PROC_STATE_SLEEPING || proc->state == PROC_STATE_BLOCKED) {
+        proc->state = PROC_STATE_READY;
+        KLOG_DEBUG("process", "Woke up process %d for signal delivery", proc->pid);
+    }
+}
+
+/* Wait for child process */
+int process_waitpid(pid_t pid, int* status, int options) {
+    if (pid <= 0) return -K_EINVAL;
+    
+    process_t* child = process_lookup(pid);
+    if (!child) return -K_ECHILD;
+    
+    /* Check if child belongs to current process */
+    process_t* current = process_current();
+    if (child->parent_pid != current->pid) {
+        return -K_ECHILD;
+    }
+    
+    /* If WNOHANG and child not ready, return 0 */
+    if ((options & 1) && child->state != PROC_STATE_ZOMBIE) { /* WNOHANG = 1 */
+        return 0;
+    }
+    
+    /* Wait for child to become zombie */
+    while (child->state != PROC_STATE_ZOMBIE) {
+        scheduler_yield();
+    }
+    
+    /* Get exit status */
+    if (status) {
+        *status = child->exit_code;
+    }
+    
+    /* Clean up zombie child */
+    process_destroy(child);
+    
+    return pid;
+}
+
+/* Get process PID */
+pid_t process_get_pid(process_t* proc) {
+    return proc ? proc->pid : 0;
+}
+
+/* Scheduler integration */
+/* Thread pool management */
+status_t process_create_thread_pool(process_t* proc, uint32_t initial_size, uint32_t max_size) {
+    if (!proc || initial_size == 0 || max_size < initial_size) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&proc->lock);
+    
+    if (proc->thread_pool) {
+        spin_unlock(&proc->lock);
+        return STATUS_EXISTS;\n    }\n    \n    thread_pool_t* pool = (thread_pool_t*)vmm_kmalloc(sizeof(thread_pool_t), 16);\n    if (!pool) {\n        spin_unlock(&proc->lock);\n        return STATUS_NOMEM;\n    }\n    \n    /* Initialize work queue */\n    work_queue_t* wq = (work_queue_t*)vmm_kmalloc(sizeof(work_queue_t), 16);\n    if (!wq) {\n        vmm_kfree(pool, sizeof(thread_pool_t));\n        spin_unlock(&proc->lock);\n        return STATUS_NOMEM;\n    }\n    \n    k_memset(wq, 0, sizeof(work_queue_t));\n    wq->max_size = MAX_WORK_QUEUE_SIZE;\n    spinlock_init(&wq->lock);\n    \n    /* Initialize thread pool */\n    k_memset(pool, 0, sizeof(thread_pool_t));\n    pool->threads = (struct thread**)vmm_kmalloc(max_size * sizeof(struct thread*), 16);\n    if (!pool->threads) {\n        vmm_kfree(wq, sizeof(work_queue_t));\n        vmm_kfree(pool, sizeof(thread_pool_t));\n        spin_unlock(&proc->lock);\n        return STATUS_NOMEM;\n    }\n    \n    pool->size = initial_size;\n    pool->max_size = max_size;\n    pool->active_count = 0;\n    pool->work_queue = wq;\n    spinlock_init(&pool->lock);\n    \n    /* Create initial worker threads */\n    for (uint32_t i = 0; i < initial_size; i++) {\n        /* Create worker thread - simplified implementation */\n        /* In real implementation, would create actual worker threads */\n        pool->threads[i] = NULL;  /* Placeholder */\n    }\n    \n    proc->thread_pool = pool;\n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\nstatus_t process_destroy_thread_pool(process_t* proc) {\n    if (!proc) return STATUS_ERROR;\n    \n    spin_lock(&proc->lock);\n    \n    if (!proc->thread_pool) {\n        spin_unlock(&proc->lock);\n        return STATUS_NOTFOUND;\n    }\n    \n    thread_pool_t* pool = proc->thread_pool;\n    \n    /* Stop all worker threads */\n    /* In real implementation, would signal threads to terminate */\n    \n    /* Free work queue */\n    if (pool->work_queue) {\n        /* Clear pending work items */\n        spin_lock(&pool->work_queue->lock);\n        work_item_t* item = pool->work_queue->head;\n        while (item) {\n            work_item_t* next = item->next;\n            vmm_kfree(item, sizeof(work_item_t));\n            item = next;\n        }\n        spin_unlock(&pool->work_queue->lock);\n        \n        vmm_kfree(pool->work_queue, sizeof(work_queue_t));\n    }\n    \n    /* Free thread array */\n    if (pool->threads) {\n        vmm_kfree(pool->threads, pool->max_size * sizeof(struct thread*));\n    }\n    \n    vmm_kfree(pool, sizeof(thread_pool_t));\n    proc->thread_pool = NULL;\n    \n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\nstatus_t process_thread_pool_add_work(process_t* proc, void (*work_func)(void*), void* arg) {\n    if (!proc || !work_func) return STATUS_ERROR;\n    \n    spin_lock(&proc->lock);\n    \n    if (!proc->thread_pool || !proc->thread_pool->work_queue) {\n        spin_unlock(&proc->lock);\n        return STATUS_NOTFOUND;\n    }\n    \n    work_queue_t* wq = proc->thread_pool->work_queue;\n    \n    spin_lock(&wq->lock);\n    \n    if (wq->size >= wq->max_size) {\n        spin_unlock(&wq->lock);\n        spin_unlock(&proc->lock);\n        return STATUS_FULL;\n    }\n    \n    /* Create work item */\n    work_item_t* item = (work_item_t*)vmm_kmalloc(sizeof(work_item_t), 16);\n    if (!item) {\n        spin_unlock(&wq->lock);\n        spin_unlock(&proc->lock);\n        return STATUS_NOMEM;\n    }\n    \n    item->work_func = work_func;\n    item->arg = arg;\n    item->next = NULL;\n    \n    /* Add to queue */\n    if (wq->tail) {\n        wq->tail->next = item;\n    } else {\n        wq->head = item;\n    }\n    wq->tail = item;\n    wq->size++;\n    \n    spin_unlock(&wq->lock);\n    spin_unlock(&proc->lock);\n    \n    /* Wake up a worker thread */\n    /* In real implementation, would signal worker threads */\n    \n    return STATUS_OK;\n}\n\n/* Resource monitoring */\nstatus_t process_update_resource_usage(process_t* proc) {\n    if (!proc) return STATUS_ERROR;\n    \n    spin_lock(&proc->lock);\n    \n    /* Update CPU time */\n    uint64_t current_time = timer_get_ticks();\n    if (proc->state == PROC_STATE_RUNNING) {\n        proc->usage.cpu_time_us += (current_time - proc->last_scheduled);\n    }\n    \n    /* Update wall clock time */\n    proc->usage.wall_time_us = current_time - proc->start_time;\n    \n    /* Update memory usage (simplified) */\n    if (proc->as) {\n        proc->usage.memory_usage = vmm_get_aspace_usage(proc->as);\n        if (proc->usage.memory_usage > proc->usage.memory_peak) {\n            proc->usage.memory_peak = proc->usage.memory_usage;\n        }\n    }\n    \n    /* Update thread count */\n    uint32_t thread_count = 0;\n    for (uint32_t i = 0; i < MAX_THREADS; i++) {\n        if (g_thread_table[i] && g_thread_table[i]->pid == proc->pid) {\n            thread_count++;\n        }\n    }\n    proc->usage.threads_count = thread_count;\n    \n    /* Update file count */\n    uint32_t file_count = 0;\n    if (proc->fdtab) {\n        for (int i = 0; i < MAX_FD; i++) {\n            if (proc->fdtab->entries[i].refcnt > 0) {\n                file_count++;\n            }\n        }\n    }\n    proc->usage.open_files = file_count;\n    \n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\nstatus_t process_get_resource_usage(process_t* proc, resource_usage_t* usage) {\n    if (!proc || !usage) return STATUS_ERROR;\n    \n    /* Update current usage */\n    process_update_resource_usage(proc);\n    \n    spin_lock(&proc->lock);\n    *usage = proc->usage;\n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\n/* Process priority and scheduling */\nstatus_t process_set_priority(process_t* proc, process_priority_t priority) {\n    if (!proc || priority > PROC_PRIO_IDLE) return STATUS_ERROR;\n    \n    spin_lock(&proc->lock);\n    proc->priority = priority;\n    \n    /* Update all threads belonging to this process */\n    for (uint32_t i = 0; i < MAX_THREADS; i++) {\n        thread_t* t = g_thread_table[i];\n        if (t && t->pid == proc->pid) {\n            t->priority = (int)priority;\n        }\n    }\n    \n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\nstatus_t process_set_nice(process_t* proc, int nice_value) {\n    if (!proc || nice_value < -20 || nice_value > 19) return STATUS_ERROR;\n    \n    spin_lock(&proc->lock);\n    proc->nice_value = nice_value;\n    \n    /* Convert nice value to priority */\n    if (nice_value < -10) {\n        proc->priority = PROC_PRIO_HIGH;\n    } else if (nice_value < 5) {\n        proc->priority = PROC_PRIO_NORMAL;\n    } else {\n        proc->priority = PROC_PRIO_LOW;\n    }\n    \n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\nstatus_t process_set_cpu_affinity(process_t* proc, uint32_t cpu_mask) {\n    if (!proc) return STATUS_ERROR;\n    \n    spin_lock(&proc->lock);\n    proc->cpu_affinity = cpu_mask;\n    \n    /* Update all threads */\n    for (uint32_t i = 0; i < MAX_THREADS; i++) {\n        thread_t* t = g_thread_table[i];\n        if (t && t->pid == proc->pid) {\n            t->affinity_cpu = cpu_mask;\n        }\n    }\n    \n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\n/* Process tree navigation */\nprocess_t* process_get_parent(process_t* proc) {\n    return proc ? proc->parent : NULL;\n}\n\nprocess_t* process_get_first_child(process_t* proc) {\n    return proc ? proc->first_child : NULL;\n}\n\nprocess_t* process_get_next_sibling(process_t* proc) {\n    return proc ? proc->next_sibling : NULL;\n}\n\n/* Security context management */\nstatus_t process_check_capability(process_t* proc, uint64_t capability) {\n    if (!proc) return STATUS_ERROR;\n    \n    spin_lock(&proc->lock);\n    bool has_capability = (proc->security.capabilities & capability) != 0;\n    spin_unlock(&proc->lock);\n    \n    return has_capability ? STATUS_OK : STATUS_DENIED;\n}\n\nstatus_t process_grant_capability(process_t* proc, uint64_t capability) {\n    if (!proc) return STATUS_ERROR;\n    \n    /* Check if current process has permission to grant capabilities */\n    process_t* current = process_current();\n    if (!current->security.is_privileged) {\n        return STATUS_DENIED;\n    }\n    \n    spin_lock(&proc->lock);\n    proc->security.capabilities |= capability;\n    spin_unlock(&proc->lock);\n    \n    return STATUS_OK;\n}\n\nvoid scheduler_add_thread(thread_t* thread) {\n    if (thread) {\n        thread->state = THREAD_RUNNABLE;\n        scheduler_enqueue(thread);\n        \n        /* Update statistics */\n        spin_lock(&g_process_stats.stats_lock);\n        g_process_stats.total_threads_created++;\n        spin_unlock(&g_process_stats.stats_lock);\n    }\n}

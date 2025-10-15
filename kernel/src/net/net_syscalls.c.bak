@@ -1,0 +1,276 @@
+/**
+ * Network syscall implementations for LimitlessOS
+ */
+
+#include "syscall.h"
+#include "net.h"
+#include "kernel.h"
+#include "process.h"
+#include "vmm.h"
+
+/* Socket table for process file descriptors */
+#define MAX_SOCKETS_PER_PROCESS 64
+
+typedef struct process_socket {
+    bool in_use;
+    int domain;
+    int type;
+    int protocol;
+    void* impl_data;  /* Points to TCP/UDP connection */
+} process_socket_t;
+
+/* Get process socket table (simplified - should be per-process) */
+static process_socket_t g_process_sockets[MAX_SOCKETS_PER_PROCESS];
+static int g_next_socket_fd = 100;  /* Start socket FDs at 100 */
+
+/* Find free socket slot */
+static int alloc_socket_fd(void) {
+    for (int i = 0; i < MAX_SOCKETS_PER_PROCESS; i++) {
+        if (!g_process_sockets[i].in_use) {
+            g_process_sockets[i].in_use = true;
+            return g_next_socket_fd + i;
+        }
+    }
+    return -1;
+}
+
+/* Get socket by FD */
+static process_socket_t* get_socket_by_fd(int sockfd) {
+    int index = sockfd - g_next_socket_fd;
+    if (index >= 0 && index < MAX_SOCKETS_PER_PROCESS && g_process_sockets[index].in_use) {
+        return &g_process_sockets[index];
+    }
+    return NULL;
+}
+
+/* Socket syscall */
+long sys_socket(int domain, int type, int protocol) {
+    if (domain != AF_INET) {
+        return -K_EAFNOSUPPORT;  /* Only IPv4 supported */
+    }
+    
+    if (type != SOCK_STREAM && type != SOCK_DGRAM) {
+        return -K_EINVAL;  /* Only TCP and UDP supported */
+    }
+    
+    int sockfd = alloc_socket_fd();
+    if (sockfd < 0) {
+        return -K_EMFILE;  /* Too many open files */
+    }
+    
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    sock->domain = domain;
+    sock->type = type;
+    sock->protocol = protocol;
+    sock->impl_data = NULL;
+    
+    return sockfd;
+}
+
+/* Bind syscall */
+long sys_bind(int sockfd, const void* addr, u32 addrlen) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (!addr || addrlen < sizeof(sockaddr_in_t)) {
+        return -K_EINVAL;
+    }
+    
+    if (sock->type == SOCK_STREAM) {
+        /* TCP socket */
+        return tcp_bind(sockfd, addr, addrlen);
+    } else if (sock->type == SOCK_DGRAM) {
+        /* UDP socket - implement UDP bind */
+        return -K_ENOTSUP;  /* TODO: Implement UDP */
+    }
+    
+    return -K_EINVAL;
+}
+
+/* Listen syscall */
+long sys_listen(int sockfd, int backlog) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (sock->type != SOCK_STREAM) {
+        return -K_EOPNOTSUPP;  /* Only TCP supports listen */
+    }
+    
+    return tcp_listen(sockfd, backlog);
+}
+
+/* Accept syscall */
+long sys_accept(int sockfd, void* addr, u32* addrlen) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (sock->type != SOCK_STREAM) {
+        return -K_EOPNOTSUPP;  /* Only TCP supports accept */
+    }
+    
+    /* TODO: Implement TCP accept */
+    (void)addr;
+    (void)addrlen;
+    return -K_ENOTSUP;
+}
+
+/* Connect syscall */
+long sys_connect(int sockfd, const void* addr, u32 addrlen) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (!addr || addrlen < sizeof(sockaddr_in_t)) {
+        return -K_EINVAL;
+    }
+    
+    if (sock->type == SOCK_STREAM) {
+        /* TCP socket */
+        return tcp_connect(sockfd, addr, addrlen);
+    } else if (sock->type == SOCK_DGRAM) {
+        /* UDP socket - implement UDP connect */
+        return -K_ENOTSUP;  /* TODO: Implement UDP */
+    }
+    
+    return -K_EINVAL;
+}
+
+/* Send syscall */
+long sys_send(int sockfd, const void* buf, u64 len, int flags) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (!buf || len == 0 || len > UINT32_MAX) {
+        return -K_EINVAL;
+    }
+    
+    (void)flags;  /* Ignore flags for now */
+    
+    if (sock->type == SOCK_STREAM) {
+        /* TCP socket */
+        return tcp_send(sockfd, buf, (u32)len);
+    } else if (sock->type == SOCK_DGRAM) {
+        /* UDP socket */
+        return -K_ENOTSUP;  /* TODO: Implement UDP */
+    }
+    
+    return -K_EINVAL;
+}
+
+/* Recv syscall */
+long sys_recv(int sockfd, void* buf, u64 len, int flags) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (!buf || len == 0 || len > UINT32_MAX) {
+        return -K_EINVAL;
+    }
+    
+    (void)flags;  /* Ignore flags for now */
+    
+    if (sock->type == SOCK_STREAM) {
+        /* TCP socket */
+        return tcp_recv(sockfd, buf, (u32)len);
+    } else if (sock->type == SOCK_DGRAM) {
+        /* UDP socket */
+        return -K_ENOTSUP;  /* TODO: Implement UDP */
+    }
+    
+    return -K_EINVAL;
+}
+
+/* Sendto syscall (UDP) */
+long sys_sendto(int sockfd, const void* buf, u64 len, int flags, const void* dest_addr, u32 addrlen) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (sock->type != SOCK_DGRAM) {
+        return -K_EOPNOTSUPP;  /* Only UDP supports sendto */
+    }
+    
+    /* TODO: Implement UDP sendto */
+    (void)buf;
+    (void)len;
+    (void)flags;
+    (void)dest_addr;
+    (void)addrlen;
+    return -K_ENOTSUP;
+}
+
+/* Recvfrom syscall (UDP) */
+long sys_recvfrom(int sockfd, void* buf, u64 len, int flags, void* src_addr, u32* addrlen) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    if (sock->type != SOCK_DGRAM) {
+        return -K_EOPNOTSUPP;  /* Only UDP supports recvfrom */
+    }
+    
+    /* TODO: Implement UDP recvfrom */
+    (void)buf;
+    (void)len;
+    (void)flags;
+    (void)src_addr;
+    (void)addrlen;
+    return -K_ENOTSUP;
+}
+
+/* Close socket syscall */
+long sys_close_socket(int sockfd) {
+    process_socket_t* sock = get_socket_by_fd(sockfd);
+    if (!sock) {
+        return -K_EBADF;
+    }
+    
+    /* TODO: Properly close TCP/UDP connections */
+    
+    sock->in_use = false;
+    k_memset(sock, 0, sizeof(process_socket_t));
+    
+    return 0;
+}
+
+/* Network initialization syscall */
+long sys_net_init(void) {
+    /* Initialize network stack */
+    net_init();
+    tcp_init();
+    
+    return 0;
+}
+
+/* ICMP ping syscall */
+long sys_net_icmp_ping(u32 target_ip, u16 id, u32 timeout_ms) {
+    ipv4_addr_t dst_ip;
+    k_memcpy(&dst_ip, &target_ip, sizeof(ipv4_addr_t));
+    
+    status_t result = icmp_send_echo_request(&dst_ip, id, 1);
+    
+    if (result == STATUS_OK) {
+        /* TODO: Wait for reply with timeout */
+        /* For now, just assume success */
+        return 0;
+    }
+    
+    (void)timeout_ms;
+    return -K_EIO;
+}

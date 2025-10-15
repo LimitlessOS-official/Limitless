@@ -1,0 +1,565 @@
+#include "crypto_lifecycle.h"
+#include "log.h"
+#include "kernel.h"
+#include "timer.h"
+#include "audit_log.h"
+
+/* Global crypto lifecycle state */
+static crypto_key_metadata_t g_key_store[CRYPTO_MAX_KEYS];
+static uint32_t g_key_count = 0;
+static spinlock_t g_crypto_lock;
+static crypto_lifecycle_stats_t g_crypto_stats;
+static crypto_lifecycle_config_t g_crypto_config;
+static bool g_maintenance_running = false;
+static uint32_t g_next_key_counter = 1;
+
+/* Audit log for key operations */
+static crypto_audit_event_t g_audit_log[1024];
+static uint32_t g_audit_count = 0;
+
+/* Helper functions */
+static uint32_t calculate_key_checksum(const crypto_key_metadata_t* key) {
+    uint32_t checksum = 0;
+    const uint8_t* data = (const uint8_t*)key;
+    
+    for (size_t i = 0; i < sizeof(*key) - sizeof(key->checksum); i++) {
+        checksum = checksum * 31 + data[i];
+    }
+    
+    return checksum;
+}
+
+static crypto_key_metadata_t* find_key_by_id(const char* key_id) {
+    for (uint32_t i = 0; i < g_key_count; i++) {
+        if (k_strcmp(g_key_store[i].key_id, key_id) == 0) {
+            return &g_key_store[i];
+        }
+    }
+    return NULL;
+}
+
+static bool is_key_expired(const crypto_key_metadata_t* key) {
+    if (key->expires_time == 0) return false;
+    return timer_get_ticks() > key->expires_time;
+}
+
+static bool is_key_rotation_due(const crypto_key_metadata_t* key) {
+    if (!key->auto_rotate || key->rotation_interval_days == 0) {
+        return false;
+    }
+    
+    uint64_t rotation_due = key->rotation_time + 
+                           (key->rotation_interval_days * 24 * 60 * 60 * 1000);
+    
+    return timer_get_ticks() > rotation_due;
+}
+
+static void generate_random_bytes(uint8_t* buffer, size_t length) {
+    uint64_t seed = timer_get_ticks();
+    for (size_t i = 0; i < length; i++) {
+        seed = seed * 1103515245 + 12345;
+        buffer[i] = (uint8_t)(seed >> 24);
+    }
+}
+
+status_t crypto_lifecycle_init(void) {
+    spinlock_init(&g_crypto_lock);
+    k_memset(g_key_store, 0, sizeof(g_key_store));
+    k_memset(&g_crypto_stats, 0, sizeof(g_crypto_stats));
+    k_memset(g_audit_log, 0, sizeof(g_audit_log));
+    
+    g_key_count = 0;
+    g_audit_count = 0;
+    g_maintenance_running = false;
+    g_next_key_counter = 1;
+    
+    /* Initialize default configuration */
+    g_crypto_config.default_rotation_interval_days = 90;
+    g_crypto_config.default_max_usage_count = 1000000;
+    g_crypto_config.enforce_rotation_policy = true;
+    g_crypto_config.audit_all_operations = true;
+    g_crypto_config.key_cache_size = 256;
+    g_crypto_config.max_concurrent_operations = 32;
+    
+    log_info("[CRYPTO] Cryptographic lifecycle management initialized");
+    return STATUS_OK;
+}
+
+status_t crypto_lifecycle_shutdown(void) {
+    /* Stop maintenance thread */
+    crypto_stop_maintenance_thread();
+    
+    /* Secure erase all keys */
+    spin_lock(&g_crypto_lock);
+    for (uint32_t i = 0; i < g_key_count; i++) {
+        k_memset(g_key_store[i].key_data, 0, sizeof(g_key_store[i].key_data));
+    }
+    g_key_count = 0;
+    spin_unlock(&g_crypto_lock);
+    
+    log_info("[CRYPTO] Cryptographic lifecycle management shutdown");
+    return STATUS_OK;
+}
+
+status_t crypto_generate_key_id(char* out_key_id) {
+    if (!out_key_id) return STATUS_INVALID;
+    
+    /* Generate unique key ID */
+    uint64_t timestamp = timer_get_ticks();
+    uint32_t counter = atomic_add(&g_next_key_counter, 1);
+    
+    k_snprintf(out_key_id, CRYPTO_KEY_ID_LEN, "key_%08lx_%08x", timestamp, counter);
+    return STATUS_OK;
+}
+
+static status_t generate_key_material(crypto_algorithm_t algorithm, uint8_t* key_data, size_t* key_length) {
+    switch (algorithm) {
+        case CRYPTO_ALG_AES128:
+            *key_length = 16;
+            generate_random_bytes(key_data, 16);
+            return STATUS_OK;
+            
+        case CRYPTO_ALG_AES256:
+        case CRYPTO_ALG_CHACHA20:
+        case CRYPTO_ALG_HMAC_SHA256:
+            *key_length = 32;
+            generate_random_bytes(key_data, 32);
+            return STATUS_OK;
+            
+        case CRYPTO_ALG_ECDSA_P256:
+        case CRYPTO_ALG_ECDH_P256:
+            *key_length = 32; /* Private key */
+            generate_random_bytes(key_data, 32);
+            return STATUS_OK;
+            
+        case CRYPTO_ALG_RSA2048:
+            *key_length = 256; /* 2048 bits */
+            generate_random_bytes(key_data, 256);
+            return STATUS_OK;
+            
+        case CRYPTO_ALG_RSA4096:
+            *key_length = 512; /* 4096 bits */
+            generate_random_bytes(key_data, 512);
+            return STATUS_OK;
+            
+        default:
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
+status_t crypto_generate_key(const crypto_key_generation_request_t* request, char* out_key_id) {
+    if (!request || !out_key_id) return STATUS_INVALID;
+    
+    spin_lock(&g_crypto_lock);
+    
+    if (g_key_count >= CRYPTO_MAX_KEYS) {
+        spin_unlock(&g_crypto_lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    /* Generate key ID */
+    char key_id[CRYPTO_KEY_ID_LEN];
+    crypto_generate_key_id(key_id);
+    
+    /* Find empty slot */
+    crypto_key_metadata_t* key = &g_key_store[g_key_count];
+    k_memset(key, 0, sizeof(*key));
+    
+    /* Fill key metadata */
+    k_strlcpy(key->key_id, key_id, sizeof(key->key_id));
+    k_strlcpy(key->label, request->label, sizeof(key->label));
+    key->type = request->type;
+    key->algorithm = request->algorithm;
+    key->status = CRYPTO_KEY_STATUS_ACTIVE;
+    key->usage_flags = request->usage_flags;
+    
+    /* Generate key material */
+    status_t result = generate_key_material(request->algorithm, key->key_data, &key->key_length);
+    if (result != STATUS_OK) {
+        spin_unlock(&g_crypto_lock);
+        return result;
+    }
+    
+    /* Set lifecycle attributes */
+    key->created_time = timer_get_ticks();
+    key->last_used_time = 0;
+    key->rotation_time = key->created_time;
+    key->usage_count = 0;
+    
+    if (request->expires_in_days > 0) {
+        key->expires_time = key->created_time + (request->expires_in_days * 24 * 60 * 60 * 1000);
+    }
+    
+    key->rotation_interval_days = request->rotation_interval_days;
+    key->auto_rotate = request->auto_rotate;
+    key->max_usage_count = request->max_usage_count;
+    
+    /* Security attributes */
+    key->security_level = request->security_level;
+    key->exportable = request->exportable;
+    key->hardware_backed = request->hardware_backed;
+    
+    /* Parent key for derived keys */
+    if (request->parent_key_id[0] != '\0') {
+        k_strlcpy(key->parent_key_id, request->parent_key_id, sizeof(key->parent_key_id));
+    }
+    
+    /* Calculate checksum */
+    key->checksum = calculate_key_checksum(key);
+    
+    k_strlcpy(out_key_id, key_id, CRYPTO_KEY_ID_LEN);
+    g_key_count++;
+    g_crypto_stats.total_keys++;
+    g_crypto_stats.active_keys++;
+    g_crypto_stats.keys_generated_today++;
+    
+    spin_unlock(&g_crypto_lock);
+    
+    /* Audit key generation */
+    crypto_audit_key_operation(key_id, "GENERATE", 0, true, request->label);
+    
+    audit_log_event(AUDIT_EVENT_CRYPTO_OPERATION, AUDIT_SEVERITY_INFO, 0,
+                   "Key generated: %s (algorithm=%d)", key_id, request->algorithm);
+    
+    return STATUS_OK;
+}
+
+status_t crypto_get_key_metadata(const char* key_id, crypto_key_metadata_t* out_metadata) {
+    if (!key_id || !out_metadata) return STATUS_INVALID;
+    
+    spin_lock(&g_crypto_lock);
+    
+    crypto_key_metadata_t* key = find_key_by_id(key_id);
+    if (!key) {
+        spin_unlock(&g_crypto_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    *out_metadata = *key;
+    /* Don't expose actual key material */
+    k_memset(out_metadata->key_data, 0, sizeof(out_metadata->key_data));
+    
+    spin_unlock(&g_crypto_lock);
+    return STATUS_OK;
+}
+
+status_t crypto_use_key(const char* key_id, crypto_key_usage_t usage, 
+                       const uint8_t** out_key_data, size_t* out_key_length) {
+    if (!key_id || !out_key_data || !out_key_length) return STATUS_INVALID;
+    
+    spin_lock(&g_crypto_lock);
+    
+    crypto_key_metadata_t* key = find_key_by_id(key_id);
+    if (!key) {
+        spin_unlock(&g_crypto_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Check key status */
+    if (key->status != CRYPTO_KEY_STATUS_ACTIVE) {
+        spin_unlock(&g_crypto_lock);
+        crypto_audit_key_operation(key_id, "USE", 0, false, "Key not active");
+        return STATUS_ERROR;
+    }
+    
+    /* Check if key is expired */
+    if (is_key_expired(key)) {
+        key->status = CRYPTO_KEY_STATUS_EXPIRED;
+        g_crypto_stats.active_keys--;
+        g_crypto_stats.expired_keys++;
+        spin_unlock(&g_crypto_lock);
+        crypto_audit_key_operation(key_id, "USE", 0, false, "Key expired");
+        return STATUS_ERROR;
+    }
+    
+    /* Check usage permissions */
+    if ((key->usage_flags & usage) == 0) {
+        spin_unlock(&g_crypto_lock);
+        crypto_audit_key_operation(key_id, "USE", 0, false, "Usage not permitted");
+        return STATUS_ERROR;
+    }
+    
+    /* Check usage limits */
+    if (key->max_usage_count > 0 && key->usage_count >= key->max_usage_count) {
+        spin_unlock(&g_crypto_lock);
+        crypto_audit_key_operation(key_id, "USE", 0, false, "Usage limit exceeded");
+        return STATUS_ERROR;
+    }
+    
+    /* Update usage tracking */
+    key->usage_count++;
+    key->last_used_time = timer_get_ticks();
+    g_crypto_stats.total_key_operations++;
+    
+    /* Return key data */
+    *out_key_data = key->key_data;
+    *out_key_length = key->key_length;
+    
+    spin_unlock(&g_crypto_lock);
+    
+    crypto_audit_key_operation(key_id, "USE", 0, true, "Key used successfully");
+    return STATUS_OK;
+}
+
+status_t crypto_rotate_key(const char* key_id, crypto_key_rotation_result_t* out_result) {
+    if (!key_id || !out_result) return STATUS_INVALID;
+    
+    spin_lock(&g_crypto_lock);
+    
+    crypto_key_metadata_t* old_key = find_key_by_id(key_id);
+    if (!old_key) {
+        spin_unlock(&g_crypto_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    if (g_key_count >= CRYPTO_MAX_KEYS) {
+        spin_unlock(&g_crypto_lock);
+        k_strlcpy(out_result->error_message, "No space for new key", 
+                 sizeof(out_result->error_message));
+        out_result->success = false;
+        return STATUS_NO_SPACE;
+    }
+    
+    /* Create new key with same properties */
+    crypto_key_metadata_t* new_key = &g_key_store[g_key_count];
+    *new_key = *old_key;
+    
+    /* Generate new key ID and material */
+    crypto_generate_key_id(new_key->key_id);
+    status_t result = generate_key_material(new_key->algorithm, new_key->key_data, &new_key->key_length);
+    if (result != STATUS_OK) {
+        spin_unlock(&g_crypto_lock);
+        k_strlcpy(out_result->error_message, "Failed to generate new key", 
+                 sizeof(out_result->error_message));
+        out_result->success = false;
+        return result;
+    }
+    
+    /* Update timestamps and counters */
+    new_key->created_time = timer_get_ticks();
+    new_key->rotation_time = new_key->created_time;
+    new_key->last_used_time = 0;
+    new_key->usage_count = 0;
+    new_key->checksum = calculate_key_checksum(new_key);
+    
+    /* Mark old key for rotation */
+    old_key->status = CRYPTO_KEY_STATUS_PENDING_ROTATION;
+    
+    /* Update statistics */
+    g_key_count++;
+    g_crypto_stats.keys_rotated_today++;
+    
+    /* Fill result */
+    k_strlcpy(out_result->old_key_id, old_key->key_id, sizeof(out_result->old_key_id));
+    k_strlcpy(out_result->new_key_id, new_key->key_id, sizeof(out_result->new_key_id));
+    out_result->rotation_time = new_key->rotation_time;
+    out_result->success = true;
+    out_result->error_message[0] = '\0';
+    
+    spin_unlock(&g_crypto_lock);
+    
+    /* Audit rotation */
+    crypto_audit_key_operation(old_key->key_id, "ROTATE", 0, true, "Key rotated successfully");
+    audit_log_event(AUDIT_EVENT_CRYPTO_OPERATION, AUDIT_SEVERITY_INFO, 0,
+                   "Key rotated: %s -> %s", old_key->key_id, new_key->key_id);
+    
+    return STATUS_OK;
+}
+
+status_t crypto_check_rotation_due(char out_key_ids[][CRYPTO_KEY_ID_LEN], uint32_t* in_out_count) {
+    if (!out_key_ids || !in_out_count) return STATUS_INVALID;
+    
+    uint32_t found = 0;
+    uint32_t max_keys = *in_out_count;
+    
+    spin_lock(&g_crypto_lock);
+    
+    for (uint32_t i = 0; i < g_key_count && found < max_keys; i++) {
+        crypto_key_metadata_t* key = &g_key_store[i];
+        
+        if (key->status == CRYPTO_KEY_STATUS_ACTIVE && is_key_rotation_due(key)) {
+            k_strlcpy(out_key_ids[found], key->key_id, CRYPTO_KEY_ID_LEN);
+            found++;
+        }
+    }
+    
+    g_crypto_stats.keys_due_rotation = found;
+    
+    spin_unlock(&g_crypto_lock);
+    
+    *in_out_count = found;
+    return STATUS_OK;
+}
+
+status_t crypto_auto_rotate_keys(void) {
+    char key_ids[32][CRYPTO_KEY_ID_LEN];
+    uint32_t key_count = 32;
+    
+    status_t result = crypto_check_rotation_due(key_ids, &key_count);
+    if (result != STATUS_OK) return result;
+    
+    uint32_t rotated = 0;
+    for (uint32_t i = 0; i < key_count; i++) {
+        crypto_key_rotation_result_t rotation_result;
+        if (crypto_rotate_key(key_ids[i], &rotation_result) == STATUS_OK) {
+            rotated++;
+        }
+    }
+    
+    log_info("[CRYPTO] Auto-rotated %u keys", rotated);
+    return STATUS_OK;
+}
+
+status_t crypto_expire_key(const char* key_id) {
+    if (!key_id) return STATUS_INVALID;
+    
+    spin_lock(&g_crypto_lock);
+    
+    crypto_key_metadata_t* key = find_key_by_id(key_id);
+    if (!key) {
+        spin_unlock(&g_crypto_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    if (key->status == CRYPTO_KEY_STATUS_ACTIVE) {
+        key->status = CRYPTO_KEY_STATUS_EXPIRED;
+        key->expires_time = timer_get_ticks();
+        g_crypto_stats.active_keys--;
+        g_crypto_stats.expired_keys++;
+    }
+    
+    spin_unlock(&g_crypto_lock);
+    
+    crypto_audit_key_operation(key_id, "EXPIRE", 0, true, "Key manually expired");
+    return STATUS_OK;
+}
+
+status_t crypto_revoke_key(const char* key_id, const char* reason) {
+    if (!key_id) return STATUS_INVALID;
+    
+    spin_lock(&g_crypto_lock);
+    
+    crypto_key_metadata_t* key = find_key_by_id(key_id);
+    if (!key) {
+        spin_unlock(&g_crypto_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    if (key->status == CRYPTO_KEY_STATUS_ACTIVE) {
+        key->status = CRYPTO_KEY_STATUS_REVOKED;
+        g_crypto_stats.active_keys--;
+        g_crypto_stats.revoked_keys++;
+    }
+    
+    spin_unlock(&g_crypto_lock);
+    
+    char audit_msg[256];
+    k_snprintf(audit_msg, sizeof(audit_msg), "Key revoked: %s", reason ? reason : "No reason provided");
+    crypto_audit_key_operation(key_id, "REVOKE", 0, true, audit_msg);
+    
+    return STATUS_OK;
+}
+
+status_t crypto_audit_key_operation(const char* key_id, const char* operation, 
+                                   uint32_t user_id, bool success, const char* details) {
+    if (!key_id || !operation) return STATUS_INVALID;
+    
+    if (!g_crypto_config.audit_all_operations) return STATUS_OK;
+    
+    spin_lock(&g_crypto_lock);
+    
+    if (g_audit_count >= sizeof(g_audit_log) / sizeof(g_audit_log[0])) {
+        /* Roll over audit log */
+        g_audit_count = 0;
+    }
+    
+    crypto_audit_event_t* event = &g_audit_log[g_audit_count++];
+    k_strlcpy(event->key_id, key_id, sizeof(event->key_id));
+    k_strlcpy(event->operation, operation, sizeof(event->operation));
+    event->user_id = user_id;
+    event->process_id = 0; /* TODO: Get current process ID */
+    event->timestamp = timer_get_ticks();
+    event->success = success;
+    k_strlcpy(event->details, details ? details : "", sizeof(event->details));
+    
+    if (!success) {
+        g_crypto_stats.failed_operations++;
+    }
+    
+    spin_unlock(&g_crypto_lock);
+    return STATUS_OK;
+}
+
+status_t crypto_get_lifecycle_statistics(crypto_lifecycle_stats_t* out_stats) {
+    if (!out_stats) return STATUS_INVALID;
+    
+    spin_lock(&g_crypto_lock);
+    *out_stats = g_crypto_stats;
+    
+    /* Calculate average key age */
+    if (g_crypto_stats.total_keys > 0) {
+        uint64_t total_age = 0;
+        uint64_t current_time = timer_get_ticks();
+        
+        for (uint32_t i = 0; i < g_key_count; i++) {
+            total_age += (current_time - g_key_store[i].created_time);
+        }
+        
+        out_stats->average_key_age_days = (float)(total_age / g_crypto_stats.total_keys) / (24 * 60 * 60 * 1000);
+    }
+    
+    spin_unlock(&g_crypto_lock);
+    return STATUS_OK;
+}
+
+status_t crypto_run_maintenance_cycle(void) {
+    log_debug("[CRYPTO] Running maintenance cycle");
+    
+    /* Check for expired keys */
+    spin_lock(&g_crypto_lock);
+    for (uint32_t i = 0; i < g_key_count; i++) {
+        crypto_key_metadata_t* key = &g_key_store[i];
+        
+        if (key->status == CRYPTO_KEY_STATUS_ACTIVE && is_key_expired(key)) {
+            key->status = CRYPTO_KEY_STATUS_EXPIRED;
+            g_crypto_stats.active_keys--;
+            g_crypto_stats.expired_keys++;
+            
+            crypto_audit_key_operation(key->key_id, "AUTO_EXPIRE", 0, true, "Automatically expired");
+        }
+    }
+    spin_unlock(&g_crypto_lock);
+    
+    /* Auto-rotate keys if enabled */
+    if (g_crypto_config.enforce_rotation_policy) {
+        crypto_auto_rotate_keys();
+    }
+    
+    return STATUS_OK;
+}
+
+status_t crypto_verify_key_store_integrity(bool* out_valid) {
+    if (!out_valid) return STATUS_INVALID;
+    
+    *out_valid = true;
+    
+    spin_lock(&g_crypto_lock);
+    
+    for (uint32_t i = 0; i < g_key_count; i++) {
+        crypto_key_metadata_t* key = &g_key_store[i];
+        uint32_t stored_checksum = key->checksum;
+        
+        /* Recalculate checksum */
+        key->checksum = 0;
+        uint32_t calculated = calculate_key_checksum(key);
+        key->checksum = stored_checksum;
+        
+        if (calculated != stored_checksum) {
+            *out_valid = false;
+            break;
+        }
+    }
+    
+    spin_unlock(&g_crypto_lock);
+    return STATUS_OK;
+}

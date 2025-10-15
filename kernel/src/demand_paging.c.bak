@@ -1,0 +1,621 @@
+/*
+ * demand_paging.c - LimitlessOS Demand Paging & Copy-on-Write
+ * 
+ * Advanced memory management with demand paging, copy-on-write fork,
+ * page cache, and comprehensive memory protection.
+ */
+
+#include "kernel.h"
+#include "vmm.h"
+#include "process.h"
+#include "signal.h"
+#include "scheduler.h"
+
+#define COW_MAGIC               0xC0WBEEF
+#define MAX_PAGE_CACHE_ENTRIES  4096
+#define PAGE_CACHE_HASH_BITS    12
+#define PAGE_CACHE_HASH_SIZE    (1 << PAGE_CACHE_HASH_BITS)
+
+/* Page flags */
+#define PAGE_FLAG_PRESENT       (1 << 0)
+#define PAGE_FLAG_WRITABLE      (1 << 1)
+#define PAGE_FLAG_USER          (1 << 2)
+#define PAGE_FLAG_ACCESSED      (1 << 5)
+#define PAGE_FLAG_DIRTY         (1 << 6)
+#define PAGE_FLAG_COW           (1 << 9)   /* Copy-on-write */
+#define PAGE_FLAG_SWAPPED       (1 << 10)  /* Swapped out */
+#define PAGE_FLAG_LOCKED        (1 << 11)  /* Locked in memory */
+
+/* VMA (Virtual Memory Area) types */
+typedef enum {
+    VMA_TYPE_ANON,          /* Anonymous memory */
+    VMA_TYPE_FILE,          /* File-backed memory */
+    VMA_TYPE_STACK,         /* Stack segment */
+    VMA_TYPE_HEAP,          /* Heap segment */
+    VMA_TYPE_SHARED,        /* Shared memory */
+} vma_type_t;
+
+/* VMA flags */
+#define VMA_FLAG_READ           (1 << 0)
+#define VMA_FLAG_WRITE          (1 << 1)
+#define VMA_FLAG_EXEC           (1 << 2)
+#define VMA_FLAG_SHARED         (1 << 3)
+#define VMA_FLAG_GROWSDOWN      (1 << 4)   /* Stack grows down */
+#define VMA_FLAG_LOCKED         (1 << 5)   /* Locked in memory */
+#define VMA_FLAG_NORESERVE      (1 << 6)   /* Don't reserve swap */
+
+/* Virtual Memory Area */
+typedef struct vma {
+    virt_addr_t start;          /* Start virtual address */
+    virt_addr_t end;            /* End virtual address */
+    vma_type_t type;            /* VMA type */
+    u32 flags;                  /* VMA flags */
+    u32 prot;                   /* Protection flags */
+    
+    /* File backing */
+    struct file* file;          /* Backing file (if any) */
+    u64 offset;                 /* File offset */
+    
+    /* Reference counting */
+    atomic_t refcount;
+    
+    /* Tree linkage */
+    struct rb_node rb_node;
+    struct list_head list;
+    
+    /* Copy-on-write */
+    struct vma* cow_parent;     /* Parent VMA for COW */
+    struct list_head cow_children; /* COW children */
+    struct list_head cow_sibling;  /* COW sibling list */
+    
+} vma_t;
+
+/* Page cache entry */
+typedef struct page_cache_entry {
+    struct file* file;          /* File this page belongs to */
+    u64 offset;                 /* Offset in file */
+    paddr_t page;               /* Physical page address */
+    u32 flags;                  /* Page flags */
+    atomic_t refcount;          /* Reference count */
+    
+    struct list_head lru;       /* LRU list linkage */
+    struct hlist_node hash;     /* Hash table linkage */
+    
+    /* Dirty tracking */
+    bool dirty;
+    u64 last_access;
+    
+} page_cache_entry_t;
+
+/* Address space */
+struct vmm_aspace {
+    /* Page table root */
+    paddr_t pml4_phys;
+    u64* pml4_virt;
+    
+    /* VMA management */
+    struct rb_root vma_tree;    /* Red-black tree of VMAs */
+    struct list_head vma_list;  /* List of VMAs */
+    spinlock_t vma_lock;
+    u32 vma_count;
+    
+    /* Memory usage */
+    u64 total_vm;               /* Total virtual memory */
+    u64 resident_set;           /* Resident set size */
+    u64 shared_vm;              /* Shared virtual memory */
+    
+    /* Heap management */
+    virt_addr_t heap_start;
+    virt_addr_t heap_end;
+    virt_addr_t heap_brk;
+    
+    /* Stack management */
+    virt_addr_t stack_start;
+    virt_addr_t stack_end;
+    
+    /* Reference counting */
+    atomic_t refcount;
+    
+    /* COW support */
+    bool cow_enabled;
+    spinlock_t cow_lock;
+    
+    /* Page fault statistics */
+    u64 minor_faults;           /* Minor page faults */
+    u64 major_faults;           /* Major page faults */
+    u64 cow_faults;             /* COW faults */
+    
+};
+
+/* Page cache */
+typedef struct page_cache {
+    struct hlist_head hash_table[PAGE_CACHE_HASH_SIZE];
+    struct list_head lru_list;
+    spinlock_t lock;
+    
+    u32 num_entries;
+    u32 max_entries;
+    
+    /* Statistics */
+    u64 hits;
+    u64 misses;
+    u64 evictions;
+    
+} page_cache_t;
+
+/* Global state */
+static struct {
+    bool initialized;
+    page_cache_t page_cache;
+    
+    /* Statistics */
+    u64 total_page_faults;
+    u64 total_cow_faults;
+    u64 total_swapouts;
+    
+} g_demand_paging = {0};
+
+/* Function prototypes */
+static int handle_page_fault(virt_addr_t fault_addr, u32 error_code, vmm_aspace_t* aspace);
+static int handle_cow_fault(vma_t* vma, virt_addr_t fault_addr, vmm_aspace_t* aspace);
+static vma_t* find_vma(vmm_aspace_t* aspace, virt_addr_t addr);
+static vma_t* create_vma(vmm_aspace_t* aspace, virt_addr_t start, virt_addr_t end, 
+                        vma_type_t type, u32 flags, u32 prot);
+static void destroy_vma(vma_t* vma);
+static int map_page_demand(vmm_aspace_t* aspace, virt_addr_t vaddr, u32 prot);
+static page_cache_entry_t* page_cache_lookup(struct file* file, u64 offset);
+static page_cache_entry_t* page_cache_add(struct file* file, u64 offset, paddr_t page);
+static void page_cache_remove(page_cache_entry_t* entry);
+static u32 page_cache_hash(struct file* file, u64 offset);
+
+/* Initialize demand paging system */
+int demand_paging_init(void) {
+    if (g_demand_paging.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing demand paging system\n");
+    
+    /* Initialize page cache */
+    page_cache_t* cache = &g_demand_paging.page_cache;
+    memset(cache, 0, sizeof(page_cache_t));
+    
+    for (u32 i = 0; i < PAGE_CACHE_HASH_SIZE; i++) {
+        INIT_HLIST_HEAD(&cache->hash_table[i]);
+    }
+    
+    INIT_LIST_HEAD(&cache->lru_list);
+    spinlock_init(&cache->lock);
+    cache->max_entries = MAX_PAGE_CACHE_ENTRIES;
+    
+    g_demand_paging.initialized = true;
+    
+    printf("Demand paging initialized (page cache: %u entries)\n", cache->max_entries);
+    return 0;
+}
+
+/* Create new address space with demand paging support */
+vmm_aspace_t* vmm_create_aspace_demand(void) {
+    vmm_aspace_t* aspace = (vmm_aspace_t*)vmm_kmalloc(sizeof(vmm_aspace_t), 64);
+    if (!aspace) return NULL;
+    
+    memset(aspace, 0, sizeof(vmm_aspace_t));
+    
+    /* Allocate page table */
+    aspace->pml4_phys = pmm_alloc_page();
+    if (!aspace->pml4_phys) {
+        vmm_kfree(aspace, sizeof(vmm_aspace_t));
+        return NULL;
+    }
+    
+    aspace->pml4_virt = (u64*)PHYS_TO_VIRT_DIRECT(aspace->pml4_phys);
+    memset(aspace->pml4_virt, 0, PAGE_SIZE);
+    
+    /* Initialize VMA management */
+    aspace->vma_tree = RB_ROOT;
+    INIT_LIST_HEAD(&aspace->vma_list);
+    spinlock_init(&aspace->vma_lock);
+    
+    /* Initialize memory areas */
+    aspace->heap_start = 0x10000000;    /* 256MB */
+    aspace->heap_end = 0x10000000;
+    aspace->heap_brk = 0x10000000;
+    
+    aspace->stack_start = 0x80000000;   /* 2GB */
+    aspace->stack_end = 0x7F000000;     /* Stack grows down */
+    
+    /* Initialize reference counting */
+    atomic_set(&aspace->refcount, 1);
+    aspace->cow_enabled = true;
+    spinlock_init(&aspace->cow_lock);
+    
+    return aspace;
+}
+
+/* Fork address space with copy-on-write */
+vmm_aspace_t* vmm_fork_aspace_cow(vmm_aspace_t* parent) {
+    if (!parent) return NULL;
+    
+    vmm_aspace_t* child = vmm_create_aspace_demand();
+    if (!child) return NULL;
+    
+    spin_lock(&parent->vma_lock);
+    
+    /* Copy heap settings */
+    child->heap_start = parent->heap_start;
+    child->heap_end = parent->heap_end;
+    child->heap_brk = parent->heap_brk;
+    child->stack_start = parent->stack_start;
+    child->stack_end = parent->stack_end;
+    
+    /* Copy VMAs and set up COW */
+    vma_t* parent_vma;
+    list_for_each_entry(parent_vma, &parent->vma_list, list) {
+        /* Create child VMA */
+        vma_t* child_vma = create_vma(child, parent_vma->start, parent_vma->end,
+                                     parent_vma->type, parent_vma->flags, parent_vma->prot);
+        if (!child_vma) continue;
+        
+        /* Set up COW relationship */
+        child_vma->cow_parent = parent_vma;
+        list_add(&child_vma->cow_sibling, &parent_vma->cow_children);
+        
+        /* File backing */
+        child_vma->file = parent_vma->file;
+        child_vma->offset = parent_vma->offset;
+        
+        /* Walk parent's page tables and set up COW */
+        for (virt_addr_t addr = parent_vma->start; addr < parent_vma->end; addr += PAGE_SIZE) {
+            paddr_t parent_phys;
+            if (vmm_get_physical(parent, addr, &parent_phys) == 0) {
+                /* Map page in child as COW */
+                u32 flags = PTE_PRESENT | PTE_USER;
+                if (parent_vma->flags & VMA_FLAG_EXEC) flags |= 0; /* No NX bit */
+                else flags |= PTE_NX;
+                
+                /* Mark as COW (read-only for now) */
+                vmm_map_page(child, addr, parent_phys, flags | PAGE_FLAG_COW);
+                
+                /* Mark parent page as COW too */
+                /* TODO: Update parent page table entry */
+                
+                /* Increment physical page reference count */
+                /* TODO: Implement page reference counting */
+            }
+        }
+    }
+    
+    spin_unlock(&parent->vma_lock);
+    
+    return child;
+}
+
+/* Handle page fault */
+void vmm_handle_page_fault_demand(u64 fault_addr, u64 err_code) {
+    process_t* current = process_current();
+    if (!current || !current->as) {
+        /* Kernel page fault */
+        panic("Kernel page fault at 0x%lx", fault_addr);
+        return;
+    }
+    
+    g_demand_paging.total_page_faults++;
+    current->as->minor_faults++;  /* Assume minor for now */
+    
+    if (handle_page_fault(fault_addr, err_code, current->as) != 0) {
+        /* Send SIGSEGV to process */
+        printf("Segmentation fault in process %d at 0x%lx\n", current->pid, fault_addr);
+        signal_send(current, SIGSEGV);
+    }
+}
+
+/* Internal page fault handler */
+static int handle_page_fault(virt_addr_t fault_addr, u32 error_code, vmm_aspace_t* aspace) {
+    /* Find VMA containing the fault address */
+    vma_t* vma = find_vma(aspace, fault_addr);
+    if (!vma) {
+        return -1;  /* Invalid address */
+    }
+    
+    /* Check permissions */
+    bool is_write = (error_code & 0x2) != 0;
+    bool is_user = (error_code & 0x4) != 0;
+    bool is_present = (error_code & 0x1) != 0;
+    
+    if (is_user && !(vma->flags & VMA_FLAG_READ)) {
+        return -1;  /* No read permission */
+    }
+    
+    if (is_write && !(vma->flags & VMA_FLAG_WRITE)) {
+        /* Check if this is a COW fault */
+        if (is_present) {
+            return handle_cow_fault(vma, fault_addr, aspace);
+        }
+        return -1;  /* No write permission */
+    }
+    
+    /* Handle different fault types */
+    if (!is_present) {
+        /* Page not present - demand page it in */
+        return map_page_demand(aspace, fault_addr & PAGE_MASK, 
+                             (vma->flags & VMA_FLAG_WRITE) ? (PTE_PRESENT | PTE_USER | PTE_WRITABLE) :
+                             (PTE_PRESENT | PTE_USER));
+    }
+    
+    return 0;
+}
+
+/* Handle copy-on-write fault */
+static int handle_cow_fault(vma_t* vma, virt_addr_t fault_addr, vmm_aspace_t* aspace) {
+    g_demand_paging.total_cow_faults++;
+    aspace->cow_faults++;
+    
+    virt_addr_t page_addr = fault_addr & PAGE_MASK;
+    
+    /* Get the current physical page */
+    paddr_t old_phys;
+    if (vmm_get_physical(aspace, page_addr, &old_phys) != 0) {
+        return -1;
+    }
+    
+    /* Allocate new physical page */
+    paddr_t new_phys = pmm_alloc_page();
+    if (!new_phys) {
+        return -1;  /* Out of memory */
+    }
+    
+    /* Copy page content */
+    void* old_virt = PHYS_TO_VIRT_DIRECT(old_phys);
+    void* new_virt = PHYS_TO_VIRT_DIRECT(new_phys);
+    memcpy(new_virt, old_virt, PAGE_SIZE);
+    
+    /* Update page table with writable mapping */
+    u32 flags = PTE_PRESENT | PTE_USER | PTE_WRITABLE;
+    if (!(vma->flags & VMA_FLAG_EXEC)) flags |= PTE_NX;
+    
+    vmm_map_page(aspace, page_addr, new_phys, flags);
+    
+    /* Decrease reference count of old page */
+    /* TODO: Implement page reference counting */
+    
+    return 0;
+}
+
+/* Find VMA containing address */
+static vma_t* find_vma(vmm_aspace_t* aspace, virt_addr_t addr) {
+    struct rb_node* node = aspace->vma_tree.rb_node;
+    
+    while (node) {
+        vma_t* vma = rb_entry(node, vma_t, rb_node);
+        
+        if (addr < vma->start) {
+            node = node->rb_left;
+        } else if (addr >= vma->end) {
+            node = node->rb_right;
+        } else {
+            return vma;  /* Found */
+        }
+    }
+    
+    return NULL;
+}
+
+/* Create new VMA */
+static vma_t* create_vma(vmm_aspace_t* aspace, virt_addr_t start, virt_addr_t end,
+                        vma_type_t type, u32 flags, u32 prot) {
+    vma_t* vma = (vma_t*)vmm_kmalloc(sizeof(vma_t), 64);
+    if (!vma) return NULL;
+    
+    memset(vma, 0, sizeof(vma_t));
+    
+    vma->start = start;
+    vma->end = end;
+    vma->type = type;
+    vma->flags = flags;
+    vma->prot = prot;
+    
+    atomic_set(&vma->refcount, 1);
+    INIT_LIST_HEAD(&vma->cow_children);
+    
+    /* Insert into VMA tree */
+    spin_lock(&aspace->vma_lock);
+    
+    /* TODO: Implement red-black tree insertion */
+    list_add(&vma->list, &aspace->vma_list);
+    aspace->vma_count++;
+    aspace->total_vm += (end - start);
+    
+    spin_unlock(&aspace->vma_lock);
+    
+    return vma;
+}
+
+/* Map page on demand */
+static int map_page_demand(vmm_aspace_t* aspace, virt_addr_t vaddr, u32 prot) {
+    /* Find VMA */
+    vma_t* vma = find_vma(aspace, vaddr);
+    if (!vma) return -1;
+    
+    paddr_t phys = 0;
+    
+    /* Handle different VMA types */
+    switch (vma->type) {
+        case VMA_TYPE_ANON:
+        case VMA_TYPE_STACK:
+        case VMA_TYPE_HEAP: {
+            /* Allocate anonymous page */
+            phys = pmm_alloc_page();
+            if (!phys) return -1;
+            
+            /* Zero the page */
+            void* virt = PHYS_TO_VIRT_DIRECT(phys);
+            memset(virt, 0, PAGE_SIZE);
+            break;
+        }
+        
+        case VMA_TYPE_FILE: {
+            /* Check page cache first */
+            u64 file_offset = vma->offset + (vaddr - vma->start);
+            page_cache_entry_t* cache_entry = page_cache_lookup(vma->file, file_offset);
+            
+            if (cache_entry) {
+                /* Page cache hit */
+                g_demand_paging.page_cache.hits++;
+                phys = cache_entry->page;
+                cache_entry->last_access = timer_get_ticks();
+            } else {
+                /* Page cache miss - allocate and read from file */
+                g_demand_paging.page_cache.misses++;
+                aspace->major_faults++;
+                
+                phys = pmm_alloc_page();
+                if (!phys) return -1;
+                
+                /* TODO: Read from file into page */
+                void* virt = PHYS_TO_VIRT_DIRECT(phys);
+                memset(virt, 0, PAGE_SIZE);  /* Temporary - should read from file */
+                
+                /* Add to page cache */
+                page_cache_add(vma->file, file_offset, phys);
+            }
+            break;
+        }
+        
+        case VMA_TYPE_SHARED: {
+            /* TODO: Implement shared memory */
+            phys = pmm_alloc_page();
+            if (!phys) return -1;
+            break;
+        }
+        
+        default:
+            return -1;
+    }
+    
+    /* Map the page */
+    return vmm_map_page(aspace, vaddr, phys, prot);
+}
+
+/* Page cache operations */
+static u32 page_cache_hash(struct file* file, u64 offset) {
+    u64 hash = ((uintptr_t)file ^ offset) >> PAGE_SHIFT;
+    return hash & (PAGE_CACHE_HASH_SIZE - 1);
+}
+
+static page_cache_entry_t* page_cache_lookup(struct file* file, u64 offset) {
+    if (!file) return NULL;
+    
+    page_cache_t* cache = &g_demand_paging.page_cache;
+    u32 hash = page_cache_hash(file, offset);
+    
+    spin_lock(&cache->lock);
+    
+    page_cache_entry_t* entry;
+    hlist_for_each_entry(entry, &cache->hash_table[hash], hash) {
+        if (entry->file == file && entry->offset == offset) {
+            /* Move to front of LRU */
+            list_del(&entry->lru);
+            list_add(&entry->lru, &cache->lru_list);
+            
+            spin_unlock(&cache->lock);
+            return entry;
+        }
+    }
+    
+    spin_unlock(&cache->lock);
+    return NULL;
+}
+
+static page_cache_entry_t* page_cache_add(struct file* file, u64 offset, paddr_t page) {
+    page_cache_t* cache = &g_demand_paging.page_cache;
+    
+    /* Allocate cache entry */
+    page_cache_entry_t* entry = (page_cache_entry_t*)vmm_kmalloc(sizeof(page_cache_entry_t), 64);
+    if (!entry) return NULL;
+    
+    memset(entry, 0, sizeof(page_cache_entry_t));
+    
+    entry->file = file;
+    entry->offset = offset;
+    entry->page = page;
+    entry->dirty = false;
+    entry->last_access = timer_get_ticks();
+    atomic_set(&entry->refcount, 1);
+    
+    u32 hash = page_cache_hash(file, offset);
+    
+    spin_lock(&cache->lock);
+    
+    /* Check if we need to evict entries */
+    if (cache->num_entries >= cache->max_entries) {
+        /* Evict LRU entry */
+        page_cache_entry_t* lru = list_last_entry(&cache->lru_list, page_cache_entry_t, lru);
+        if (lru) {
+            page_cache_remove(lru);
+        }
+    }
+    
+    /* Add to hash table and LRU list */
+    hlist_add_head(&entry->hash, &cache->hash_table[hash]);
+    list_add(&entry->lru, &cache->lru_list);
+    cache->num_entries++;
+    
+    spin_unlock(&cache->lock);
+    
+    return entry;
+}
+
+static void page_cache_remove(page_cache_entry_t* entry) {
+    page_cache_t* cache = &g_demand_paging.page_cache;
+    
+    hlist_del(&entry->hash);
+    list_del(&entry->lru);
+    cache->num_entries--;
+    cache->evictions++;
+    
+    /* TODO: Write back if dirty */
+    if (entry->dirty) {
+        /* Write back to file */
+    }
+    
+    /* Free physical page if no other references */
+    if (atomic_dec_and_test(&entry->refcount)) {
+        pmm_free_page(entry->page);
+    }
+    
+    vmm_kfree(entry, sizeof(page_cache_entry_t));
+}
+
+/* Memory statistics */
+void demand_paging_get_stats(struct vmm_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct vmm_stats));
+    
+    stats->total_page_faults = g_demand_paging.total_page_faults;
+    stats->total_cow_faults = g_demand_paging.total_cow_faults;
+    
+    page_cache_t* cache = &g_demand_paging.page_cache;
+    stats->page_cache_entries = cache->num_entries;
+    stats->page_cache_hits = cache->hits;
+    stats->page_cache_misses = cache->misses;
+    stats->page_cache_evictions = cache->evictions;
+}
+
+/* Debugging */
+void demand_paging_dump_stats(void) {
+    printf("Demand Paging Statistics:\n");
+    printf("  Total page faults: %lu\n", g_demand_paging.total_page_faults);
+    printf("  COW faults: %lu\n", g_demand_paging.total_cow_faults);
+    
+    page_cache_t* cache = &g_demand_paging.page_cache;
+    printf("  Page cache entries: %u / %u\n", cache->num_entries, cache->max_entries);
+    printf("  Page cache hits: %lu\n", cache->hits);
+    printf("  Page cache misses: %lu\n", cache->misses);
+    printf("  Page cache evictions: %lu\n", cache->evictions);
+    
+    if (cache->hits + cache->misses > 0) {
+        u64 hit_rate = (cache->hits * 100) / (cache->hits + cache->misses);
+        printf("  Hit rate: %lu%%\n", hit_rate);
+    }
+}

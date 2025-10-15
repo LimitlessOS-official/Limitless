@@ -1,0 +1,788 @@
+/*
+ * Advanced Device Driver Framework
+ * Production-quality device management with plug-and-play, hot-swap, and driver loading
+ */
+
+#include "kernel.h"
+#include "hal.h"
+#include "pci.h"
+
+/* Device types */
+typedef enum {
+    DEVICE_TYPE_UNKNOWN = 0,
+    DEVICE_TYPE_STORAGE,        /* Storage devices (HDD, SSD, NVMe) */
+    DEVICE_TYPE_NETWORK,        /* Network interfaces */
+    DEVICE_TYPE_DISPLAY,        /* Display controllers */
+    DEVICE_TYPE_AUDIO,          /* Audio devices */
+    DEVICE_TYPE_INPUT,          /* Input devices (keyboard, mouse) */
+    DEVICE_TYPE_USB,            /* USB controllers and devices */
+    DEVICE_TYPE_PCI,            /* PCI devices */
+    DEVICE_TYPE_ACPI,           /* ACPI devices */
+    DEVICE_TYPE_PLATFORM,       /* Platform devices */
+    DEVICE_TYPE_VIRTUAL,        /* Virtual devices */
+    DEVICE_TYPE_CHAR,           /* Character devices */
+    DEVICE_TYPE_BLOCK,          /* Block devices */
+    DEVICE_TYPE_MISC            /* Miscellaneous devices */
+} device_type_t;
+
+/* Device states */
+typedef enum {
+    DEVICE_STATE_UNKNOWN = 0,
+    DEVICE_STATE_DETECTED,      /* Device detected but not initialized */
+    DEVICE_STATE_INITIALIZING,  /* Device being initialized */
+    DEVICE_STATE_READY,         /* Device ready for use */
+    DEVICE_STATE_ACTIVE,        /* Device actively in use */
+    DEVICE_STATE_SUSPENDED,     /* Device suspended */
+    DEVICE_STATE_ERROR,         /* Device in error state */
+    DEVICE_STATE_REMOVED        /* Device removed/unplugged */
+} device_state_t;
+
+/* Driver states */
+typedef enum {
+    DRIVER_STATE_UNLOADED = 0,
+    DRIVER_STATE_LOADING,
+    DRIVER_STATE_LOADED,
+    DRIVER_STATE_INITIALIZED,
+    DRIVER_STATE_ACTIVE,
+    DRIVER_STATE_UNLOADING,
+    DRIVER_STATE_ERROR
+} driver_state_t;
+
+/* Device operations structure */
+typedef struct device_ops {
+    status_t (*probe)(struct device* dev);           /* Probe device */
+    status_t (*remove)(struct device* dev);          /* Remove device */
+    status_t (*suspend)(struct device* dev);         /* Suspend device */
+    status_t (*resume)(struct device* dev);          /* Resume device */
+    status_t (*reset)(struct device* dev);           /* Reset device */
+    status_t (*power_on)(struct device* dev);        /* Power on device */
+    status_t (*power_off)(struct device* dev);       /* Power off device */
+    status_t (*ioctl)(struct device* dev, uint32_t cmd, void* arg); /* Device control */
+    ssize_t (*read)(struct device* dev, void* buffer, size_t size, off_t offset);
+    ssize_t (*write)(struct device* dev, const void* buffer, size_t size, off_t offset);
+} device_ops_t;
+
+/* Driver structure */
+typedef struct driver {
+    char name[64];                      /* Driver name */
+    char version[32];                   /* Driver version */
+    char description[256];              /* Driver description */
+    uint32_t flags;                     /* Driver flags */
+    driver_state_t state;               /* Driver state */
+    
+    /* Driver operations */
+    device_ops_t ops;                   /* Device operations */
+    
+    /* Matching criteria */
+    uint16_t vendor_id;                 /* PCI vendor ID (0 = any) */
+    uint16_t device_id;                 /* PCI device ID (0 = any) */
+    uint16_t subsystem_vendor_id;       /* Subsystem vendor ID */
+    uint16_t subsystem_device_id;       /* Subsystem device ID */
+    uint32_t class_mask;                /* Device class mask */
+    device_type_t device_type;          /* Supported device type */
+    
+    /* Driver module */
+    void* module_base;                  /* Module base address */
+    size_t module_size;                 /* Module size */
+    
+    /* Reference counting */
+    atomic_t ref_count;                 /* Reference count */
+    
+    struct driver* next;                /* Next driver in list */
+} driver_t;
+
+/* Device structure */
+typedef struct device {
+    char name[64];                      /* Device name */
+    char path[256];                     /* Device path (/dev/...) */
+    device_type_t type;                 /* Device type */
+    device_state_t state;               /* Device state */
+    
+    /* Device identification */
+    uint32_t device_id;                 /* Unique device ID */
+    uint16_t vendor_id;                 /* Vendor ID */
+    uint16_t product_id;                /* Product ID */
+    uint32_t class_code;                /* Device class code */
+    
+    /* Hardware information */
+    uint64_t base_address;              /* Base memory/IO address */
+    uint32_t irq;                       /* IRQ number */
+    size_t memory_size;                 /* Memory region size */
+    uint32_t flags;                     /* Device flags */
+    
+    /* Driver binding */
+    driver_t* driver;                   /* Associated driver */
+    void* driver_data;                  /* Driver-specific data */
+    
+    /* Power management */
+    uint32_t power_state;               /* Current power state */
+    bool can_wake;                      /* Can wake from suspend */
+    
+    /* Parent/child relationships */
+    struct device* parent;              /* Parent device */
+    struct device* children;            /* Child devices */
+    struct device* sibling;             /* Sibling device */
+    
+    /* Bus-specific data */
+    void* bus_data;                     /* Bus-specific information */
+    
+    /* Statistics */
+    uint64_t io_operations;             /* Number of I/O operations */
+    uint64_t bytes_read;                /* Bytes read */
+    uint64_t bytes_written;             /* Bytes written */
+    uint64_t errors;                    /* Error count */
+    uint64_t last_access;               /* Last access time */
+    
+    /* Synchronization */
+    volatile uint32_t lock;             /* Device lock */
+    
+    struct device* next;                /* Next device in global list */
+} device_t;
+
+/* Device manager state */
+static struct {
+    device_t* devices;                  /* Global device list */
+    driver_t* drivers;                  /* Global driver list */
+    uint32_t device_count;              /* Number of devices */
+    uint32_t driver_count;              /* Number of drivers */
+    uint32_t next_device_id;            /* Next device ID */
+    volatile uint32_t lock;             /* Manager lock */
+    
+    /* Hot-plug support */
+    bool hotplug_enabled;               /* Hot-plug support enabled */
+    void (*hotplug_callback)(device_t* dev, bool added); /* Hot-plug callback */
+    
+} device_manager;
+
+/* Device driver matching */
+static bool driver_matches_device(driver_t* driver, device_t* device) {
+    /* Check device type */
+    if (driver->device_type != DEVICE_TYPE_UNKNOWN && 
+        driver->device_type != device->type) {
+        return false;
+    }
+    
+    /* Check vendor ID */
+    if (driver->vendor_id != 0 && driver->vendor_id != device->vendor_id) {
+        return false;
+    }
+    
+    /* Check device ID */
+    if (driver->device_id != 0 && driver->device_id != device->product_id) {
+        return false;
+    }
+    
+    /* Check class code */
+    if (driver->class_mask != 0 && 
+        (device->class_code & driver->class_mask) != driver->class_mask) {
+        return false;
+    }
+    
+    return true;
+}
+
+/* Find driver for device */
+static driver_t* find_driver_for_device(device_t* device) {
+    driver_t* driver = device_manager.drivers;
+    
+    while (driver) {
+        if (driver->state == DRIVER_STATE_LOADED && 
+            driver_matches_device(driver, device)) {
+            return driver;
+        }
+        driver = driver->next;
+    }
+    
+    return NULL;
+}
+
+/* Bind driver to device */
+static status_t bind_driver_to_device(driver_t* driver, device_t* device) {
+    if (!driver || !device || device->driver) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_INFO("DEVICE", "Binding driver %s to device %s", driver->name, device->name);
+    
+    /* Increment driver reference count */
+    atomic_inc(&driver->ref_count);
+    
+    /* Associate driver with device */
+    device->driver = driver;
+    device->state = DEVICE_STATE_INITIALIZING;
+    
+    /* Call driver probe function */
+    if (driver->ops.probe) {
+        status_t result = driver->ops.probe(device);
+        if (result != STATUS_OK) {
+            KLOG_ERROR("DEVICE", "Driver %s probe failed for device %s: %d", 
+                       driver->name, device->name, result);
+            device->driver = NULL;
+            device->state = DEVICE_STATE_ERROR;
+            atomic_dec(&driver->ref_count);
+            return result;
+        }
+    }
+    
+    device->state = DEVICE_STATE_READY;
+    KLOG_INFO("DEVICE", "Successfully bound driver %s to device %s", 
+              driver->name, device->name);
+    
+    return STATUS_OK;
+}
+
+/* Unbind driver from device */
+static status_t unbind_driver_from_device(device_t* device) {
+    if (!device || !device->driver) {
+        return STATUS_INVALID;
+    }
+    
+    driver_t* driver = device->driver;
+    
+    KLOG_INFO("DEVICE", "Unbinding driver %s from device %s", 
+              driver->name, device->name);
+    
+    /* Call driver remove function */
+    if (driver->ops.remove) {
+        driver->ops.remove(device);
+    }
+    
+    /* Clear association */
+    device->driver = NULL;
+    device->state = DEVICE_STATE_DETECTED;
+    
+    /* Decrement driver reference count */
+    atomic_dec(&driver->ref_count);
+    
+    KLOG_INFO("DEVICE", "Unbound driver %s from device %s", 
+              driver->name, device->name);
+    
+    return STATUS_OK;
+}
+
+/* Register device driver */
+status_t device_driver_register(driver_t* driver) {
+    if (!driver || !driver->name[0]) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_INFO("DEVICE", "Registering driver: %s v%s", driver->name, driver->version);
+    
+    /* Initialize driver state */
+    driver->state = DRIVER_STATE_LOADED;
+    atomic_set(&driver->ref_count, 0);
+    
+    /* Add to driver list */
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    
+    driver->next = device_manager.drivers;
+    device_manager.drivers = driver;
+    device_manager.driver_count++;
+    
+    __sync_lock_release(&device_manager.lock);
+    
+    /* Try to bind to existing devices */
+    device_t* device = device_manager.devices;
+    while (device) {
+        if (device->state == DEVICE_STATE_DETECTED && !device->driver &&
+            driver_matches_device(driver, device)) {
+            bind_driver_to_device(driver, device);
+        }
+        device = device->next;
+    }
+    
+    KLOG_INFO("DEVICE", "Driver %s registered successfully", driver->name);
+    return STATUS_OK;
+}
+
+/* Unregister device driver */
+status_t device_driver_unregister(driver_t* driver) {
+    if (!driver) return STATUS_INVALID;
+    
+    KLOG_INFO("DEVICE", "Unregistering driver: %s", driver->name);
+    
+    /* Check if driver is still in use */
+    if (atomic_read(&driver->ref_count) > 0) {
+        KLOG_WARNING("DEVICE", "Driver %s still in use, unbinding devices", driver->name);
+        
+        /* Unbind all devices using this driver */
+        device_t* device = device_manager.devices;
+        while (device) {
+            if (device->driver == driver) {
+                unbind_driver_from_device(device);
+            }
+            device = device->next;
+        }
+    }
+    
+    /* Remove from driver list */
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    
+    driver_t** current = &device_manager.drivers;
+    while (*current) {
+        if (*current == driver) {
+            *current = driver->next;
+            device_manager.driver_count--;
+            break;
+        }
+        current = &(*current)->next;
+    }
+    
+    __sync_lock_release(&device_manager.lock);
+    
+    driver->state = DRIVER_STATE_UNLOADED;
+    
+    KLOG_INFO("DEVICE", "Driver %s unregistered successfully", driver->name);
+    return STATUS_OK;
+}
+
+/* Register device */
+device_t* device_register(device_type_t type, const char* name, 
+                         uint16_t vendor_id, uint16_t product_id) {
+    if (!name) return NULL;
+    
+    device_t* device = (device_t*)kalloc(sizeof(device_t));
+    if (!device) return NULL;
+    
+    memset(device, 0, sizeof(*device));
+    
+    /* Initialize device */
+    strncpy(device->name, name, sizeof(device->name) - 1);
+    device->type = type;
+    device->state = DEVICE_STATE_DETECTED;
+    device->vendor_id = vendor_id;
+    device->product_id = product_id;
+    
+    /* Assign unique device ID */
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    device->device_id = device_manager.next_device_id++;
+    
+    /* Create device path */
+    switch (type) {
+        case DEVICE_TYPE_STORAGE:
+            snprintf(device->path, sizeof(device->path), "/dev/sd%c", 'a' + device->device_id);
+            break;
+        case DEVICE_TYPE_NETWORK:
+            snprintf(device->path, sizeof(device->path), "/dev/eth%u", device->device_id);
+            break;
+        case DEVICE_TYPE_CHAR:
+            snprintf(device->path, sizeof(device->path), "/dev/char%u", device->device_id);
+            break;
+        case DEVICE_TYPE_BLOCK:
+            snprintf(device->path, sizeof(device->path), "/dev/block%u", device->device_id);
+            break;
+        default:
+            snprintf(device->path, sizeof(device->path), "/dev/device%u", device->device_id);
+            break;
+    }
+    
+    /* Add to device list */
+    device->next = device_manager.devices;
+    device_manager.devices = device;
+    device_manager.device_count++;
+    
+    __sync_lock_release(&device_manager.lock);
+    
+    KLOG_INFO("DEVICE", "Registered device: %s (ID: %u, Path: %s)", 
+              device->name, device->device_id, device->path);
+    
+    /* Try to find and bind a driver */
+    driver_t* driver = find_driver_for_device(device);
+    if (driver) {
+        bind_driver_to_device(driver, device);
+    } else {
+        KLOG_DEBUG("DEVICE", "No driver found for device %s", device->name);
+    }
+    
+    /* Notify hot-plug callback */
+    if (device_manager.hotplug_enabled && device_manager.hotplug_callback) {
+        device_manager.hotplug_callback(device, true);
+    }
+    
+    return device;
+}
+
+/* Unregister device */
+status_t device_unregister(device_t* device) {
+    if (!device) return STATUS_INVALID;
+    
+    KLOG_INFO("DEVICE", "Unregistering device: %s", device->name);
+    
+    /* Unbind driver if present */
+    if (device->driver) {
+        unbind_driver_from_device(device);
+    }
+    
+    device->state = DEVICE_STATE_REMOVED;
+    
+    /* Notify hot-plug callback */
+    if (device_manager.hotplug_enabled && device_manager.hotplug_callback) {
+        device_manager.hotplug_callback(device, false);
+    }
+    
+    /* Remove from device list */
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    
+    device_t** current = &device_manager.devices;
+    while (*current) {
+        if (*current == device) {
+            *current = device->next;
+            device_manager.device_count--;
+            break;
+        }
+        current = &(*current)->next;
+    }
+    
+    __sync_lock_release(&device_manager.lock);
+    
+    /* Free device */
+    kfree(device);
+    
+    KLOG_INFO("DEVICE", "Device unregistered successfully");
+    return STATUS_OK;
+}
+
+/* Find device by name */
+device_t* device_find_by_name(const char* name) {
+    if (!name) return NULL;
+    
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    
+    device_t* device = device_manager.devices;
+    while (device) {
+        if (strcmp(device->name, name) == 0) {
+            __sync_lock_release(&device_manager.lock);
+            return device;
+        }
+        device = device->next;
+    }
+    
+    __sync_lock_release(&device_manager.lock);
+    return NULL;
+}
+
+/* Find device by path */
+device_t* device_find_by_path(const char* path) {
+    if (!path) return NULL;
+    
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    
+    device_t* device = device_manager.devices;
+    while (device) {
+        if (strcmp(device->path, path) == 0) {
+            __sync_lock_release(&device_manager.lock);
+            return device;
+        }
+        device = device->next;
+    }
+    
+    __sync_lock_release(&device_manager.lock);
+    return NULL;
+}
+
+/* Device power management */
+status_t device_suspend(device_t* device) {
+    if (!device || !device->driver) return STATUS_INVALID;
+    
+    KLOG_DEBUG("DEVICE", "Suspending device %s", device->name);
+    
+    if (device->driver->ops.suspend) {
+        status_t result = device->driver->ops.suspend(device);
+        if (result == STATUS_OK) {
+            device->state = DEVICE_STATE_SUSPENDED;
+        }
+        return result;
+    }
+    
+    device->state = DEVICE_STATE_SUSPENDED;
+    return STATUS_OK;
+}
+
+status_t device_resume(device_t* device) {
+    if (!device || !device->driver) return STATUS_INVALID;
+    
+    KLOG_DEBUG("DEVICE", "Resuming device %s", device->name);
+    
+    if (device->driver->ops.resume) {
+        status_t result = device->driver->ops.resume(device);
+        if (result == STATUS_OK) {
+            device->state = DEVICE_STATE_READY;
+        }
+        return result;
+    }
+    
+    device->state = DEVICE_STATE_READY;
+    return STATUS_OK;
+}
+
+/* Device I/O operations */
+ssize_t device_read(device_t* device, void* buffer, size_t size, off_t offset) {
+    if (!device || !device->driver || !buffer) return -1;
+    
+    __sync_lock_test_and_set(&device->lock, 1);
+    
+    ssize_t result = -1;
+    if (device->driver->ops.read) {
+        result = device->driver->ops.read(device, buffer, size, offset);
+        if (result > 0) {
+            device->bytes_read += result;
+            device->io_operations++;
+            device->last_access = hal_timer_get_timestamp_ns();
+        }
+    }
+    
+    __sync_lock_release(&device->lock);
+    return result;
+}
+
+ssize_t device_write(device_t* device, const void* buffer, size_t size, off_t offset) {
+    if (!device || !device->driver || !buffer) return -1;
+    
+    __sync_lock_test_and_set(&device->lock, 1);
+    
+    ssize_t result = -1;
+    if (device->driver->ops.write) {
+        result = device->driver->ops.write(device, buffer, size, offset);
+        if (result > 0) {
+            device->bytes_written += result;
+            device->io_operations++;
+            device->last_access = hal_timer_get_timestamp_ns();
+        }
+    }
+    
+    __sync_lock_release(&device->lock);
+    return result;
+}
+
+/* Device control operations */
+status_t device_ioctl(device_t* device, uint32_t cmd, void* arg) {
+    if (!device || !device->driver) return STATUS_INVALID;
+    
+    if (device->driver->ops.ioctl) {
+        return device->driver->ops.ioctl(device, cmd, arg);
+    }
+    
+    return STATUS_NOT_SUPPORTED;
+}
+
+/* List all devices */
+void device_list_all(void) {
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    
+    kprintf("Devices (%u total):\n", device_manager.device_count);
+    kprintf("ID   Type     State      Name                 Driver               Path\n");
+    kprintf("---- -------- ---------- -------------------- -------------------- --------------------\n");
+    
+    device_t* device = device_manager.devices;
+    while (device) {
+        const char* type_str;
+        switch (device->type) {
+            case DEVICE_TYPE_STORAGE: type_str = "STORAGE"; break;
+            case DEVICE_TYPE_NETWORK: type_str = "NETWORK"; break;
+            case DEVICE_TYPE_DISPLAY: type_str = "DISPLAY"; break;
+            case DEVICE_TYPE_AUDIO: type_str = "AUDIO"; break;
+            case DEVICE_TYPE_INPUT: type_str = "INPUT"; break;
+            case DEVICE_TYPE_USB: type_str = "USB"; break;
+            case DEVICE_TYPE_PCI: type_str = "PCI"; break;
+            case DEVICE_TYPE_CHAR: type_str = "CHAR"; break;
+            case DEVICE_TYPE_BLOCK: type_str = "BLOCK"; break;
+            default: type_str = "OTHER"; break;
+        }
+        
+        const char* state_str;
+        switch (device->state) {
+            case DEVICE_STATE_DETECTED: state_str = "DETECTED"; break;
+            case DEVICE_STATE_INITIALIZING: state_str = "INIT"; break;
+            case DEVICE_STATE_READY: state_str = "READY"; break;
+            case DEVICE_STATE_ACTIVE: state_str = "ACTIVE"; break;
+            case DEVICE_STATE_SUSPENDED: state_str = "SUSPENDED"; break;
+            case DEVICE_STATE_ERROR: state_str = "ERROR"; break;
+            case DEVICE_STATE_REMOVED: state_str = "REMOVED"; break;
+            default: state_str = "UNKNOWN"; break;
+        }
+        
+        const char* driver_name = device->driver ? device->driver->name : "<none>";
+        
+        kprintf("%4u %-8s %-10s %-20s %-20s %s\n",
+                device->device_id, type_str, state_str, 
+                device->name, driver_name, device->path);
+        
+        device = device->next;
+    }
+    
+    __sync_lock_release(&device_manager.lock);
+}
+
+/* List all drivers */
+void device_list_drivers(void) {
+    __sync_lock_test_and_set(&device_manager.lock, 1);
+    
+    kprintf("Drivers (%u total):\n", device_manager.driver_count);
+    kprintf("Name                 Version    State      Refs Description\n");
+    kprintf("-------------------- ---------- ---------- ---- --------------------\n");
+    
+    driver_t* driver = device_manager.drivers;
+    while (driver) {
+        const char* state_str;
+        switch (driver->state) {
+            case DRIVER_STATE_UNLOADED: state_str = "UNLOADED"; break;
+            case DRIVER_STATE_LOADING: state_str = "LOADING"; break;
+            case DRIVER_STATE_LOADED: state_str = "LOADED"; break;
+            case DRIVER_STATE_INITIALIZED: state_str = "INIT"; break;
+            case DRIVER_STATE_ACTIVE: state_str = "ACTIVE"; break;
+            case DRIVER_STATE_UNLOADING: state_str = "UNLOADING"; break;
+            case DRIVER_STATE_ERROR: state_str = "ERROR"; break;
+            default: state_str = "UNKNOWN"; break;
+        }
+        
+        kprintf("%-20s %-10s %-10s %4d %s\n",
+                driver->name, driver->version, state_str, 
+                atomic_read(&driver->ref_count), driver->description);
+        
+        driver = driver->next;
+    }
+    
+    __sync_lock_release(&device_manager.lock);
+}
+
+/* Set hot-plug callback */
+void device_set_hotplug_callback(void (*callback)(device_t* dev, bool added)) {
+    device_manager.hotplug_callback = callback;
+    device_manager.hotplug_enabled = (callback != NULL);
+    
+    KLOG_INFO("DEVICE", "Hot-plug support %s", 
+              device_manager.hotplug_enabled ? "enabled" : "disabled");
+}
+
+/* Scan for PCI devices */
+void device_scan_pci_bus(void) {
+    KLOG_INFO("DEVICE", "Scanning PCI bus for devices");
+    
+    for (uint32_t bus = 0; bus < 256; bus++) {
+        for (uint32_t slot = 0; slot < 32; slot++) {
+            for (uint32_t func = 0; func < 8; func++) {
+                uint32_t vendor_device = pci_config_read_32(bus, slot, func, 0x00);
+                
+                if ((vendor_device & 0xFFFF) == 0xFFFF) {
+                    continue; /* No device */
+                }
+                
+                uint16_t vendor_id = vendor_device & 0xFFFF;
+                uint16_t device_id = (vendor_device >> 16) & 0xFFFF;
+                uint32_t class_code = pci_config_read_32(bus, slot, func, 0x08);
+                
+                /* Determine device type from class code */
+                device_type_t type = DEVICE_TYPE_PCI;
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                
+                switch (base_class) {
+                    case 0x01: type = DEVICE_TYPE_STORAGE; break;
+                    case 0x02: type = DEVICE_TYPE_NETWORK; break;
+                    case 0x03: type = DEVICE_TYPE_DISPLAY; break;
+                    case 0x04: type = DEVICE_TYPE_AUDIO; break;
+                    case 0x09: type = DEVICE_TYPE_INPUT; break;
+                    case 0x0C: 
+                        if (((class_code >> 16) & 0xFF) == 0x03) {
+                            type = DEVICE_TYPE_USB;
+                        }
+                        break;
+                }
+                
+                char device_name[64];
+                snprintf(device_name, sizeof(device_name), 
+                         "pci_%02x_%02x_%02x", bus, slot, func);
+                
+                device_t* device = device_register(type, device_name, vendor_id, device_id);
+                if (device) {
+                    device->class_code = class_code;
+                    device->base_address = pci_config_read_32(bus, slot, func, 0x10);
+                    device->irq = pci_config_read_32(bus, slot, func, 0x3C) & 0xFF;
+                    
+                    KLOG_DEBUG("DEVICE", "Found PCI device %04x:%04x at %02x:%02x.%x", 
+                               vendor_id, device_id, bus, slot, func);
+                }
+            }
+        }
+    }
+}
+
+/* Initialize device manager */
+status_t device_manager_init(void) {
+    KLOG_INFO("DEVICE", "Initializing device manager");
+    
+    memset(&device_manager, 0, sizeof(device_manager));
+    device_manager.next_device_id = 1;
+    
+    /* Scan for initial devices */
+    device_scan_pci_bus();
+    
+    KLOG_INFO("DEVICE", "Device manager initialized with %u devices", 
+              device_manager.device_count);
+    
+    return STATUS_OK;
+}
+
+/* Device management function implementations */
+status_t device_create_node(void* device_ptr, const char* name) {
+    device_t* device = (device_t*)device_ptr;
+    if (!device || !name) return STATUS_INVALID;
+    
+    KLOG_DEBUG("DEVICE", "Creating device node for %s", name);
+    
+    /* Create /dev entry for device */
+    char dev_path[256];
+    snprintf(dev_path, sizeof(dev_path), "/dev/%s", name);
+    
+    /* Create device file in VFS */
+    vfs_node_t* dev_node = vfs_create_node(dev_path, VFS_TYPE_DEVICE, 0666);
+    if (dev_node) {
+        dev_node->device = device;
+        dev_node->ops.read = device->ops.read;
+        dev_node->ops.write = device->ops.write;
+        dev_node->ops.ioctl = device->ops.ioctl;
+        KLOG_INFO("DEVICE", "Created device node %s", dev_path);
+    }
+    
+    return STATUS_OK;
+}
+
+status_t device_remove_node(void* device_ptr) {
+    device_t* device = (device_t*)device_ptr;
+    if (!device) return STATUS_INVALID;
+    
+    KLOG_DEBUG("DEVICE", "Removing device node for %s", device->name);
+    
+    /* Remove /dev entry for device */
+    char dev_path[256];
+    snprintf(dev_path, sizeof(dev_path), "/dev/%s", device->name);
+    
+    /* Remove device file from VFS */
+    vfs_node_t* dev_node = vfs_lookup(dev_path);
+    if (dev_node) {
+        vfs_remove_node(dev_node);
+        KLOG_INFO("DEVICE", "Removed device node %s", dev_path);
+    }
+    
+    return STATUS_OK;
+}
+
+status_t device_hotplug_event(void* device_ptr, bool connected) {
+    device_t* device = (device_t*)device_ptr;
+    if (!device) return STATUS_INVALID;
+    
+    if (connected) {
+        KLOG_INFO("DEVICE", "Hot-plug: Device %s connected", device->name);
+        device->state = DEVICE_STATE_DETECTED;
+        
+        /* Try to find and bind driver */
+        driver_t* driver = find_driver_for_device(device);
+        if (driver) {
+            bind_driver_to_device(driver, device);
+        }
+    } else {
+        KLOG_INFO("DEVICE", "Hot-plug: Device %s disconnected", device->name);
+        device_unregister(device);
+    }
+    
+    return STATUS_OK;
+}

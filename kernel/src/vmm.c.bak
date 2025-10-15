@@ -1,0 +1,600 @@
+#include "vmm.h"
+#include "kernel.h"
+#include "hal.h"
+
+/* Enhanced kernel heap with proper allocation tracking */
+#define KERNEL_HEAP_SIZE (16 * 1024 * 1024)  /* 16MB kernel heap */
+#define HEAP_BLOCK_SIZE 64
+#define MAX_HEAP_BLOCKS (KERNEL_HEAP_SIZE / HEAP_BLOCK_SIZE)
+
+static uint8_t kernel_heap[KERNEL_HEAP_SIZE] __attribute__((aligned(PAGE_SIZE)));
+static uint8_t heap_bitmap[MAX_HEAP_BLOCKS / 8];
+static size_t heap_blocks_used = 0;
+static spinlock_t heap_lock;
+
+/* Global kernel address space */
+static vmm_aspace_t kernel_aspace;
+
+/* Page table management */
+#define PML4_ENTRIES 512
+#define PDPT_ENTRIES 512
+#define PD_ENTRIES 512
+#define PT_ENTRIES 512
+
+/* Get page table entry address */
+static inline uint64_t* get_pte_addr(vmm_aspace_t* as, vaddr_t vaddr) {
+    if (!as || !as->arch_pml) return NULL;
+    
+    uint64_t* pml4 = (uint64_t*)as->arch_pml;
+    uint32_t pml4_idx = (vaddr >> 39) & 0x1FF;
+    uint32_t pdpt_idx = (vaddr >> 30) & 0x1FF;
+    uint32_t pd_idx = (vaddr >> 21) & 0x1FF;
+    uint32_t pt_idx = (vaddr >> 12) & 0x1FF;
+    
+    /* Check PML4 entry */
+    if (!(pml4[pml4_idx] & PTE_PRESENT)) return NULL;
+    
+    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFF);
+    if (!(pdpt[pdpt_idx] & PTE_PRESENT)) return NULL;
+    
+    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFF);
+    if (!(pd[pd_idx] & PTE_PRESENT)) return NULL;
+    
+    uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFF);
+    return &pt[pt_idx];
+}
+
+/* Allocate page table */
+static uint64_t* alloc_page_table(void) {
+    paddr_t phys = pmm_alloc_page();
+    if (!phys) return NULL;
+    
+    uint64_t* table = (uint64_t*)PHYS_TO_VIRT_DIRECT(phys);
+    k_memset(table, 0, PAGE_SIZE);
+    return table;
+}
+
+void vmm_init(const boot_info_t* bi) {
+    (void)bi;
+    
+    /* Initialize heap bitmap and lock */
+    k_memset(heap_bitmap, 0, sizeof(heap_bitmap));
+    heap_blocks_used = 0;
+    spinlock_init(&heap_lock);
+    
+    /* Initialize kernel address space with identity mapping */
+    k_memset(&kernel_aspace, 0, sizeof(kernel_aspace));
+    kernel_aspace.arch_pml = alloc_page_table();
+    
+    if (kernel_aspace.arch_pml) {
+        /* Set up initial identity mappings for kernel */
+        for (paddr_t addr = 0; addr < (16ULL * 1024 * 1024 * 1024); addr += PAGE_SIZE) {
+            vmm_map_page(&kernel_aspace, addr, addr, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL);
+        }
+    }
+}
+
+/* Bitmap operations for heap */
+static inline bool heap_block_allocated(size_t block) {
+    return (heap_bitmap[block / 8] & (1 << (block % 8))) != 0;
+}
+
+static inline void heap_block_set(size_t block) {
+    heap_bitmap[block / 8] |= (1 << (block % 8));
+}
+
+static inline void heap_block_clear(size_t block) {
+    heap_bitmap[block / 8] &= ~(1 << (block % 8));
+}
+
+/* Find consecutive free blocks */
+static size_t find_free_blocks(size_t count) {
+    size_t found = 0;
+    size_t start = 0;
+    
+    for (size_t i = 0; i < MAX_HEAP_BLOCKS; i++) {
+        if (!heap_block_allocated(i)) {
+            if (found == 0) start = i;
+            found++;
+            if (found >= count) return start;
+        } else {
+            found = 0;
+        }
+    }
+    return (size_t)-1;
+}
+
+void* vmm_kmalloc(size_t size, size_t align) {
+    if (size == 0) return NULL;
+    if (align == 0) align = sizeof(void*);
+    
+    /* Calculate blocks needed */
+    size_t blocks = (size + align - 1 + HEAP_BLOCK_SIZE - 1) / HEAP_BLOCK_SIZE;
+    
+    spin_lock(&heap_lock);
+    size_t start_block = find_free_blocks(blocks);
+    if (start_block == (size_t)-1) {
+        spin_unlock(&heap_lock);
+        return NULL;
+    }
+    
+    /* Mark blocks as allocated */
+    for (size_t i = 0; i < blocks; i++) {
+        heap_block_set(start_block + i);
+    }
+    heap_blocks_used += blocks;
+    spin_unlock(&heap_lock);
+    
+    void* ptr = &kernel_heap[start_block * HEAP_BLOCK_SIZE];
+    
+    /* Align the pointer */
+    uintptr_t aligned = ((uintptr_t)ptr + align - 1) & ~(align - 1);
+    return (void*)aligned;
+}
+
+void vmm_kfree(void* ptr, size_t size) {
+    if (!ptr || size == 0) return;
+    
+    uintptr_t offset = (uintptr_t)ptr - (uintptr_t)kernel_heap;
+    if (offset >= KERNEL_HEAP_SIZE) return;
+    
+    size_t start_block = offset / HEAP_BLOCK_SIZE;
+    size_t blocks = (size + HEAP_BLOCK_SIZE - 1) / HEAP_BLOCK_SIZE;
+    
+    spin_lock(&heap_lock);
+    for (size_t i = 0; i < blocks && (start_block + i) < MAX_HEAP_BLOCKS; i++) {
+        if (heap_block_allocated(start_block + i)) {
+            heap_block_clear(start_block + i);
+            heap_blocks_used--;
+        }
+    }
+    spin_unlock(&heap_lock);
+}
+
+vmm_aspace_t* vmm_create_aspace(void) {
+    vmm_aspace_t* as = (vmm_aspace_t*)vmm_kmalloc(sizeof(vmm_aspace_t), sizeof(void*));
+    if (!as) return NULL;
+    
+    k_memset(as, 0, sizeof(*as));
+    
+    /* Allocate PML4 root page table */
+    as->arch_pml = alloc_page_table();
+    if (!as->arch_pml) {
+        vmm_kfree(as, sizeof(vmm_aspace_t));
+        return NULL;
+    }
+    
+    /* Copy kernel mappings to new address space */
+    uint64_t* kernel_pml4 = (uint64_t*)kernel_aspace.arch_pml;
+    uint64_t* new_pml4 = (uint64_t*)as->arch_pml;
+    
+    /* Copy upper half (kernel space) mappings */
+    for (int i = 256; i < 512; i++) {
+        new_pml4[i] = kernel_pml4[i];
+    }
+    
+    return as;
+}
+
+void vmm_destroy_aspace(vmm_aspace_t* as) {
+    if (!as) return;
+    
+    /* Free page tables recursively */
+    if (as->arch_pml) {
+        uint64_t* pml4 = (uint64_t*)as->arch_pml;
+        
+        /* Free user space page tables (lower half) */
+        for (int pml4_idx = 0; pml4_idx < 256; pml4_idx++) {
+            if (!(pml4[pml4_idx] & PTE_PRESENT)) continue;
+            
+            uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFF);
+            for (int pdpt_idx = 0; pdpt_idx < PDPT_ENTRIES; pdpt_idx++) {
+                if (!(pdpt[pdpt_idx] & PTE_PRESENT)) continue;
+                
+                uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFF);
+                for (int pd_idx = 0; pd_idx < PD_ENTRIES; pd_idx++) {
+                    if (!(pd[pd_idx] & PTE_PRESENT)) continue;
+                    
+                    /* Free page table */
+                    paddr_t pt_phys = pd[pd_idx] & ~0xFFF;
+                    pmm_free_page(pt_phys);
+                }
+                
+                /* Free page directory */
+                paddr_t pd_phys = pdpt[pdpt_idx] & ~0xFFF;
+                pmm_free_page(pd_phys);
+            }
+            
+            /* Free PDPT */
+            paddr_t pdpt_phys = pml4[pml4_idx] & ~0xFFF;
+            pmm_free_page(pdpt_phys);
+        }
+        
+        /* Free PML4 */
+        paddr_t pml4_phys = VIRT_TO_PHYS_DIRECT((vaddr_t)as->arch_pml);
+        pmm_free_page(pml4_phys);
+    }
+    
+    /* Free regions */
+    vmm_region_t* region = as->regions;
+    while (region) {
+        vmm_region_t* next = region->next;
+        vmm_kfree(region, sizeof(vmm_region_t));
+        region = next;
+    }
+    
+    vmm_kfree(as, sizeof(vmm_aspace_t));
+}
+
+int vmm_map(vmm_aspace_t* as, virt_addr_t va, phys_addr_t pa, size_t size, pte_flags_t flags) {
+    if (!as || !as->arch_pml || size == 0) return K_EINVAL;
+    
+    /* Align addresses and size to page boundaries */
+    vaddr_t vaddr_aligned = PAGE_ALIGN_DOWN(va);
+    paddr_t paddr_aligned = PAGE_ALIGN_DOWN(pa);
+    size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    /* Map each page */
+    for (size_t i = 0; i < pages; i++) {
+        status_t result = vmm_map_page(as, vaddr_aligned + (i * PAGE_SIZE), 
+                                      paddr_aligned + (i * PAGE_SIZE), flags);
+        if (FAILED(result)) {
+            /* Unmap what we've mapped so far */
+            for (size_t j = 0; j < i; j++) {
+                vmm_unmap_page(as, vaddr_aligned + (j * PAGE_SIZE));
+            }
+            return result;
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+status_t vmm_unmap(vmm_aspace_t* aspace, vaddr_t vaddr, size_t size) {
+    if (!aspace || !aspace->arch_pml || size == 0) return K_EINVAL;
+    
+    vaddr_t vaddr_aligned = PAGE_ALIGN_DOWN(vaddr);
+    size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    for (size_t i = 0; i < pages; i++) {
+        vmm_unmap_page(aspace, vaddr_aligned + (i * PAGE_SIZE));
+    }
+    
+    return STATUS_OK;
+}
+
+/* Unmap a single page */
+status_t vmm_unmap_page(vmm_aspace_t* aspace, vaddr_t vaddr) {
+    if (!aspace || !aspace->arch_pml) return K_EINVAL;
+    
+    uint64_t* pte = get_pte_addr(aspace, vaddr);
+    if (!pte || !(*pte & PTE_PRESENT)) return K_ENOENT;
+    
+    /* Clear the PTE */
+    *pte = 0;
+    
+    /* Invalidate TLB entry */
+    __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+    
+    return STATUS_OK;
+}
+
+/* Page-level mapping function */
+status_t vmm_map_page(vmm_aspace_t* aspace, vaddr_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!aspace || !aspace->arch_pml) return K_EINVAL;
+    if (vaddr & (PAGE_SIZE - 1) || paddr & (PAGE_SIZE - 1)) return K_EINVAL;
+    
+    uint64_t* pml4 = (uint64_t*)aspace->arch_pml;
+    uint32_t pml4_idx = (vaddr >> 39) & 0x1FF;
+    uint32_t pdpt_idx = (vaddr >> 30) & 0x1FF;
+    uint32_t pd_idx = (vaddr >> 21) & 0x1FF;
+    uint32_t pt_idx = (vaddr >> 12) & 0x1FF;
+    
+    /* Ensure PDPT exists */
+    if (!(pml4[pml4_idx] & PTE_PRESENT)) {
+        uint64_t* pdpt = alloc_page_table();
+        if (!pdpt) return STATUS_NOMEM;
+        
+        paddr_t pdpt_phys = VIRT_TO_PHYS_DIRECT((vaddr_t)pdpt);
+        pml4[pml4_idx] = pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+    
+    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFF);
+    
+    /* Ensure PD exists */
+    if (!(pdpt[pdpt_idx] & PTE_PRESENT)) {
+        uint64_t* pd = alloc_page_table();
+        if (!pd) return STATUS_NOMEM;
+        
+        paddr_t pd_phys = VIRT_TO_PHYS_DIRECT((vaddr_t)pd);
+        pdpt[pdpt_idx] = pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+    
+    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFF);
+    
+    /* Ensure PT exists */
+    if (!(pd[pd_idx] & PTE_PRESENT)) {
+        uint64_t* pt = alloc_page_table();
+        if (!pt) return STATUS_NOMEM;
+        
+        paddr_t pt_phys = VIRT_TO_PHYS_DIRECT((vaddr_t)pt);
+        pd[pd_idx] = pt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+    
+    uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFF);
+    
+    /* Apply W^X policy */
+    flags = vmm_enforce_wx(flags);
+    
+    /* Set the PTE */
+    pt[pt_idx] = paddr | flags;
+    
+    /* Invalidate TLB entry */
+    __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+    
+    return STATUS_OK;
+}
+
+int vmm_get_physical(vmm_aspace_t* as, virt_addr_t va, phys_addr_t* out_pa) {
+    if (!as || !as->arch_pml || !out_pa) return K_EINVAL;
+    
+    uint64_t* pte = get_pte_addr(as, va);
+    if (!pte || !(*pte & PTE_PRESENT)) {
+        return K_ENOENT;
+    }
+    
+    *out_pa = (*pte & ~0xFFF) | (va & 0xFFF);
+    return STATUS_OK;
+}
+
+int vmm_region_add(vmm_aspace_t* as, virt_addr_t start, size_t length, u32 flags) {
+    if (!as || length == 0) return K_EINVAL;
+    
+    /* Check for overlapping regions */
+    vmm_region_t* existing = vmm_region_find(as, start);
+    if (existing) return K_EEXIST;
+    
+    /* Allocate new region */
+    vmm_region_t* region = (vmm_region_t*)vmm_kmalloc(sizeof(vmm_region_t), 8);
+    if (!region) return K_ENOMEM;
+    
+    region->start = start;
+    region->length = length;
+    region->flags = flags;
+    region->file_map = NULL;
+    
+    /* Add to linked list */
+    region->next = as->regions;
+    as->regions = region;
+    
+    return STATUS_OK;
+}
+
+vmm_region_t* vmm_region_find(vmm_aspace_t* as, virt_addr_t addr) {
+    if (!as) return NULL;
+    
+    vmm_region_t* region = as->regions;
+    while (region) {
+        if (addr >= region->start && addr < (region->start + region->length)) {
+            return region;
+        }
+        region = region->next;
+    }
+    
+    return NULL;
+}
+
+vmm_region_t* vmm_region_find_range(vmm_aspace_t* as, virt_addr_t start, size_t length) {
+    if (!as) return NULL;
+    
+    virt_addr_t end = start + length;
+    vmm_region_t* region = as->regions;
+    
+    while (region) {
+        virt_addr_t region_end = region->start + region->length;
+        
+        /* Check for overlap */
+        if (start < region_end && end > region->start) {
+            return region;
+        }
+        region = region->next;
+    }
+    
+    return NULL;
+}
+
+/* Copy-on-Write implementation */
+int vmm_clone_address_space_cow(vmm_aspace_t* dst, vmm_aspace_t* src) {
+    if (!dst || !src || !src->arch_pml) return K_EINVAL;
+    
+    /* Create new address space */
+    dst->arch_pml = alloc_page_table();
+    if (!dst->arch_pml) return K_ENOMEM;
+    
+    uint64_t* src_pml4 = (uint64_t*)src->arch_pml;
+    uint64_t* dst_pml4 = (uint64_t*)dst->arch_pml;
+    
+    /* Copy kernel space mappings (upper half) */
+    for (int i = 256; i < 512; i++) {
+        dst_pml4[i] = src_pml4[i];
+    }
+    
+    /* Clone user space with COW (lower half) */
+    for (int pml4_idx = 0; pml4_idx < 256; pml4_idx++) {
+        if (!(src_pml4[pml4_idx] & PTE_PRESENT)) continue;
+        
+        uint64_t* src_pdpt = (uint64_t*)(src_pml4[pml4_idx] & ~0xFFF);
+        uint64_t* dst_pdpt = alloc_page_table();
+        if (!dst_pdpt) return K_ENOMEM;
+        
+        dst_pml4[pml4_idx] = VIRT_TO_PHYS_DIRECT((vaddr_t)dst_pdpt) | PTE_PRESENT | PTE_USER;
+        
+        for (int pdpt_idx = 0; pdpt_idx < PDPT_ENTRIES; pdpt_idx++) {
+            if (!(src_pdpt[pdpt_idx] & PTE_PRESENT)) continue;
+            
+            uint64_t* src_pd = (uint64_t*)(src_pdpt[pdpt_idx] & ~0xFFF);
+            uint64_t* dst_pd = alloc_page_table();
+            if (!dst_pd) return K_ENOMEM;
+            
+            dst_pdpt[pdpt_idx] = VIRT_TO_PHYS_DIRECT((vaddr_t)dst_pd) | PTE_PRESENT | PTE_USER;
+            
+            for (int pd_idx = 0; pd_idx < PD_ENTRIES; pd_idx++) {
+                if (!(src_pd[pd_idx] & PTE_PRESENT)) continue;
+                
+                uint64_t* src_pt = (uint64_t*)(src_pd[pd_idx] & ~0xFFF);
+                uint64_t* dst_pt = alloc_page_table();
+                if (!dst_pt) return K_ENOMEM;
+                
+                dst_pd[pd_idx] = VIRT_TO_PHYS_DIRECT((vaddr_t)dst_pt) | PTE_PRESENT | PTE_USER;
+                
+                /* Copy page table entries with COW */
+                for (int pt_idx = 0; pt_idx < PT_ENTRIES; pt_idx++) {
+                    if (!(src_pt[pt_idx] & PTE_PRESENT)) continue;
+                    
+                    paddr_t phys_addr = src_pt[pt_idx] & ~0xFFF;
+                    uint64_t flags = src_pt[pt_idx] & 0xFFF;
+                    
+                    /* Mark both parent and child as read-only for COW */
+                    if (flags & PTE_WRITABLE) {
+                        flags &= ~PTE_WRITABLE;
+                        flags |= PTE_COW;  /* Custom flag to track COW pages */
+                        src_pt[pt_idx] = phys_addr | flags;
+                    }
+                    
+                    dst_pt[pt_idx] = phys_addr | flags;
+                    
+                    /* Increment reference count */
+                    pmm_incref(phys_addr);
+                }
+            }
+        }
+    }
+    
+    /* Copy regions */
+    dst->regions = NULL;
+    vmm_region_t* src_region = src->regions;
+    while (src_region) {
+        vmm_region_add(dst, src_region->start, src_region->length, src_region->flags);
+        src_region = src_region->next;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Map physical pages into kernel space */
+void* vmm_map_physical_pages(paddr_t paddr, size_t pages) {
+    if (pages == 0) return NULL;
+    
+    /* For kernel, use direct mapping in upper half */
+    vaddr_t vaddr = (vaddr_t)PHYS_TO_VIRT_DIRECT(paddr);
+    
+    /* Map pages into kernel address space */
+    for (size_t i = 0; i < pages; i++) {
+        status_t result = vmm_map_page(&kernel_aspace, 
+                                      vaddr + (i * PAGE_SIZE),
+                                      paddr + (i * PAGE_SIZE),
+                                      PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL);
+        if (FAILED(result)) {
+            /* Unmap what we mapped so far */
+            for (size_t j = 0; j < i; j++) {
+                vmm_unmap_page(&kernel_aspace, vaddr + (j * PAGE_SIZE));
+            }
+            return NULL;
+        }
+    }
+    
+    return (void*)vaddr;
+}
+
+void vmm_unmap_physical_pages(void* vaddr, size_t pages) {
+    if (!vaddr || pages == 0) return;
+    
+    vaddr_t va = (vaddr_t)vaddr;
+    for (size_t i = 0; i < pages; i++) {
+        vmm_unmap_page(&kernel_aspace, va + (i * PAGE_SIZE));
+    }
+}
+
+vmm_aspace_t* vmm_get_kernel_aspace(void) {
+    return &kernel_aspace;
+}
+
+status_t vmm_switch_aspace(vmm_aspace_t* as) {
+    if (!as || !as->arch_pml) return K_EINVAL;
+    
+    /* Load new CR3 */
+    paddr_t pml4_phys = VIRT_TO_PHYS_DIRECT((vaddr_t)as->arch_pml);
+    __asm__ volatile("mov %0, %%cr3" :: "r"(pml4_phys) : "memory");
+    
+    return STATUS_OK;
+}
+
+/* Page fault handler */
+void vmm_handle_page_fault(u64 fault_addr, u64 err_code) {
+    /* Get current address space */
+    vmm_aspace_t* current_as = vmm_get_current_aspace();
+    if (!current_as) return;
+    
+    /* Check if this is a COW fault */
+    uint64_t* pte = get_pte_addr(current_as, fault_addr);
+    if (pte && (*pte & PTE_COW) && (err_code & 0x2)) {  /* Write to COW page */
+        paddr_t old_phys = *pte & ~0xFFF;
+        uint64_t flags = *pte & 0xFFF;
+        
+        /* Allocate new page */
+        paddr_t new_phys = pmm_alloc_page();
+        if (!new_phys) {
+            /* Out of memory - send SIGKILL */
+            return;
+        }
+        
+        /* Copy page contents */
+        void* old_page = (void*)PHYS_TO_VIRT_DIRECT(old_phys);
+        void* new_page = (void*)PHYS_TO_VIRT_DIRECT(new_phys);
+        k_memcpy(new_page, old_page, PAGE_SIZE);
+        
+        /* Update PTE */
+        flags &= ~PTE_COW;
+        flags |= PTE_WRITABLE;
+        *pte = new_phys | flags;
+        
+        /* Decrement old page reference */
+        pmm_decref(old_phys);
+        
+        /* Invalidate TLB */
+        __asm__ volatile("invlpg (%0)" :: "r"(fault_addr) : "memory");
+        
+        return;
+    }
+    
+    /* Check for lazy allocation */
+    vmm_region_t* region = vmm_region_find(current_as, fault_addr);
+    if (region && (region->flags & VMM_REGION_ANON)) {
+        /* Allocate page on demand */
+        paddr_t phys = pmm_alloc_page();
+        if (!phys) return;
+        
+        /* Zero the page */
+        void* page = (void*)PHYS_TO_VIRT_DIRECT(phys);
+        k_memset(page, 0, PAGE_SIZE);
+        
+        /* Map page */
+        uint32_t flags = PTE_PRESENT | PTE_USER;
+        if (region->flags & VMM_REGION_WRITE) flags |= PTE_WRITABLE;
+        
+        vaddr_t page_addr = PAGE_ALIGN_DOWN(fault_addr);
+        vmm_map_page(current_as, page_addr, phys, flags);
+        
+        return;
+    }
+    
+    /* Unhandled page fault - this would normally send SIGSEGV */
+    KLOG_ERROR("VMM", "Unhandled page fault at 0x%llx (error=0x%llx)", fault_addr, err_code);
+}
+
+/* Get current address space (would be per-process) */
+vmm_aspace_t* vmm_get_current_aspace(void) {
+    /* For now, return kernel address space */
+    /* In full implementation, would get from current process */
+    return &kernel_aspace;
+}

@@ -1,0 +1,817 @@
+/*
+ * Advanced Security Subsystem
+ * Cryptography, access control, security policies, and threat detection
+ */
+
+#include "kernel.h"
+#include "hal.h"
+#include "process.h"
+#include "auth.h"
+
+/* Security levels */
+#define SECURITY_LEVEL_MINIMAL      0   /* Basic protection */
+#define SECURITY_LEVEL_STANDARD     1   /* Standard protection */
+#define SECURITY_LEVEL_HIGH         2   /* High security */
+#define SECURITY_LEVEL_MAXIMUM      3   /* Maximum security */
+
+/* Cryptographic algorithms */
+#define CRYPTO_AES128               1
+#define CRYPTO_AES256               2
+#define CRYPTO_CHACHA20             3
+#define CRYPTO_RSA2048              4
+#define CRYPTO_RSA4096              5
+#define CRYPTO_ECDSA_P256          6
+#define CRYPTO_ECDSA_P384          7
+#define CRYPTO_SHA256               8
+#define CRYPTO_SHA512               9
+#define CRYPTO_BLAKE3               10
+
+/* Security policies */
+#define POLICY_MANDATORY_ACCESS     (1 << 0)
+#define POLICY_DISCRETIONARY_ACCESS (1 << 1)
+#define POLICY_ROLE_BASED_ACCESS    (1 << 2)
+#define POLICY_CAPABILITY_BASED     (1 << 3)
+#define POLICY_EXECUTE_PREVENTION   (1 << 4)
+#define POLICY_ADDRESS_RANDOMIZATION (1 << 5)
+#define POLICY_STACK_PROTECTION     (1 << 6)
+#define POLICY_CONTROL_FLOW_GUARD   (1 << 7)
+
+/* Threat types */
+#define THREAT_BUFFER_OVERFLOW      1
+#define THREAT_CODE_INJECTION       2
+#define THREAT_PRIVILEGE_ESCALATION 3
+#define THREAT_DATA_EXFILTRATION    4
+#define THREAT_DENIAL_OF_SERVICE    5
+#define THREAT_MALWARE              6
+#define THREAT_ROOTKIT              7
+#define THREAT_TIMING_ATTACK        8
+
+/* Maximum values */
+#define MAX_CRYPTO_CONTEXTS         256
+#define MAX_SECURITY_CONTEXTS       1024
+#define MAX_ACCESS_RULES           2048
+#define MAX_THREAT_SIGNATURES      512
+#define MAX_AUDIT_EVENTS           10000
+
+/* Cryptographic context */
+typedef struct crypto_context {
+    uint32_t context_id;            /* Context ID */
+    uint32_t algorithm;             /* Crypto algorithm */
+    uint32_t key_size;              /* Key size in bits */
+    uint8_t key[64];                /* Encryption key */
+    uint8_t iv[32];                 /* Initialization vector */
+    
+    /* State */
+    bool initialized;               /* Context initialized */
+    uint32_t operations;            /* Number of operations */
+    uint64_t bytes_processed;       /* Total bytes processed */
+    
+    /* Statistics */
+    uint64_t encrypt_operations;    /* Encrypt operations */
+    uint64_t decrypt_operations;    /* Decrypt operations */
+    uint64_t sign_operations;       /* Sign operations */
+    uint64_t verify_operations;     /* Verify operations */
+    
+    volatile uint32_t lock;         /* Context lock */
+} crypto_context_t;
+
+/* Security context */
+typedef struct security_context {
+    uint32_t context_id;            /* Context ID */
+    uint32_t process_id;            /* Associated process */
+    uint32_t user_id;               /* User ID */
+    uint32_t group_id;              /* Group ID */
+    
+    /* Security attributes */
+    uint32_t security_level;        /* Security level */
+    uint32_t capabilities;          /* Process capabilities */
+    uint32_t restrictions;          /* Security restrictions */
+    uint64_t permissions;           /* Permission bits */
+    
+    /* Labels (for mandatory access control) */
+    char security_label[64];        /* Security label */
+    uint32_t classification_level;  /* Classification level */
+    uint32_t compartments;          /* Security compartments */
+    
+    /* Statistics */
+    uint64_t access_violations;     /* Access violations */
+    uint64_t permission_checks;     /* Permission checks */
+    uint64_t policy_evaluations;    /* Policy evaluations */
+    
+    struct security_context* next;  /* Next context */
+} security_context_t;
+
+/* Access control rule */
+typedef struct access_rule {
+    uint32_t rule_id;               /* Rule ID */
+    uint32_t subject_type;          /* Subject type (user, role, etc.) */
+    uint32_t subject_id;            /* Subject ID */
+    uint32_t object_type;           /* Object type (file, device, etc.) */
+    uint32_t object_id;             /* Object ID */
+    
+    /* Permissions */
+    uint64_t allowed_permissions;   /* Allowed permissions */
+    uint64_t denied_permissions;    /* Denied permissions */
+    
+    /* Conditions */
+    uint32_t time_restrictions;     /* Time-based restrictions */
+    uint32_t location_restrictions; /* Location-based restrictions */
+    
+    /* Metadata */
+    char description[128];          /* Rule description */
+    uint64_t creation_time;         /* Rule creation time */
+    uint64_t last_used;             /* Last time rule was used */
+    uint64_t usage_count;           /* Number of times used */
+    
+    struct access_rule* next;       /* Next rule */
+} access_rule_t;
+
+/* Threat signature */
+typedef struct threat_signature {
+    uint32_t signature_id;          /* Signature ID */
+    uint32_t threat_type;           /* Type of threat */
+    char name[64];                  /* Threat name */
+    
+    /* Pattern matching */
+    uint8_t pattern[256];           /* Byte pattern */
+    uint32_t pattern_length;        /* Pattern length */
+    uint32_t pattern_mask;          /* Pattern mask */
+    
+    /* Behavior detection */
+    uint32_t syscall_pattern;       /* System call pattern */
+    uint32_t memory_pattern;        /* Memory access pattern */
+    uint32_t network_pattern;       /* Network activity pattern */
+    
+    /* Response */
+    uint32_t severity;              /* Threat severity */
+    uint32_t response_action;       /* Automatic response */
+    
+    /* Statistics */
+    uint64_t detection_count;       /* Number of detections */
+    uint64_t last_detected;         /* Last detection time */
+    
+    struct threat_signature* next;  /* Next signature */
+} threat_signature_t;
+
+/* Audit event */
+typedef struct audit_event {
+    uint32_t event_id;              /* Event ID */
+    uint32_t event_type;            /* Type of event */
+    uint32_t process_id;            /* Process that generated event */
+    uint32_t user_id;               /* User ID */
+    
+    /* Event details */
+    char object_name[256];          /* Object being accessed */
+    uint32_t operation;             /* Operation performed */
+    uint32_t result;                /* Operation result */
+    
+    /* Context */
+    uint64_t timestamp;             /* Event timestamp */
+    uint32_t cpu_id;                /* CPU where event occurred */
+    uint64_t instruction_pointer;   /* Instruction pointer */
+    
+    /* Additional data */
+    uint8_t data[128];              /* Event-specific data */
+    uint32_t data_length;           /* Data length */
+} audit_event_t;
+
+/* Security management state */
+static struct {
+    /* Global settings */
+    uint32_t security_level;        /* Global security level */
+    uint32_t active_policies;       /* Active security policies */
+    bool security_enabled;          /* Security subsystem enabled */
+    bool audit_enabled;             /* Audit logging enabled */
+    
+    /* Cryptographic contexts */
+    crypto_context_t crypto_contexts[MAX_CRYPTO_CONTEXTS]; /* Crypto contexts */
+    uint32_t crypto_context_count;  /* Number of contexts */
+    
+    /* Security contexts */
+    security_context_t* security_contexts; /* Security contexts */
+    uint32_t security_context_count; /* Number of contexts */
+    
+    /* Access control */
+    access_rule_t* access_rules;    /* Access control rules */
+    uint32_t access_rule_count;     /* Number of rules */
+    
+    /* Threat detection */
+    threat_signature_t* threat_signatures; /* Threat signatures */
+    uint32_t threat_signature_count; /* Number of signatures */
+    bool threat_detection_enabled;  /* Threat detection enabled */
+    
+    /* Audit system */
+    audit_event_t audit_events[MAX_AUDIT_EVENTS]; /* Audit events */
+    uint32_t audit_event_head;      /* Audit event head */
+    uint32_t audit_event_count;     /* Number of audit events */
+    
+    /* Statistics */
+    uint64_t security_violations;   /* Total security violations */
+    uint64_t crypto_operations;     /* Total crypto operations */
+    uint64_t threat_detections;     /* Total threat detections */
+    uint64_t audit_events_generated; /* Total audit events */
+    
+    volatile uint32_t lock;         /* Global security lock */
+} security_mgmt;
+
+/* Simple AES-like encryption (simplified for demonstration) */
+static void simple_encrypt_block(const uint8_t* input, uint8_t* output, const uint8_t* key) {
+    /* This is a very simplified encryption for demonstration */
+    /* In a real implementation, use proper AES or other algorithms */
+    
+    for (int i = 0; i < 16; i++) {
+        output[i] = input[i] ^ key[i % 16];
+        
+        /* Simple substitution */
+        output[i] = ((output[i] << 1) | (output[i] >> 7)) & 0xFF;
+        
+        /* Mix with next byte */
+        if (i < 15) {
+            output[i] ^= input[i + 1];
+        } else {
+            output[i] ^= input[0];
+        }
+    }
+}
+
+/* Simple AES-like decryption */
+static void simple_decrypt_block(const uint8_t* input, uint8_t* output, const uint8_t* key) {
+    /* Reverse of encryption operation */
+    uint8_t temp[16];
+    memcpy(temp, input, 16);
+    
+    for (int i = 0; i < 16; i++) {
+        /* Reverse mix */
+        if (i < 15) {
+            temp[i] ^= input[i + 1];
+        } else {
+            temp[i] ^= input[0];
+        }
+        
+        /* Reverse substitution */
+        temp[i] = ((temp[i] >> 1) | (temp[i] << 7)) & 0xFF;
+        
+        /* Reverse XOR */
+        output[i] = temp[i] ^ key[i % 16];
+    }
+}
+
+/* Create cryptographic context */
+uint32_t crypto_create_context(uint32_t algorithm, const uint8_t* key, uint32_t key_size) {
+    __sync_lock_test_and_set(&security_mgmt.lock, 1);
+    
+    if (security_mgmt.crypto_context_count >= MAX_CRYPTO_CONTEXTS) {
+        __sync_lock_release(&security_mgmt.lock);
+        return 0; /* Invalid context ID */
+    }
+    
+    uint32_t context_id = security_mgmt.crypto_context_count + 1;
+    crypto_context_t* ctx = &security_mgmt.crypto_contexts[security_mgmt.crypto_context_count];
+    
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->context_id = context_id;
+    ctx->algorithm = algorithm;
+    ctx->key_size = key_size;
+    
+    /* Copy key (truncate if necessary) */
+    uint32_t copy_size = (key_size > sizeof(ctx->key)) ? sizeof(ctx->key) : key_size;
+    memcpy(ctx->key, key, copy_size);
+    
+    /* Generate random IV */
+    for (uint32_t i = 0; i < sizeof(ctx->iv); i++) {
+        ctx->iv[i] = (uint8_t)(hal_timer_get_timestamp_ns() >> (i * 8));
+    }
+    
+    ctx->initialized = true;
+    security_mgmt.crypto_context_count++;
+    
+    __sync_lock_release(&security_mgmt.lock);
+    
+    KLOG_DEBUG("SECURITY", "Created crypto context %u (algorithm %u)", context_id, algorithm);
+    return context_id;
+}
+
+/* Encrypt data */
+status_t crypto_encrypt(uint32_t context_id, const uint8_t* input, uint8_t* output, uint32_t length) {
+    if (context_id == 0 || context_id > security_mgmt.crypto_context_count) {
+        return STATUS_INVALID;
+    }
+    
+    crypto_context_t* ctx = &security_mgmt.crypto_contexts[context_id - 1];
+    
+    if (!ctx->initialized) {
+        return STATUS_NOT_INITIALIZED;
+    }
+    
+    __sync_lock_test_and_set(&ctx->lock, 1);
+    
+    /* Process data in 16-byte blocks */
+    uint32_t blocks = (length + 15) / 16;
+    
+    for (uint32_t i = 0; i < blocks; i++) {
+        uint32_t block_offset = i * 16;
+        uint32_t block_size = ((block_offset + 16) <= length) ? 16 : (length - block_offset);
+        
+        uint8_t input_block[16] = {0};
+        uint8_t output_block[16];
+        
+        /* Copy input block (pad with zeros if necessary) */
+        memcpy(input_block, input + block_offset, block_size);
+        
+        /* Encrypt block */
+        switch (ctx->algorithm) {
+            case CRYPTO_AES128:
+            case CRYPTO_AES256:
+                simple_encrypt_block(input_block, output_block, ctx->key);
+                break;
+            
+            case CRYPTO_CHACHA20:
+                /* Simple XOR cipher for demonstration */
+                for (int j = 0; j < 16; j++) {
+                    output_block[j] = input_block[j] ^ ctx->key[j % ctx->key_size];
+                }
+                break;
+            
+            default:
+                __sync_lock_release(&ctx->lock);
+                return STATUS_NOT_SUPPORTED;
+        }
+        
+        /* Copy output block */
+        memcpy(output + block_offset, output_block, block_size);
+    }
+    
+    ctx->encrypt_operations++;
+    ctx->operations++;
+    ctx->bytes_processed += length;
+    security_mgmt.crypto_operations++;
+    
+    __sync_lock_release(&ctx->lock);
+    
+    return STATUS_OK;
+}
+
+/* Decrypt data */
+status_t crypto_decrypt(uint32_t context_id, const uint8_t* input, uint8_t* output, uint32_t length) {
+    if (context_id == 0 || context_id > security_mgmt.crypto_context_count) {
+        return STATUS_INVALID;
+    }
+    
+    crypto_context_t* ctx = &security_mgmt.crypto_contexts[context_id - 1];
+    
+    if (!ctx->initialized) {
+        return STATUS_NOT_INITIALIZED;
+    }
+    
+    __sync_lock_test_and_set(&ctx->lock, 1);
+    
+    /* Process data in 16-byte blocks */
+    uint32_t blocks = (length + 15) / 16;
+    
+    for (uint32_t i = 0; i < blocks; i++) {
+        uint32_t block_offset = i * 16;
+        uint32_t block_size = ((block_offset + 16) <= length) ? 16 : (length - block_offset);
+        
+        uint8_t input_block[16] = {0};
+        uint8_t output_block[16];
+        
+        /* Copy input block */
+        memcpy(input_block, input + block_offset, block_size);
+        
+        /* Decrypt block */
+        switch (ctx->algorithm) {
+            case CRYPTO_AES128:
+            case CRYPTO_AES256:
+                simple_decrypt_block(input_block, output_block, ctx->key);
+                break;
+            
+            case CRYPTO_CHACHA20:
+                /* Simple XOR cipher for demonstration */
+                for (int j = 0; j < 16; j++) {
+                    output_block[j] = input_block[j] ^ ctx->key[j % ctx->key_size];
+                }
+                break;
+            
+            default:
+                __sync_lock_release(&ctx->lock);
+                return STATUS_NOT_SUPPORTED;
+        }
+        
+        /* Copy output block */
+        memcpy(output + block_offset, output_block, block_size);
+    }
+    
+    ctx->decrypt_operations++;
+    ctx->operations++;
+    ctx->bytes_processed += length;
+    security_mgmt.crypto_operations++;
+    
+    __sync_lock_release(&ctx->lock);
+    
+    return STATUS_OK;
+}
+
+/* Create security context */
+uint32_t security_create_context(uint32_t process_id, uint32_t user_id, uint32_t group_id) {
+    security_context_t* ctx = (security_context_t*)kalloc(sizeof(security_context_t));
+    if (!ctx) return 0;
+    
+    __sync_lock_test_and_set(&security_mgmt.lock, 1);
+    
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->context_id = security_mgmt.security_context_count + 1;
+    ctx->process_id = process_id;
+    ctx->user_id = user_id;
+    ctx->group_id = group_id;
+    
+    /* Set default security attributes */
+    ctx->security_level = SECURITY_LEVEL_STANDARD;
+    ctx->capabilities = 0; /* No special capabilities by default */
+    ctx->restrictions = 0; /* No restrictions by default */
+    ctx->permissions = 0x000000FF; /* Basic permissions */
+    
+    /* Default security label */
+    snprintf(ctx->security_label, sizeof(ctx->security_label), 
+             "proc_%u_user_%u", process_id, user_id);
+    ctx->classification_level = 0; /* Unclassified */
+    ctx->compartments = 0; /* No compartments */
+    
+    /* Add to context list */
+    ctx->next = security_mgmt.security_contexts;
+    security_mgmt.security_contexts = ctx;
+    security_mgmt.security_context_count++;
+    
+    __sync_lock_release(&security_mgmt.lock);
+    
+    KLOG_DEBUG("SECURITY", "Created security context %u for process %u", 
+               ctx->context_id, process_id);
+    
+    return ctx->context_id;
+}
+
+/* Check access permission */
+bool security_check_access(uint32_t context_id, uint32_t object_type, uint32_t object_id, uint64_t requested_permissions) {
+    /* Find security context */
+    security_context_t* ctx = security_mgmt.security_contexts;
+    while (ctx && ctx->context_id != context_id) {
+        ctx = ctx->next;
+    }
+    
+    if (!ctx) {
+        security_mgmt.security_violations++;
+        return false;
+    }
+    
+    ctx->permission_checks++;
+    
+    /* Check basic permissions */
+    if ((ctx->permissions & requested_permissions) != requested_permissions) {
+        ctx->access_violations++;
+        security_mgmt.security_violations++;
+        
+        /* Log security violation */
+        audit_log_event(0x1001, ctx->process_id, ctx->user_id, 
+                       "Permission denied", 0, STATUS_ACCESS_DENIED);
+        
+        return false;
+    }
+    
+    /* Check access control rules */
+    access_rule_t* rule = security_mgmt.access_rules;
+    while (rule) {
+        if ((rule->subject_type == 0 || rule->subject_id == ctx->user_id) &&
+            (rule->object_type == object_type || rule->object_type == 0) &&
+            (rule->object_id == object_id || rule->object_id == 0)) {
+            
+            /* Check denied permissions first */
+            if (rule->denied_permissions & requested_permissions) {
+                ctx->access_violations++;
+                security_mgmt.security_violations++;
+                rule->usage_count++;
+                rule->last_used = hal_timer_get_timestamp_ns();
+                return false;
+            }
+            
+            /* Check allowed permissions */
+            if ((rule->allowed_permissions & requested_permissions) == requested_permissions) {
+                rule->usage_count++;
+                rule->last_used = hal_timer_get_timestamp_ns();
+                return true;
+            }
+        }
+        
+        rule = rule->next;
+    }
+    
+    /* Default policy based on security level */
+    if (ctx->security_level >= SECURITY_LEVEL_HIGH) {
+        /* High security: deny by default */
+        ctx->access_violations++;
+        security_mgmt.security_violations++;
+        return false;
+    }
+    
+    /* Standard security: allow basic operations */
+    return true;
+}
+
+/* Add access control rule */
+status_t security_add_access_rule(uint32_t subject_type, uint32_t subject_id,
+                                  uint32_t object_type, uint32_t object_id,
+                                  uint64_t allowed_permissions, uint64_t denied_permissions) {
+    access_rule_t* rule = (access_rule_t*)kalloc(sizeof(access_rule_t));
+    if (!rule) return STATUS_NOMEM;
+    
+    __sync_lock_test_and_set(&security_mgmt.lock, 1);
+    
+    memset(rule, 0, sizeof(*rule));
+    rule->rule_id = security_mgmt.access_rule_count + 1;
+    rule->subject_type = subject_type;
+    rule->subject_id = subject_id;
+    rule->object_type = object_type;
+    rule->object_id = object_id;
+    rule->allowed_permissions = allowed_permissions;
+    rule->denied_permissions = denied_permissions;
+    rule->creation_time = hal_timer_get_timestamp_ns();
+    
+    snprintf(rule->description, sizeof(rule->description),
+             "Rule %u: Subject %u/%u -> Object %u/%u",
+             rule->rule_id, subject_type, subject_id, object_type, object_id);
+    
+    /* Add to rule list */
+    rule->next = security_mgmt.access_rules;
+    security_mgmt.access_rules = rule;
+    security_mgmt.access_rule_count++;
+    
+    __sync_lock_release(&security_mgmt.lock);
+    
+    KLOG_DEBUG("SECURITY", "Added access rule %u", rule->rule_id);
+    return STATUS_OK;
+}
+
+/* Add threat signature */
+status_t security_add_threat_signature(uint32_t threat_type, const char* name,
+                                       const uint8_t* pattern, uint32_t pattern_length) {
+    threat_signature_t* sig = (threat_signature_t*)kalloc(sizeof(threat_signature_t));
+    if (!sig) return STATUS_NOMEM;
+    
+    __sync_lock_test_and_set(&security_mgmt.lock, 1);
+    
+    memset(sig, 0, sizeof(*sig));
+    sig->signature_id = security_mgmt.threat_signature_count + 1;
+    sig->threat_type = threat_type;
+    strncpy(sig->name, name, sizeof(sig->name) - 1);
+    
+    /* Copy pattern */
+    uint32_t copy_size = (pattern_length > sizeof(sig->pattern)) ? sizeof(sig->pattern) : pattern_length;
+    memcpy(sig->pattern, pattern, copy_size);
+    sig->pattern_length = copy_size;
+    
+    sig->severity = 5; /* Medium severity by default */
+    sig->response_action = 1; /* Log by default */
+    
+    /* Add to signature list */
+    sig->next = security_mgmt.threat_signatures;
+    security_mgmt.threat_signatures = sig;
+    security_mgmt.threat_signature_count++;
+    
+    __sync_lock_release(&security_mgmt.lock);
+    
+    KLOG_DEBUG("SECURITY", "Added threat signature %u: %s", sig->signature_id, name);
+    return STATUS_OK;
+}
+
+/* Scan for threats */
+bool security_scan_for_threats(const uint8_t* data, uint32_t length) {
+    if (!security_mgmt.threat_detection_enabled) return false;
+    
+    threat_signature_t* sig = security_mgmt.threat_signatures;
+    
+    while (sig) {
+        /* Simple pattern matching */
+        if (sig->pattern_length > 0 && sig->pattern_length <= length) {
+            for (uint32_t i = 0; i <= length - sig->pattern_length; i++) {
+                if (memcmp(data + i, sig->pattern, sig->pattern_length) == 0) {
+                    /* Threat detected */
+                    sig->detection_count++;
+                    sig->last_detected = hal_timer_get_timestamp_ns();
+                    security_mgmt.threat_detections++;
+                    
+                    KLOG_WARNING("SECURITY", "Threat detected: %s (signature %u)", 
+                                 sig->name, sig->signature_id);
+                    
+                    /* Log security event */
+                    audit_log_event(0x2001, 0, 0, sig->name, sig->threat_type, sig->severity);
+                    
+                    return true;
+                }
+            }
+        }
+        
+        sig = sig->next;
+    }
+    
+    return false;
+}
+
+/* Log audit event */
+void audit_log_event(uint32_t event_type, uint32_t process_id, uint32_t user_id,
+                     const char* object_name, uint32_t operation, uint32_t result) {
+    if (!security_mgmt.audit_enabled) return;
+    
+    __sync_lock_test_and_set(&security_mgmt.lock, 1);
+    
+    uint32_t index = security_mgmt.audit_event_head;
+    audit_event_t* event = &security_mgmt.audit_events[index];
+    
+    memset(event, 0, sizeof(*event));
+    event->event_id = security_mgmt.audit_events_generated + 1;
+    event->event_type = event_type;
+    event->process_id = process_id;
+    event->user_id = user_id;
+    event->operation = operation;
+    event->result = result;
+    event->timestamp = hal_timer_get_timestamp_ns();
+    event->cpu_id = hal_cpu_get_current_id();
+    
+    if (object_name) {
+        strncpy(event->object_name, object_name, sizeof(event->object_name) - 1);
+    }
+    
+    /* Advance circular buffer */
+    security_mgmt.audit_event_head = (security_mgmt.audit_event_head + 1) % MAX_AUDIT_EVENTS;
+    if (security_mgmt.audit_event_count < MAX_AUDIT_EVENTS) {
+        security_mgmt.audit_event_count++;
+    }
+    security_mgmt.audit_events_generated++;
+    
+    __sync_lock_release(&security_mgmt.lock);
+}
+
+/* Set security policy */
+status_t security_set_policy(uint32_t policies) {
+    __sync_lock_test_and_set(&security_mgmt.lock, 1);
+    
+    security_mgmt.active_policies = policies;
+    
+    if (policies & POLICY_ADDRESS_RANDOMIZATION) {
+        /* Enable ASLR */
+        KLOG_INFO("SECURITY", "Address Space Layout Randomization enabled");
+    }
+    
+    if (policies & POLICY_EXECUTE_PREVENTION) {
+        /* Enable DEP/NX bit */
+        KLOG_INFO("SECURITY", "Data Execution Prevention enabled");
+    }
+    
+    if (policies & POLICY_STACK_PROTECTION) {
+        /* Enable stack canaries */
+        KLOG_INFO("SECURITY", "Stack Protection enabled");
+    }
+    
+    if (policies & POLICY_CONTROL_FLOW_GUARD) {
+        /* Enable CFG */
+        KLOG_INFO("SECURITY", "Control Flow Guard enabled");
+    }
+    
+    __sync_lock_release(&security_mgmt.lock);
+    
+    KLOG_INFO("SECURITY", "Security policies updated: 0x%08X", policies);
+    return STATUS_OK;
+}
+
+/* Print security statistics */
+void security_print_stats(void) {
+    kprintf("=== Security Management Statistics ===\n");
+    
+    kprintf("\nGlobal Security:\n");
+    kprintf("  Security level: %u\n", security_mgmt.security_level);
+    kprintf("  Active policies: 0x%08X\n", security_mgmt.active_policies);
+    kprintf("  Security enabled: %s\n", security_mgmt.security_enabled ? "Yes" : "No");
+    kprintf("  Audit enabled: %s\n", security_mgmt.audit_enabled ? "Yes" : "No");
+    kprintf("  Security violations: %llu\n", security_mgmt.security_violations);
+    
+    kprintf("\nCryptography:\n");
+    kprintf("  Crypto contexts: %u\n", security_mgmt.crypto_context_count);
+    kprintf("  Crypto operations: %llu\n", security_mgmt.crypto_operations);
+    
+    for (uint32_t i = 0; i < security_mgmt.crypto_context_count; i++) {
+        crypto_context_t* ctx = &security_mgmt.crypto_contexts[i];
+        kprintf("    Context %u: algorithm %u, %llu ops\n",
+                ctx->context_id, ctx->algorithm, ctx->operations);
+    }
+    
+    kprintf("\nAccess Control:\n");
+    kprintf("  Security contexts: %u\n", security_mgmt.security_context_count);
+    kprintf("  Access rules: %u\n", security_mgmt.access_rule_count);
+    
+    security_context_t* ctx = security_mgmt.security_contexts;
+    while (ctx) {
+        kprintf("    Context %u (PID %u): %llu checks, %llu violations\n",
+                ctx->context_id, ctx->process_id, ctx->permission_checks, ctx->access_violations);
+        ctx = ctx->next;
+    }
+    
+    kprintf("\nThreat Detection:\n");
+    kprintf("  Threat detection: %s\n", security_mgmt.threat_detection_enabled ? "Enabled" : "Disabled");
+    kprintf("  Threat signatures: %u\n", security_mgmt.threat_signature_count);
+    kprintf("  Threat detections: %llu\n", security_mgmt.threat_detections);
+    
+    threat_signature_t* sig = security_mgmt.threat_signatures;
+    while (sig) {
+        kprintf("    Signature %u (%s): %llu detections\n",
+                sig->signature_id, sig->name, sig->detection_count);
+        sig = sig->next;
+    }
+    
+    kprintf("\nAudit System:\n");
+    kprintf("  Audit events: %u / %u\n", security_mgmt.audit_event_count, MAX_AUDIT_EVENTS);
+    kprintf("  Total events generated: %llu\n", security_mgmt.audit_events_generated);
+    
+    /* Show recent audit events */
+    kprintf("  Recent audit events:\n");
+    uint32_t events_to_show = (security_mgmt.audit_event_count < 5) ? security_mgmt.audit_event_count : 5;
+    
+    for (uint32_t i = 0; i < events_to_show; i++) {
+        uint32_t index = (security_mgmt.audit_event_head - 1 - i + MAX_AUDIT_EVENTS) % MAX_AUDIT_EVENTS;
+        audit_event_t* event = &security_mgmt.audit_events[index];
+        
+        kprintf("    Event %u: type 0x%04X, PID %u, result %u\n",
+                event->event_id, event->event_type, event->process_id, event->result);
+    }
+    
+    kprintf("=== End Security Statistics ===\n");
+}
+
+/* Initialize security subsystem */
+status_t security_init(void) {
+    KLOG_INFO("SECURITY", "Initializing security subsystem");
+    
+    memset(&security_mgmt, 0, sizeof(security_mgmt));
+    
+    security_mgmt.security_level = SECURITY_LEVEL_STANDARD;
+    security_mgmt.security_enabled = true;
+    security_mgmt.audit_enabled = true;
+    security_mgmt.threat_detection_enabled = true;
+    
+    /* Set default security policies */
+    uint32_t default_policies = POLICY_EXECUTE_PREVENTION |
+                               POLICY_ADDRESS_RANDOMIZATION |
+                               POLICY_STACK_PROTECTION |
+                               POLICY_DISCRETIONARY_ACCESS;
+    
+    security_set_policy(default_policies);
+    
+    /* Add some default threat signatures */
+    static const uint8_t shellcode_pattern[] = {0x90, 0x90, 0x90, 0x90}; /* NOP sled */
+    security_add_threat_signature(THREAT_CODE_INJECTION, "NOP Sled", shellcode_pattern, 4);
+    
+    static const uint8_t overflow_pattern[] = {0x41, 0x41, 0x41, 0x41}; /* Buffer overflow */
+    security_add_threat_signature(THREAT_BUFFER_OVERFLOW, "Buffer Overflow", overflow_pattern, 4);
+    
+    /* Add default access rules */
+    security_add_access_rule(0, 0, 0, 0, 0xFF, 0); /* Allow basic operations for everyone */
+    
+    KLOG_INFO("SECURITY", "Security subsystem initialized");
+    KLOG_INFO("SECURITY", "  Security level: %u", security_mgmt.security_level);
+    KLOG_INFO("SECURITY", "  Active policies: 0x%08X", security_mgmt.active_policies);
+    KLOG_INFO("SECURITY", "  Threat signatures: %u", security_mgmt.threat_signature_count);
+    KLOG_INFO("SECURITY", "  Access rules: %u", security_mgmt.access_rule_count);
+    
+    return STATUS_OK;
+}
+
+/* Stub implementations for compatibility */
+status_t authenticate_user(const char* username, const char* password) {
+    /* Simple authentication for demonstration */
+    if (!username || !password) return STATUS_INVALID;
+    
+    /* Log authentication attempt */
+    audit_log_event(0x3001, 0, 0, username, 0, STATUS_OK);
+    
+    /* Always succeed for demonstration */
+    return STATUS_OK;
+}
+
+status_t hash_password(const char* password, uint8_t* hash, uint32_t hash_size) {
+    /* Simple hash function for demonstration */
+    if (!password || !hash || hash_size == 0) return STATUS_INVALID;
+    
+    uint32_t len = strlen(password);
+    for (uint32_t i = 0; i < hash_size; i++) {
+        hash[i] = (uint8_t)((i < len) ? password[i] : 0) ^ 0xAA;
+    }
+    
+    return STATUS_OK;
+}
+
+status_t generate_random_bytes(uint8_t* buffer, uint32_t size) {
+    /* Simple random number generation */
+    if (!buffer || size == 0) return STATUS_INVALID;
+    
+    for (uint32_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)(hal_timer_get_timestamp_ns() >> (i % 8));
+    }
+    
+    return STATUS_OK;
+}

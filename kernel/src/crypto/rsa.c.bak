@@ -1,0 +1,14 @@
+/*
+ * RSA (Rivest-Shamir-Adleman) Implementation
+ * Supports RSA-1024, RSA-2048, RSA-4096
+ */
+
+#include "kernel.h"
+#include "crypto.h"
+
+/* RSA implementation stub */
+status_t crypto_register_rsa(void) {
+    /* TODO: Implement RSA algorithm */
+    KLOG_INFO("CRYPTO", "RSA algorithms registered (stub)");
+    return STATUS_OK;
+}

@@ -1,0 +1,31 @@
+#include "kmem.h"
+#include "vmm.h"
+
+/* Header stored before each allocation when debug enabled */
+typedef struct kmem_hdr {
+    u32 magic;
+    u32 size;
+    struct kmem_hdr* next;
+    struct kmem_hdr* prev;
+} kmem_hdr_t;
+
+static int g_debug = 1; /* enabled by default for development */
+static kmem_hdr_t* g_head = 0;
+static kmem_stats_t g_stats = {0};
+
+#define KMAGIC 0xC0A11EAFu
+
+static void list_add(kmem_hdr_t* h){ if(!g_head){ g_head=h; h->next=h->prev=h; return;} h->next=g_head; h->prev=g_head->prev; g_head->prev->next=h; g_head->prev=h; }
+static void list_del(kmem_hdr_t* h){ if(h->next==h){ g_head=0; return;} if(g_head==h) g_head=h->next; h->prev->next=h->next; h->next->prev=h->prev; }
+
+void kmem_set_debug(int enabled){ g_debug = enabled; }
+
+const kmem_stats_t* kmem_get_stats(void){ return &g_stats; }
+
+void* kalloc_aligned(size_t size, size_t align){ if(!align) align=16; size_t total = size + (g_debug? sizeof(kmem_hdr_t):0); void* mem = vmm_kmalloc(total, align); if(!mem) return 0; if(g_debug){ kmem_hdr_t* h=(kmem_hdr_t*)mem; h->magic=KMAGIC; h->size=(u32)size; list_add(h); mem = (void*)(h+1); } g_stats.alloc_count++; g_stats.bytes_live += size; if(g_stats.bytes_live>g_stats.bytes_peak) g_stats.bytes_peak=g_stats.bytes_live; return mem; }
+void* kalloc(size_t size){ return kalloc_aligned(size, 16); }
+
+void kfree(void* ptr){ if(!ptr) return; if(g_debug){ kmem_hdr_t* h = ((kmem_hdr_t*)ptr)-1; if(h->magic!=KMAGIC){ /* corrupt */ return; } g_stats.free_count++; g_stats.bytes_live -= h->size; list_del(h); vmm_kfree(h, h->size + sizeof(kmem_hdr_t)); } else { /* no size known, assume 0? can't free safely */ }
+}
+
+void kmem_dump_leaks(void){ if(!g_debug) return; kmem_hdr_t* cur=g_head; if(!cur){ g_stats.leaks=0; return;} u64 leaks=0; do { leaks++; cur=cur->next; } while(cur!=g_head); g_stats.leaks=leaks; }

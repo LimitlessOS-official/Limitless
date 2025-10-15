@@ -1,0 +1,223 @@
+#include "net/firewall.h"
+#include "kernel.h"
+#include "log.h"
+#include "vfs.h"
+
+static fw_rule_t g_rules[FW_MAX_RULES];
+static uint32_t  g_rule_count = 0;
+static spinlock_t g_rule_lock;
+static fw_metrics_t g_metrics;
+
+/* Simple connection tracking hash */
+static fw_conn_entry_t* g_conn_buckets[FW_CONN_TRACK_BUCKETS];
+static spinlock_t g_conn_locks[FW_CONN_TRACK_BUCKETS];
+
+static inline uint32_t conn_hash(uint32_t s, uint32_t d, uint16_t sp, uint16_t dp, uint8_t proto){
+    uint64_t v = ((uint64_t)s<<32) ^ ((uint64_t)d) ^ ((uint64_t)sp<<16) ^ dp ^ proto;
+    return (uint32_t)(v % FW_CONN_TRACK_BUCKETS);
+}
+
+static fw_conn_entry_t* conn_lookup(uint32_t s, uint32_t d, uint16_t sp, uint16_t dp, uint8_t proto, bool create){
+    uint32_t h = conn_hash(s,d,sp,dp,proto);
+    spin_lock(&g_conn_locks[h]);
+    fw_conn_entry_t* e = g_conn_buckets[h];
+    while(e){
+        if(e->src_ip_be==s && e->dst_ip_be==d && e->src_port_be==sp && e->dst_port_be==dp && e->proto==proto) {
+            spin_unlock(&g_conn_locks[h]);
+            return e;
+        }
+        e = e->next;
+    }
+    if(!create){ spin_unlock(&g_conn_locks[h]); return NULL; }
+    e = (fw_conn_entry_t*)kmalloc(sizeof(fw_conn_entry_t));
+    if(!e){ spin_unlock(&g_conn_locks[h]); return NULL; }
+    k_memset(e,0,sizeof(*e));
+    e->src_ip_be=s; e->dst_ip_be=d; e->src_port_be=sp; e->dst_port_be=dp; e->proto=proto; e->state=FW_STATE_NEW; e->last_seen_ticks=timer_get_ticks();
+    e->next = g_conn_buckets[h];
+    g_conn_buckets[h]=e;
+    spin_unlock(&g_conn_locks[h]);
+    __sync_fetch_and_add(&g_metrics.connections_tracked,1);
+    return e;
+}
+
+status_t fw_init(void){
+    spinlock_init(&g_rule_lock);
+    for(int i=0;i<FW_CONN_TRACK_BUCKETS;i++){ spinlock_init(&g_conn_locks[i]); g_conn_buckets[i]=NULL; }
+    k_memset(g_rules,0,sizeof(g_rules));
+    k_memset(&g_metrics,0,sizeof(g_metrics));
+    log_info("[FW] Firewall initialized (capacity %u rules)", FW_MAX_RULES);
+    return STATUS_OK;
+}
+
+static bool ip_match(uint32_t ip, uint32_t rule_ip, uint32_t mask){ return (ip & mask) == (rule_ip & mask); }
+
+static bool rule_matches(const fw_rule_t* r, const nf_packet_t* p, fw_conn_entry_t* ce){
+    if(!r->enabled) return false;
+    if(r->direction != p->direction) return false;
+    if(r->match_flags & FW_MATCH_PROTO){ if(r->proto != p->proto) return false; }
+    if(r->match_flags & FW_MATCH_SRC_IP){ if(!ip_match(p->src_ip_be, r->src_ip_be, r->src_mask_be)) return false; }
+    if(r->match_flags & FW_MATCH_DST_IP){ if(!ip_match(p->dst_ip_be, r->dst_ip_be, r->dst_mask_be)) return false; }
+    if(r->match_flags & FW_MATCH_SRC_PORT){ if(r->src_port_be != p->src_port_be) return false; }
+    if(r->match_flags & FW_MATCH_DST_PORT){ if(r->dst_port_be != p->dst_port_be) return false; }
+    if((r->match_flags & FW_MATCH_STATE) && ce){
+        uint8_t bit = 1u << ce->state;
+        if(!(r->state_mask & bit)) return false;
+    }
+    return true;
+}
+
+int fw_apply_rules(const nf_packet_t* p, nf_verdict_t* out_verdict){
+    if(!p||!out_verdict) return 0;
+    __sync_fetch_and_add(&g_metrics.packets_inspected,1);
+    /* Lookup or create connection entry for TCP/UDP */
+    fw_conn_entry_t* ce = NULL;
+    if(p->proto==IPPROTO_TCP || p->proto==IPPROTO_UDP){
+        ce = conn_lookup(p->src_ip_be, p->dst_ip_be, p->src_port_be, p->dst_port_be, p->proto, true);
+        if(ce) { ce->last_seen_ticks = timer_get_ticks(); if(ce->state==FW_STATE_NEW) ce->state = FW_STATE_ESTABLISHED; }
+    }
+    spin_lock(&g_rule_lock);
+    for(uint32_t i=0;i<g_rule_count;i++){
+        fw_rule_t* r = &g_rules[i];
+        if(!r->enabled) continue;
+        if(rule_matches(r,p,ce)){
+            r->hit_count++;
+            r->byte_count += 0; /* TODO: integrate real packet length when available */
+            __sync_fetch_and_add(&g_metrics.rules_matched,1);
+            fw_action_t a = r->action;
+            spin_unlock(&g_rule_lock);
+            switch(a){
+                case FW_ACT_ACCEPT: __sync_fetch_and_add(&g_metrics.packets_accepted,1); *out_verdict = NF_ACCEPT; return 1;
+                case FW_ACT_DROP:   __sync_fetch_and_add(&g_metrics.packets_dropped,1); *out_verdict = NF_DROP; return 1;
+                case FW_ACT_REJECT: __sync_fetch_and_add(&g_metrics.packets_rejected,1); *out_verdict = NF_DROP; return 1;
+                case FW_ACT_LOG: /* fallthrough to continue matching after logging */ log_info("[FW] LOG rule=%s proto=%u", r->name, p->proto); break;
+                case FW_ACT_RETURN: /* Return stops processing -> default policy */ return 0;
+            }
+            spin_lock(&g_rule_lock); /* Re-acquire if continuing */
+        }
+    }
+    spin_unlock(&g_rule_lock);
+    return 0; /* no match -> default policy */
+}
+
+status_t fw_add_rule(const fw_rule_t* rule, uint32_t* out_index){
+    if(!rule) return STATUS_INVALID;
+    spin_lock(&g_rule_lock);
+    if(g_rule_count>=FW_MAX_RULES){ spin_unlock(&g_rule_lock); return STATUS_NO_SPACE; }
+    g_rules[g_rule_count] = *rule;
+    g_rules[g_rule_count].hit_count = 0;
+    g_rules[g_rule_count].byte_count = 0;
+    if(!g_rules[g_rule_count].enabled) g_rules[g_rule_count].enabled = true;
+    if(out_index) *out_index = g_rule_count;
+    g_rule_count++;
+    g_metrics.rules_defined = g_rule_count;
+    spin_unlock(&g_rule_lock);
+    return STATUS_OK;
+}
+
+status_t fw_delete_rule(uint32_t index){
+    spin_lock(&g_rule_lock);
+    if(index>=g_rule_count){ spin_unlock(&g_rule_lock); return STATUS_INVALID; }
+    if(index != g_rule_count-1){ g_rules[index] = g_rules[g_rule_count-1]; }
+    g_rule_count--;
+    g_metrics.rules_defined = g_rule_count;
+    spin_unlock(&g_rule_lock);
+    return STATUS_OK;
+}
+
+status_t fw_enable_rule(uint32_t index, bool enable){
+    spin_lock(&g_rule_lock);
+    if(index>=g_rule_count){ spin_unlock(&g_rule_lock); return STATUS_INVALID; }
+    g_rules[index].enabled = enable;
+    spin_unlock(&g_rule_lock);
+    return STATUS_OK;
+}
+
+status_t fw_get_rule(uint32_t index, fw_rule_t* out){
+    if(!out) return STATUS_INVALID;
+    spin_lock(&g_rule_lock);
+    if(index>=g_rule_count){ spin_unlock(&g_rule_lock); return STATUS_INVALID; }
+    *out = g_rules[index];
+    spin_unlock(&g_rule_lock);
+    return STATUS_OK;
+}
+
+status_t fw_replace_rule(uint32_t index, const fw_rule_t* rule){
+    if(!rule) return STATUS_INVALID;
+    spin_lock(&g_rule_lock);
+    if(index>=g_rule_count){ spin_unlock(&g_rule_lock); return STATUS_INVALID; }
+    uint64_t old_hits = g_rules[index].hit_count;
+    uint64_t old_bytes= g_rules[index].byte_count;
+    g_rules[index] = *rule;
+    g_rules[index].hit_count = old_hits;
+    g_rules[index].byte_count = old_bytes;
+    spin_unlock(&g_rule_lock);
+    return STATUS_OK;
+}
+
+status_t fw_flush(void){
+    spin_lock(&g_rule_lock);
+    g_rule_count = 0;
+    k_memset(g_rules,0,sizeof(g_rules));
+    g_metrics.rules_defined = 0;
+    spin_unlock(&g_rule_lock);
+    return STATUS_OK;
+}
+
+status_t fw_get_metrics(fw_metrics_t* out){ if(!out) return STATUS_INVALID; *out = g_metrics; return STATUS_OK; }
+
+status_t fw_conntrack_sweep(uint64_t now_ticks, uint64_t timeout_ticks){
+    for(int i=0;i<FW_CONN_TRACK_BUCKETS;i++){
+        spin_lock(&g_conn_locks[i]);
+        fw_conn_entry_t** cur = &g_conn_buckets[i];
+        while(*cur){
+            fw_conn_entry_t* e = *cur;
+            if(now_ticks - e->last_seen_ticks > timeout_ticks){
+                *cur = e->next; kfree(e); continue;
+            }
+            cur = &(*cur)->next;
+        }
+        spin_unlock(&g_conn_locks[i]);
+    }
+    return STATUS_OK;
+}
+
+/* Persistence: simple textual format */
+status_t fw_save_rules(const char* path){
+    if(!path) return STATUS_INVALID;
+    file_t* f=NULL; if(vfs_open(path, VFS_O_CREATE|VFS_O_TRUNC|VFS_O_WRONLY,&f)!=0) return STATUS_ERROR;
+    spin_lock(&g_rule_lock);
+    char line[256];
+    for(uint32_t i=0;i<g_rule_count;i++){
+        fw_rule_t* r=&g_rules[i];
+        k_snprintf(line,sizeof(line),"rule %s %u %u %u %u %u %u %u %u %u %u\n", r->name, r->match_flags, r->src_ip_be, r->src_mask_be,
+            r->dst_ip_be, r->dst_mask_be, r->src_port_be, r->dst_port_be, r->proto, r->direction, r->action);
+        size_t wr=0; vfs_write(f,line,k_strlen(line),&wr);
+    }
+    spin_unlock(&g_rule_lock);
+    vfs_close(f);
+    return STATUS_OK;
+}
+status_t fw_load_rules(const char* path){
+    if(!path) return STATUS_INVALID;
+    file_t* f=NULL; if(vfs_open(path, VFS_O_RDONLY,&f)!=0) return STATUS_ERROR;
+    fw_flush();
+    char buf[512]; size_t rd=0;
+    while(vfs_read(f,buf,sizeof(buf)-1,&rd)==0 && rd){
+        buf[rd]='\0';
+        /* Extremely naive parser; expects full lines present */
+        char* p=buf; while(*p){
+            if(k_strncmp(p,"rule",4)==0){
+                fw_rule_t r; k_memset(&r,0,sizeof(r)); r.enabled=true; char nm[FW_MAX_NAME_LEN];
+                unsigned mf; unsigned sip,sm,dip,dm,sp,dp,proto,dir,act;
+                int consumed=0;
+                if(k_sscanf(p,"rule %31s %u %u %u %u %u %u %u %u %u %u%n", nm,&mf,&sip,&sm,&dip,&dm,&sp,&dp,&proto,&dir,&act,&consumed)==11){
+                    k_strlcpy(r.name,nm,sizeof(r.name)); r.match_flags=mf; r.src_ip_be=sip; r.src_mask_be=sm; r.dst_ip_be=dip; r.dst_mask_be=dm; r.src_port_be=sp; r.dst_port_be=dp; r.proto=proto; r.direction=dir; r.action=(fw_action_t)act; fw_add_rule(&r,NULL); p+=consumed; continue;
+                }
+            }
+            /* Skip to next line */
+            while(*p && *p!='\n') p++; if(*p=='\n') p++;
+        }
+    }
+    vfs_close(f);
+    return STATUS_OK;
+}

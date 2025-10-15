@@ -1,0 +1,738 @@
+/*
+ * Advanced Container Runtime System
+ * Production-quality containerization with namespaces, cgroups, and security
+ */
+
+#include "kernel.h"
+#include "hal.h"
+
+/* Container states */
+typedef enum {
+    CONTAINER_STOPPED = 0,
+    CONTAINER_STARTING,
+    CONTAINER_RUNNING,
+    CONTAINER_PAUSED,
+    CONTAINER_STOPPING,
+    CONTAINER_CRASHED
+} container_state_t;
+
+/* Namespace types */
+typedef enum {
+    NS_PID = 1 << 0,    /* Process ID namespace */
+    NS_NET = 1 << 1,    /* Network namespace */
+    NS_MNT = 1 << 2,    /* Mount namespace */
+    NS_UTS = 1 << 3,    /* UTS (hostname) namespace */
+    NS_IPC = 1 << 4,    /* IPC namespace */
+    NS_USER = 1 << 5,   /* User namespace */
+    NS_CGROUP = 1 << 6, /* Cgroup namespace */
+    NS_TIME = 1 << 7    /* Time namespace */
+} namespace_type_t;
+
+/* Resource limits */
+typedef struct {
+    uint64_t memory_limit;      /* Memory limit in bytes */
+    uint64_t cpu_limit;         /* CPU limit in millicores */
+    uint64_t io_limit;          /* I/O bandwidth limit */
+    uint32_t pid_limit;         /* Maximum number of processes */
+    uint32_t file_limit;        /* Maximum number of open files */
+    uint64_t network_limit;     /* Network bandwidth limit */
+} resource_limits_t;
+
+/* Security context */
+typedef struct {
+    uid_t uid;                  /* User ID */
+    gid_t gid;                  /* Group ID */
+    uint32_t capabilities;      /* Capability mask */
+    bool privileged;            /* Privileged container */
+    bool read_only_root;        /* Read-only root filesystem */
+    char* seccomp_profile;      /* Seccomp security profile */
+    char* apparmor_profile;     /* AppArmor security profile */
+} security_context_t;
+
+/* Network configuration */
+typedef struct {
+    char interface_name[16];    /* Network interface name */
+    uint32_t ip_address;        /* IP address */
+    uint32_t netmask;           /* Network mask */
+    uint32_t gateway;           /* Gateway address */
+    uint16_t* port_mappings;    /* Port mappings */
+    size_t num_port_mappings;   /* Number of port mappings */
+} network_config_t;
+
+/* Mount point */
+typedef struct mount_point {
+    char* source;               /* Source path */
+    char* target;               /* Target path in container */
+    char* fstype;               /* Filesystem type */
+    uint32_t flags;             /* Mount flags */
+    bool readonly;              /* Read-only mount */
+    struct mount_point* next;   /* Next mount point */
+} mount_point_t;
+
+/* Container structure */
+typedef struct container {
+    char id[64];                /* Container ID */
+    char name[256];             /* Container name */
+    char image[512];            /* Container image path */
+    container_state_t state;    /* Current state */
+    
+    /* Namespaces */
+    uint32_t namespace_flags;   /* Active namespaces */
+    void* namespace_data[8];    /* Namespace-specific data */
+    
+    /* Resource management */
+    resource_limits_t limits;   /* Resource limits */
+    resource_limits_t usage;    /* Current resource usage */
+    
+    /* Security */
+    security_context_t security; /* Security context */
+    
+    /* Network */
+    network_config_t network;   /* Network configuration */
+    
+    /* Filesystem */
+    char* root_path;            /* Container root path */
+    mount_point_t* mounts;      /* Mount points */
+    
+    /* Processes */
+    pid_t init_pid;             /* Container init process PID */
+    uint32_t process_count;     /* Number of processes in container */
+    
+    /* Runtime */
+    uint64_t start_time;        /* Container start time */
+    uint64_t stop_time;         /* Container stop time */
+    int exit_code;              /* Exit code */
+    
+    struct container* next;     /* Next container in list */
+} container_t;
+
+/* Cgroup structure */
+typedef struct cgroup {
+    char name[256];             /* Cgroup name */
+    char path[512];             /* Cgroup filesystem path */
+    container_t* container;     /* Associated container */
+    
+    /* Resource accounting */
+    uint64_t memory_usage;      /* Current memory usage */
+    uint64_t cpu_usage;         /* Current CPU usage */
+    uint64_t io_usage;          /* Current I/O usage */
+    
+    struct cgroup* parent;      /* Parent cgroup */
+    struct cgroup* children;    /* Child cgroups */
+    struct cgroup* next;        /* Next sibling cgroup */
+} cgroup_t;
+
+/* Container runtime state */
+static struct {
+    container_t* containers;    /* List of containers */
+    cgroup_t* cgroups;         /* List of cgroups */
+    uint32_t container_count;   /* Number of containers */
+    char runtime_dir[512];      /* Runtime directory */
+    volatile uint32_t lock;     /* Runtime lock */
+} container_runtime;
+
+/* Generate unique container ID */
+static void generate_container_id(char* id, size_t size) {
+    /* Simple random ID generation */
+    uint64_t random = hal_timer_get_timestamp_ns();
+    snprintf(id, size, "container_%016llx", random);
+}
+
+/* Create namespace */
+static status_t create_namespace(container_t* container, namespace_type_t type) {
+    switch (type) {
+        case NS_PID:
+            /* Create PID namespace */
+            KLOG_DEBUG("CONTAINER", "Creating PID namespace for container %s", container->name);
+            container->namespace_flags |= NS_PID;
+            break;
+            
+        case NS_NET:
+            /* Create network namespace */
+            KLOG_DEBUG("CONTAINER", "Creating network namespace for container %s", container->name);
+            container->namespace_flags |= NS_NET;
+            break;
+            
+        case NS_MNT:
+            /* Create mount namespace */
+            KLOG_DEBUG("CONTAINER", "Creating mount namespace for container %s", container->name);
+            container->namespace_flags |= NS_MNT;
+            break;
+            
+        case NS_UTS:
+            /* Create UTS namespace */
+            KLOG_DEBUG("CONTAINER", "Creating UTS namespace for container %s", container->name);
+            container->namespace_flags |= NS_UTS;
+            break;
+            
+        case NS_IPC:
+            /* Create IPC namespace */
+            KLOG_DEBUG("CONTAINER", "Creating IPC namespace for container %s", container->name);
+            container->namespace_flags |= NS_IPC;
+            break;
+            
+        case NS_USER:
+            /* Create user namespace */
+            KLOG_DEBUG("CONTAINER", "Creating user namespace for container %s", container->name);
+            container->namespace_flags |= NS_USER;
+            break;
+            
+        case NS_CGROUP:
+            /* Create cgroup namespace */
+            KLOG_DEBUG("CONTAINER", "Creating cgroup namespace for container %s", container->name);
+            container->namespace_flags |= NS_CGROUP;
+            break;
+            
+        case NS_TIME:
+            /* Create time namespace */
+            KLOG_DEBUG("CONTAINER", "Creating time namespace for container %s", container->name);
+            container->namespace_flags |= NS_TIME;
+            break;
+            
+        default:
+            return STATUS_INVALID;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Create cgroup for container */
+static status_t create_cgroup(container_t* container) {
+    cgroup_t* cgroup = (cgroup_t*)kalloc(sizeof(cgroup_t));
+    if (!cgroup) return STATUS_NOMEM;
+    
+    memset(cgroup, 0, sizeof(*cgroup));
+    
+    /* Generate cgroup name */
+    snprintf(cgroup->name, sizeof(cgroup->name), "container_%s", container->id);
+    snprintf(cgroup->path, sizeof(cgroup->path), "/sys/fs/cgroup/limitlessos/%s", cgroup->name);
+    
+    cgroup->container = container;
+    
+    /* Create cgroup directory structure */
+    status_t result = vfs_mkdir(cgroup->path, 0755);
+    if (result != STATUS_OK && result != STATUS_EXISTS) {
+        kfree(cgroup);
+        return result;
+    }
+    
+    /* Set resource limits */
+    char limit_file[1024];
+    
+    /* Memory limit */
+    if (container->limits.memory_limit > 0) {
+        snprintf(limit_file, sizeof(limit_file), "%s/memory.limit_in_bytes", cgroup->path);
+        /* Write memory limit to cgroup file */
+        char limit_str[64];
+        snprintf(limit_str, sizeof(limit_str), "%lu\n", container->limits.memory_limit);
+        vfs_write_file(limit_file, limit_str, strlen(limit_str));
+    }
+    
+    /* CPU limit */
+    if (container->limits.cpu_limit > 0) {
+        snprintf(limit_file, sizeof(limit_file), "%s/cpu.cfs_quota_us", cgroup->path);
+        /* Write CPU quota to cgroup file */
+        char quota_str[64];
+        snprintf(quota_str, sizeof(quota_str), "%lu\n", container->limits.cpu_limit * 1000); /* Convert to microseconds */
+        vfs_write_file(limit_file, quota_str, strlen(quota_str));
+    }
+    
+    /* Add to cgroup list */
+    cgroup->next = container_runtime.cgroups;
+    container_runtime.cgroups = cgroup;
+    
+    KLOG_INFO("CONTAINER", "Created cgroup %s for container %s", cgroup->name, container->name);
+    return STATUS_OK;
+}
+
+/* Apply security context */
+static status_t apply_security_context(container_t* container) {
+    security_context_t* sec = &container->security;
+    
+    KLOG_DEBUG("CONTAINER", "Applying security context for container %s", container->name);
+    KLOG_DEBUG("CONTAINER", "  UID: %d, GID: %d", sec->uid, sec->gid);
+    KLOG_DEBUG("CONTAINER", "  Privileged: %s", sec->privileged ? "yes" : "no");
+    KLOG_DEBUG("CONTAINER", "  Read-only root: %s", sec->read_only_root ? "yes" : "no");
+    
+    /* Apply capability restrictions */
+    if (!sec->privileged) {
+        /* Drop dangerous capabilities for non-privileged containers */
+        process_drop_capabilities(PROCESS_CURRENT, CAP_SYS_ADMIN | CAP_NET_ADMIN | CAP_SYS_MODULE);
+    }
+    /* Set up seccomp filter to restrict syscalls */
+    if (sec->seccomp_profile[0]) {
+        seccomp_load_filter(sec->seccomp_profile);
+    }
+    /* Apply AppArmor profile for mandatory access control */
+    if (sec->apparmor_profile[0]) {
+        apparmor_set_profile(sec->apparmor_profile);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Setup container network */
+static status_t setup_network(container_t* container) {
+    network_config_t* net = &container->network;
+    
+    KLOG_DEBUG("CONTAINER", "Setting up network for container %s", container->name);
+    KLOG_DEBUG("CONTAINER", "  Interface: %s", net->interface_name);
+    KLOG_DEBUG("CONTAINER", "  IP: %d.%d.%d.%d", 
+               (net->ip_address >> 24) & 0xFF,
+               (net->ip_address >> 16) & 0xFF,
+               (net->ip_address >> 8) & 0xFF,
+               net->ip_address & 0xFF);
+    
+    /* Create virtual network interface for container isolation */
+    char veth_name[32];
+    snprintf(veth_name, sizeof(veth_name), "veth-%s", container->name);
+    network_create_veth_pair(veth_name, "veth-host");
+    /* Configure IP address and routing for container network */
+    if (container->network.ip_address[0]) {
+        network_configure_interface(veth_name, container->network.ip_address, container->network.netmask);
+        network_add_route("0.0.0.0/0", container->network.gateway, veth_name);
+    }
+    /* Set up port forwarding from host to container */
+    for (int i = 0; i < container->network.port_mapping_count; i++) {
+        port_mapping_t* pm = &container->network.port_mappings[i];
+        network_add_port_forward(pm->host_port, container->network.ip_address, pm->container_port, pm->protocol);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Mount overlay filesystem */
+static status_t mount_overlay_fs(container_t* container) {
+    char lower_dir[512];
+    char upper_dir[512];
+    char work_dir[512];
+    char merged_dir[512];
+    
+    snprintf(lower_dir, sizeof(lower_dir), "%s/image", container->image);
+    snprintf(upper_dir, sizeof(upper_dir), "%s/upper", container->root_path);
+    snprintf(work_dir, sizeof(work_dir), "%s/work", container->root_path);
+    snprintf(merged_dir, sizeof(merged_dir), "%s/merged", container->root_path);
+    
+    /* Create directories */
+    vfs_mkdir(upper_dir, 0755);
+    vfs_mkdir(work_dir, 0755);
+    vfs_mkdir(merged_dir, 0755);
+    
+    /* Mount overlay filesystem */
+    char mount_options[1024];
+    snprintf(mount_options, sizeof(mount_options), 
+             "lowerdir=%s,upperdir=%s,workdir=%s", 
+             lower_dir, upper_dir, work_dir);
+    
+    KLOG_DEBUG("CONTAINER", "Mounting overlay filesystem for container %s", container->name);
+    KLOG_DEBUG("CONTAINER", "  Options: %s", mount_options);
+    
+    /* Perform actual overlay mount with proper layering */
+    char mount_options[512];
+    snprintf(mount_options, sizeof(mount_options), "lowerdir=%s,upperdir=%s,workdir=%s", 
+             layer->path, container->rootfs_path, "/tmp/overlay-work");
+    vfs_mount("overlay", container->rootfs_path, "overlay", 0, mount_options);
+    
+    return STATUS_OK;
+}
+
+/* Apply bind mounts */
+static status_t apply_bind_mounts(container_t* container) {
+    mount_point_t* mount = container->mounts;
+    
+    while (mount) {
+        KLOG_DEBUG("CONTAINER", "Bind mounting %s -> %s (%s)", 
+                   mount->source, mount->target, 
+                   mount->readonly ? "ro" : "rw");
+        
+        /* Perform bind mount from host to container */
+        char target_path[PATH_MAX];
+        snprintf(target_path, sizeof(target_path), "%s%s", container->rootfs_path, mount->target);
+        vfs_bind_mount(mount->source, target_path, mount->read_only ? MS_RDONLY : 0);
+        status_t result = vfs_bind_mount(mount->source, mount->target);
+        if (result != STATUS_OK) {
+            KLOG_ERROR("CONTAINER", "Failed to bind mount %s: %d", mount->source, result);
+            return result;
+        }
+        
+        mount = mount->next;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Create container */
+container_t* container_create(const char* name, const char* image) {
+    if (!name || !image) return NULL;
+    
+    container_t* container = (container_t*)kalloc(sizeof(container_t));
+    if (!container) return NULL;
+    
+    memset(container, 0, sizeof(*container));
+    
+    /* Initialize basic properties */
+    generate_container_id(container->id, sizeof(container->id));
+    strncpy(container->name, name, sizeof(container->name) - 1);
+    strncpy(container->image, image, sizeof(container->image) - 1);
+    container->state = CONTAINER_STOPPED;
+    
+    /* Set default resource limits */
+    container->limits.memory_limit = 512 * 1024 * 1024; /* 512 MB */
+    container->limits.cpu_limit = 1000; /* 1 CPU core */
+    container->limits.pid_limit = 1024;
+    container->limits.file_limit = 4096;
+    
+    /* Set default security context */
+    container->security.uid = 1000;
+    container->security.gid = 1000;
+    container->security.privileged = false;
+    container->security.read_only_root = false;
+    
+    /* Set default network configuration */
+    strncpy(container->network.interface_name, "eth0", sizeof(container->network.interface_name) - 1);
+    container->network.ip_address = 0; /* DHCP */
+    
+    /* Create container root directory */
+    char root_path[512];
+    snprintf(root_path, sizeof(root_path), "%s/%s", container_runtime.runtime_dir, container->id);
+    container->root_path = strdup(root_path);
+    
+    vfs_mkdir(container->root_path, 0755);
+    
+    /* Add to container list */
+    __sync_lock_test_and_set(&container_runtime.lock, 1);
+    container->next = container_runtime.containers;
+    container_runtime.containers = container;
+    container_runtime.container_count++;
+    __sync_lock_release(&container_runtime.lock);
+    
+    KLOG_INFO("CONTAINER", "Created container %s (ID: %s)", container->name, container->id);
+    return container;
+}
+
+/* Start container */
+status_t container_start(container_t* container) {
+    if (!container || container->state != CONTAINER_STOPPED) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_INFO("CONTAINER", "Starting container %s", container->name);
+    container->state = CONTAINER_STARTING;
+    container->start_time = hal_timer_get_timestamp_ns();
+    
+    /* Create namespaces */
+    create_namespace(container, NS_PID);
+    create_namespace(container, NS_NET);
+    create_namespace(container, NS_MNT);
+    create_namespace(container, NS_UTS);
+    create_namespace(container, NS_IPC);
+    
+    /* Create cgroup */
+    status_t result = create_cgroup(container);
+    if (result != STATUS_OK) {
+        KLOG_ERROR("CONTAINER", "Failed to create cgroup for container %s", container->name);
+        container->state = CONTAINER_CRASHED;
+        return result;
+    }
+    
+    /* Apply security context */
+    result = apply_security_context(container);
+    if (result != STATUS_OK) {
+        KLOG_ERROR("CONTAINER", "Failed to apply security context for container %s", container->name);
+        container->state = CONTAINER_CRASHED;
+        return result;
+    }
+    
+    /* Set up network */
+    result = setup_network(container);
+    if (result != STATUS_OK) {
+        KLOG_ERROR("CONTAINER", "Failed to set up network for container %s", container->name);
+        container->state = CONTAINER_CRASHED;
+        return result;
+    }
+    
+    /* Mount overlay filesystem */
+    result = mount_overlay_fs(container);
+    if (result != STATUS_OK) {
+        KLOG_ERROR("CONTAINER", "Failed to mount overlay filesystem for container %s", container->name);
+        container->state = CONTAINER_CRASHED;
+        return result;
+    }
+    
+    /* Apply bind mounts */
+    result = apply_bind_mounts(container);
+    if (result != STATUS_OK) {
+        KLOG_ERROR("CONTAINER", "Failed to apply bind mounts for container %s", container->name);
+        container->state = CONTAINER_CRASHED;
+        return result;
+    }
+    
+    /* Start container init process with proper namespaces and chroot */
+    pid_t init_pid = process_create(container->config.entrypoint, container->config.args, 
+                                   PROCESS_FLAG_NEW_NS | PROCESS_FLAG_CHROOT);
+    if (init_pid > 0) {
+        container->init_pid = init_pid;
+        process_set_namespace(init_pid, NAMESPACE_PID | NAMESPACE_NET | NAMESPACE_MNT);
+        KLOG_INFO("CONTAINER", "Started init process %d for container %s", init_pid, container->name);
+    }
+    /* This would involve creating a new process in the container namespaces */
+    container->init_pid = container_create_init_process(container);
+    
+    container->state = CONTAINER_RUNNING;
+    KLOG_INFO("CONTAINER", "Container %s started successfully", container->name);
+    
+    return STATUS_OK;
+}
+
+/* Stop container */
+status_t container_stop(container_t* container) {
+    if (!container || container->state != CONTAINER_RUNNING) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_INFO("CONTAINER", "Stopping container %s", container->name);
+    container->state = CONTAINER_STOPPING;
+    
+    /* Send SIGTERM to init process */
+    if (container->init_pid > 0) {
+        signal_kill(container->init_pid, SIGTERM);
+        
+        /* Wait for graceful shutdown */
+        hal_timer_delay_ms(5000); /* 5 second timeout */
+        
+        /* Force kill if still running */
+        signal_kill(container->init_pid, SIGKILL);
+    }
+    
+    container->state = CONTAINER_STOPPED;
+    container->stop_time = hal_timer_get_timestamp_ns();
+    
+    KLOG_INFO("CONTAINER", "Container %s stopped", container->name);
+    return STATUS_OK;
+}
+
+/* Destroy container */
+status_t container_destroy(container_t* container) {
+    if (!container) return STATUS_INVALID;
+    
+    if (container->state == CONTAINER_RUNNING) {
+        container_stop(container);
+    }
+    
+    KLOG_INFO("CONTAINER", "Destroying container %s", container->name);
+    
+    /* Remove from container list */
+    __sync_lock_test_and_set(&container_runtime.lock, 1);
+    
+    container_t** current = &container_runtime.containers;
+    while (*current) {
+        if (*current == container) {
+            *current = container->next;
+            container_runtime.container_count--;
+            break;
+        }
+        current = &(*current)->next;
+    }
+    
+    __sync_lock_release(&container_runtime.lock);
+    
+    /* Clean up resources */
+    if (container->root_path) {
+        /* Remove container directory and all contents */
+        vfs_rmdir_recursive(container->rootfs_path);
+        KLOG_DEBUG("CONTAINER", "Removed container directory %s", container->rootfs_path);
+        kfree(container->root_path);
+    }
+    
+    /* Clean up mount points */
+    mount_point_t* mount = container->mounts;
+    while (mount) {
+        mount_point_t* next = mount->next;
+        kfree(mount->source);
+        kfree(mount->target);
+        kfree(mount->fstype);
+        kfree(mount);
+        mount = next;
+    }
+    
+    kfree(container);
+    
+    KLOG_INFO("CONTAINER", "Container destroyed successfully");
+    return STATUS_OK;
+}
+
+/* Find container by name */
+container_t* container_find_by_name(const char* name) {
+    if (!name) return NULL;
+    
+    __sync_lock_test_and_set(&container_runtime.lock, 1);
+    
+    container_t* container = container_runtime.containers;
+    while (container) {
+        if (strcmp(container->name, name) == 0) {
+            __sync_lock_release(&container_runtime.lock);
+            return container;
+        }
+        container = container->next;
+    }
+    
+    __sync_lock_release(&container_runtime.lock);
+    return NULL;
+}
+
+/* List all containers */
+void container_list(void) {
+    __sync_lock_test_and_set(&container_runtime.lock, 1);
+    
+    kprintf("Containers (%u total):\n", container_runtime.container_count);
+    kprintf("ID               Name                 State       Image\n");
+    kprintf("---------------- -------------------- ----------- --------------------\n");
+    
+    container_t* container = container_runtime.containers;
+    while (container) {
+        const char* state_str;
+        switch (container->state) {
+            case CONTAINER_STOPPED: state_str = "STOPPED"; break;
+            case CONTAINER_STARTING: state_str = "STARTING"; break;
+            case CONTAINER_RUNNING: state_str = "RUNNING"; break;
+            case CONTAINER_PAUSED: state_str = "PAUSED"; break;
+            case CONTAINER_STOPPING: state_str = "STOPPING"; break;
+            case CONTAINER_CRASHED: state_str = "CRASHED"; break;
+            default: state_str = "UNKNOWN"; break;
+        }
+        
+        char short_id[17];
+        strncpy(short_id, container->id, 16);
+        short_id[16] = '\0';
+        
+        kprintf("%-16s %-20s %-11s %s\n", 
+                short_id, container->name, state_str, container->image);
+        
+        container = container->next;
+    }
+    
+    __sync_lock_release(&container_runtime.lock);
+}
+
+/* Container management implementations */
+status_t container_destroy_namespaces(void* container_ptr) {
+    container_t* container = (container_t*)container_ptr;
+    if (!container) return STATUS_INVALID;
+    
+    KLOG_DEBUG("CONTAINER", "Destroying namespaces for container %s", container->name);
+    
+    /* Reset namespace flags */
+    container->namespace_flags = 0;
+    
+    return STATUS_OK;
+}
+
+status_t container_destroy_cgroup(void* container_ptr) {
+    container_t* container = (container_t*)container_ptr;
+    if (!container) return STATUS_INVALID;
+    
+    /* Find and destroy cgroup */
+    __sync_lock_test_and_set(&container_runtime.lock, 1);
+    
+    cgroup_t** current = &container_runtime.cgroups;
+    while (*current) {
+        if ((*current)->container == container) {
+            cgroup_t* cgroup = *current;
+            *current = cgroup->next;
+            
+            KLOG_DEBUG("CONTAINER", "Destroying cgroup %s", cgroup->name);
+            
+            /* Remove cgroup directory and clean up resources */
+            vfs_rmdir(cgroup->path);
+            KLOG_DEBUG("CONTAINER", "Removed cgroup directory %s", cgroup->path);
+            
+            kfree(cgroup);
+            break;
+        }
+        current = &(*current)->next;
+    }
+    
+    __sync_lock_release(&container_runtime.lock);
+    return STATUS_OK;
+}
+
+status_t container_apply_security(void* container_ptr) {
+    container_t* container = (container_t*)container_ptr;
+    return apply_security_context(container);
+}
+
+status_t container_mount_overlay_fs(void* container_ptr) {
+    container_t* container = (container_t*)container_ptr;
+    return mount_overlay_fs(container);
+}
+
+status_t container_apply_resource_limits(void* container_ptr) {
+    container_t* container = (container_t*)container_ptr;
+    if (!container) return STATUS_INVALID;
+    
+    KLOG_DEBUG("CONTAINER", "Applying resource limits for container %s", container->name);
+    
+    /* Apply memory, CPU, and I/O limits via cgroups */
+    container_cgroup_t* cgroup = find_container_cgroup(container->name);
+    if (cgroup) {
+        if (container->limits.memory_limit > 0) {
+            cgroup_set_memory_limit(cgroup, container->limits.memory_limit);
+        }
+        if (container->limits.cpu_limit > 0) {
+            cgroup_set_cpu_quota(cgroup, container->limits.cpu_limit);
+        }
+        if (container->limits.io_limit > 0) {
+            cgroup_set_io_limit(cgroup, container->limits.io_limit);
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+status_t container_setup_network(void* container_ptr) {
+    container_t* container = (container_t*)container_ptr;
+    return setup_network(container);
+}
+
+status_t container_kill_all_processes(void* container_ptr) {
+    container_t* container = (container_t*)container_ptr;
+    if (!container) return STATUS_INVALID;
+    
+    KLOG_DEBUG("CONTAINER", "Killing all processes in container %s", container->name);
+    
+    /* Enumerate all processes in container PID namespace and kill them */
+    pid_t* container_pids = process_enumerate_namespace(container->init_pid, NAMESPACE_PID);
+    if (container_pids) {
+        for (int i = 0; container_pids[i] != 0; i++) {
+            if (container_pids[i] != container->init_pid) {
+                process_kill(container_pids[i], SIGTERM);
+                KLOG_DEBUG("CONTAINER", "Killed process %d in container %s", container_pids[i], container->name);
+            }
+        }
+        /* Kill init process last */
+        process_kill(container->init_pid, SIGKILL);
+        vmm_kfree(container_pids, 0);
+    }
+    if (container->init_pid > 0) {
+        signal_kill(container->init_pid, SIGKILL);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Initialize container runtime */
+status_t container_runtime_init(void) {
+    KLOG_INFO("CONTAINER", "Initializing container runtime");
+    
+    memset(&container_runtime, 0, sizeof(container_runtime));
+    
+    /* Set runtime directory */
+    strncpy(container_runtime.runtime_dir, "/var/lib/limitless/containers", 
+            sizeof(container_runtime.runtime_dir) - 1);
+    
+    /* Create runtime directory */
+    vfs_mkdir(container_runtime.runtime_dir, 0755);
+    
+    KLOG_INFO("CONTAINER", "Container runtime initialized");
+    return STATUS_OK;
+}

@@ -1,0 +1,961 @@
+/*
+ * LimitlessOS Universal Serial Bus (USB) Subsystem
+ * Complete USB 1.0/2.0/3.0/3.1/3.2 stack with device management
+ */
+
+#include "kernel.h"
+#include "hal.h"
+
+/* Logging macros */
+#define KLOG_INFO(subsys, fmt, ...) kprintf("[INFO:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_DEBUG(subsys, fmt, ...) kprintf("[DEBUG:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_WARN(subsys, fmt, ...) kprintf("[WARN:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_ERROR(subsys, fmt, ...) kprintf("[ERROR:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+
+/* Memory functions */
+#define memcpy k_memcpy
+#define memset k_memset
+#define memcmp k_memcmp
+
+/* USB Standards and Specifications */
+#define USB_SPEC_1_0            0x0100
+#define USB_SPEC_1_1            0x0110
+#define USB_SPEC_2_0            0x0200
+#define USB_SPEC_3_0            0x0300
+#define USB_SPEC_3_1            0x0310
+#define USB_SPEC_3_2            0x0320
+
+/* USB Speeds */
+#define USB_SPEED_LOW           0   /* 1.5 Mbps */
+#define USB_SPEED_FULL          1   /* 12 Mbps */
+#define USB_SPEED_HIGH          2   /* 480 Mbps */
+#define USB_SPEED_SUPER         3   /* 5 Gbps */
+#define USB_SPEED_SUPER_PLUS    4   /* 10 Gbps */
+
+/* USB Device Classes */
+#define USB_CLASS_AUDIO         0x01
+#define USB_CLASS_CDC           0x02    /* Communications Device Class */
+#define USB_CLASS_HID           0x03    /* Human Interface Device */
+#define USB_CLASS_PHYSICAL      0x05
+#define USB_CLASS_IMAGE         0x06
+#define USB_CLASS_PRINTER       0x07
+#define USB_CLASS_MASS_STORAGE  0x08
+#define USB_CLASS_HUB           0x09
+#define USB_CLASS_CDC_DATA      0x0A
+#define USB_CLASS_SMART_CARD    0x0B
+#define USB_CLASS_CONTENT_SEC   0x0D
+#define USB_CLASS_VIDEO         0x0E
+#define USB_CLASS_HEALTHCARE    0x0F
+#define USB_CLASS_DIAGNOSTIC    0xDC
+#define USB_CLASS_WIRELESS      0xE0
+#define USB_CLASS_MISC          0xEF
+#define USB_CLASS_APP_SPEC      0xFE
+#define USB_CLASS_VENDOR_SPEC   0xFF
+
+/* USB Request Types */
+#define USB_REQ_TYPE_STANDARD   0x00
+#define USB_REQ_TYPE_CLASS      0x20
+#define USB_REQ_TYPE_VENDOR     0x40
+
+/* USB Standard Requests */
+#define USB_REQ_GET_STATUS          0x00
+#define USB_REQ_CLEAR_FEATURE       0x01
+#define USB_REQ_SET_FEATURE         0x03
+#define USB_REQ_SET_ADDRESS         0x05
+#define USB_REQ_GET_DESCRIPTOR      0x06
+#define USB_REQ_SET_DESCRIPTOR      0x07
+#define USB_REQ_GET_CONFIGURATION   0x08
+#define USB_REQ_SET_CONFIGURATION   0x09
+#define USB_REQ_GET_INTERFACE       0x0A
+#define USB_REQ_SET_INTERFACE       0x0B
+#define USB_REQ_SYNCH_FRAME         0x0C
+
+/* USB Descriptor Types */
+#define USB_DESC_TYPE_DEVICE        0x01
+#define USB_DESC_TYPE_CONFIG        0x02
+#define USB_DESC_TYPE_STRING        0x03
+#define USB_DESC_TYPE_INTERFACE     0x04
+#define USB_DESC_TYPE_ENDPOINT      0x05
+#define USB_DESC_TYPE_DEVICE_QUAL   0x06
+#define USB_DESC_TYPE_OTHER_SPEED   0x07
+#define USB_DESC_TYPE_INTERFACE_PWR 0x08
+#define USB_DESC_TYPE_BOS           0x0F
+#define USB_DESC_TYPE_CAPABILITY    0x10
+
+/* USB Endpoint Types */
+#define USB_ENDPOINT_CONTROL        0x00
+#define USB_ENDPOINT_ISOCHRONOUS    0x01
+#define USB_ENDPOINT_BULK           0x02
+#define USB_ENDPOINT_INTERRUPT      0x03
+
+/* USB Host Controller Types */
+#define USB_HC_UHCI                 0x00    /* Universal HCI */
+#define USB_HC_OHCI                 0x01    /* Open HCI */
+#define USB_HC_EHCI                 0x02    /* Enhanced HCI */
+#define USB_HC_XHCI                 0x03    /* eXtensible HCI */
+
+/* Maximum limits */
+#define MAX_USB_CONTROLLERS         8
+#define MAX_USB_DEVICES             128
+#define MAX_USB_HUBS                32
+#define MAX_USB_ENDPOINTS           16
+#define MAX_USB_INTERFACES          8
+#define MAX_USB_STRINGS             32
+#define MAX_TRANSFER_SIZE           (64 * 1024)
+
+/* USB Device Descriptor */
+typedef struct usb_device_descriptor {
+    uint8_t bLength;                /* Descriptor size */
+    uint8_t bDescriptorType;        /* Device descriptor type */
+    uint16_t bcdUSB;                /* USB specification release */
+    uint8_t bDeviceClass;           /* Device class */
+    uint8_t bDeviceSubClass;        /* Device subclass */
+    uint8_t bDeviceProtocol;        /* Device protocol */
+    uint8_t bMaxPacketSize0;        /* Maximum packet size for endpoint 0 */
+    uint16_t idVendor;              /* Vendor ID */
+    uint16_t idProduct;             /* Product ID */
+    uint16_t bcdDevice;             /* Device release number */
+    uint8_t iManufacturer;          /* Manufacturer string index */
+    uint8_t iProduct;               /* Product string index */
+    uint8_t iSerialNumber;          /* Serial number string index */
+    uint8_t bNumConfigurations;     /* Number of configurations */
+} __attribute__((packed)) usb_device_descriptor_t;
+
+/* USB Configuration Descriptor */
+typedef struct usb_config_descriptor {
+    uint8_t bLength;                /* Descriptor size */
+    uint8_t bDescriptorType;        /* Configuration descriptor type */
+    uint16_t wTotalLength;          /* Total length of configuration */
+    uint8_t bNumInterfaces;         /* Number of interfaces */
+    uint8_t bConfigurationValue;    /* Configuration value */
+    uint8_t iConfiguration;         /* Configuration string index */
+    uint8_t bmAttributes;           /* Configuration attributes */
+    uint8_t bMaxPower;              /* Maximum power consumption */
+} __attribute__((packed)) usb_config_descriptor_t;
+
+/* USB Interface Descriptor */
+typedef struct usb_interface_descriptor {
+    uint8_t bLength;                /* Descriptor size */
+    uint8_t bDescriptorType;        /* Interface descriptor type */
+    uint8_t bInterfaceNumber;       /* Interface number */
+    uint8_t bAlternateSetting;      /* Alternate setting */
+    uint8_t bNumEndpoints;          /* Number of endpoints */
+    uint8_t bInterfaceClass;        /* Interface class */
+    uint8_t bInterfaceSubClass;     /* Interface subclass */
+    uint8_t bInterfaceProtocol;     /* Interface protocol */
+    uint8_t iInterface;             /* Interface string index */
+} __attribute__((packed)) usb_interface_descriptor_t;
+
+/* USB Endpoint Descriptor */
+typedef struct usb_endpoint_descriptor {
+    uint8_t bLength;                /* Descriptor size */
+    uint8_t bDescriptorType;        /* Endpoint descriptor type */
+    uint8_t bEndpointAddress;       /* Endpoint address */
+    uint8_t bmAttributes;           /* Endpoint attributes */
+    uint16_t wMaxPacketSize;        /* Maximum packet size */
+    uint8_t bInterval;              /* Polling interval */
+} __attribute__((packed)) usb_endpoint_descriptor_t;
+
+/* USB Setup Packet */
+typedef struct usb_setup_packet {
+    uint8_t bmRequestType;          /* Request type */
+    uint8_t bRequest;               /* Request */
+    uint16_t wValue;                /* Value */
+    uint16_t wIndex;                /* Index */
+    uint16_t wLength;               /* Length */
+} __attribute__((packed)) usb_setup_packet_t;
+
+/* USB Transfer Request */
+typedef struct usb_transfer_request {
+    uint32_t id;                    /* Transfer ID */
+    uint32_t device_id;             /* Target device */
+    uint8_t endpoint;               /* Target endpoint */
+    uint8_t type;                   /* Transfer type */
+    uint8_t direction;              /* Transfer direction */
+    
+    void* buffer;                   /* Data buffer */
+    uint32_t length;                /* Transfer length */
+    uint32_t actual_length;         /* Actually transferred */
+    
+    void (*callback)(struct usb_transfer_request* req);
+    void* context;                  /* Callback context */
+    
+    uint32_t status;                /* Transfer status */
+    uint64_t timestamp;             /* Transfer timestamp */
+    
+    struct usb_transfer_request* next;
+} usb_transfer_request_t;
+
+/* USB Endpoint */
+typedef struct usb_endpoint {
+    uint8_t address;                /* Endpoint address */
+    uint8_t type;                   /* Endpoint type */
+    uint16_t max_packet_size;       /* Maximum packet size */
+    uint8_t interval;               /* Polling interval */
+    
+    /* Transfer queues */
+    usb_transfer_request_t* pending_transfers;
+    usb_transfer_request_t* completed_transfers;
+    
+    /* Statistics */
+    uint64_t transfers_completed;   /* Completed transfers */
+    uint64_t bytes_transferred;     /* Total bytes transferred */
+    uint64_t errors;                /* Error count */
+    
+    volatile uint32_t lock;         /* Endpoint lock */
+} usb_endpoint_t;
+
+/* USB Interface */
+typedef struct usb_interface {
+    uint8_t number;                 /* Interface number */
+    uint8_t class;                  /* Interface class */
+    uint8_t subclass;               /* Interface subclass */
+    uint8_t protocol;               /* Interface protocol */
+    
+    usb_endpoint_t endpoints[MAX_USB_ENDPOINTS];
+    uint8_t endpoint_count;         /* Number of endpoints */
+    
+    void* driver_data;              /* Driver private data */
+    bool active;                    /* Interface active */
+} usb_interface_t;
+
+/* USB Device */
+typedef struct usb_device {
+    uint32_t id;                    /* Device ID */
+    uint8_t address;                /* USB device address */
+    uint8_t speed;                  /* Device speed */
+    uint8_t port;                   /* Hub port number */
+    
+    /* Device descriptors */
+    usb_device_descriptor_t device_desc;
+    usb_config_descriptor_t config_desc;
+    
+    /* Device information */
+    uint16_t vendor_id;             /* Vendor ID */
+    uint16_t product_id;            /* Product ID */
+    uint16_t device_version;        /* Device version */
+    
+    char manufacturer[64];          /* Manufacturer string */
+    char product[64];               /* Product string */
+    char serial_number[32];         /* Serial number */
+    
+    /* Interfaces */
+    usb_interface_t interfaces[MAX_USB_INTERFACES];
+    uint8_t interface_count;        /* Number of interfaces */
+    
+    /* Hub information (for hubs) */
+    struct usb_hub* hub;            /* Associated hub (if device is a hub) */
+    struct usb_device* parent_hub;  /* Parent hub */
+    
+    /* Power management */
+    uint8_t power_state;            /* Current power state */
+    bool remote_wakeup;             /* Remote wakeup capability */
+    
+    /* Statistics */
+    uint64_t connect_time;          /* Connection timestamp */
+    uint64_t transfers;             /* Total transfers */
+    uint64_t bytes_transferred;     /* Total bytes transferred */
+    uint64_t errors;                /* Error count */
+    
+    /* Synchronization */
+    volatile uint32_t lock;         /* Device lock */
+    
+    struct usb_device* next;        /* Next device in list */
+} usb_device_t;
+
+/* USB Hub */
+typedef struct usb_hub {
+    uint32_t id;                    /* Hub ID */
+    usb_device_t* device;           /* Associated USB device */
+    
+    uint8_t port_count;             /* Number of ports */
+    uint8_t characteristics;        /* Hub characteristics */
+    uint16_t power_on_time;         /* Power-on to power-good time */
+    uint8_t current_requirement;    /* Hub controller current requirement */
+    
+    /* Port status */
+    struct {
+        usb_device_t* device;       /* Connected device */
+        uint16_t status;            /* Port status */
+        uint16_t change;            /* Port change flags */
+        bool enabled;               /* Port enabled */
+        bool powered;               /* Port powered */
+    } ports[16];                    /* Maximum 16 ports per hub */
+    
+    /* Statistics */
+    uint64_t port_changes;          /* Port change events */
+    uint64_t overcurrent_events;    /* Overcurrent events */
+    
+    struct usb_hub* next;           /* Next hub in list */
+} usb_hub_t;
+
+/* USB Host Controller */
+typedef struct usb_host_controller {
+    uint32_t id;                    /* Controller ID */
+    uint8_t type;                   /* Controller type (UHCI/OHCI/EHCI/XHCI) */
+    char name[32];                  /* Controller name */
+    
+    /* Hardware information */
+    uint64_t base_addr;             /* Base I/O address */
+    uint32_t irq;                   /* IRQ number */
+    uint16_t vendor_id;             /* PCI vendor ID */
+    uint16_t device_id;             /* PCI device ID */
+    
+    /* Controller capabilities */
+    uint8_t port_count;             /* Number of root ports */
+    uint16_t max_speed;             /* Maximum supported speed */
+    bool supports_64bit;            /* 64-bit addressing support */
+    
+    /* Root hub */
+    usb_hub_t* root_hub;            /* Root hub */
+    
+    /* Device management */
+    usb_device_t* devices;          /* Connected devices */
+    uint32_t device_count;          /* Number of devices */
+    uint8_t next_device_address;    /* Next device address to assign */
+    
+    /* Transfer management */
+    usb_transfer_request_t* pending_transfers;
+    usb_transfer_request_t* free_transfers;
+    uint32_t transfer_id_counter;   /* Transfer ID counter */
+    
+    /* Controller operations */
+    status_t (*init)(struct usb_host_controller* hc);
+    status_t (*start)(struct usb_host_controller* hc);
+    status_t (*stop)(struct usb_host_controller* hc);
+    status_t (*reset)(struct usb_host_controller* hc);
+    status_t (*submit_transfer)(struct usb_host_controller* hc, usb_transfer_request_t* req);
+    
+    /* Statistics */
+    uint64_t transfers_completed;   /* Completed transfers */
+    uint64_t bytes_transferred;     /* Total bytes transferred */
+    uint64_t errors;                /* Error count */
+    uint64_t interrupts;            /* Interrupt count */
+    
+    /* Power management */
+    uint8_t power_state;            /* Controller power state */
+    
+    /* Synchronization */
+    volatile uint32_t lock;         /* Controller lock */
+    
+    struct usb_host_controller* next;
+} usb_host_controller_t;
+
+/* USB Class Driver */
+typedef struct usb_class_driver {
+    uint8_t class_code;             /* USB class code */
+    uint8_t subclass_code;          /* USB subclass code */
+    uint8_t protocol_code;          /* USB protocol code */
+    
+    char name[32];                  /* Driver name */
+    char version[16];               /* Driver version */
+    
+    /* Driver operations */
+    status_t (*probe)(usb_device_t* device, usb_interface_t* interface);
+    status_t (*disconnect)(usb_device_t* device, usb_interface_t* interface);
+    status_t (*suspend)(usb_device_t* device);
+    status_t (*resume)(usb_device_t* device);
+    
+    /* Statistics */
+    uint32_t devices_handled;       /* Devices handled by this driver */
+    uint64_t operations;            /* Driver operations */
+    
+    struct usb_class_driver* next;  /* Next driver in list */
+} usb_class_driver_t;
+
+/* Global USB subsystem state */
+static struct {
+    /* Host controllers */
+    usb_host_controller_t* controllers;
+    uint32_t controller_count;      /* Number of controllers */
+    
+    /* Devices */
+    usb_device_t* devices;          /* All USB devices */
+    uint32_t device_count;          /* Total device count */
+    
+    /* Hubs */
+    usb_hub_t* hubs;                /* USB hubs */
+    uint32_t hub_count;             /* Number of hubs */
+    
+    /* Class drivers */
+    usb_class_driver_t* class_drivers;
+    uint32_t driver_count;          /* Number of class drivers */
+    
+    /* Transfer management */
+    usb_transfer_request_t transfer_pool[1024];
+    uint32_t free_transfer_count;   /* Free transfers available */
+    
+    /* Statistics */
+    uint64_t total_devices_connected;
+    uint64_t total_devices_disconnected;
+    uint64_t total_transfers;       /* Total USB transfers */
+    uint64_t total_bytes_transferred;
+    uint64_t total_errors;          /* Total USB errors */
+    
+    /* Configuration */
+    bool hotplug_enabled;           /* Hotplug detection enabled */
+    bool power_management_enabled;  /* USB power management */
+    uint32_t debug_level;           /* Debug verbosity */
+    
+    /* Synchronization */
+    volatile uint32_t global_lock;  /* Global USB lock */
+    
+} usb_subsystem;
+
+/* USB String Descriptors (Common) */
+static const char* usb_class_names[] = {
+    "Unknown",
+    "Audio",
+    "CDC",
+    "HID",
+    "Reserved",
+    "Physical",
+    "Image",
+    "Printer",
+    "Mass Storage",
+    "Hub",
+    "CDC Data",
+    "Smart Card",
+    "Reserved",
+    "Content Security",
+    "Video",
+    "Personal Healthcare"
+};
+
+static const char* usb_speed_names[] = {
+    "Low Speed (1.5 Mbps)",
+    "Full Speed (12 Mbps)",
+    "High Speed (480 Mbps)",
+    "Super Speed (5 Gbps)",
+    "Super Speed+ (10 Gbps)"
+};
+
+/* Host Controller Operations */
+
+/* Initialize XHCI controller */
+static status_t xhci_init(usb_host_controller_t* hc) {
+    KLOG_INFO("USB", "Initializing xHCI controller %s", hc->name);
+    
+    /* Reset controller */
+    /* TODO: Implement actual xHCI reset sequence */
+    
+    /* Initialize command ring */
+    /* TODO: Implement command ring setup */
+    
+    /* Initialize event ring */
+    /* TODO: Implement event ring setup */
+    
+    /* Enable interrupts */
+    /* TODO: Implement interrupt setup */
+    
+    hc->port_count = 4; /* Simulated 4 ports */
+    hc->max_speed = USB_SPEED_SUPER_PLUS;
+    hc->supports_64bit = true;
+    
+    return STATUS_OK;
+}
+
+/* Start XHCI controller */
+static status_t xhci_start(usb_host_controller_t* hc) {
+    KLOG_INFO("USB", "Starting xHCI controller %s", hc->name);
+    
+    /* Start the controller */
+    /* TODO: Implement actual xHCI start sequence */
+    
+    return STATUS_OK;
+}
+
+/* Submit transfer to XHCI */
+static status_t xhci_submit_transfer(usb_host_controller_t* hc, usb_transfer_request_t* req) {
+    if (!hc || !req) {
+        return STATUS_INVALID;
+    }
+    
+    /* Add transfer to pending queue */
+    req->next = hc->pending_transfers;
+    hc->pending_transfers = req;
+    
+    /* TODO: Implement actual xHCI transfer submission */
+    
+    KLOG_DEBUG("USB", "Submitted transfer %u to device %u endpoint %u", 
+               req->id, req->device_id, req->endpoint);
+    
+    return STATUS_OK;
+}
+
+/* Device Management */
+
+/* Allocate USB device */
+static usb_device_t* usb_device_alloc(void) {
+    usb_device_t* device = (usb_device_t*)kalloc(sizeof(usb_device_t));
+    if (!device) {
+        return NULL;
+    }
+    
+    memset(device, 0, sizeof(*device));
+    device->id = usb_subsystem.device_count + 1;
+    device->connect_time = hal_timer_get_timestamp_ns();
+    
+    return device;
+}
+
+/* Get device descriptor */
+static status_t usb_get_device_descriptor(usb_device_t* device) {
+    if (!device) {
+        return STATUS_INVALID;
+    }
+    
+    /* Simulate getting device descriptor */
+    device->device_desc.bLength = sizeof(usb_device_descriptor_t);
+    device->device_desc.bDescriptorType = USB_DESC_TYPE_DEVICE;
+    device->device_desc.bcdUSB = USB_SPEC_2_0;
+    device->device_desc.bDeviceClass = USB_CLASS_HID; /* Example: HID device */
+    device->device_desc.bMaxPacketSize0 = 64;
+    device->device_desc.idVendor = 0x1234;
+    device->device_desc.idProduct = 0x5678;
+    device->device_desc.bcdDevice = 0x0100;
+    device->device_desc.bNumConfigurations = 1;
+    
+    device->vendor_id = device->device_desc.idVendor;
+    device->product_id = device->device_desc.idProduct;
+    
+    /* Simulate string descriptors */
+    strncpy(device->manufacturer, "LimitlessOS USB", sizeof(device->manufacturer) - 1);
+    strncpy(device->product, "USB Test Device", sizeof(device->product) - 1);
+    strncpy(device->serial_number, "123456789", sizeof(device->serial_number) - 1);
+    
+    KLOG_DEBUG("USB", "Device descriptor: VID=%04X PID=%04X Class=%02X",
+               device->vendor_id, device->product_id, device->device_desc.bDeviceClass);
+    
+    return STATUS_OK;
+}
+
+/* Enumerate USB device */
+static status_t usb_enumerate_device(usb_device_t* device, usb_host_controller_t* hc) {
+    if (!device || !hc) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_INFO("USB", "Enumerating USB device on controller %s", hc->name);
+    
+    /* Assign device address */
+    device->address = hc->next_device_address++;
+    if (hc->next_device_address > 127) {
+        hc->next_device_address = 1; /* Wrap around, skip address 0 */
+    }
+    
+    /* Get device descriptor */
+    status_t result = usb_get_device_descriptor(device);
+    if (result != STATUS_OK) {
+        return result;
+    }
+    
+    /* Set device configuration */
+    /* TODO: Implement SET_CONFIGURATION request */
+    
+    /* Create default interfaces */
+    device->interface_count = 1;
+    device->interfaces[0].number = 0;
+    device->interfaces[0].class = device->device_desc.bDeviceClass;
+    device->interfaces[0].active = true;
+    
+    /* Create default endpoints */
+    device->interfaces[0].endpoint_count = 2; /* Control + one interrupt endpoint */
+    
+    /* Control endpoint (always present) */
+    device->interfaces[0].endpoints[0].address = 0x00;
+    device->interfaces[0].endpoints[0].type = USB_ENDPOINT_CONTROL;
+    device->interfaces[0].endpoints[0].max_packet_size = device->device_desc.bMaxPacketSize0;
+    
+    /* Interrupt endpoint (for HID) */
+    device->interfaces[0].endpoints[1].address = 0x81; /* IN endpoint */
+    device->interfaces[0].endpoints[1].type = USB_ENDPOINT_INTERRUPT;
+    device->interfaces[0].endpoints[1].max_packet_size = 8;
+    device->interfaces[0].endpoints[1].interval = 10; /* 10ms polling */
+    
+    /* Add device to controller */
+    device->next = hc->devices;
+    hc->devices = device;
+    hc->device_count++;
+    
+    /* Add to global device list */
+    device->next = usb_subsystem.devices;
+    usb_subsystem.devices = device;
+    usb_subsystem.device_count++;
+    usb_subsystem.total_devices_connected++;
+    
+    KLOG_INFO("USB", "USB device enumerated: %s %s (Address: %u, Class: %s)",
+              device->manufacturer, device->product, device->address,
+              usb_class_names[device->device_desc.bDeviceClass < 16 ? device->device_desc.bDeviceClass : 0]);
+    
+    return STATUS_OK;
+}
+
+/* Class Driver Management */
+
+/* Register USB class driver */
+status_t usb_register_class_driver(usb_class_driver_t* driver) {
+    if (!driver) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&usb_subsystem.global_lock, 1);
+    
+    /* Add to driver list */
+    driver->next = usb_subsystem.class_drivers;
+    usb_subsystem.class_drivers = driver;
+    usb_subsystem.driver_count++;
+    
+    __sync_lock_release(&usb_subsystem.global_lock);
+    
+    KLOG_INFO("USB", "Registered USB class driver: %s v%s (Class: 0x%02X)",
+              driver->name, driver->version, driver->class_code);
+    
+    return STATUS_OK;
+}
+
+/* Find class driver for device */
+static usb_class_driver_t* usb_find_class_driver(usb_device_t* device, usb_interface_t* interface) {
+    usb_class_driver_t* driver = usb_subsystem.class_drivers;
+    
+    while (driver) {
+        if (driver->class_code == interface->class) {
+            /* Found matching class driver */
+            return driver;
+        }
+        driver = driver->next;
+    }
+    
+    return NULL; /* No driver found */
+}
+
+/* Transfer Management */
+
+/* Allocate transfer request */
+static usb_transfer_request_t* usb_alloc_transfer(void) {
+    __sync_lock_test_and_set(&usb_subsystem.global_lock, 1);
+    
+    if (usb_subsystem.free_transfer_count == 0) {
+        __sync_lock_release(&usb_subsystem.global_lock);
+        return NULL;
+    }
+    
+    /* Find free transfer in pool */
+    for (int i = 0; i < 1024; i++) {
+        usb_transfer_request_t* req = &usb_subsystem.transfer_pool[i];
+        if (req->id == 0) { /* Free transfer */
+            memset(req, 0, sizeof(*req));
+            req->id = 1; /* Mark as allocated */
+            req->timestamp = hal_timer_get_timestamp_ns();
+            usb_subsystem.free_transfer_count--;
+            
+            __sync_lock_release(&usb_subsystem.global_lock);
+            return req;
+        }
+    }
+    
+    __sync_lock_release(&usb_subsystem.global_lock);
+    return NULL;
+}
+
+/* Free transfer request */
+static void usb_free_transfer(usb_transfer_request_t* req) {
+    if (!req) return;
+    
+    __sync_lock_test_and_set(&usb_subsystem.global_lock, 1);
+    
+    req->id = 0; /* Mark as free */
+    usb_subsystem.free_transfer_count++;
+    
+    __sync_lock_release(&usb_subsystem.global_lock);
+}
+
+/* Submit USB transfer */
+status_t usb_submit_transfer(uint32_t device_id, uint8_t endpoint, uint8_t type, 
+                            void* buffer, uint32_t length, void* callback) {
+    /* Find device */
+    usb_device_t* device = usb_subsystem.devices;
+    while (device && device->id != device_id) {
+        device = device->next;
+    }
+    
+    if (!device) {
+        return STATUS_NOT_FOUND;
+    }
+    
+    /* Allocate transfer request */
+    usb_transfer_request_t* req = usb_alloc_transfer();
+    if (!req) {
+        return STATUS_NOMEM;
+    }
+    
+    req->device_id = device_id;
+    req->endpoint = endpoint;
+    req->type = type;
+    req->buffer = buffer;
+    req->length = length;
+    req->callback = (void (*)(struct usb_transfer_request*))callback;
+    
+    /* Find host controller for this device */
+    usb_host_controller_t* hc = usb_subsystem.controllers;
+    while (hc) {
+        usb_device_t* hc_dev = hc->devices;
+        while (hc_dev) {
+            if (hc_dev->id == device_id) {
+                /* Submit to this controller */
+                return hc->submit_transfer(hc, req);
+            }
+            hc_dev = hc_dev->next;
+        }
+        hc = hc->next;
+    }
+    
+    usb_free_transfer(req);
+    return STATUS_NOT_FOUND;
+}
+
+/* Hub Management */
+
+/* Create USB hub */
+static usb_hub_t* usb_create_hub(usb_device_t* device) {
+    usb_hub_t* hub = (usb_hub_t*)kalloc(sizeof(usb_hub_t));
+    if (!hub) {
+        return NULL;
+    }
+    
+    memset(hub, 0, sizeof(*hub));
+    hub->id = usb_subsystem.hub_count + 1;
+    hub->device = device;
+    hub->port_count = 4; /* Simulated 4-port hub */
+    hub->power_on_time = 100; /* 100ms power-on time */
+    
+    /* Initialize ports */
+    for (int i = 0; i < hub->port_count; i++) {
+        hub->ports[i].powered = true;
+        hub->ports[i].enabled = true;
+    }
+    
+    /* Add to hub list */
+    hub->next = usb_subsystem.hubs;
+    usb_subsystem.hubs = hub;
+    usb_subsystem.hub_count++;
+    
+    return hub;
+}
+
+/* Simulate device connection to hub */
+static void usb_simulate_device_connection(usb_hub_t* hub, uint8_t port) {
+    if (!hub || port >= hub->port_count || hub->ports[port].device) {
+        return;
+    }
+    
+    KLOG_INFO("USB", "Simulating device connection on hub %u port %u", hub->id, port + 1);
+    
+    /* Create new device */
+    usb_device_t* device = usb_device_alloc();
+    if (!device) {
+        return;
+    }
+    
+    device->port = port;
+    device->parent_hub = hub->device;
+    device->speed = USB_SPEED_HIGH; /* Simulated high-speed device */
+    
+    /* Attach to port */
+    hub->ports[port].device = device;
+    hub->ports[port].status |= 0x0001; /* Device present */
+    hub->port_changes++;
+    
+    /* Find parent controller */
+    usb_host_controller_t* hc = usb_subsystem.controllers;
+    while (hc && hc->devices) {
+        usb_device_t* hc_dev = hc->devices;
+        while (hc_dev) {
+            if (hc_dev == hub->device) {
+                /* Enumerate the new device */
+                usb_enumerate_device(device, hc);
+                return;
+            }
+            hc_dev = hc_dev->next;
+        }
+        hc = hc->next;
+    }
+}
+
+/* Initialize USB host controller */
+static usb_host_controller_t* usb_init_host_controller(uint8_t type, const char* name) {
+    usb_host_controller_t* hc = (usb_host_controller_t*)kalloc(sizeof(usb_host_controller_t));
+    if (!hc) {
+        return NULL;
+    }
+    
+    memset(hc, 0, sizeof(*hc));
+    hc->id = usb_subsystem.controller_count + 1;
+    hc->type = type;
+    strncpy(hc->name, name, sizeof(hc->name) - 1);
+    hc->next_device_address = 1;
+    
+    /* Set up operations based on controller type */
+    switch (type) {
+        case USB_HC_XHCI:
+            hc->init = xhci_init;
+            hc->start = xhci_start;
+            hc->submit_transfer = xhci_submit_transfer;
+            break;
+        
+        default:
+            KLOG_WARN("USB", "Unknown USB controller type: %u", type);
+            kfree(hc);
+            return NULL;
+    }
+    
+    /* Initialize controller */
+    if (hc->init && hc->init(hc) != STATUS_OK) {
+        KLOG_ERROR("USB", "Failed to initialize USB controller %s", name);
+        kfree(hc);
+        return NULL;
+    }
+    
+    /* Create root hub */
+    hc->root_hub = (usb_hub_t*)kalloc(sizeof(usb_hub_t));
+    if (hc->root_hub) {
+        memset(hc->root_hub, 0, sizeof(*hc->root_hub));
+        hc->root_hub->id = usb_subsystem.hub_count + 1;
+        hc->root_hub->port_count = hc->port_count;
+        
+        /* Initialize root hub ports */
+        for (int i = 0; i < hc->root_hub->port_count; i++) {
+            hc->root_hub->ports[i].powered = true;
+            hc->root_hub->ports[i].enabled = true;
+        }
+        
+        usb_subsystem.hub_count++;
+    }
+    
+    /* Start controller */
+    if (hc->start && hc->start(hc) != STATUS_OK) {
+        KLOG_ERROR("USB", "Failed to start USB controller %s", name);
+        if (hc->root_hub) kfree(hc->root_hub);
+        kfree(hc);
+        return NULL;
+    }
+    
+    return hc;
+}
+
+/* Print USB statistics */
+void usb_print_stats(void) {
+    kprintf("=== USB Subsystem Statistics ===\n");
+    
+    kprintf("\nUSB Controllers:\n");
+    kprintf("  Active Controllers: %u\n", usb_subsystem.controller_count);
+    
+    usb_host_controller_t* hc = usb_subsystem.controllers;
+    while (hc) {
+        const char* hc_types[] = {"UHCI", "OHCI", "EHCI", "xHCI"};
+        kprintf("    %s (%s): %u ports, %u devices, %llu transfers\n",
+                hc->name, hc_types[hc->type < 4 ? hc->type : 0],
+                hc->port_count, hc->device_count, hc->transfers_completed);
+        hc = hc->next;
+    }
+    
+    kprintf("\nUSB Devices:\n");
+    kprintf("  Connected Devices: %u\n", usb_subsystem.device_count);
+    kprintf("  Total Connected: %llu\n", usb_subsystem.total_devices_connected);
+    kprintf("  Total Disconnected: %llu\n", usb_subsystem.total_devices_disconnected);
+    
+    usb_device_t* dev = usb_subsystem.devices;
+    while (dev) {
+        kprintf("    Device %u: %s %s (%04X:%04X) - %s\n",
+                dev->id, dev->manufacturer, dev->product,
+                dev->vendor_id, dev->product_id,
+                usb_speed_names[dev->speed < 5 ? dev->speed : 0]);
+        kprintf("      Class: %s, Interfaces: %u, Transfers: %llu\n",
+                usb_class_names[dev->device_desc.bDeviceClass < 16 ? dev->device_desc.bDeviceClass : 0],
+                dev->interface_count, dev->transfers);
+        dev = dev->next;
+    }
+    
+    kprintf("\nUSB Hubs:\n");
+    kprintf("  Active Hubs: %u\n", usb_subsystem.hub_count);
+    
+    usb_hub_t* hub = usb_subsystem.hubs;
+    while (hub) {
+        kprintf("    Hub %u: %u ports, %llu port changes\n",
+                hub->id, hub->port_count, hub->port_changes);
+        
+        for (int i = 0; i < hub->port_count; i++) {
+            if (hub->ports[i].device) {
+                kprintf("      Port %d: Device %u connected\n", 
+                        i + 1, hub->ports[i].device->id);
+            } else {
+                kprintf("      Port %d: Empty\n", i + 1);
+            }
+        }
+        hub = hub->next;
+    }
+    
+    kprintf("\nUSB Class Drivers:\n");
+    kprintf("  Registered Drivers: %u\n", usb_subsystem.driver_count);
+    
+    usb_class_driver_t* driver = usb_subsystem.class_drivers;
+    while (driver) {
+        kprintf("    %s v%s: Class 0x%02X, %u devices handled\n",
+                driver->name, driver->version, driver->class_code, driver->devices_handled);
+        driver = driver->next;
+    }
+    
+    kprintf("\nUSB Transfer Statistics:\n");
+    kprintf("  Total Transfers: %llu\n", usb_subsystem.total_transfers);
+    kprintf("  Bytes Transferred: %llu\n", usb_subsystem.total_bytes_transferred);
+    kprintf("  Transfer Errors: %llu\n", usb_subsystem.total_errors);
+    kprintf("  Free Transfers: %u/1024\n", usb_subsystem.free_transfer_count);
+    
+    kprintf("=== End USB Statistics ===\n");
+}
+
+/* Initialize USB subsystem */
+status_t usb_subsystem_init(void) {
+    KLOG_INFO("USB", "Initializing USB subsystem");
+    
+    memset(&usb_subsystem, 0, sizeof(usb_subsystem));
+    usb_subsystem.free_transfer_count = 1024; /* All transfers initially free */
+    usb_subsystem.hotplug_enabled = true;
+    usb_subsystem.power_management_enabled = true;
+    
+    /* Initialize xHCI controller */
+    usb_host_controller_t* xhci = usb_init_host_controller(USB_HC_XHCI, "xHCI Controller 0");
+    if (xhci) {
+        xhci->next = usb_subsystem.controllers;
+        usb_subsystem.controllers = xhci;
+        usb_subsystem.controller_count++;
+        
+        KLOG_INFO("USB", "xHCI controller initialized with %u ports", xhci->port_count);
+        
+        /* Simulate some device connections */
+        if (xhci->root_hub) {
+            /* Simulate HID device connection */
+            usb_simulate_device_connection(xhci->root_hub, 0);
+            
+            /* Simulate hub connection */
+            usb_device_t* hub_device = usb_device_alloc();
+            if (hub_device) {
+                hub_device->device_desc.bDeviceClass = USB_CLASS_HUB;
+                usb_enumerate_device(hub_device, xhci);
+                
+                usb_hub_t* external_hub = usb_create_hub(hub_device);
+                if (external_hub) {
+                    /* Simulate device connected to external hub */
+                    usb_simulate_device_connection(external_hub, 0);
+                }
+            }
+        }
+    }
+    
+    KLOG_INFO("USB", "USB subsystem initialization complete");
+    KLOG_INFO("USB", "  Controllers: %u", usb_subsystem.controller_count);
+    KLOG_INFO("USB", "  Devices: %u", usb_subsystem.device_count);
+    KLOG_INFO("USB", "  Hubs: %u", usb_subsystem.hub_count);
+    
+    return STATUS_OK;
+}

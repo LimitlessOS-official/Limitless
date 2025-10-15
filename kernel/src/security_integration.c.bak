@@ -1,0 +1,304 @@
+/**
+ * Security Module Integration for LimitlessOS Kernel
+ * Integrates all security components into kernel initialization
+ */
+
+#include "kernel.h"
+#include "security.h"
+#include "auth.h"
+#include "process.h"
+
+/* External security system functions */
+extern status_t security_init(void);
+extern status_t ids_init(void);
+extern status_t secure_boot_init(void);
+
+/* Security integration state */
+static struct {
+    bool security_initialized;
+    bool ids_initialized;
+    bool secure_boot_initialized;
+    bool integration_complete;
+    uint64_t init_start_time;
+    uint64_t init_complete_time;
+} security_integration = {0};
+
+/* Initialize security subsystem */
+status_t kernel_security_init(void) {
+    security_integration.init_start_time = timer_get_ticks();
+    
+    console_printf("LimitlessOS: Initializing Security Framework...\n");
+    
+    /* Initialize core security framework */
+    status_t status = security_init();
+    if (status != STATUS_OK) {
+        console_printf("ERROR: Failed to initialize security framework: %d\n", status);
+        return status;
+    }
+    security_integration.security_initialized = true;
+    console_printf("Security framework initialized\n");
+    
+    /* Initialize secure boot system */
+    status = secure_boot_init();
+    if (status != STATUS_OK) {
+        console_printf("ERROR: Failed to initialize secure boot: %d\n", status);
+        return status;
+    }
+    security_integration.secure_boot_initialized = true;
+    console_printf("Secure boot system initialized\n");
+    
+    /* Initialize intrusion detection system */
+    status = ids_init();
+    if (status != STATUS_OK) {
+        console_printf("ERROR: Failed to initialize IDS: %d\n", status);
+        return status;
+    }
+    security_integration.ids_initialized = true;
+    console_printf("Intrusion detection system initialized\n");
+    
+    /* Configure default security policies */
+    security_config_t default_config = {
+        .policy_type = SECURITY_POLICY_DAC,
+        .enforce_mac = false,
+        .audit_enabled = true,
+        .crypto_required = false,
+        .secure_boot = false,
+        .min_password_length = 8,
+        .require_uppercase = true,
+        .require_lowercase = true,
+        .require_numbers = true,
+        .require_symbols = false,
+        .password_expiry_days = 90,
+        .session_timeout_minutes = 30,
+        .max_failed_logins = 3,
+        .lockout_duration_minutes = 15,
+        .default_symmetric_alg = CRYPTO_ALG_AES_256,
+        .default_asymmetric_alg = CRYPTO_ALG_RSA_2048,
+        .default_hash_alg = HASH_ALG_SHA256
+    };
+    
+    status = security_configure(&default_config);
+    if (status != STATUS_OK) {
+        console_printf("WARNING: Failed to configure security policies: %d\n", status);
+    }
+    
+    /* Enable IDS monitoring */
+    status = ids_set_enabled(true);
+    if (status != STATUS_OK) {
+        console_printf("WARNING: Failed to enable IDS: %d\n", status);
+    }
+    
+    /* Generate initial cryptographic keys */
+    uint32_t system_key_id;
+    status = crypto_generate_key(CRYPTO_ALG_AES_256, &system_key_id);
+    if (status == STATUS_OK) {
+        console_printf("System encryption key generated (ID: %u)\n", system_key_id);
+    } else {
+        console_printf("WARNING: Failed to generate system key: %d\n", status);
+    }
+    
+    security_integration.integration_complete = true;
+    security_integration.init_complete_time = timer_get_ticks();
+    
+    uint64_t init_duration = security_integration.init_complete_time - security_integration.init_start_time;
+    console_printf("Security framework initialization complete (%llu ms)\n", 
+                  init_duration * 1000 / TIMER_HZ);
+    
+    /* Audit security initialization */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Security framework fully initialized", "kernel_security", 1);
+    
+    return STATUS_OK;
+}
+
+/* Process creation security hook */
+status_t kernel_security_process_create_hook(process_t* proc, uid_t parent_uid) {
+    if (!security_integration.integration_complete || !proc) {
+        return STATUS_OK;
+    }
+    
+    /* Initialize process security context */
+    if (proc->security.uid == 0) {
+        proc->security.uid = parent_uid;
+    }
+    
+    /* Set default capabilities */
+    proc->security.capabilities = 0;
+    if (proc->security.uid == UID_ROOT) {
+        proc->security.capabilities = 0xFFFFFFFF;  /* Root gets all capabilities */
+    } else {
+        proc->security.capabilities = CAP_DEFAULT_USER;  /* Limited user capabilities */
+    }
+    
+    /* Enable security hardening */
+    security_enable_aslr(proc);
+    security_enable_dep(proc);
+    
+    /* Monitor process spawn for IDS */
+    ids_monitor_process_spawn(proc->pid, proc->name, proc->security.uid);
+    
+    return STATUS_OK;
+}
+
+/* File access security hook */
+status_t kernel_security_file_access_hook(pid_t pid, uid_t uid, const char* filename, uint32_t access_flags) {
+    if (!security_integration.integration_complete) {
+        return STATUS_OK;
+    }
+    
+    /* Check access permissions */
+    uint32_t required_perms = 0;
+    if (access_flags & FILE_READ) required_perms |= PERM_READ;
+    if (access_flags & FILE_WRITE) required_perms |= PERM_WRITE;
+    if (access_flags & FILE_EXECUTE) required_perms |= PERM_EXECUTE;
+    
+    /* For demonstration, use simple file ID hash */
+    uint32_t file_id = 0;
+    for (const char* p = filename; *p; p++) {
+        file_id = (file_id * 31) + *p;
+    }
+    
+    status_t status = security_check_access(uid, file_id, required_perms);
+    if (status != STATUS_OK && uid != UID_ROOT) {
+        /* Access denied - audit and return error */
+        security_audit_event(SECURITY_EVENT_ACCESS_DENIED, pid, uid,
+                            "File access denied", filename, 0);
+        return STATUS_DENIED;
+    }
+    
+    /* Monitor file access for IDS */
+    ids_monitor_file_access(pid, uid, filename, access_flags);
+    
+    return STATUS_OK;
+}
+
+/* Network activity security hook */
+status_t kernel_security_network_hook(pid_t pid, uid_t uid, uint32_t src_ip, uint16_t src_port,
+                                     uint32_t dst_ip, uint16_t dst_port, network_protocol_t protocol) {
+    if (!security_integration.integration_complete) {
+        return STATUS_OK;
+    }
+    
+    /* Monitor network activity for IDS */
+    ids_monitor_network_activity(src_ip, src_port, dst_ip, dst_port, protocol);
+    
+    /* Check for privileged ports */
+    if (src_port < 1024 && uid != UID_ROOT) {
+        security_audit_event(SECURITY_EVENT_ACCESS_DENIED, pid, uid,
+                            "Privileged port access denied", "network", 0);
+        return STATUS_DENIED;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Privilege escalation security hook */
+status_t kernel_security_privilege_escalation_hook(pid_t pid, uid_t old_uid, uid_t new_uid) {
+    if (!security_integration.integration_complete) {
+        return STATUS_OK;
+    }
+    
+    /* Monitor for IDS */
+    ids_monitor_privilege_escalation(pid, old_uid, new_uid);
+    
+    /* Audit privilege changes */
+    security_audit_event(SECURITY_EVENT_PRIVILEGE_ESCALATION, pid, old_uid,
+                        "Privilege escalation attempt", "privilege", 
+                        (new_uid == UID_ROOT) ? 0 : 1);
+    
+    return STATUS_OK;
+}
+
+/* Security system status */
+status_t kernel_security_get_status(kernel_security_status_t* status) {
+    if (!status) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(status, 0, sizeof(kernel_security_status_t));
+    
+    status->initialized = security_integration.integration_complete;
+    status->security_framework_active = security_integration.security_initialized;
+    status->ids_active = security_integration.ids_initialized;
+    status->secure_boot_active = security_integration.secure_boot_initialized;
+    
+    if (security_integration.integration_complete) {
+        /* Get current security configuration */
+        security_config_t config;
+        if (security_get_config(&config) == STATUS_OK) {
+            status->audit_enabled = config.audit_enabled;
+            status->crypto_required = config.crypto_required;
+            status->secure_boot_enabled = config.secure_boot;
+        }
+        
+        /* Get IDS statistics */
+        ids_statistics_t ids_stats;
+        if (ids_get_statistics(&ids_stats) == STATUS_OK) {
+            status->current_threat_level = ids_stats.current_threat_level;
+            status->alerts_generated = ids_stats.alerts_generated;
+            status->threats_blocked = ids_stats.threats_blocked;
+        }
+        
+        /* Check secure boot status */
+        status->secure_boot_verified = secure_boot_is_verified();
+    }
+    
+    status->init_time = security_integration.init_complete_time - security_integration.init_start_time;
+    
+    return STATUS_OK;
+}
+
+/* Perform security scan */
+status_t kernel_security_perform_scan(void) {
+    if (!security_integration.integration_complete) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("Performing system security scan...\n");
+    
+    /* Run IDS threat scan */
+    status_t status = ids_perform_threat_scan();
+    if (status != STATUS_OK) {
+        console_printf("WARNING: IDS threat scan failed: %d\n", status);
+    }
+    
+    /* Validate secure boot chain if enabled */
+    if (secure_boot_is_verified()) {
+        status = secure_boot_validate_chain();
+        if (status != STATUS_OK) {
+            console_printf("WARNING: Secure boot validation failed: %d\n", status);
+        }
+    }
+    
+    console_printf("Security scan completed\n");
+    
+    return STATUS_OK;
+}
+
+/* Security system shutdown */
+status_t kernel_security_shutdown(void) {
+    if (!security_integration.integration_complete) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Shutting down security framework...\n");
+    
+    /* Shutdown components in reverse order */
+    if (security_integration.ids_initialized) {
+        ids_shutdown();
+    }
+    
+    if (security_integration.secure_boot_initialized) {
+        secure_boot_shutdown();
+    }
+    
+    if (security_integration.security_initialized) {
+        security_shutdown();
+    }
+    
+    k_memset(&security_integration, 0, sizeof(security_integration));
+    
+    console_printf("Security framework shutdown complete\n");
+    
+    return STATUS_OK;
+}

@@ -1,0 +1,426 @@
+/**
+ * NUMA-Aware Memory Allocator for LimitlessOS
+ * Optimized memory allocation with NUMA topology awareness
+ */
+
+#include "kernel.h"
+#include "advanced_vmm.h"
+#include "security.h"
+#include "timer.h"
+
+/* NUMA allocation policies */
+typedef enum {
+    NUMA_POLICY_DEFAULT = 0,    /* Use current node, fallback to others */
+    NUMA_POLICY_BIND,           /* Strict binding to specific nodes */
+    NUMA_POLICY_INTERLEAVE,     /* Round-robin across nodes */
+    NUMA_POLICY_PREFERRED,      /* Prefer specific node, allow others */
+    NUMA_POLICY_LOCAL           /* Always allocate on local node */
+} numa_policy_t;
+
+/* NUMA allocation context */
+typedef struct {
+    numa_policy_t policy;
+    uint32_t node_mask;         /* Bitmask of allowed nodes */
+    uint32_t preferred_node;
+    uint32_t current_node;      /* For interleave policy */
+    
+    /* Statistics */
+    uint64_t local_allocations;
+    uint64_t remote_allocations;
+    uint64_t failed_allocations;
+    
+    /* Performance tracking */
+    uint64_t local_allocation_time_ns;
+    uint64_t remote_allocation_time_ns;
+    
+    spinlock_t lock;
+} numa_allocator_t;
+
+/* Global NUMA allocator state */
+static numa_allocator_t g_numa_allocator = {0};
+
+/* NUMA distance matrix (simplified) */
+static uint32_t numa_distance_matrix[MAX_NUMA_NODES][MAX_NUMA_NODES] = {0};
+
+/* Initialize NUMA allocator */
+status_t numa_allocator_init(void) {
+    k_memset(&g_numa_allocator, 0, sizeof(numa_allocator_t));
+    spinlock_init(&g_numa_allocator.lock);
+    
+    /* Set default policy */
+    g_numa_allocator.policy = NUMA_POLICY_DEFAULT;
+    g_numa_allocator.node_mask = 0xFFFFFFFF;  /* All nodes allowed */
+    g_numa_allocator.preferred_node = 0;
+    g_numa_allocator.current_node = 0;
+    
+    /* Initialize NUMA distance matrix */
+    extern advanced_vmm_t g_advanced_vmm;
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        for (uint32_t j = 0; j < g_advanced_vmm.numa_node_count; j++) {
+            if (i == j) {
+                numa_distance_matrix[i][j] = 10;  /* Local access */
+            } else {
+                numa_distance_matrix[i][j] = 20;  /* Remote access */
+            }
+        }
+    }
+    
+    console_printf("NUMA allocator initialized\n");
+    
+    return STATUS_OK;
+}
+
+/* Set NUMA allocation policy */
+status_t numa_set_policy(uint32_t policy, uint32_t node_mask) {
+    if (policy >= 5) {  /* Invalid policy */
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_numa_allocator.lock);
+    
+    g_numa_allocator.policy = (numa_policy_t)policy;
+    g_numa_allocator.node_mask = node_mask;
+    
+    spin_unlock(&g_numa_allocator.lock);
+    
+    console_printf("NUMA policy set: %u, mask: 0x%X\n", policy, node_mask);
+    
+    return STATUS_OK;
+}
+
+/* Get optimal NUMA node for allocation */
+uint32_t numa_get_optimal_node(void* addr) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    /* Determine which NUMA node contains this address */
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        numa_node_t* node = &g_advanced_vmm.numa_nodes[i];
+        uint64_t node_end = node->base_address + node->size;
+        
+        if ((uint64_t)addr >= node->base_address && (uint64_t)addr < node_end) {
+            return i;
+        }
+    }
+    
+    /* Default to current node if not found */
+    return numa_get_current_node();
+}
+
+/* Select NUMA node based on policy */
+static uint32_t numa_select_node(const memory_alloc_hints_t* hints) {
+    extern advanced_vmm_t g_advanced_vmm;
+    uint32_t selected_node = 0;
+    
+    spin_lock(&g_numa_allocator.lock);
+    
+    switch (g_numa_allocator.policy) {
+        case NUMA_POLICY_DEFAULT:
+            /* Try preferred node first, then current, then any */
+            if (hints && hints->preferred_numa_node < g_advanced_vmm.numa_node_count) {
+                selected_node = hints->preferred_numa_node;
+            } else {
+                selected_node = numa_get_current_node();
+            }
+            break;
+            
+        case NUMA_POLICY_BIND:
+            /* Must use nodes in mask */
+            for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+                if (g_numa_allocator.node_mask & (1U << i)) {
+                    selected_node = i;
+                    break;
+                }
+            }
+            break;
+            
+        case NUMA_POLICY_INTERLEAVE:
+            /* Round-robin through allowed nodes */
+            do {
+                g_numa_allocator.current_node = 
+                    (g_numa_allocator.current_node + 1) % g_advanced_vmm.numa_node_count;
+                selected_node = g_numa_allocator.current_node;
+            } while (!(g_numa_allocator.node_mask & (1U << selected_node)));
+            break;
+            
+        case NUMA_POLICY_PREFERRED:
+            /* Prefer specific node but allow fallback */
+            selected_node = g_numa_allocator.preferred_node;
+            break;
+            
+        case NUMA_POLICY_LOCAL:
+            /* Always use local node */
+            selected_node = numa_get_current_node();
+            break;
+    }
+    
+    spin_unlock(&g_numa_allocator.lock);
+    
+    return selected_node;
+}
+
+/* NUMA-aware allocation with fallback */
+void* numa_alloc_with_fallback(size_t size, const memory_alloc_hints_t* hints) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!g_advanced_vmm.initialized || size == 0) {
+        return NULL;
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    uint32_t target_node = numa_select_node(hints);
+    
+    /* Try allocation on target node first */
+    void* result = vmm_alloc_numa(size, target_node, 0);
+    
+    if (result) {
+        /* Successful local allocation */
+        uint64_t allocation_time = timer_get_ticks() - start_time;
+        
+        spin_lock(&g_numa_allocator.lock);
+        g_numa_allocator.local_allocations++;
+        g_numa_allocator.local_allocation_time_ns += 
+            allocation_time * 1000000 / TIMER_HZ;
+        spin_unlock(&g_numa_allocator.lock);
+        
+        return result;
+    }
+    
+    /* Fallback to other nodes if policy allows */
+    if (g_numa_allocator.policy != NUMA_POLICY_BIND && 
+        g_numa_allocator.policy != NUMA_POLICY_LOCAL) {
+        
+        /* Try nodes in order of proximity */
+        for (uint32_t distance = 1; distance < g_advanced_vmm.numa_node_count; distance++) {
+            for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+                if (i == target_node) continue;
+                
+                /* Check if node is allowed */
+                if (!(g_numa_allocator.node_mask & (1U << i))) continue;
+                
+                /* Check distance */
+                if (numa_distance_matrix[target_node][i] == (10 + distance * 10)) {
+                    result = vmm_alloc_numa(size, i, 0);
+                    if (result) {
+                        /* Remote allocation succeeded */
+                        uint64_t allocation_time = timer_get_ticks() - start_time;
+                        
+                        spin_lock(&g_numa_allocator.lock);
+                        g_numa_allocator.remote_allocations++;
+                        g_numa_allocator.remote_allocation_time_ns += 
+                            allocation_time * 1000000 / TIMER_HZ;
+                        spin_unlock(&g_numa_allocator.lock);
+                        
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+    
+    /* All allocations failed */
+    spin_lock(&g_numa_allocator.lock);
+    g_numa_allocator.failed_allocations++;
+    spin_unlock(&g_numa_allocator.lock);
+    
+    return NULL;
+}
+
+/* Get NUMA allocation statistics */
+status_t numa_get_allocation_stats(numa_alloc_stats_t* stats) {
+    if (!stats) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_numa_allocator.lock);
+    
+    k_memset(stats, 0, sizeof(numa_alloc_stats_t));
+    
+    stats->policy = g_numa_allocator.policy;
+    stats->node_mask = g_numa_allocator.node_mask;
+    stats->preferred_node = g_numa_allocator.preferred_node;
+    
+    stats->local_allocations = g_numa_allocator.local_allocations;
+    stats->remote_allocations = g_numa_allocator.remote_allocations;
+    stats->failed_allocations = g_numa_allocator.failed_allocations;
+    
+    uint64_t total_allocs = stats->local_allocations + stats->remote_allocations;
+    if (total_allocs > 0) {
+        stats->local_hit_rate_percent = (stats->local_allocations * 100) / total_allocs;
+    }
+    
+    if (g_numa_allocator.local_allocations > 0) {
+        stats->average_local_time_ns = 
+            g_numa_allocator.local_allocation_time_ns / g_numa_allocator.local_allocations;
+    }
+    
+    if (g_numa_allocator.remote_allocations > 0) {
+        stats->average_remote_time_ns = 
+            g_numa_allocator.remote_allocation_time_ns / g_numa_allocator.remote_allocations;
+    }
+    
+    spin_unlock(&g_numa_allocator.lock);
+    
+    return STATUS_OK;
+}
+
+/* Balance NUMA usage across nodes */
+status_t memory_balance_numa_usage(void) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("Balancing NUMA memory usage...\n");
+    
+    /* Calculate average usage across nodes */
+    uint64_t total_used = 0;
+    uint32_t active_nodes = 0;
+    
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        numa_node_t* node = &g_advanced_vmm.numa_nodes[i];
+        if (node->total_pages > 0) {
+            total_used += (node->total_pages - node->free_pages);
+            active_nodes++;
+        }
+    }
+    
+    if (active_nodes == 0) {
+        return STATUS_OK;  /* No active nodes */
+    }
+    
+    uint64_t average_usage = total_used / active_nodes;
+    uint32_t imbalanced_nodes = 0;
+    
+    /* Check for imbalanced nodes */
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        numa_node_t* node = &g_advanced_vmm.numa_nodes[i];
+        if (node->total_pages == 0) continue;
+        
+        uint64_t node_used = node->total_pages - node->free_pages;
+        uint64_t usage_diff = (node_used > average_usage) ? 
+                             (node_used - average_usage) : (average_usage - node_used);
+        
+        /* If node usage differs by more than 20% from average */
+        if ((usage_diff * 100) / average_usage > 20) {
+            imbalanced_nodes++;
+            console_printf("  Node %u: %llu%% usage (avg: %llu%%)\n", 
+                          i, (node_used * 100) / node->total_pages,
+                          (average_usage * 100) / (total_used / g_advanced_vmm.numa_node_count));
+        }
+    }
+    
+    if (imbalanced_nodes > 0) {
+        console_printf("Found %u imbalanced NUMA nodes\n", imbalanced_nodes);
+        /* In real implementation, would migrate pages between nodes */
+    } else {
+        console_printf("NUMA memory usage is balanced\n");
+    }
+    
+    return STATUS_OK;
+}
+
+/* Dump NUMA statistics */
+status_t memory_dump_numa_stats(void) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("=== NUMA Memory Statistics ===\n");
+    console_printf("NUMA Nodes: %u\n", g_advanced_vmm.numa_node_count);
+    console_printf("Current Node: %u\n", g_advanced_vmm.current_node);
+    
+    /* NUMA allocator statistics */
+    numa_alloc_stats_t alloc_stats;
+    if (numa_get_allocation_stats(&alloc_stats) == STATUS_OK) {
+        console_printf("\nAllocation Policy: %u (mask: 0x%X)\n", 
+                      alloc_stats.policy, alloc_stats.node_mask);
+        console_printf("Local Allocations: %llu\n", alloc_stats.local_allocations);
+        console_printf("Remote Allocations: %llu\n", alloc_stats.remote_allocations);
+        console_printf("Failed Allocations: %llu\n", alloc_stats.failed_allocations);
+        console_printf("Local Hit Rate: %u%%\n", alloc_stats.local_hit_rate_percent);
+        console_printf("Average Local Time: %llu ns\n", alloc_stats.average_local_time_ns);
+        console_printf("Average Remote Time: %llu ns\n", alloc_stats.average_remote_time_ns);
+    }
+    
+    /* Per-node statistics */
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        numa_node_t* node = &g_advanced_vmm.numa_nodes[i];
+        
+        console_printf("\nNUMA Node %u:\n", i);
+        console_printf("  Base Address: 0x%lX\n", node->base_address);
+        console_printf("  Size: %llu MB\n", node->size / (1024 * 1024));
+        console_printf("  CPU Mask: 0x%X\n", node->cpu_mask);
+        console_printf("  Access Latency: %u ns\n", node->access_latency_ns);
+        console_printf("  Bandwidth: %u MB/s\n", node->bandwidth_mbps);
+        console_printf("  Total Pages: %llu\n", node->total_pages);
+        console_printf("  Free Pages: %llu\n", node->free_pages);
+        console_printf("  Cached Pages: %llu\n", node->cached_pages);
+        console_printf("  Active Pages: %llu\n", node->active_pages);
+        console_printf("  Usage: %llu%%\n", 
+                      node->total_pages ? ((node->total_pages - node->free_pages) * 100) / node->total_pages : 0);
+        
+        /* Zone information */
+        for (uint32_t z = 0; z < MAX_MEMORY_ZONES; z++) {
+            if (node->zones[z].end_pfn > node->zones[z].start_pfn) {
+                console_printf("    Zone %s: PFN %llu-%llu (%llu pages, %llu free)\n",
+                              zone_names[z], node->zones[z].start_pfn, node->zones[z].end_pfn,
+                              node->zones[z].end_pfn - node->zones[z].start_pfn,
+                              node->zones[z].free_pages);
+            }
+        }
+    }
+    
+    /* Distance matrix */
+    console_printf("\nNUMA Distance Matrix:\n");
+    console_printf("     ");
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        console_printf("%3u ", i);
+    }
+    console_printf("\n");
+    
+    for (uint32_t i = 0; i < g_advanced_vmm.numa_node_count; i++) {
+        console_printf("%3u: ", i);
+        for (uint32_t j = 0; j < g_advanced_vmm.numa_node_count; j++) {
+            console_printf("%3u ", numa_distance_matrix[i][j]);
+        }
+        console_printf("\n");
+    }
+    
+    console_printf("\n=== End NUMA Statistics ===\n");
+    
+    return STATUS_OK;
+}
+
+/* Register NUMA node */
+status_t numa_register_node(uint32_t node_id, uint64_t base, uint64_t size, uint32_t cpu_mask) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (node_id >= MAX_NUMA_NODES || g_advanced_vmm.numa_node_count >= MAX_NUMA_NODES) {
+        return STATUS_ERROR;
+    }
+    
+    numa_node_t* node = &g_advanced_vmm.numa_nodes[node_id];
+    
+    node->node_id = node_id;
+    node->base_address = base;
+    node->size = size;
+    node->cpu_mask = cpu_mask;
+    node->access_latency_ns = 100 + (node_id * 10);  /* Simulate increasing latency */
+    node->bandwidth_mbps = 10000 - (node_id * 1000); /* Simulate decreasing bandwidth */
+    node->total_pages = size / PAGE_SIZE;
+    node->free_pages = node->total_pages;
+    
+    spinlock_init(&node->lock);
+    
+    if (node_id >= g_advanced_vmm.numa_node_count) {
+        g_advanced_vmm.numa_node_count = node_id + 1;
+    }
+    
+    console_printf("Registered NUMA node %u: %llu MB at 0x%lX (CPUs: 0x%X)\n",
+                  node_id, size / (1024 * 1024), base, cpu_mask);
+    
+    return STATUS_OK;
+}

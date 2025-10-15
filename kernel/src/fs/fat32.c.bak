@@ -1,0 +1,358 @@
+/* FAT32 filesystem (read-only minimal) */
+#if 1
+#include "kernel.h"
+#include "log.h"
+#include "vfs.h"
+#include "fs/fat32.h"
+#include "kmem.h" /* kalloc/kfree */
+
+/*
+ Minimal FAT32 reader (read-only)
+ Supports:
+    - BPB parsing
+    - Cluster chain following
+    - Short name directory lookup/list
+    - File read
+
+ Limitations:
+  - No write
+  - No long file names (LFN)
+*/
+
+#pragma pack(push,1)
+typedef struct {
+    u8  jmpBoot[3];
+    u8  OEMName[8];
+    u16 BytsPerSec;
+    u8  SecPerClus;
+    u16 RsvdSecCnt;
+    u8  NumFATs;
+    u16 RootEntCnt;
+    u16 TotSec16;
+    u8  Media;
+    u16 FATSz16;
+    u16 SecPerTrk;
+    u16 NumHeads;
+    u32 HiddSec;
+    u32 TotSec32;
+    u32 FATSz32;
+    u16 ExtFlags;
+    u16 FSVer;
+    u32 RootClus;
+    u16 FSInfo;
+    u16 BkBootSec;
+    u8  Reserved[12];
+    u8  DrvNum;
+    u8  Reserved1;
+    u8  BootSig;
+    u32 VolID;
+    u8  VolLab[11];
+    u8  FilSysType[8];
+} fat32_bpb_t;
+
+typedef struct {
+    u8  Name[11];
+    u8  Attr;
+    u8  NTRes;
+    u8  CrtTimeTenth;
+    u16 CrtTime;
+    u16 CrtDate;
+    u16 LstAccDate;
+    u16 FstClusHI;
+    u16 WrtTime;
+    u16 WrtDate;
+    u16 FstClusLO;
+    u32 FileSize;
+} fat32_dirent_t;
+#pragma pack(pop)
+
+#define ATTR_DIRECTORY 0x10
+#define IS_FREE(name0) ((name0)==0xE5 || (name0)==0x00)
+
+typedef struct {
+    block_dev_t* bdev;
+    u32 byps;
+    u32 spc;
+    u32 rsvd;
+    u32 nfats;
+    u32 fatsz;
+    u32 root_clus;
+    u32 first_fat_sector;
+    u32 first_data_sector;
+} fat32_sb_info;
+
+typedef struct {
+    fat32_sb_info* sbi;
+    u32 start_cluster;
+    u32 size;
+    int is_dir;
+} fat32_inode;
+
+static int fat32_read_sector(fat32_sb_info* sbi, u32 sector, void* buf) {
+    return bdev_read_bytes(sbi->bdev, (u64)sector * sbi->byps, buf, sbi->byps);
+}
+
+static u32 clus_to_first_sector(fat32_sb_info* sbi, u32 clus) {
+    return sbi->first_data_sector + (clus - 2) * sbi->spc;
+}
+
+static int fat32_read_fat_entry(fat32_sb_info* sbi, u32 clus, u32* out) {
+    u32 fatOffset = clus * 4;
+    u32 fatSec = sbi->first_fat_sector + (fatOffset / sbi->byps);
+    u32 entOff = fatOffset % sbi->byps;
+    u8* buf = (u8*)kalloc(sbi->byps);
+    if (!buf) return K_ENOMEM;
+    int rc = fat32_read_sector(sbi, fatSec, buf);
+    if (rc != 0) { kfree(buf); return rc; }
+    u32 val = *(u32*)(buf + entOff);
+    kfree(buf);
+    *out = val & 0x0FFFFFFF;
+    return 0;
+}
+
+static int fat32_is_eoc(u32 clus) {
+    return clus >= 0x0FFFFFF8;
+}
+
+static int fat32_read_cluster(fat32_sb_info* sbi, u32 clus, void* buf) {
+    u32 first = clus_to_first_sector(sbi, clus);
+    for (u32 i=0;i<sbi->spc;i++) {
+        int rc = fat32_read_sector(sbi, first + i, (u8*)buf + i * sbi->byps);
+        if (rc!=0) return rc;
+    }
+    return 0;
+}
+
+/* Short name compare (8.3) */
+static int fat32_name_match(const char* want, size_t wantlen, const u8 name83[11]) {
+    char temp[12];
+    int p = 0;
+    for (int i=0;i<8 && name83[i]!=' '; i++) temp[p++] = (char)name83[i];
+    if (name83[8] != ' ') {
+        temp[p++] = '.';
+        for (int i=8;i<11 && name83[i]!=' '; i++) temp[p++] = (char)name83[i];
+    }
+    temp[p] = 0;
+    if (k_strlen(want) != (size_t)p) return 0;
+    for (int i=0;i<p;i++) {
+        char a = temp[i]; char b = want[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int fat32_dir_iterate(fat32_inode* dir, vfs_dirent_cb cb, void* ctx) {
+    fat32_sb_info* sbi = dir->sbi;
+    u32 clus = dir->start_cluster;
+    u32 clus_bytes = sbi->spc * sbi->byps;
+    u8* buf = (u8*)kalloc(clus_bytes);
+    if (!buf) return K_ENOMEM;
+    while (!fat32_is_eoc(clus)) {
+        if (fat32_read_cluster(sbi, clus, buf) != 0) break;
+        for (u32 off=0; off<clus_bytes; off += sizeof(fat32_dirent_t)) {
+            fat32_dirent_t* de = (fat32_dirent_t*)(buf + off);
+            if (IS_FREE(de->Name[0]) || de->Name[0]==0x2E) continue;
+            if (de->Attr == 0x0F) continue; /* LFN skip */
+            int isdir = (de->Attr & ATTR_DIRECTORY) ? 1 : 0;
+            cb((const char*)de->Name, 11, isdir, ctx); /* caller may need translation */
+        }
+        u32 next;
+        if (fat32_read_fat_entry(sbi, clus, &next) != 0) break;
+        if (fat32_is_eoc(next)) break;
+        clus = next;
+    }
+    kfree(buf);
+    return 0;
+}
+
+static struct vnode* fat32_lookup_vnode(struct vnode* dirvn, const char* name, size_t namelen);
+
+static long fat32_file_read(vnode_t* vn, u64 off, void* buf, size_t len) {
+    fat32_inode* in = (fat32_inode*)vn->fs_priv;
+    if (!in || in->is_dir) return K_EISDIR;
+    if (off >= in->size) return 0;
+    if (off + len > in->size) len = (size_t)(in->size - off);
+
+    fat32_sb_info* sbi = in->sbi;
+    u32 clus_bytes = sbi->spc * sbi->byps;
+    u8* out = (u8*)buf;
+    size_t remain = len;
+
+    u32 clus = in->start_cluster;
+    u64 pos = 0;
+    u8* cbuf = (u8*)kalloc(clus_bytes);
+    if (!cbuf) return K_ENOMEM;
+
+    while (!fat32_is_eoc(clus) && remain) {
+        if (fat32_read_cluster(sbi, clus, cbuf) != 0) { kfree(cbuf); return K_EIO; }
+        if (pos + clus_bytes <= off) {
+            pos += clus_bytes;
+        } else {
+            u32 inner_off = (off > pos) ? (u32)(off - pos) : 0;
+            u32 can = clus_bytes - inner_off; if (can > remain) can = (u32)remain;
+            k_memcpy(out, cbuf + inner_off, can);
+            out += can; remain -= can; off += can; pos += clus_bytes;
+        }
+        u32 next;
+        if (fat32_read_fat_entry(sbi, clus, &next) != 0) break;
+        clus = next;
+    }
+    kfree(cbuf);
+    return (long)len;
+}
+
+struct fat32_ctx {
+    vfs_dirent_cb cb;
+    void* ctx;
+};
+static int fat32_shim(const char* name83, size_t nlen, int is_dir, void* p) {
+    struct fat32_ctx* c = (struct fat32_ctx*)p;
+    char temp[13];
+    int pz = 0;
+    const u8* nm = (const u8*)name83;
+    for (int i=0;i<8 && nm[i]!=' '; i++) temp[pz++] = (char)nm[i];
+    if (nm[8] != ' ') {
+        temp[pz++] = '.';
+        for (int i=8;i<11 && nm[i]!=' '; i++) temp[pz++] = (char)nm[i];
+    }
+    temp[pz] = 0;
+    return c->cb(temp, (size_t)pz, is_dir, c->ctx);
+}
+static int fat32_readdir(vnode_t* dirvn, vfs_dirent_cb cb, void* ctx) {
+    fat32_inode* in = (fat32_inode*)dirvn->fs_priv;
+    if (!in || !in->is_dir) return K_ENOTDIR;
+    struct fat32_ctx lctx = { cb, ctx };
+    return fat32_dir_iterate(in, fat32_shim, &lctx);
+}
+
+static vnode_t* fat32_lookup_vnode(vnode_t* dirvn, const char* name, size_t namelen) {
+    fat32_inode* dir = (fat32_inode*)dirvn->fs_priv;
+    if (!dir || !dir->is_dir) return NULL;
+    fat32_sb_info* sbi = dir->sbi;
+    u32 clus = dir->start_cluster;
+    u32 clus_bytes = sbi->spc * sbi->byps;
+    u8* buf = (u8*)kalloc(clus_bytes);
+    if (!buf) return NULL;
+
+    vnode_t* found = NULL;
+
+    while (!fat32_is_eoc(clus)) {
+        if (fat32_read_cluster(sbi, clus, buf) != 0) break;
+        for (u32 off=0; off<clus_bytes; off += sizeof(fat32_dirent_t)) {
+            fat32_dirent_t* de = (fat32_dirent_t*)(buf + off);
+            if (IS_FREE(de->Name[0]) || de->Name[0]==0x2E) continue;
+            if (de->Attr == 0x0F) continue; /* LFN */
+            if (fat32_name_match(name, namelen, de->Name)) {
+                fat32_inode* child = (fat32_inode*)kalloc(sizeof(fat32_inode));
+                if (!child) { kfree(buf); return NULL; }
+                u32 clus_no = ((u32)de->FstClusHI << 16) | de->FstClusLO;
+                child->sbi = sbi;
+                child->start_cluster = clus_no;
+                child->size = de->FileSize;
+                child->is_dir = (de->Attr & ATTR_DIRECTORY)?1:0;
+
+                vnode_t* vn = (vnode_t*)kalloc(sizeof(vnode_t));
+                if (!vn) { kfree(child); kfree(buf); return NULL; }
+                vn->mnt = dirvn->mnt;
+                vn->type = child->is_dir ? VNODE_DIR : VNODE_FILE;
+                vn->size = child->size;
+                vn->ino = clus_no;
+                vn->fs_priv = child;
+                static const vnode_ops_t ops = {
+                    .read = fat32_file_read,
+                    .readdir = fat32_readdir,
+                    .lookup = fat32_lookup_vnode,
+                    .release = NULL
+                };
+                vn->ops = &ops;
+                found = vn;
+                goto done;
+            }
+        }
+        u32 next;
+        if (fat32_read_fat_entry(sbi, clus, &next) != 0) break;
+        if (fat32_is_eoc(next)) break;
+        clus = next;
+    }
+
+done:
+    kfree(buf);
+    return found;
+}
+
+static vnode_t* fat32_get_root(vfs_super_t* sb) {
+    fat32_sb_info* sbi = (fat32_sb_info*)sb->fs_priv;
+    fat32_inode* ri = (fat32_inode*)kalloc(sizeof(fat32_inode));
+    if (!ri) return NULL;
+    ri->sbi = sbi;
+    ri->start_cluster = sbi->root_clus;
+    ri->size = 0xFFFFFFFFu;
+    ri->is_dir = 1;
+
+    vnode_t* vn = (vnode_t*)kalloc(sizeof(vnode_t));
+    if (!vn) { kfree(ri); return NULL; }
+    vn->mnt = sb->mnt;
+    vn->type = VNODE_DIR;
+    vn->size = 0;
+    vn->ino = sbi->root_clus;
+    vn->fs_priv = ri;
+    static const vnode_ops_t ops = {
+        .read = fat32_file_read,
+        .readdir = fat32_readdir,
+        .lookup = fat32_lookup_vnode,
+        .release = NULL
+    };
+    vn->ops = &ops;
+    return vn;
+}
+
+static const vfs_super_ops_t g_fat32_sops = {
+    .get_root = fat32_get_root,
+    .put_super = NULL
+};
+
+static int fat32_mount(block_dev_t* bdev, vfs_super_t** out_sb) {
+    if (!bdev || !out_sb) return K_EINVAL;
+    fat32_bpb_t bpb;
+    if (bdev_read_bytes(bdev, 0, &bpb, sizeof(bpb)) != 0) return K_EIO;
+
+    u16 byps = bpb.BytsPerSec;
+    u8 spc = bpb.SecPerClus;
+    u16 rsvd = bpb.RsvdSecCnt;
+    u8 nfats = bpb.NumFATs;
+    u32 fatsz = bpb.FATSz16 ? bpb.FATSz16 : bpb.FATSz32;
+    u32 rootclus = bpb.RootClus ? bpb.RootClus : 2;
+
+    fat32_sb_info* sbi = (fat32_sb_info*)kalloc(sizeof(fat32_sb_info));
+    if (!sbi) return K_ENOMEM;
+    sbi->bdev = bdev;
+    sbi->byps = byps;
+    sbi->spc = spc;
+    sbi->rsvd = rsvd;
+    sbi->nfats = nfats;
+    sbi->fatsz = fatsz;
+    sbi->root_clus = rootclus;
+    sbi->first_fat_sector = rsvd;
+    sbi->first_data_sector = rsvd + nfats * fatsz;
+
+    vfs_super_t* sb = (vfs_super_t*)kalloc(sizeof(vfs_super_t));
+    if (!sb) { kfree(sbi); return K_ENOMEM; }
+    sb->bdev = bdev;
+    sb->block_size = byps * spc;
+    sb->fs_priv = sbi;
+    sb->ops = &g_fat32_sops;
+    *out_sb = sb;
+
+    KLOG_INFO("fat32", "mounted byps=%u spc=%u rootclus=%u", byps, spc, rootclus);
+    return 0;
+}
+
+const fs_type_t g_fat32_type = {
+    .name = "fat32",
+    .mount = fat32_mount
+};
+
+int fat32_register(void) { return vfs_register_fs(&g_fat32_type); }
+#endif /* fat32 end guard (temporary) */

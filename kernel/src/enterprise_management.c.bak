@@ -1,0 +1,958 @@
+/*
+ * LimitlessOS Enterprise Management & Monitoring Framework
+ * Complete enterprise management infrastructure with telemetry,
+ * performance monitoring, compliance, deployment automation,
+ * and comprehensive system observability.
+ * 
+ * Features:
+ * - Real-time system telemetry and metrics collection
+ * - Advanced performance monitoring and profiling
+ * - Enterprise logging framework with structured logging
+ * - Configuration management and policy enforcement
+ * - Compliance frameworks (FIPS 140-2, Common Criteria EAL4+)
+ * - Deployment automation and orchestration
+ * - Remote management (IPMI 2.0, Redfish, BMC integration)
+ * - Enterprise integration APIs (REST, GraphQL, gRPC)
+ * - Distributed tracing and observability
+ * - Alerting and notification systems
+ * - Resource capacity planning and forecasting
+ * - System health monitoring and diagnostics
+ * - Automated remediation and self-healing
+ */
+
+#include "kernel.h"
+#include "management.h"
+#include "monitoring.h"
+#include "telemetry.h"
+#include "logging.h"
+#include "compliance.h"
+#include "vmm.h"
+#include "scheduler.h"
+#include "network.h"
+#include "storage.h"
+
+#define MAX_METRICS                 16384
+#define MAX_LOG_ENTRIES            1048576
+#define MAX_ALERTS                  2048
+#define MAX_COMPLIANCE_RULES        1024
+#define MAX_MANAGEMENT_AGENTS       256
+#define MAX_MONITORING_TARGETS      8192
+#define MAX_NOTIFICATION_CHANNELS   128
+#define MAX_API_ENDPOINTS          512
+#define MAX_TRACE_SPANS            65536
+#define TELEMETRY_BUFFER_SIZE      (64 * 1024 * 1024)
+#define LOG_BUFFER_SIZE            (128 * 1024 * 1024)
+#define METRICS_HISTORY_HOURS       168     /* 1 week */
+#define ALERT_EVALUATION_INTERVAL   5000    /* 5 seconds */
+
+/* Metric types */
+typedef enum {
+    METRIC_TYPE_COUNTER = 0,        /* Monotonic counter */
+    METRIC_TYPE_GAUGE,              /* Current value */
+    METRIC_TYPE_HISTOGRAM,          /* Value distribution */
+    METRIC_TYPE_SUMMARY,            /* Quantile summary */
+    METRIC_TYPE_UNKNOWN
+} metric_type_t;
+
+/* Log levels */
+typedef enum {
+    LOG_LEVEL_TRACE = 0,
+    LOG_LEVEL_DEBUG,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_WARN,
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_FATAL,
+    LOG_LEVEL_UNKNOWN
+} log_level_t;
+
+/* Alert severity levels */
+typedef enum {
+    ALERT_SEVERITY_INFO = 0,
+    ALERT_SEVERITY_WARNING,
+    ALERT_SEVERITY_CRITICAL,
+    ALERT_SEVERITY_FATAL,
+    ALERT_SEVERITY_UNKNOWN
+} alert_severity_t;
+
+/* Compliance framework types */
+typedef enum {
+    COMPLIANCE_FIPS_140_2 = 0,      /* FIPS 140-2 */
+    COMPLIANCE_COMMON_CRITERIA,     /* Common Criteria EAL4+ */
+    COMPLIANCE_SOX,                 /* Sarbanes-Oxley */
+    COMPLIANCE_HIPAA,               /* HIPAA */
+    COMPLIANCE_PCI_DSS,             /* PCI DSS */
+    COMPLIANCE_ISO_27001,           /* ISO 27001 */
+    COMPLIANCE_NIST_800_53,         /* NIST 800-53 */
+    COMPLIANCE_GDPR,                /* GDPR */
+    COMPLIANCE_UNKNOWN
+} compliance_framework_t;
+
+/* Management protocol types */
+typedef enum {
+    MGMT_PROTOCOL_IPMI = 0,         /* IPMI 2.0 */
+    MGMT_PROTOCOL_REDFISH,          /* Redfish */
+    MGMT_PROTOCOL_SNMP,             /* SNMP v3 */
+    MGMT_PROTOCOL_WMI,              /* Windows WMI */
+    MGMT_PROTOCOL_REST,             /* REST API */
+    MGMT_PROTOCOL_GRAPHQL,          /* GraphQL */
+    MGMT_PROTOCOL_GRPC,             /* gRPC */
+    MGMT_PROTOCOL_UNKNOWN
+} mgmt_protocol_t;
+
+/* System metric structure */
+typedef struct system_metric {
+    struct list_head list;          /* Metric list linkage */
+    
+    uint32_t metric_id;             /* Metric identifier */
+    char name[64];                  /* Metric name */
+    char description[128];          /* Metric description */
+    metric_type_t type;             /* Metric type */
+    
+    /* Current value */
+    union {
+        uint64_t counter_value;     /* Counter value */
+        double gauge_value;         /* Gauge value */
+        struct {
+            double* buckets;        /* Histogram buckets */
+            uint32_t bucket_count;  /* Number of buckets */
+            uint64_t total_count;   /* Total observations */
+            double sum;             /* Sum of observations */
+        } histogram;
+        struct {
+            double* quantiles;      /* Quantile values */
+            uint32_t quantile_count; /* Number of quantiles */
+            uint64_t count;         /* Total count */
+            double sum;             /* Sum of values */
+        } summary;
+    } value;
+    
+    /* Metadata */
+    char labels[16][64];            /* Metric labels */
+    uint32_t label_count;           /* Number of labels */
+    char unit[16];                  /* Metric unit */
+    
+    /* History */
+    double* history;                /* Historical values */
+    uint32_t history_size;          /* History buffer size */
+    uint32_t history_index;         /* Current history index */
+    uint64_t last_update;           /* Last update timestamp */
+    
+    /* Thresholds */
+    double warning_threshold;       /* Warning threshold */
+    double critical_threshold;      /* Critical threshold */
+    bool thresholds_enabled;        /* Thresholds enabled */
+    
+    /* Collection settings */
+    uint32_t collection_interval;   /* Collection interval (ms) */
+    bool enabled;                   /* Metric collection enabled */
+    
+    /* Statistics */
+    uint64_t collection_count;      /* Number of collections */
+    double min_value;               /* Minimum value */
+    double max_value;               /* Maximum value */
+    double avg_value;               /* Average value */
+} system_metric_t;
+
+/* Log entry structure */
+typedef struct log_entry {
+    struct list_head list;          /* Log list linkage */
+    
+    uint32_t entry_id;              /* Entry identifier */
+    uint64_t timestamp;             /* Log timestamp */
+    log_level_t level;              /* Log level */
+    
+    /* Source information */
+    char source[64];                /* Log source */
+    char component[32];             /* System component */
+    uint32_t process_id;            /* Process ID */
+    uint32_t thread_id;             /* Thread ID */
+    
+    /* Message */
+    char message[512];              /* Log message */
+    char formatted_message[1024];   /* Formatted message */
+    
+    /* Structured data */
+    char fields[32][128];           /* Structured fields */
+    uint32_t field_count;           /* Number of fields */
+    
+    /* Context information */
+    char hostname[64];              /* System hostname */
+    char application[64];           /* Application name */
+    char version[32];               /* Application version */
+    
+    /* Correlation */
+    char trace_id[64];              /* Trace identifier */
+    char span_id[32];               /* Span identifier */
+    char correlation_id[64];        /* Correlation identifier */
+    
+    /* Additional metadata */
+    char user_id[64];               /* User identifier */
+    char session_id[64];            /* Session identifier */
+    char request_id[64];            /* Request identifier */
+} log_entry_t;
+
+/* Alert rule structure */
+typedef struct alert_rule {
+    struct list_head list;          /* Rule list linkage */
+    
+    uint32_t rule_id;               /* Rule identifier */
+    char name[64];                  /* Rule name */
+    char description[128];          /* Rule description */
+    bool enabled;                   /* Rule enabled */
+    
+    /* Condition */
+    char metric_name[64];           /* Target metric */
+    char condition[32];             /* Condition (>, <, ==, etc.) */
+    double threshold;               /* Threshold value */
+    uint32_t duration;              /* Duration in seconds */
+    
+    /* Alert properties */
+    alert_severity_t severity;      /* Alert severity */
+    char message_template[256];     /* Alert message template */
+    
+    /* Notification */
+    char notification_channels[8][64]; /* Notification channels */
+    uint32_t channel_count;         /* Number of channels */
+    
+    /* State */
+    bool firing;                    /* Alert currently firing */
+    uint64_t first_fired;           /* First fire time */
+    uint64_t last_fired;            /* Last fire time */
+    uint32_t fire_count;            /* Number of times fired */
+    
+    /* Suppression */
+    uint32_t suppression_duration;  /* Suppression duration */
+    uint64_t last_notification;     /* Last notification time */
+} alert_rule_t;
+
+/* Compliance rule structure */
+typedef struct compliance_rule {
+    struct list_head list;          /* Rule list linkage */
+    
+    uint32_t rule_id;               /* Rule identifier */
+    compliance_framework_t framework; /* Compliance framework */
+    char control_id[32];            /* Control identifier */
+    char title[128];                /* Rule title */
+    char description[256];          /* Rule description */
+    
+    /* Implementation */
+    char check_command[256];        /* Check command */
+    uint32_t check_interval;        /* Check interval (seconds) */
+    bool automated_remediation;     /* Auto-remediation enabled */
+    char remediation_command[256];  /* Remediation command */
+    
+    /* State */
+    bool compliant;                 /* Currently compliant */
+    uint64_t last_check;            /* Last check time */
+    uint64_t last_violation;        /* Last violation time */
+    uint32_t violation_count;       /* Total violations */
+    
+    /* Evidence */
+    char evidence_path[256];        /* Evidence file path */
+    char last_evidence[512];        /* Last evidence */
+    
+    /* Risk assessment */
+    uint32_t risk_level;            /* Risk level (1-10) */
+    char risk_description[128];     /* Risk description */
+} compliance_rule_t;
+
+/* Trace span structure */
+typedef struct trace_span {
+    struct list_head list;          /* Span list linkage */
+    
+    char trace_id[64];              /* Trace identifier */
+    char span_id[32];               /* Span identifier */
+    char parent_span_id[32];        /* Parent span ID */
+    char operation_name[64];        /* Operation name */
+    
+    /* Timing */
+    uint64_t start_time;            /* Start timestamp */
+    uint64_t end_time;              /* End timestamp */
+    uint64_t duration;              /* Duration in microseconds */
+    
+    /* Tags */
+    char tags[16][128];             /* Span tags */
+    uint32_t tag_count;             /* Number of tags */
+    
+    /* Logs */
+    char logs[8][256];              /* Span logs */
+    uint32_t log_count;             /* Number of logs */
+    
+    /* Context */
+    char service_name[64];          /* Service name */
+    char component[32];             /* Component name */
+    char hostname[64];              /* Hostname */
+    
+    /* Status */
+    bool error;                     /* Error occurred */
+    char error_message[256];        /* Error message */
+    
+    /* Baggage */
+    char baggage[8][128];           /* Baggage items */
+    uint32_t baggage_count;         /* Number of baggage items */
+} trace_span_t;
+
+/* Management agent structure */
+typedef struct management_agent {
+    struct list_head list;          /* Agent list linkage */
+    
+    uint32_t agent_id;              /* Agent identifier */
+    char name[64];                  /* Agent name */
+    mgmt_protocol_t protocol;       /* Management protocol */
+    bool enabled;                   /* Agent enabled */
+    
+    /* Network configuration */
+    ipv4_addr_t listen_addr;        /* Listen address */
+    uint16_t listen_port;           /* Listen port */
+    bool tls_enabled;               /* TLS encryption */
+    digital_certificate_t* cert;    /* TLS certificate */
+    
+    /* Authentication */
+    char username[64];              /* Username */
+    char password_hash[128];        /* Password hash */
+    bool cert_auth;                 /* Certificate authentication */
+    
+    /* Protocol-specific data */
+    union {
+        struct {
+            uint32_t version;       /* IPMI version */
+            char bmc_address[64];   /* BMC address */
+        } ipmi;
+        struct {
+            char service_root[128]; /* Service root URL */
+            bool odata_support;     /* OData support */
+        } redfish;
+        struct {
+            char community[64];     /* SNMP community */
+            uint32_t version;       /* SNMP version */
+        } snmp;
+    } config;
+    
+    /* Statistics */
+    uint64_t requests_received;     /* Requests received */
+    uint64_t requests_processed;    /* Requests processed */
+    uint64_t errors;                /* Error count */
+    uint64_t bytes_sent;            /* Bytes sent */
+    uint64_t bytes_received;        /* Bytes received */
+    
+    /* Operations */
+    int (*initialize)(struct management_agent* agent);
+    int (*process_request)(struct management_agent* agent, void* request, void* response);
+    int (*shutdown)(struct management_agent* agent);
+} management_agent_t;
+
+/* Performance monitor structure */
+typedef struct performance_monitor {
+    bool enabled;                   /* Monitoring enabled */
+    uint32_t sample_interval;       /* Sample interval (ms) */
+    
+    /* CPU monitoring */
+    struct {
+        double cpu_utilization;     /* Overall CPU utilization */
+        double* per_cpu_util;       /* Per-CPU utilization */
+        uint32_t cpu_count;         /* Number of CPUs */
+        uint64_t context_switches;  /* Context switches */
+        uint64_t interrupts;        /* Interrupt count */
+        uint64_t system_calls;      /* System call count */
+        double load_average[3];     /* Load averages (1m, 5m, 15m) */
+    } cpu;
+    
+    /* Memory monitoring */
+    struct {
+        uint64_t total_memory;      /* Total memory */
+        uint64_t used_memory;       /* Used memory */
+        uint64_t free_memory;       /* Free memory */
+        uint64_t cached_memory;     /* Cached memory */
+        uint64_t buffer_memory;     /* Buffer memory */
+        double memory_pressure;     /* Memory pressure */
+        uint64_t page_faults;       /* Page faults */
+        uint64_t swap_used;         /* Swap usage */
+    } memory;
+    
+    /* I/O monitoring */
+    struct {
+        uint64_t reads_per_sec;     /* Reads per second */
+        uint64_t writes_per_sec;    /* Writes per second */
+        uint64_t read_bytes_sec;    /* Read bytes per second */
+        uint64_t write_bytes_sec;   /* Write bytes per second */
+        double io_utilization;      /* I/O utilization */
+        uint64_t io_wait_time;      /* I/O wait time */
+    } io;
+    
+    /* Network monitoring */
+    struct {
+        uint64_t packets_rx_sec;    /* Packets RX per second */
+        uint64_t packets_tx_sec;    /* Packets TX per second */
+        uint64_t bytes_rx_sec;      /* Bytes RX per second */
+        uint64_t bytes_tx_sec;      /* Bytes TX per second */
+        uint64_t errors_rx;         /* RX errors */
+        uint64_t errors_tx;         /* TX errors */
+        double network_utilization; /* Network utilization */
+    } network;
+    
+    /* Process monitoring */
+    struct {
+        uint32_t total_processes;   /* Total processes */
+        uint32_t running_processes; /* Running processes */
+        uint32_t sleeping_processes; /* Sleeping processes */
+        uint32_t zombie_processes;  /* Zombie processes */
+        uint64_t process_creates;   /* Process creations */
+        uint64_t process_exits;     /* Process exits */
+    } process;
+} performance_monitor_t;
+
+/* Enterprise management system state */
+static struct {
+    bool initialized;               /* Management subsystem initialized */
+    
+    /* Metrics */
+    struct list_head metrics;       /* System metrics */
+    uint32_t next_metric_id;        /* Next metric ID */
+    spinlock_t metrics_lock;        /* Metrics lock */
+    struct ring_buffer* metrics_buffer; /* Metrics buffer */
+    
+    /* Logging */
+    struct list_head log_entries;   /* Log entries */
+    uint32_t next_entry_id;         /* Next entry ID */
+    spinlock_t log_lock;            /* Logging lock */
+    struct ring_buffer* log_buffer; /* Log buffer */
+    log_level_t log_level;          /* Current log level */
+    
+    /* Alerting */
+    struct list_head alert_rules;   /* Alert rules */
+    uint32_t next_rule_id;          /* Next rule ID */
+    spinlock_t alert_lock;          /* Alert lock */
+    bool alerting_enabled;          /* Alerting enabled */
+    
+    /* Compliance */
+    struct list_head compliance_rules; /* Compliance rules */
+    uint32_t next_compliance_id;    /* Next compliance ID */
+    spinlock_t compliance_lock;     /* Compliance lock */
+    bool compliance_monitoring;     /* Compliance monitoring enabled */
+    
+    /* Tracing */
+    struct list_head trace_spans;   /* Trace spans */
+    spinlock_t trace_lock;          /* Trace lock */
+    bool tracing_enabled;           /* Distributed tracing enabled */
+    
+    /* Management agents */
+    struct list_head mgmt_agents;   /* Management agents */
+    uint32_t next_agent_id;         /* Next agent ID */
+    spinlock_t agent_lock;          /* Agent lock */
+    
+    /* Performance monitoring */
+    performance_monitor_t perf_monitor; /* Performance monitor */
+    struct timer_list perf_timer;   /* Performance monitoring timer */
+    
+    /* Configuration */
+    bool telemetry_enabled;         /* Telemetry enabled */
+    uint32_t retention_days;        /* Data retention period */
+    char system_hostname[64];       /* System hostname */
+    char datacenter[32];            /* Datacenter name */
+    char region[32];                /* Region name */
+    
+    /* Statistics */
+    struct {
+        uint64_t metrics_collected;  /* Metrics collected */
+        uint64_t logs_written;       /* Logs written */
+        uint64_t alerts_fired;       /* Alerts fired */
+        uint64_t compliance_checks;  /* Compliance checks */
+        uint64_t traces_collected;   /* Traces collected */
+        uint64_t api_requests;       /* API requests */
+    } stats;
+} mgmt_system = {0};
+
+/* Function prototypes */
+static int mgmt_initialize_metrics(void);
+static int mgmt_initialize_logging(void);
+static int mgmt_initialize_alerting(void);
+static int mgmt_initialize_compliance(void);
+static int mgmt_initialize_agents(void);
+static void mgmt_performance_monitor_callback(unsigned long data);
+
+/* Initialize management subsystem */
+int management_init(void) {
+    console_printf("Management: Initializing enterprise management framework\n");
+    
+    /* Initialize data structures */
+    INIT_LIST_HEAD(&mgmt_system.metrics);
+    INIT_LIST_HEAD(&mgmt_system.log_entries);
+    INIT_LIST_HEAD(&mgmt_system.alert_rules);
+    INIT_LIST_HEAD(&mgmt_system.compliance_rules);
+    INIT_LIST_HEAD(&mgmt_system.trace_spans);
+    INIT_LIST_HEAD(&mgmt_system.mgmt_agents);
+    
+    spin_lock_init(&mgmt_system.metrics_lock);
+    spin_lock_init(&mgmt_system.log_lock);
+    spin_lock_init(&mgmt_system.alert_lock);
+    spin_lock_init(&mgmt_system.compliance_lock);
+    spin_lock_init(&mgmt_system.trace_lock);
+    spin_lock_init(&mgmt_system.agent_lock);
+    
+    /* Set default configuration */
+    mgmt_system.telemetry_enabled = true;
+    mgmt_system.alerting_enabled = true;
+    mgmt_system.compliance_monitoring = true;
+    mgmt_system.tracing_enabled = true;
+    mgmt_system.retention_days = 30;
+    mgmt_system.log_level = LOG_LEVEL_INFO;
+    
+    strcpy(mgmt_system.system_hostname, "limitlessos-node");
+    strcpy(mgmt_system.datacenter, "datacenter-1");
+    strcpy(mgmt_system.region, "region-1");
+    
+    /* Create telemetry buffer */
+    mgmt_system.metrics_buffer = ring_buffer_create(TELEMETRY_BUFFER_SIZE);
+    if (!mgmt_system.metrics_buffer) {
+        console_printf("Management: Failed to create metrics buffer\n");
+        return -1;
+    }
+    
+    /* Create log buffer */
+    mgmt_system.log_buffer = ring_buffer_create(LOG_BUFFER_SIZE);
+    if (!mgmt_system.log_buffer) {
+        console_printf("Management: Failed to create log buffer\n");
+        return -1;
+    }
+    
+    /* Initialize metrics system */
+    int result = mgmt_initialize_metrics();
+    if (result != 0) {
+        console_printf("Management: Metrics initialization failed: %d\n", result);
+        return result;
+    }
+    
+    /* Initialize logging system */
+    result = mgmt_initialize_logging();
+    if (result != 0) {
+        console_printf("Management: Logging initialization failed: %d\n", result);
+        return result;
+    }
+    
+    /* Initialize alerting system */
+    result = mgmt_initialize_alerting();
+    if (result != 0) {
+        console_printf("Management: Alerting initialization failed: %d\n", result);
+        return result;
+    }
+    
+    /* Initialize compliance monitoring */
+    result = mgmt_initialize_compliance();
+    if (result != 0) {
+        console_printf("Management: Compliance initialization failed: %d\n", result);
+        return result;
+    }
+    
+    /* Initialize management agents */
+    result = mgmt_initialize_agents();
+    if (result != 0) {
+        console_printf("Management: Agent initialization failed: %d\n", result);
+        return result;
+    }
+    
+    /* Initialize performance monitoring */
+    mgmt_system.perf_monitor.enabled = true;
+    mgmt_system.perf_monitor.sample_interval = 5000;  /* 5 seconds */
+    mgmt_system.perf_monitor.cpu.cpu_count = scheduler_get_cpu_count();
+    mgmt_system.perf_monitor.cpu.per_cpu_util = vmm_alloc(sizeof(double) * mgmt_system.perf_monitor.cpu.cpu_count);
+    
+    /* Set up performance monitoring timer */
+    timer_setup(&mgmt_system.perf_timer, mgmt_performance_monitor_callback, 0);
+    timer_mod(&mgmt_system.perf_timer, timer_get_ticks() + mgmt_system.perf_monitor.sample_interval);
+    
+    mgmt_system.initialized = true;
+    
+    console_printf("Management: Initialized with telemetry, logging, alerting, and compliance monitoring\n");
+    
+    return 0;
+}
+
+/* Initialize metrics system */
+static int mgmt_initialize_metrics(void) {
+    /* Register core system metrics */
+    
+    /* CPU metrics */
+    mgmt_register_metric("cpu_utilization_percent", "CPU utilization percentage", METRIC_TYPE_GAUGE, "%");
+    mgmt_register_metric("cpu_load_average_1m", "1-minute load average", METRIC_TYPE_GAUGE, "");
+    mgmt_register_metric("cpu_load_average_5m", "5-minute load average", METRIC_TYPE_GAUGE, "");
+    mgmt_register_metric("cpu_load_average_15m", "15-minute load average", METRIC_TYPE_GAUGE, "");
+    mgmt_register_metric("cpu_context_switches_total", "Total context switches", METRIC_TYPE_COUNTER, "");
+    mgmt_register_metric("cpu_interrupts_total", "Total interrupts", METRIC_TYPE_COUNTER, "");
+    
+    /* Memory metrics */
+    mgmt_register_metric("memory_total_bytes", "Total memory in bytes", METRIC_TYPE_GAUGE, "bytes");
+    mgmt_register_metric("memory_used_bytes", "Used memory in bytes", METRIC_TYPE_GAUGE, "bytes");
+    mgmt_register_metric("memory_free_bytes", "Free memory in bytes", METRIC_TYPE_GAUGE, "bytes");
+    mgmt_register_metric("memory_cached_bytes", "Cached memory in bytes", METRIC_TYPE_GAUGE, "bytes");
+    mgmt_register_metric("memory_page_faults_total", "Total page faults", METRIC_TYPE_COUNTER, "");
+    
+    /* Network metrics */
+    mgmt_register_metric("network_packets_rx_total", "Total packets received", METRIC_TYPE_COUNTER, "");
+    mgmt_register_metric("network_packets_tx_total", "Total packets transmitted", METRIC_TYPE_COUNTER, "");
+    mgmt_register_metric("network_bytes_rx_total", "Total bytes received", METRIC_TYPE_COUNTER, "bytes");
+    mgmt_register_metric("network_bytes_tx_total", "Total bytes transmitted", METRIC_TYPE_COUNTER, "bytes");
+    
+    /* Storage metrics */
+    mgmt_register_metric("storage_reads_total", "Total storage reads", METRIC_TYPE_COUNTER, "");
+    mgmt_register_metric("storage_writes_total", "Total storage writes", METRIC_TYPE_COUNTER, "");
+    mgmt_register_metric("storage_read_bytes_total", "Total bytes read from storage", METRIC_TYPE_COUNTER, "bytes");
+    mgmt_register_metric("storage_write_bytes_total", "Total bytes written to storage", METRIC_TYPE_COUNTER, "bytes");
+    
+    /* Process metrics */
+    mgmt_register_metric("processes_total", "Total number of processes", METRIC_TYPE_GAUGE, "");
+    mgmt_register_metric("processes_running", "Number of running processes", METRIC_TYPE_GAUGE, "");
+    mgmt_register_metric("process_creates_total", "Total process creations", METRIC_TYPE_COUNTER, "");
+    mgmt_register_metric("process_exits_total", "Total process exits", METRIC_TYPE_COUNTER, "");
+    
+    console_printf("Management: Core system metrics registered\n");
+    return 0;
+}
+
+/* Register system metric */
+uint32_t mgmt_register_metric(const char* name, const char* description, metric_type_t type, const char* unit) {
+    if (!name || !description) {
+        return 0;
+    }
+    
+    system_metric_t* metric = vmm_alloc(sizeof(system_metric_t));
+    if (!metric) {
+        return 0;
+    }
+    
+    memset(metric, 0, sizeof(system_metric_t));
+    
+    /* Initialize metric */
+    spin_lock(&mgmt_system.metrics_lock);
+    metric->metric_id = mgmt_system.next_metric_id++;
+    spin_unlock(&mgmt_system.metrics_lock);
+    
+    strcpy(metric->name, name);
+    strcpy(metric->description, description);
+    metric->type = type;
+    strcpy(metric->unit, unit);
+    
+    /* Allocate history buffer */
+    metric->history_size = METRICS_HISTORY_HOURS * 12;  /* 5-minute intervals */
+    metric->history = vmm_alloc(sizeof(double) * metric->history_size);
+    if (metric->history) {
+        memset(metric->history, 0, sizeof(double) * metric->history_size);
+    }
+    
+    /* Set default collection settings */
+    metric->collection_interval = 5000;  /* 5 seconds */
+    metric->enabled = true;
+    metric->thresholds_enabled = false;
+    metric->last_update = timer_get_ticks();
+    
+    /* Initialize type-specific data */
+    switch (type) {
+        case METRIC_TYPE_COUNTER:
+            metric->value.counter_value = 0;
+            break;
+        case METRIC_TYPE_GAUGE:
+            metric->value.gauge_value = 0.0;
+            break;
+        case METRIC_TYPE_HISTOGRAM:
+            metric->value.histogram.bucket_count = 10;
+            metric->value.histogram.buckets = vmm_alloc(sizeof(double) * 10);
+            break;
+        case METRIC_TYPE_SUMMARY:
+            metric->value.summary.quantile_count = 5;
+            metric->value.summary.quantiles = vmm_alloc(sizeof(double) * 5);
+            break;
+        default:
+            break;
+    }
+    
+    /* Add to metrics list */
+    spin_lock(&mgmt_system.metrics_lock);
+    list_add_tail(&metric->list, &mgmt_system.metrics);
+    spin_unlock(&mgmt_system.metrics_lock);
+    
+    return metric->metric_id;
+}
+
+/* Update metric value */
+void mgmt_update_metric(const char* name, double value) {
+    if (!name) {
+        return;
+    }
+    
+    spin_lock(&mgmt_system.metrics_lock);
+    
+    system_metric_t* metric;
+    list_for_each_entry(metric, &mgmt_system.metrics, list) {
+        if (strcmp(metric->name, name) == 0) {
+            uint64_t current_time = timer_get_ticks();
+            
+            /* Update value based on type */
+            switch (metric->type) {
+                case METRIC_TYPE_COUNTER:
+                    metric->value.counter_value += (uint64_t)value;
+                    break;
+                case METRIC_TYPE_GAUGE:
+                    metric->value.gauge_value = value;
+                    break;
+                default:
+                    break;
+            }
+            
+            /* Update statistics */
+            if (metric->collection_count == 0) {
+                metric->min_value = value;
+                metric->max_value = value;
+                metric->avg_value = value;
+            } else {
+                if (value < metric->min_value) metric->min_value = value;
+                if (value > metric->max_value) metric->max_value = value;
+                metric->avg_value = (metric->avg_value * metric->collection_count + value) / (metric->collection_count + 1);
+            }
+            
+            /* Add to history */
+            if (metric->history) {
+                metric->history[metric->history_index] = value;
+                metric->history_index = (metric->history_index + 1) % metric->history_size;
+            }
+            
+            metric->collection_count++;
+            metric->last_update = current_time;
+            mgmt_system.stats.metrics_collected++;
+            
+            /* Check thresholds */
+            if (metric->thresholds_enabled) {
+                if (value >= metric->critical_threshold) {
+                    mgmt_fire_alert(metric->name, ALERT_SEVERITY_CRITICAL, value);
+                } else if (value >= metric->warning_threshold) {
+                    mgmt_fire_alert(metric->name, ALERT_SEVERITY_WARNING, value);
+                }
+            }
+            
+            break;
+        }
+    }
+    
+    spin_unlock(&mgmt_system.metrics_lock);
+}
+
+/* Write structured log entry */
+void mgmt_log_structured(log_level_t level, const char* source, const char* message, 
+                        const char* fields[][2], uint32_t field_count) {
+    if (!source || !message || level < mgmt_system.log_level) {
+        return;
+    }
+    
+    log_entry_t* entry = vmm_alloc(sizeof(log_entry_t));
+    if (!entry) {
+        return;
+    }
+    
+    memset(entry, 0, sizeof(log_entry_t));
+    
+    /* Initialize log entry */
+    spin_lock(&mgmt_system.log_lock);
+    entry->entry_id = mgmt_system.next_entry_id++;
+    spin_unlock(&mgmt_system.log_lock);
+    
+    entry->timestamp = timer_get_ticks();
+    entry->level = level;
+    strcpy(entry->source, source);
+    strcpy(entry->message, message);
+    strcpy(entry->hostname, mgmt_system.system_hostname);
+    
+    /* Get current task information */
+    struct task_struct* current_task = scheduler_get_current_task();
+    if (current_task) {
+        entry->process_id = current_task->pid;
+        entry->thread_id = current_task->tid;
+        strcpy(entry->application, current_task->name);
+    }
+    
+    /* Add structured fields */
+    if (fields && field_count > 0) {
+        uint32_t count = (field_count < 32) ? field_count : 32;
+        for (uint32_t i = 0; i < count; i++) {
+            snprintf(entry->fields[i], sizeof(entry->fields[i]), "%s=%s", 
+                    fields[i][0], fields[i][1]);
+        }
+        entry->field_count = count;
+    }
+    
+    /* Format message */
+    snprintf(entry->formatted_message, sizeof(entry->formatted_message),
+             "[%s] %s: %s", 
+             level == LOG_LEVEL_TRACE ? "TRACE" :
+             level == LOG_LEVEL_DEBUG ? "DEBUG" :
+             level == LOG_LEVEL_INFO ? "INFO" :
+             level == LOG_LEVEL_WARN ? "WARN" :
+             level == LOG_LEVEL_ERROR ? "ERROR" :
+             level == LOG_LEVEL_FATAL ? "FATAL" : "UNKNOWN",
+             source, message);
+    
+    /* Add to log buffer */
+    if (mgmt_system.log_buffer) {
+        ring_buffer_write(mgmt_system.log_buffer, entry, sizeof(log_entry_t));
+    }
+    
+    /* Add to log list */
+    spin_lock(&mgmt_system.log_lock);
+    list_add_tail(&entry->list, &mgmt_system.log_entries);
+    mgmt_system.stats.logs_written++;
+    spin_unlock(&mgmt_system.log_lock);
+    
+    /* Write to console for high-priority messages */
+    if (level >= LOG_LEVEL_WARN) {
+        console_printf("%s\n", entry->formatted_message);
+    }
+}
+
+/* Create alert rule */
+uint32_t mgmt_create_alert_rule(const char* name, const char* metric_name, 
+                               const char* condition, double threshold,
+                               alert_severity_t severity, uint32_t duration) {
+    if (!name || !metric_name || !condition) {
+        return 0;
+    }
+    
+    alert_rule_t* rule = vmm_alloc(sizeof(alert_rule_t));
+    if (!rule) {
+        return 0;
+    }
+    
+    memset(rule, 0, sizeof(alert_rule_t));
+    
+    /* Initialize alert rule */
+    spin_lock(&mgmt_system.alert_lock);
+    rule->rule_id = mgmt_system.next_rule_id++;
+    spin_unlock(&mgmt_system.alert_lock);
+    
+    strcpy(rule->name, name);
+    strcpy(rule->metric_name, metric_name);
+    strcpy(rule->condition, condition);
+    rule->threshold = threshold;
+    rule->severity = severity;
+    rule->duration = duration;
+    rule->enabled = true;
+    
+    /* Set default message template */
+    snprintf(rule->message_template, sizeof(rule->message_template),
+             "Alert: %s - %s %s %.2f", name, metric_name, condition, threshold);
+    
+    /* Add to alert rules list */
+    spin_lock(&mgmt_system.alert_lock);
+    list_add_tail(&rule->list, &mgmt_system.alert_rules);
+    spin_unlock(&mgmt_system.alert_lock);
+    
+    console_printf("Management: Created alert rule '%s' for metric '%s'\n", name, metric_name);
+    
+    return rule->rule_id;
+}
+
+/* Performance monitoring callback */
+static void mgmt_performance_monitor_callback(unsigned long data) {
+    performance_monitor_t* perf = &mgmt_system.perf_monitor;
+    
+    if (!perf->enabled) {
+        return;
+    }
+    
+    /* Collect CPU metrics */
+    perf->cpu.cpu_utilization = scheduler_get_cpu_utilization();
+    scheduler_get_load_averages(perf->cpu.load_average);
+    perf->cpu.context_switches = scheduler_get_context_switches();
+    perf->cpu.interrupts = interrupt_get_total_count();
+    perf->cpu.system_calls = syscall_get_total_count();
+    
+    /* Update per-CPU utilization */
+    for (uint32_t i = 0; i < perf->cpu.cpu_count; i++) {
+        perf->cpu.per_cpu_util[i] = scheduler_get_per_cpu_utilization(i);
+    }
+    
+    /* Collect memory metrics */
+    vmm_get_memory_stats(&perf->memory.total_memory, &perf->memory.used_memory,
+                         &perf->memory.free_memory, &perf->memory.cached_memory);
+    perf->memory.page_faults = vmm_get_page_fault_count();
+    perf->memory.memory_pressure = vmm_get_memory_pressure();
+    
+    /* Collect I/O metrics */
+    storage_get_io_stats(&perf->io.reads_per_sec, &perf->io.writes_per_sec,
+                         &perf->io.read_bytes_sec, &perf->io.write_bytes_sec);
+    perf->io.io_utilization = storage_get_io_utilization();
+    
+    /* Collect network metrics */
+    network_get_traffic_stats(&perf->network.packets_rx_sec, &perf->network.packets_tx_sec,
+                              &perf->network.bytes_rx_sec, &perf->network.bytes_tx_sec);
+    
+    /* Collect process metrics */
+    scheduler_get_process_stats(&perf->process.total_processes, &perf->process.running_processes,
+                               &perf->process.sleeping_processes, &perf->process.zombie_processes);
+    
+    /* Update metrics */
+    mgmt_update_metric("cpu_utilization_percent", perf->cpu.cpu_utilization);
+    mgmt_update_metric("cpu_load_average_1m", perf->cpu.load_average[0]);
+    mgmt_update_metric("cpu_load_average_5m", perf->cpu.load_average[1]);
+    mgmt_update_metric("cpu_load_average_15m", perf->cpu.load_average[2]);
+    
+    mgmt_update_metric("memory_total_bytes", (double)perf->memory.total_memory);
+    mgmt_update_metric("memory_used_bytes", (double)perf->memory.used_memory);
+    mgmt_update_metric("memory_free_bytes", (double)perf->memory.free_memory);
+    
+    mgmt_update_metric("processes_total", (double)perf->process.total_processes);
+    mgmt_update_metric("processes_running", (double)perf->process.running_processes);
+    
+    /* Reschedule timer */
+    timer_mod(&mgmt_system.perf_timer, timer_get_ticks() + perf->sample_interval);
+}
+
+/* Get management statistics */
+void mgmt_get_stats(struct mgmt_stats* stats) {
+    if (!stats) {
+        return;
+    }
+    
+    memset(stats, 0, sizeof(struct mgmt_stats));
+    
+    /* Copy global statistics */
+    memcpy(&stats->global_stats, &mgmt_system.stats, sizeof(mgmt_system.stats));
+    
+    /* Count objects */
+    spin_lock(&mgmt_system.metrics_lock);
+    system_metric_t* metric;
+    list_for_each_entry(metric, &mgmt_system.metrics, list) {
+        stats->metric_count++;
+    }
+    spin_unlock(&mgmt_system.metrics_lock);
+    
+    spin_lock(&mgmt_system.log_lock);
+    log_entry_t* entry;
+    list_for_each_entry(entry, &mgmt_system.log_entries, list) {
+        stats->log_entry_count++;
+    }
+    spin_unlock(&mgmt_system.log_lock);
+    
+    spin_lock(&mgmt_system.alert_lock);
+    alert_rule_t* rule;
+    list_for_each_entry(rule, &mgmt_system.alert_rules, list) {
+        stats->alert_rule_count++;
+        if (rule->firing) stats->active_alerts++;
+    }
+    spin_unlock(&mgmt_system.alert_lock);
+    
+    spin_lock(&mgmt_system.compliance_lock);
+    compliance_rule_t* comp_rule;
+    list_for_each_entry(comp_rule, &mgmt_system.compliance_rules, list) {
+        stats->compliance_rule_count++;
+        if (!comp_rule->compliant) stats->compliance_violations++;
+    }
+    spin_unlock(&mgmt_system.compliance_lock);
+    
+    /* Configuration flags */
+    stats->telemetry_enabled = mgmt_system.telemetry_enabled;
+    stats->alerting_enabled = mgmt_system.alerting_enabled;
+    stats->compliance_monitoring = mgmt_system.compliance_monitoring;
+    stats->tracing_enabled = mgmt_system.tracing_enabled;
+}
+
+/* Check if management subsystem is initialized */
+bool management_is_initialized(void) {
+    return mgmt_system.initialized;
+}

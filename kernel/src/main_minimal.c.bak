@@ -1,0 +1,149 @@
+/*
+ * LimitlessOS Enterprise Kernel with GUI Support
+ * Demonstrates P1/P2 frameworks: GPU, WiFi, Crypto, Containers + Graphics
+ */
+
+#include "kernel.h"
+
+/* VGA Text Mode Constants */
+#define VGA_MEMORY 0xB8000
+#define VGA_WIDTH 80
+
+/* Simple VGA print function */
+static int cursor_pos = 0;
+
+void vga_print(const char* str) {
+    volatile short* vga = (volatile short*)VGA_MEMORY;
+    while (*str) {
+        vga[cursor_pos++] = (*str) | (0x07 << 8); /* White on black */
+        str++;
+    }
+}
+
+/* VGA print number helper function */
+void vga_print_num(u32 num) {
+    if (num == 0) {
+        vga_print("0");
+        return;
+    }
+    
+    char buffer[12];
+    int pos = 0;
+    
+    while (num > 0) {
+        buffer[pos++] = '0' + (num % 10);
+        num /= 10;
+    }
+    
+    /* Reverse the string */
+    char result[12];
+    for (int i = 0; i < pos; i++) {
+        result[i] = buffer[pos - 1 - i];
+    }
+    result[pos] = '\0';
+    
+    vga_print(result);
+}
+
+void vga_println(const char* str) {
+    vga_print(str);
+    /* Move to next line */
+    cursor_pos = ((cursor_pos / VGA_WIDTH) + 1) * VGA_WIDTH;
+}
+
+/* External system initialization functions */
+extern void pmm_init(void);
+extern void simple_gui_init(void);
+extern void simple_gui_draw_desktop(void);
+extern void pci_init(void);
+extern void storage_init(void);
+extern void network_init(void);
+extern void simple_fs_init(void);
+extern void network_stack_init(void);
+extern void syscall_init(void);
+extern void compat_init(void);
+extern status_t limitless_main_integration(void);
+
+/* Kernel entry point */
+void kernel_main(void) {
+    /* Clear screen */
+    volatile short* vga = (volatile short*)VGA_MEMORY;
+    for (int i = 0; i < VGA_WIDTH * 25; i++) {
+        vga[i] = 0x0720; /* Space with light gray on black */
+    }
+    cursor_pos = 0;
+    
+    vga_println("LimitlessOS Enterprise Kernel v1.0");
+    vga_println("=====================================");
+    vga_println("");
+    
+    /* Initialize basic memory management first */
+    vga_println("Initializing Core Memory Management...");
+    pmm_init();
+    vga_println("  [OK] Physical Memory Manager");
+    vga_println("");
+    
+    /* Initialize basic graphics */
+    vga_println("Initializing Basic Graphics...");
+    simple_gui_init();
+    simple_gui_draw_desktop();
+    vga_println("  [OK] Basic GUI System");
+    vga_println("");
+    
+    /* Initialize basic hardware */
+    vga_println("Initializing Basic Hardware...");
+    pci_init();
+    vga_println("  [OK] PCI Bus Enumeration");
+    vga_println("");
+    
+    /* Initialize basic file system */
+    vga_println("Initializing Basic File System...");
+    simple_fs_init();
+    vga_println("  [OK] Basic File System");
+    vga_println("");
+    
+    /* Initialize basic networking */
+    vga_println("Initializing Basic Networking...");
+    network_stack_init();
+    vga_println("  [OK] Basic Network Stack");
+    vga_println("");
+    
+    /* Initialize basic system calls */
+    vga_println("Initializing Basic System Calls...");
+    syscall_init();
+    vga_println("  [OK] Basic System Calls");
+    vga_println("");
+    
+    /* Initialize basic compatibility */
+    vga_println("Initializing Basic Compatibility...");
+    compat_init();
+    vga_println("  [OK] Basic Compatibility Layers");
+    vga_println("");
+    
+    vga_println("Basic kernel initialization complete.");
+    vga_println("Starting advanced subsystem integration...");
+    vga_println("");
+    
+    /* Hand off to the integration framework for complete initialization */
+    status_t result = limitless_main_integration();
+    
+    if (result != STATUS_OK) {
+        vga_println("CRITICAL ERROR: Advanced subsystem initialization failed!");
+        vga_print("Error code: ");
+        vga_print_num(result);
+        vga_println("");
+        
+        /* Halt system */
+        while (1) {
+            __asm__ volatile("hlt");
+        }
+    }
+    
+    /* Should not reach here as integration framework runs the main loop */
+    vga_println("Unexpected return from integration framework!");
+    while (1) {
+        __asm__ volatile("hlt");
+    }
+}
+
+/* Boot entry called from assembly boot code */

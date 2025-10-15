@@ -1,0 +1,1 @@
+/* Ramdisk stub */ #include "kernel.h"

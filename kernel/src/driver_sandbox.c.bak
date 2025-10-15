@@ -1,0 +1,585 @@
+/**
+ * Universal Driver Interface and Sandboxing for LimitlessOS
+ * Standardized driver APIs with security isolation
+ */
+
+#include "kernel.h"
+#include "driver_framework.h"
+#include "security.h"
+#include "vmm.h"
+#include "process.h"
+
+/* Universal driver interface definitions */
+#define UDI_VERSION_MAJOR       1
+#define UDI_VERSION_MINOR       0
+#define UDI_API_VERSION        ((UDI_VERSION_MAJOR << 16) | UDI_VERSION_MINOR)
+
+/* Driver sandbox limits */
+#define SANDBOX_MAX_MEMORY     (64 * 1024 * 1024)  /* 64MB */
+#define SANDBOX_MAX_CPU_QUOTA   50                  /* 50% */
+#define SANDBOX_STACK_SIZE     (1 * 1024 * 1024)   /* 1MB */
+#define SANDBOX_HEAP_SIZE      (16 * 1024 * 1024)  /* 16MB */
+
+/* Universal Driver Interface (UDI) */
+typedef struct {
+    uint32_t api_version;
+    
+    /* Driver lifecycle callbacks */
+    status_t (*init)(void* driver_context);
+    status_t (*cleanup)(void* driver_context);
+    status_t (*suspend)(void* driver_context, power_state_t state);
+    status_t (*resume)(void* driver_context);
+    
+    /* Device management callbacks */
+    status_t (*device_probe)(void* driver_context, device_t* device);
+    status_t (*device_remove)(void* driver_context, device_t* device);
+    status_t (*device_reset)(void* driver_context, device_t* device);
+    
+    /* I/O operations */
+    status_t (*read)(void* driver_context, device_t* device, 
+                    void* buffer, size_t size, uint64_t offset);
+    status_t (*write)(void* driver_context, device_t* device, 
+                     const void* buffer, size_t size, uint64_t offset);
+    status_t (*ioctl)(void* driver_context, device_t* device, 
+                     uint32_t cmd, void* arg);
+    
+    /* Interrupt handling */
+    status_t (*interrupt_handler)(void* driver_context, device_t* device, uint32_t irq);
+    
+    /* DMA operations */
+    status_t (*dma_alloc)(void* driver_context, device_t* device, 
+                         size_t size, uint64_t* phys_addr, void** virt_addr);
+    status_t (*dma_free)(void* driver_context, device_t* device, 
+                        void* virt_addr, size_t size);
+    status_t (*dma_sync)(void* driver_context, device_t* device, 
+                        void* virt_addr, size_t size, bool to_device);
+    
+    /* Memory mapping */
+    status_t (*mmap)(void* driver_context, device_t* device, vm_area_t* vma);
+    status_t (*munmap)(void* driver_context, device_t* device, vm_area_t* vma);
+    
+    /* Power management */
+    status_t (*set_power_state)(void* driver_context, device_t* device, power_state_t state);
+    power_state_t (*get_power_state)(void* driver_context, device_t* device);
+    
+    /* Statistics and diagnostics */
+    status_t (*get_stats)(void* driver_context, device_t* device, void* stats_buffer);
+    status_t (*run_diagnostic)(void* driver_context, device_t* device, uint32_t test_id);
+    
+    /* Error handling */
+    status_t (*handle_error)(void* driver_context, device_t* device, uint32_t error_code);
+} udi_interface_t;
+
+/* Driver sandbox context */
+typedef struct {
+    uint32_t sandbox_id;
+    process_t* sandbox_process;
+    thread_t* main_thread;
+    
+    /* Memory management */
+    void* heap_base;
+    size_t heap_size;
+    size_t heap_used;
+    void* stack_base;
+    size_t stack_size;
+    
+    /* Resource limits */
+    uint32_t max_memory;
+    uint32_t max_cpu_quota;
+    uint32_t max_files;
+    uint32_t max_sockets;
+    
+    /* Security context */
+    uint32_t security_level;
+    uint32_t allowed_operations;
+    char security_label[32];
+    
+    /* Performance metrics */
+    uint64_t cpu_time_used;
+    uint64_t memory_peak;
+    uint64_t io_operations;
+    uint64_t syscalls_made;
+    
+    /* Communication channels */
+    struct {
+        void* request_buffer;
+        void* response_buffer;
+        size_t buffer_size;
+        spinlock_t lock;
+    } ipc;
+    
+    spinlock_t lock;
+} driver_sandbox_t;
+
+/* Sandbox system state */
+static struct {
+    bool initialized;
+    uint32_t next_sandbox_id;
+    
+    driver_sandbox_t* sandboxes[MAX_DRIVERS];
+    uint32_t sandbox_count;
+    
+    /* Sandbox resource pools */
+    struct {
+        void* pool_base;
+        size_t pool_size;
+        size_t pool_used;
+        bitmap_t allocation_bitmap;
+    } memory_pool;
+    
+    spinlock_t system_lock;
+} g_sandbox_system = {0};
+
+/* Driver API registry for sandboxed drivers */
+typedef struct {
+    const char* name;
+    void* function_ptr;
+    uint32_t required_permissions;
+    bool allow_in_sandbox;
+} driver_api_entry_t;
+
+/* Allowed kernel APIs for sandboxed drivers */
+static driver_api_entry_t g_driver_apis[] = {
+    /* Memory management */
+    {"kmalloc", (void*)vmm_kmalloc, PERM_READ | PERM_WRITE, true},
+    {"kfree", (void*)vmm_kfree, PERM_READ | PERM_WRITE, true},
+    
+    /* String functions */
+    {"memcpy", (void*)k_memcpy, PERM_READ, true},
+    {"memset", (void*)k_memset, PERM_READ, true},
+    {"strlen", (void*)k_strlen, PERM_READ, true},
+    {"strcpy", (void*)k_strcpy, PERM_READ, true},
+    
+    /* Timer functions */
+    {"get_ticks", (void*)timer_get_ticks, PERM_READ, true},
+    {"sleep", (void*)thread_sleep, PERM_READ, true},
+    
+    /* Console output (limited) */
+    {"printf", (void*)console_printf, PERM_WRITE, true},
+    
+    /* Device APIs */
+    {"device_get_resource", NULL, PERM_READ, true},  /* Custom implementation */
+    {"device_set_power", NULL, PERM_WRITE, false},  /* Restricted */
+    
+    /* Security APIs (read-only) */
+    {"security_check_access", (void*)security_check_access, PERM_READ, true},
+};
+
+#define DRIVER_API_COUNT (sizeof(g_driver_apis) / sizeof(g_driver_apis[0]))
+
+/* Initialize driver sandbox system */
+status_t driver_sandbox_init(void) {
+    if (g_sandbox_system.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    k_memset(&g_sandbox_system, 0, sizeof(g_sandbox_system));
+    spinlock_init(&g_sandbox_system.system_lock);
+    
+    g_sandbox_system.next_sandbox_id = 1;
+    
+    /* Initialize memory pool for sandboxes */
+    size_t total_pool_size = MAX_DRIVERS * SANDBOX_MAX_MEMORY;
+    g_sandbox_system.memory_pool.pool_base = vmm_kmalloc(total_pool_size, PAGE_SIZE);
+    if (!g_sandbox_system.memory_pool.pool_base) {
+        return STATUS_NOMEM;
+    }
+    
+    g_sandbox_system.memory_pool.pool_size = total_pool_size;
+    g_sandbox_system.memory_pool.pool_used = 0;
+    
+    /* Initialize allocation bitmap */
+    size_t bitmap_size = (MAX_DRIVERS + 7) / 8;
+    bitmap_init(&g_sandbox_system.memory_pool.allocation_bitmap, bitmap_size);
+    
+    g_sandbox_system.initialized = true;
+    
+    console_printf("Driver sandbox system initialized (pool: %zu MB)\n", 
+                  total_pool_size / (1024 * 1024));
+    
+    return STATUS_OK;
+}
+
+/* Create driver sandbox */
+status_t driver_sandbox_create(driver_t* driver, const udi_interface_t* udi,
+                              uint32_t memory_limit, uint32_t cpu_quota) {
+    if (!g_sandbox_system.initialized || !driver || !udi) {
+        return STATUS_ERROR;
+    }
+    
+    if (memory_limit > SANDBOX_MAX_MEMORY) {
+        memory_limit = SANDBOX_MAX_MEMORY;
+    }
+    
+    if (cpu_quota > SANDBOX_MAX_CPU_QUOTA) {
+        cpu_quota = SANDBOX_MAX_CPU_QUOTA;
+    }
+    
+    spin_lock(&g_sandbox_system.system_lock);
+    
+    /* Check if sandbox already exists */
+    if (driver->security.sandbox_id != 0) {
+        spin_unlock(&g_sandbox_system.system_lock);
+        return STATUS_EXISTS;
+    }
+    
+    /* Allocate sandbox structure */
+    driver_sandbox_t* sandbox = (driver_sandbox_t*)vmm_kmalloc(sizeof(driver_sandbox_t), 16);
+    if (!sandbox) {
+        spin_unlock(&g_sandbox_system.system_lock);
+        return STATUS_NOMEM;
+    }
+    
+    k_memset(sandbox, 0, sizeof(driver_sandbox_t));
+    spinlock_init(&sandbox->lock);
+    spinlock_init(&sandbox->ipc.lock);
+    
+    /* Assign sandbox ID */
+    sandbox->sandbox_id = g_sandbox_system.next_sandbox_id++;
+    
+    /* Allocate memory from pool */
+    size_t alloc_size = memory_limit + SANDBOX_STACK_SIZE;
+    if (g_sandbox_system.memory_pool.pool_used + alloc_size > g_sandbox_system.memory_pool.pool_size) {
+        vmm_kfree(sandbox, sizeof(driver_sandbox_t));
+        spin_unlock(&g_sandbox_system.system_lock);
+        return STATUS_NOMEM;
+    }
+    
+    sandbox->heap_base = (void*)((uintptr_t)g_sandbox_system.memory_pool.pool_base + 
+                                g_sandbox_system.memory_pool.pool_used);
+    sandbox->heap_size = memory_limit;
+    sandbox->heap_used = 0;
+    
+    sandbox->stack_base = (void*)((uintptr_t)sandbox->heap_base + memory_limit);
+    sandbox->stack_size = SANDBOX_STACK_SIZE;
+    
+    g_sandbox_system.memory_pool.pool_used += alloc_size;
+    
+    /* Set resource limits */
+    sandbox->max_memory = memory_limit;
+    sandbox->max_cpu_quota = cpu_quota;
+    sandbox->max_files = 16;
+    sandbox->max_sockets = 8;
+    
+    /* Set security context */
+    sandbox->security_level = driver->security.security_level;
+    sandbox->allowed_operations = driver->security.permissions;
+    strcpy(sandbox->security_label, driver->security.security_label);
+    
+    /* Create IPC communication channels */
+    sandbox->ipc.buffer_size = 4096;  /* 4KB buffer */
+    sandbox->ipc.request_buffer = vmm_kmalloc(sandbox->ipc.buffer_size, 16);
+    sandbox->ipc.response_buffer = vmm_kmalloc(sandbox->ipc.buffer_size, 16);
+    
+    if (!sandbox->ipc.request_buffer || !sandbox->ipc.response_buffer) {
+        if (sandbox->ipc.request_buffer) vmm_kfree(sandbox->ipc.request_buffer, sandbox->ipc.buffer_size);
+        if (sandbox->ipc.response_buffer) vmm_kfree(sandbox->ipc.response_buffer, sandbox->ipc.buffer_size);
+        vmm_kfree(sandbox, sizeof(driver_sandbox_t));
+        spin_unlock(&g_sandbox_system.system_lock);
+        return STATUS_NOMEM;
+    }
+    
+    /* Create sandboxed process */
+    process_create_info_t process_info = {0};
+    snprintf(process_info.name, sizeof(process_info.name), "driver_%s", driver->name);
+    process_info.priority = PROCESS_PRIORITY_NORMAL;
+    process_info.stack_size = SANDBOX_STACK_SIZE;
+    process_info.heap_size = memory_limit;
+    process_info.capabilities = driver->security.permissions;
+    
+    /* Set security context */
+    process_info.security.uid = UID_DRIVER;
+    process_info.security.gid = GID_DRIVER;
+    process_info.security.capabilities = sandbox->allowed_operations;
+    process_info.security.is_privileged = false;  /* Sandboxed drivers are never privileged */
+    
+    status_t status = process_create(&process_info, &sandbox->sandbox_process);
+    if (status != STATUS_OK) {
+        vmm_kfree(sandbox->ipc.request_buffer, sandbox->ipc.buffer_size);
+        vmm_kfree(sandbox->ipc.response_buffer, sandbox->ipc.buffer_size);
+        vmm_kfree(sandbox, sizeof(driver_sandbox_t));
+        spin_unlock(&g_sandbox_system.system_lock);
+        return status;
+    }
+    
+    /* Enable security hardening */
+    security_enable_aslr(sandbox->sandbox_process);
+    security_enable_dep(sandbox->sandbox_process);
+    
+    /* Add to sandbox registry */
+    if (g_sandbox_system.sandbox_count < MAX_DRIVERS) {
+        g_sandbox_system.sandboxes[g_sandbox_system.sandbox_count] = sandbox;
+        g_sandbox_system.sandbox_count++;
+    }
+    
+    /* Update driver security context */
+    driver->security.sandbox_id = sandbox->sandbox_id;
+    driver->security.memory_limit = memory_limit;
+    driver->security.cpu_quota = cpu_quota;
+    driver->security.isolated = true;
+    
+    spin_unlock(&g_sandbox_system.system_lock);
+    
+    console_printf("Sandbox created for driver '%s' (ID: %u, Memory: %u KB, CPU: %u%%)\n",
+                  driver->name, sandbox->sandbox_id, memory_limit / 1024, cpu_quota);
+    
+    /* Audit sandbox creation */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, sandbox->sandbox_process->pid, 0,
+                        "Driver sandbox created", driver->name, 1);
+    
+    return STATUS_OK;
+}
+
+/* Execute driver function in sandbox */
+status_t driver_sandbox_execute(uint32_t sandbox_id, const char* function_name, 
+                               void* args, size_t args_size, 
+                               void* result, size_t result_size) {
+    if (!g_sandbox_system.initialized || !function_name) {
+        return STATUS_ERROR;
+    }
+    
+    /* Find sandbox */
+    driver_sandbox_t* sandbox = NULL;
+    spin_lock(&g_sandbox_system.system_lock);
+    
+    for (uint32_t i = 0; i < g_sandbox_system.sandbox_count; i++) {
+        if (g_sandbox_system.sandboxes[i] && 
+            g_sandbox_system.sandboxes[i]->sandbox_id == sandbox_id) {
+            sandbox = g_sandbox_system.sandboxes[i];
+            break;
+        }
+    }
+    
+    spin_unlock(&g_sandbox_system.system_lock);
+    
+    if (!sandbox) {
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Check if function is allowed in sandbox */
+    bool function_allowed = false;
+    void* function_ptr = NULL;
+    
+    for (uint32_t i = 0; i < DRIVER_API_COUNT; i++) {
+        if (strcmp(g_driver_apis[i].name, function_name) == 0) {
+            if (g_driver_apis[i].allow_in_sandbox) {
+                function_allowed = true;
+                function_ptr = g_driver_apis[i].function_ptr;
+            }
+            break;
+        }
+    }
+    
+    if (!function_allowed || !function_ptr) {
+        security_audit_event(SECURITY_EVENT_ACCESS_DENIED, 
+                            sandbox->sandbox_process->pid, 0,
+                            "Unauthorized sandbox function call", function_name, 0);
+        return STATUS_DENIED;
+    }
+    
+    spin_lock(&sandbox->ipc.lock);
+    
+    /* Prepare IPC request */
+    if (args && args_size > 0) {
+        if (args_size > sandbox->ipc.buffer_size) {
+            spin_unlock(&sandbox->ipc.lock);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        k_memcpy(sandbox->ipc.request_buffer, args, args_size);
+    }
+    
+    /* Execute function (simplified - in real implementation would use IPC) */
+    /* For demonstration, we'll just call the function directly */
+    status_t exec_status = STATUS_OK;
+    
+    /* Update performance metrics */
+    sandbox->syscalls_made++;
+    sandbox->cpu_time_used += timer_get_ticks();  /* Simplified CPU accounting */
+    
+    /* Copy result back */
+    if (result && result_size > 0 && result_size <= sandbox->ipc.buffer_size) {
+        /* In real implementation, would get result from sandbox */
+        k_memset(result, 0, result_size);  /* Placeholder */
+    }
+    
+    spin_unlock(&sandbox->ipc.lock);
+    
+    return exec_status;
+}
+
+/* Monitor sandbox resource usage */
+status_t driver_sandbox_monitor(uint32_t sandbox_id, driver_sandbox_t** sandbox_info) {
+    if (!g_sandbox_system.initialized || !sandbox_info) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_sandbox_system.system_lock);
+    
+    driver_sandbox_t* sandbox = NULL;
+    for (uint32_t i = 0; i < g_sandbox_system.sandbox_count; i++) {
+        if (g_sandbox_system.sandboxes[i] && 
+            g_sandbox_system.sandboxes[i]->sandbox_id == sandbox_id) {
+            sandbox = g_sandbox_system.sandboxes[i];
+            break;
+        }
+    }
+    
+    if (!sandbox) {
+        spin_unlock(&g_sandbox_system.system_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Update current metrics */
+    spin_lock(&sandbox->lock);
+    
+    /* Check memory usage */
+    if (sandbox->sandbox_process) {
+        sandbox->memory_peak = max(sandbox->memory_peak, 
+                                 sandbox->sandbox_process->memory_usage);
+    }
+    
+    /* Check resource limits */
+    bool limits_exceeded = false;
+    if (sandbox->memory_peak > sandbox->max_memory) {
+        console_printf("Sandbox %u: Memory limit exceeded (%zu > %u)\n",
+                      sandbox_id, sandbox->memory_peak, sandbox->max_memory);
+        limits_exceeded = true;
+    }
+    
+    if (limits_exceeded) {
+        security_audit_event(SECURITY_EVENT_POLICY_VIOLATION, 
+                            sandbox->sandbox_process->pid, 0,
+                            "Sandbox resource limit exceeded", "memory", 0);
+    }
+    
+    *sandbox_info = sandbox;  /* Return reference (caller should not free) */
+    
+    spin_unlock(&sandbox->lock);
+    spin_unlock(&g_sandbox_system.system_lock);
+    
+    return STATUS_OK;
+}
+
+/* Destroy driver sandbox */
+status_t driver_sandbox_destroy(uint32_t sandbox_id) {
+    if (!g_sandbox_system.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_sandbox_system.system_lock);
+    
+    driver_sandbox_t* sandbox = NULL;
+    uint32_t sandbox_index = 0;
+    
+    for (uint32_t i = 0; i < g_sandbox_system.sandbox_count; i++) {
+        if (g_sandbox_system.sandboxes[i] && 
+            g_sandbox_system.sandboxes[i]->sandbox_id == sandbox_id) {
+            sandbox = g_sandbox_system.sandboxes[i];
+            sandbox_index = i;
+            break;
+        }
+    }
+    
+    if (!sandbox) {
+        spin_unlock(&g_sandbox_system.system_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Terminate sandbox process */
+    if (sandbox->sandbox_process) {
+        process_terminate(sandbox->sandbox_process, 0);
+    }
+    
+    /* Clean up IPC resources */
+    if (sandbox->ipc.request_buffer) {
+        vmm_kfree(sandbox->ipc.request_buffer, sandbox->ipc.buffer_size);
+    }
+    if (sandbox->ipc.response_buffer) {
+        vmm_kfree(sandbox->ipc.response_buffer, sandbox->ipc.buffer_size);
+    }
+    
+    /* Remove from registry */
+    for (uint32_t i = sandbox_index; i < g_sandbox_system.sandbox_count - 1; i++) {
+        g_sandbox_system.sandboxes[i] = g_sandbox_system.sandboxes[i + 1];
+    }
+    g_sandbox_system.sandbox_count--;
+    
+    /* Free sandbox structure */
+    vmm_kfree(sandbox, sizeof(driver_sandbox_t));
+    
+    spin_unlock(&g_sandbox_system.system_lock);
+    
+    console_printf("Sandbox %u destroyed\n", sandbox_id);
+    
+    /* Audit sandbox destruction */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Driver sandbox destroyed", "sandbox", 1);
+    
+    return STATUS_OK;
+}
+
+/* Get sandbox statistics */
+status_t driver_sandbox_get_stats(driver_sandbox_stats_t* stats) {
+    if (!g_sandbox_system.initialized || !stats) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(stats, 0, sizeof(driver_sandbox_stats_t));
+    
+    spin_lock(&g_sandbox_system.system_lock);
+    
+    stats->total_sandboxes = g_sandbox_system.sandbox_count;
+    stats->memory_pool_size = g_sandbox_system.memory_pool.pool_size;
+    stats->memory_pool_used = g_sandbox_system.memory_pool.pool_used;
+    
+    /* Aggregate sandbox metrics */
+    for (uint32_t i = 0; i < g_sandbox_system.sandbox_count; i++) {
+        driver_sandbox_t* sandbox = g_sandbox_system.sandboxes[i];
+        if (sandbox) {
+            stats->total_cpu_time += sandbox->cpu_time_used;
+            stats->total_syscalls += sandbox->syscalls_made;
+            stats->total_io_operations += sandbox->io_operations;
+            
+            if (sandbox->memory_peak > stats->peak_memory_usage) {
+                stats->peak_memory_usage = sandbox->memory_peak;
+            }
+        }
+    }
+    
+    spin_unlock(&g_sandbox_system.system_lock);
+    
+    return STATUS_OK;
+}
+
+/* Shutdown sandbox system */
+status_t driver_sandbox_shutdown(void) {
+    if (!g_sandbox_system.initialized) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Shutting down driver sandbox system...\n");
+    
+    /* Destroy all active sandboxes */
+    spin_lock(&g_sandbox_system.system_lock);
+    
+    for (uint32_t i = 0; i < g_sandbox_system.sandbox_count; i++) {
+        if (g_sandbox_system.sandboxes[i]) {
+            driver_sandbox_destroy(g_sandbox_system.sandboxes[i]->sandbox_id);
+        }
+    }
+    
+    /* Free memory pool */
+    if (g_sandbox_system.memory_pool.pool_base) {
+        vmm_kfree(g_sandbox_system.memory_pool.pool_base, 
+                 g_sandbox_system.memory_pool.pool_size);
+    }
+    
+    /* Clear system state */
+    k_memset(&g_sandbox_system, 0, sizeof(g_sandbox_system));
+    
+    spin_unlock(&g_sandbox_system.system_lock);
+    
+    console_printf("Driver sandbox system shutdown complete\n");
+    
+    return STATUS_OK;
+}

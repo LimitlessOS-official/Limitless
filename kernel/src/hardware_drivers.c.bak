@@ -1,0 +1,209 @@
+/*
+ * LimitlessOS Hardware Detection and Basic Drivers
+ * Essential drivers for laptop installation
+ */
+
+#include "kernel_types.h"
+#include "multiboot2.h"
+
+/* PCI Configuration Space Access */
+#define PCI_CONFIG_ADDRESS 0xCF8
+#define PCI_CONFIG_DATA    0xCFC
+
+/* Hardware detection results */
+struct hardware_info {
+    bool has_nvme;
+    bool has_ahci;
+    bool has_usb3;
+    bool has_intel_gpu;
+    bool has_amd_gpu;
+    bool has_nvidia_gpu;
+    bool has_ethernet;
+    bool has_wifi;
+} g_hardware;
+
+/* I/O port operations */
+static inline void outl(uint16_t port, uint32_t val) {
+    asm volatile("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint32_t inl(uint16_t port) {
+    uint32_t ret;
+    asm volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+/* PCI configuration read */
+static uint32_t pci_config_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset) {
+    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)device << 11) | 
+                       ((uint32_t)func << 8) | (offset & 0xFC);
+    
+    outl(PCI_CONFIG_ADDRESS, address);
+    return inl(PCI_CONFIG_DATA);
+}
+
+/* Basic NVMe driver initialization */
+static int nvme_driver_init(uint8_t bus, uint8_t device, uint8_t func) {
+    uint32_t bar0 = pci_config_read(bus, device, func, 0x10);
+    if (bar0 & 1) return -1; /* Memory-mapped only */
+    
+    /* Enable PCI device */
+    uint32_t command = pci_config_read(bus, device, func, 0x04);
+    command |= 0x06; /* Enable memory space and bus mastering */
+    
+    /* Configure NVMe controller for basic operation */
+    volatile uint32_t* nvme_regs = (volatile uint32_t*)(bar0 & ~0xF);
+    
+    /* Reset controller */
+    nvme_regs[0x14/4] = 0; /* CC register - disable controller */
+    while (nvme_regs[0x1C/4] & 1); /* Wait for ready bit to clear */
+    
+    /* Configure basic settings */
+    nvme_regs[0x14/4] = 0x00460001; /* Enable controller with basic settings */
+    while (!(nvme_regs[0x1C/4] & 1)); /* Wait for ready bit */
+    
+    return 0;
+}
+
+/* Basic AHCI driver initialization */
+static int ahci_driver_init(uint8_t bus, uint8_t device, uint8_t func) {
+    uint32_t bar5 = pci_config_read(bus, device, func, 0x24);
+    if (bar5 & 1) return -1; /* Memory-mapped only */
+    
+    /* Enable PCI device */
+    uint32_t command = pci_config_read(bus, device, func, 0x04);
+    command |= 0x06; /* Enable memory space and bus mastering */
+    
+    /* Configure AHCI controller */
+    volatile uint32_t* ahci_regs = (volatile uint32_t*)(bar5 & ~0xF);
+    
+    /* Enable AHCI mode */
+    ahci_regs[0x04/4] |= (1 << 31); /* GHC.AE = 1 */
+    
+    return 0;
+}
+
+/* Basic USB 3.0 driver initialization */
+static int usb3_driver_init(uint8_t bus, uint8_t device, uint8_t func) {
+    /* Enable PCI device */
+    uint32_t command = pci_config_read(bus, device, func, 0x04);
+    command |= 0x06; /* Enable memory space and bus mastering */
+    
+    /* Basic xHCI controller setup would go here */
+    return 0;
+}
+
+/* Basic framebuffer graphics driver */
+static int graphics_driver_init(uint8_t bus, uint8_t device, uint8_t func) {
+    /* Get framebuffer address from PCI BAR */
+    uint32_t bar0 = pci_config_read(bus, device, func, 0x10);
+    
+    /* Enable PCI device */
+    uint32_t command = pci_config_read(bus, device, func, 0x04);
+    command |= 0x02; /* Enable memory space */
+    
+    /* Set up basic framebuffer for GUI */
+    /* This would configure the graphics card for basic display output */
+    
+    return 0;
+}
+
+/* Basic Ethernet driver initialization */
+static int ethernet_driver_init(uint8_t bus, uint8_t device, uint8_t func) {
+    /* Enable PCI device */
+    uint32_t command = pci_config_read(bus, device, func, 0x04);
+    command |= 0x06; /* Enable memory space and bus mastering */
+    
+    /* Basic network controller setup */
+    return 0;
+}
+
+/* Hardware detection and driver initialization */
+void hardware_detect_and_init(void) {
+    /* Clear hardware info */
+    g_hardware = (struct hardware_info){0};
+    
+    /* Scan PCI bus for devices */
+    for (uint8_t bus = 0; bus < 8; bus++) {
+        for (uint8_t device = 0; device < 32; device++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t vendor_device = pci_config_read(bus, device, func, 0);
+                if ((vendor_device & 0xFFFF) == 0xFFFF) continue; /* No device */
+                
+                uint32_t class_code = pci_config_read(bus, device, func, 0x08);
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                uint8_t sub_class = (class_code >> 16) & 0xFF;
+                uint8_t prog_if = (class_code >> 8) & 0xFF;
+                
+                /* Storage controllers */
+                if (base_class == 0x01) { /* Mass storage */
+                    if (sub_class == 0x08 && prog_if == 0x02) { /* NVMe */
+                        g_hardware.has_nvme = true;
+                        nvme_driver_init(bus, device, func);
+                    } else if (sub_class == 0x06 && prog_if == 0x01) { /* AHCI */
+                        g_hardware.has_ahci = true;
+                        ahci_driver_init(bus, device, func);
+                    }
+                }
+                
+                /* Network controllers */
+                else if (base_class == 0x02) { /* Network */
+                    if (sub_class == 0x00) { /* Ethernet */
+                        g_hardware.has_ethernet = true;
+                        ethernet_driver_init(bus, device, func);
+                    } else if (sub_class == 0x80) { /* WiFi */
+                        g_hardware.has_wifi = true;
+                    }
+                }
+                
+                /* Display controllers */
+                else if (base_class == 0x03) { /* Display */
+                    uint16_t vendor_id = vendor_device & 0xFFFF;
+                    if (vendor_id == 0x8086) { /* Intel */
+                        g_hardware.has_intel_gpu = true;
+                    } else if (vendor_id == 0x1002) { /* AMD */
+                        g_hardware.has_amd_gpu = true;
+                    } else if (vendor_id == 0x10DE) { /* NVIDIA */
+                        g_hardware.has_nvidia_gpu = true;
+                    }
+                    graphics_driver_init(bus, device, func);
+                }
+                
+                /* USB controllers */
+                else if (base_class == 0x0C && sub_class == 0x03) { /* USB */
+                    if (prog_if == 0x30) { /* xHCI (USB 3.0) */
+                        g_hardware.has_usb3 = true;
+                        usb3_driver_init(bus, device, func);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Memory management initialization */
+void memory_init(struct multiboot_info* mbi) {
+    /* Parse multiboot memory map */
+    uint8_t* tag = mbi->tags;
+    uint8_t* end = (uint8_t*)mbi + mbi->total_size;
+    
+    while (tag < end) {
+        struct multiboot_tag {
+            uint32_t type;
+            uint32_t size;
+        } *current_tag = (struct multiboot_tag*)tag;
+        
+        if (current_tag->type == 0) break; /* End tag */
+        
+        if (current_tag->type == 6) { /* Memory map */
+            /* Parse memory regions and set up page tables */
+            /* This would implement proper memory management */
+        }
+        
+        /* Move to next tag */
+        tag += ((current_tag->size + 7) & ~7);
+    }
+    
+    /* Set up basic paging for kernel */
+    /* This would create proper page tables for the kernel */
+}

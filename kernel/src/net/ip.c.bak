@@ -1,0 +1,22 @@
+#include "net/ip.h"
+#include "net/ipv4.h"
+#include "net/net.h"
+
+void ip_stack_init(void) {
+    ipv4_init();
+}
+
+int ip4_output(net_if_t* nif, u8 proto, u32 dst_ip_be, const void* payload, u16 plen) {
+    return ipv4_send_packet(nif, proto, dst_ip_be, payload, plen);
+}
+
+void ip4_input(net_if_t* nif, const u8* pkt, u32 len) {
+    ipv4_input(nif, (net_buf_t*)pkt);
+}
+
+int ip6_output(net_if_t* nif, u8 next_hdr, const u8 dst[16], const void* payload, u16 plen) {
+    (void)nif; (void)next_hdr; (void)dst; (void)payload; (void)plen; return K_ENOTSUP;
+}
+void ip6_input(net_if_t* nif, const u8* pkt, u32 len) {
+    (void)nif; (void)pkt; (void)len; /* IPv6 not implemented yet */
+}

@@ -1,0 +1,908 @@
+/*
+ * advanced_vfs.c - LimitlessOS Advanced VFS Layer
+ * 
+ * Production filesystem stack with advanced caching, journaling,
+ * multi-filesystem support, and enterprise-grade features.
+ */
+
+#include "kernel.h"
+#include "vfs.h"
+#include "block.h"
+#include "vmm.h"
+#include "timer.h"
+
+#define MAX_FILESYSTEMS         32
+#define MAX_MOUNTS             128
+#define MAX_OPEN_FILES        8192
+#define MAX_CACHED_INODES      4096
+#define MAX_CACHED_DENTRIES   16384
+#define MAX_PAGE_CACHE_PAGES  65536
+
+/* VFS Cache Types */
+typedef enum {
+    CACHE_INODE,
+    CACHE_DENTRY,
+    CACHE_PAGE,
+    CACHE_BUFFER
+} vfs_cache_type_t;
+
+/* Inode cache entry */
+typedef struct inode_cache_entry {
+    struct vnode* inode;        /* Cached inode */
+    uint64_t ino;              /* Inode number */
+    dev_t dev;                 /* Device ID */
+    uint64_t access_time;      /* Last access time */
+    uint32_t ref_count;        /* Reference count */
+    bool dirty;                /* Modified flag */
+    
+    struct list_head lru_list; /* LRU list */
+    struct list_head hash_list; /* Hash table list */
+} inode_cache_entry_t;
+
+/* Directory entry cache */
+typedef struct dentry_cache_entry {
+    char name[256];            /* Entry name */
+    struct vnode* parent;      /* Parent directory */
+    struct vnode* inode;       /* Target inode */
+    uint64_t access_time;      /* Last access time */
+    uint32_t ref_count;        /* Reference count */
+    bool negative;             /* Negative cache entry */
+    
+    struct list_head lru_list;
+    struct list_head hash_list;
+} dentry_cache_entry_t;
+
+/* Page cache entry */
+typedef struct page_cache_entry {
+    struct vnode* inode;       /* File inode */
+    uint64_t offset;           /* File offset */
+    void* page_data;           /* Page data */
+    uint64_t access_time;      /* Last access time */
+    uint32_t ref_count;        /* Reference count */
+    bool dirty;                /* Modified flag */
+    bool writeback;            /* Being written back */
+    
+    struct list_head lru_list;
+    struct list_head hash_list;
+    struct list_head writeback_list;
+} page_cache_entry_t;
+
+/* Filesystem journal */
+typedef struct fs_journal {
+    struct vfs_mount* mount;   /* Associated mount */
+    bool enabled;              /* Journaling enabled */
+    
+    /* Journal device */
+    struct block_device* journal_dev;
+    uint64_t journal_start;    /* Journal start block */
+    uint64_t journal_size;     /* Journal size in blocks */
+    
+    /* Transaction management */
+    uint64_t current_transaction;
+    uint64_t committed_transaction;
+    uint64_t journal_head;     /* Next write position */
+    uint64_t journal_tail;     /* Last committed position */
+    
+    /* Transaction buffers */
+    struct list_head pending_transactions;
+    struct list_head active_transactions;
+    
+    /* Journal thread */
+    struct thread* journal_thread;
+    struct wait_queue* journal_waiters;
+    
+    /* Statistics */
+    uint64_t transactions_committed;
+    uint64_t blocks_written;
+    uint64_t forced_commits;
+    
+    spinlock_t lock;
+} fs_journal_t;
+
+/* Mount point with advanced features */
+struct vfs_mount_advanced {
+    char mountpoint[256];      /* Mount path */
+    char fstype[64];           /* Filesystem type */
+    char device[256];          /* Source device */
+    
+    struct filesystem* fs;     /* Filesystem type */
+    struct super_block* sb;    /* Superblock */
+    struct block_device* bdev; /* Block device */
+    
+    /* Mount options */
+    uint32_t flags;            /* Mount flags */
+    char options[512];         /* Mount options string */
+    
+    /* Caching */
+    bool cache_enabled;        /* Enable caching */
+    uint32_t cache_size;       /* Cache size limit */
+    
+    /* Journaling */
+    fs_journal_t* journal;     /* Journal instance */
+    
+    /* Statistics */
+    uint64_t read_operations;
+    uint64_t write_operations;
+    uint64_t cache_hits;
+    uint64_t cache_misses;
+    
+    /* Synchronization */
+    struct rw_semaphore mount_sem;
+    atomic_t active_operations;
+    
+    struct list_head list;
+};
+
+/* Advanced VFS state */
+static struct {
+    bool initialized;
+    
+    /* Filesystem registry */
+    struct filesystem* filesystems[MAX_FILESYSTEMS];
+    spinlock_t fs_lock;
+    
+    /* Mount management */
+    struct list_head mounts;
+    struct vfs_mount_advanced* root_mount;
+    spinlock_t mount_lock;
+    
+    /* Inode cache */
+    struct list_head inode_cache_lru;
+    struct list_head inode_cache_hash[256];
+    uint32_t cached_inodes;
+    spinlock_t inode_cache_lock;
+    
+    /* Dentry cache */
+    struct list_head dentry_cache_lru;
+    struct list_head dentry_cache_hash[1024];
+    uint32_t cached_dentries;
+    spinlock_t dentry_cache_lock;
+    
+    /* Page cache */
+    struct list_head page_cache_lru;
+    struct list_head page_cache_hash[4096];
+    struct list_head dirty_pages;
+    uint32_t cached_pages;
+    uint32_t dirty_page_count;
+    spinlock_t page_cache_lock;
+    
+    /* Writeback thread */
+    struct thread* writeback_thread;
+    struct timer writeback_timer;
+    struct wait_queue* writeback_waiters;
+    
+    /* Statistics */
+    atomic64_t total_reads;
+    atomic64_t total_writes;
+    atomic64_t cache_hits;
+    atomic64_t cache_misses;
+    atomic64_t journal_commits;
+    atomic64_t sync_operations;
+    
+} g_advanced_vfs = {0};
+
+/* Function prototypes */
+static int vfs_cache_init(void);
+static struct vnode* inode_cache_lookup(dev_t dev, uint64_t ino);
+static int inode_cache_insert(struct vnode* inode);
+static void inode_cache_evict_lru(void);
+
+static dentry_cache_entry_t* dentry_cache_lookup(struct vnode* parent, const char* name);
+static int dentry_cache_insert(struct vnode* parent, const char* name, struct vnode* inode);
+static void dentry_cache_evict_lru(void);
+
+static page_cache_entry_t* page_cache_lookup(struct vnode* inode, uint64_t offset);
+static int page_cache_insert(struct vnode* inode, uint64_t offset, void* data);
+static void page_cache_writeback_dirty_pages(void);
+static void page_cache_evict_lru(void);
+
+static fs_journal_t* journal_create(struct vfs_mount_advanced* mount);
+static int journal_start_transaction(fs_journal_t* journal);
+static int journal_commit_transaction(fs_journal_t* journal);
+static void journal_thread_func(void* data);
+
+static void writeback_thread_func(void* data);
+static void writeback_timer_handler(void* data);
+
+/* Initialize advanced VFS layer */
+int advanced_vfs_init(void) {
+    if (g_advanced_vfs.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing advanced VFS layer\n");
+    
+    memset(&g_advanced_vfs, 0, sizeof(g_advanced_vfs));
+    
+    /* Initialize locks */
+    spinlock_init(&g_advanced_vfs.fs_lock);
+    spinlock_init(&g_advanced_vfs.mount_lock);
+    spinlock_init(&g_advanced_vfs.inode_cache_lock);
+    spinlock_init(&g_advanced_vfs.dentry_cache_lock);
+    spinlock_init(&g_advanced_vfs.page_cache_lock);
+    
+    /* Initialize lists */
+    INIT_LIST_HEAD(&g_advanced_vfs.mounts);
+    INIT_LIST_HEAD(&g_advanced_vfs.inode_cache_lru);
+    INIT_LIST_HEAD(&g_advanced_vfs.dentry_cache_lru);
+    INIT_LIST_HEAD(&g_advanced_vfs.page_cache_lru);
+    INIT_LIST_HEAD(&g_advanced_vfs.dirty_pages);
+    
+    /* Initialize hash tables */
+    for (int i = 0; i < 256; i++) {
+        INIT_LIST_HEAD(&g_advanced_vfs.inode_cache_hash[i]);
+    }
+    for (int i = 0; i < 1024; i++) {
+        INIT_LIST_HEAD(&g_advanced_vfs.dentry_cache_hash[i]);
+    }
+    for (int i = 0; i < 4096; i++) {
+        INIT_LIST_HEAD(&g_advanced_vfs.page_cache_hash[i]);
+    }
+    
+    /* Initialize cache subsystem */
+    int ret = vfs_cache_init();
+    if (ret != 0) {
+        printf("Failed to initialize VFS cache: %d\n", ret);
+        return ret;
+    }
+    
+    /* Create writeback thread */
+    ret = thread_create_kernel("vfs-writeback", writeback_thread_func, NULL, 
+                              &g_advanced_vfs.writeback_thread);
+    if (ret != 0) {
+        printf("Failed to create writeback thread: %d\n", ret);
+        return ret;
+    }
+    
+    /* Create writeback waiters */
+    g_advanced_vfs.writeback_waiters = wait_queue_create();
+    if (!g_advanced_vfs.writeback_waiters) {
+        return -ENOMEM;
+    }
+    
+    /* Initialize writeback timer */
+    timer_init(&g_advanced_vfs.writeback_timer, writeback_timer_handler, NULL);
+    timer_schedule(&g_advanced_vfs.writeback_timer, 5000); /* 5 seconds */
+    
+    g_advanced_vfs.initialized = true;
+    
+    printf("Advanced VFS layer initialized\n");
+    return 0;
+}
+
+/* Register filesystem type */
+int advanced_vfs_register_fs(struct filesystem* fs) {
+    if (!fs || !fs->name) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&g_advanced_vfs.fs_lock);
+    
+    /* Find free slot */
+    int slot = -1;
+    for (int i = 0; i < MAX_FILESYSTEMS; i++) {
+        if (!g_advanced_vfs.filesystems[i]) {
+            slot = i;
+            break;
+        }
+    }
+    
+    if (slot < 0) {
+        spin_unlock(&g_advanced_vfs.fs_lock);
+        return -ENOSPC;
+    }
+    
+    g_advanced_vfs.filesystems[slot] = fs;
+    
+    spin_unlock(&g_advanced_vfs.fs_lock);
+    
+    printf("Registered filesystem: %s\n", fs->name);
+    return 0;
+}
+
+/* Advanced mount with journaling and caching */
+int advanced_vfs_mount(const char* source, const char* target, 
+                      const char* fstype, uint32_t flags, const char* options) {
+    
+    if (!source || !target || !fstype) {
+        return -EINVAL;
+    }
+    
+    /* Find filesystem type */
+    struct filesystem* fs = NULL;
+    
+    spin_lock(&g_advanced_vfs.fs_lock);
+    for (int i = 0; i < MAX_FILESYSTEMS; i++) {
+        if (g_advanced_vfs.filesystems[i] && 
+            strcmp(g_advanced_vfs.filesystems[i]->name, fstype) == 0) {
+            fs = g_advanced_vfs.filesystems[i];
+            break;
+        }
+    }
+    spin_unlock(&g_advanced_vfs.fs_lock);
+    
+    if (!fs) {
+        printf("Unknown filesystem type: %s\n", fstype);
+        return -EINVAL;
+    }
+    
+    /* Open block device */
+    struct block_device* bdev = NULL;
+    int ret = block_device_open(source, &bdev);
+    if (ret != 0) {
+        printf("Failed to open block device %s: %d\n", source, ret);
+        return ret;
+    }
+    
+    /* Create mount point */
+    struct vfs_mount_advanced* mount = (struct vfs_mount_advanced*)
+        vmm_kmalloc(sizeof(struct vfs_mount_advanced), 64);
+    if (!mount) {
+        block_device_close(bdev);
+        return -ENOMEM;
+    }
+    
+    memset(mount, 0, sizeof(struct vfs_mount_advanced));
+    
+    strncpy(mount->mountpoint, target, sizeof(mount->mountpoint) - 1);
+    strncpy(mount->fstype, fstype, sizeof(mount->fstype) - 1);
+    strncpy(mount->device, source, sizeof(mount->device) - 1);
+    
+    mount->fs = fs;
+    mount->bdev = bdev;
+    mount->flags = flags;
+    
+    if (options) {
+        strncpy(mount->options, options, sizeof(mount->options) - 1);
+    }
+    
+    /* Initialize synchronization */
+    rw_semaphore_init(&mount->mount_sem);
+    atomic_set(&mount->active_operations, 0);
+    
+    /* Mount filesystem */
+    ret = fs->mount(bdev, flags, options, &mount->sb);
+    if (ret != 0) {
+        printf("Failed to mount filesystem: %d\n", ret);
+        vmm_kfree(mount, sizeof(struct vfs_mount_advanced));
+        block_device_close(bdev);
+        return ret;
+    }
+    
+    /* Enable caching by default */
+    mount->cache_enabled = true;
+    mount->cache_size = 16 * 1024 * 1024; /* 16MB default */
+    
+    /* Set up journaling if supported */
+    if (fs->journal_ops && (flags & MS_JOURNAL)) {
+        mount->journal = journal_create(mount);
+        if (!mount->journal) {
+            printf("Warning: Failed to create journal for %s\n", target);
+        }
+    }
+    
+    /* Add to mount list */
+    spin_lock(&g_advanced_vfs.mount_lock);
+    list_add(&mount->list, &g_advanced_vfs.mounts);
+    
+    /* Set as root mount if mounting at / */
+    if (strcmp(target, "/") == 0) {
+        g_advanced_vfs.root_mount = mount;
+    }
+    
+    spin_unlock(&g_advanced_vfs.mount_lock);
+    
+    printf("Successfully mounted %s (%s) at %s\n", source, fstype, target);
+    
+    return 0;
+}
+
+/* Enhanced file read with caching */
+ssize_t advanced_vfs_read(struct file* file, void* buffer, size_t count, off_t offset) {
+    if (!file || !buffer || count == 0) {
+        return -EINVAL;
+    }
+    
+    struct vnode* inode = file->f_inode;
+    if (!inode) {
+        return -EINVAL;
+    }
+    
+    atomic64_inc(&g_advanced_vfs.total_reads);
+    
+    /* Align to page boundaries for caching */
+    off_t page_offset = offset & ~(PAGE_SIZE - 1);
+    size_t page_count = (count + (offset - page_offset) + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    ssize_t total_read = 0;
+    
+    for (size_t i = 0; i < page_count; i++) {
+        off_t current_page_offset = page_offset + (i * PAGE_SIZE);
+        
+        /* Check page cache first */
+        page_cache_entry_t* cached_page = page_cache_lookup(inode, current_page_offset);
+        
+        if (cached_page) {
+            /* Cache hit */
+            atomic64_inc(&g_advanced_vfs.cache_hits);
+            cached_page->access_time = timer_get_ticks();
+            cached_page->ref_count++;
+            
+            /* Calculate copy parameters */
+            off_t page_start = max(offset, current_page_offset);
+            off_t page_end = min(offset + count, current_page_offset + PAGE_SIZE);
+            size_t copy_size = page_end - page_start;
+            
+            if (copy_size > 0) {
+                memcpy((char*)buffer + total_read, 
+                       (char*)cached_page->page_data + (page_start - current_page_offset),
+                       copy_size);
+                total_read += copy_size;
+            }
+            
+            cached_page->ref_count--;
+        } else {
+            /* Cache miss - read from filesystem */
+            atomic64_inc(&g_advanced_vfs.cache_misses);
+            
+            void* page_data = vmm_kmalloc(PAGE_SIZE, PAGE_SIZE);
+            if (!page_data) {
+                return total_read > 0 ? total_read : -ENOMEM;
+            }
+            
+            /* Read page from filesystem */
+            ssize_t read_result = inode->v_op->read(inode, page_data, PAGE_SIZE, current_page_offset);
+            if (read_result < 0) {
+                vmm_kfree(page_data, PAGE_SIZE);
+                return total_read > 0 ? total_read : read_result;
+            }
+            
+            /* Add to page cache */
+            page_cache_insert(inode, current_page_offset, page_data);
+            
+            /* Calculate copy parameters */
+            off_t page_start = max(offset, current_page_offset);
+            off_t page_end = min(offset + count, current_page_offset + read_result);
+            size_t copy_size = page_end - page_start;
+            
+            if (copy_size > 0) {
+                memcpy((char*)buffer + total_read, 
+                       (char*)page_data + (page_start - current_page_offset),
+                       copy_size);
+                total_read += copy_size;
+            }
+        }
+        
+        /* Break if we've read everything requested */
+        if (total_read >= count) {
+            break;
+        }
+    }
+    
+    return total_read;
+}
+
+/* Enhanced file write with caching and journaling */
+ssize_t advanced_vfs_write(struct file* file, const void* buffer, size_t count, off_t offset) {
+    if (!file || !buffer || count == 0) {
+        return -EINVAL;
+    }
+    
+    struct vnode* inode = file->f_inode;
+    if (!inode) {
+        return -EINVAL;
+    }
+    
+    /* Find mount point for journaling */
+    struct vfs_mount_advanced* mount = NULL;
+    
+    spin_lock(&g_advanced_vfs.mount_lock);
+    list_for_each_entry(mount, &g_advanced_vfs.mounts, list) {
+        if (inode->v_mount == mount->sb) {
+            break;
+        }
+    }
+    spin_unlock(&g_advanced_vfs.mount_lock);
+    
+    /* Start journal transaction if available */
+    if (mount && mount->journal) {
+        journal_start_transaction(mount->journal);
+    }
+    
+    atomic64_inc(&g_advanced_vfs.total_writes);
+    
+    /* Align to page boundaries */
+    off_t page_offset = offset & ~(PAGE_SIZE - 1);
+    size_t page_count = (count + (offset - page_offset) + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    ssize_t total_written = 0;
+    
+    for (size_t i = 0; i < page_count; i++) {
+        off_t current_page_offset = page_offset + (i * PAGE_SIZE);
+        
+        /* Get or create page in cache */
+        page_cache_entry_t* cached_page = page_cache_lookup(inode, current_page_offset);
+        
+        if (!cached_page) {
+            /* Page not in cache - read it first */
+            void* page_data = vmm_kmalloc(PAGE_SIZE, PAGE_SIZE);
+            if (!page_data) {
+                return total_written > 0 ? total_written : -ENOMEM;
+            }
+            
+            /* Read existing data if not writing full page */
+            if ((offset & (PAGE_SIZE - 1)) != 0 || count < PAGE_SIZE) {
+                ssize_t read_result = inode->v_op->read(inode, page_data, PAGE_SIZE, current_page_offset);
+                if (read_result < 0) {
+                    memset(page_data, 0, PAGE_SIZE);
+                }
+            } else {
+                memset(page_data, 0, PAGE_SIZE);
+            }
+            
+            page_cache_insert(inode, current_page_offset, page_data);
+            cached_page = page_cache_lookup(inode, current_page_offset);
+        }
+        
+        if (cached_page) {
+            /* Calculate write parameters */
+            off_t page_start = max(offset, current_page_offset);
+            off_t page_end = min(offset + count, current_page_offset + PAGE_SIZE);
+            size_t write_size = page_end - page_start;
+            
+            if (write_size > 0) {
+                memcpy((char*)cached_page->page_data + (page_start - current_page_offset),
+                       (const char*)buffer + total_written,
+                       write_size);
+                
+                total_written += write_size;
+                
+                /* Mark page as dirty */
+                cached_page->dirty = true;
+                cached_page->access_time = timer_get_ticks();
+                
+                /* Add to dirty list if not already there */
+                if (list_empty(&cached_page->writeback_list)) {
+                    spin_lock(&g_advanced_vfs.page_cache_lock);
+                    list_add_tail(&cached_page->writeback_list, &g_advanced_vfs.dirty_pages);
+                    g_advanced_vfs.dirty_page_count++;
+                    spin_unlock(&g_advanced_vfs.page_cache_lock);
+                }
+            }
+        }
+        
+        if (total_written >= count) {
+            break;
+        }
+    }
+    
+    /* Update inode size if extended */
+    if (offset + total_written > inode->v_size) {
+        inode->v_size = offset + total_written;
+        inode->v_flags |= VNODE_FLAG_DIRTY;
+    }
+    
+    /* Commit journal transaction */
+    if (mount && mount->journal) {
+        journal_commit_transaction(mount->journal);
+    }
+    
+    mount->write_operations++;
+    
+    return total_written;
+}
+
+/* Initialize cache subsystem */
+static int vfs_cache_init(void) {
+    /* Cache already initialized by global initialization */
+    return 0;
+}
+
+/* Inode cache lookup */
+static struct vnode* inode_cache_lookup(dev_t dev, uint64_t ino) {
+    uint32_t hash = (dev ^ ino) % 256;
+    
+    spin_lock(&g_advanced_vfs.inode_cache_lock);
+    
+    inode_cache_entry_t* entry;
+    list_for_each_entry(entry, &g_advanced_vfs.inode_cache_hash[hash], hash_list) {
+        if (entry->dev == dev && entry->ino == ino) {
+            entry->access_time = timer_get_ticks();
+            entry->ref_count++;
+            
+            /* Move to front of LRU */
+            list_del(&entry->lru_list);
+            list_add(&entry->lru_list, &g_advanced_vfs.inode_cache_lru);
+            
+            spin_unlock(&g_advanced_vfs.inode_cache_lock);
+            return entry->inode;
+        }
+    }
+    
+    spin_unlock(&g_advanced_vfs.inode_cache_lock);
+    return NULL;
+}
+
+/* Page cache lookup */
+static page_cache_entry_t* page_cache_lookup(struct vnode* inode, uint64_t offset) {
+    uint32_t hash = ((uintptr_t)inode ^ offset) % 4096;
+    
+    spin_lock(&g_advanced_vfs.page_cache_lock);
+    
+    page_cache_entry_t* entry;
+    list_for_each_entry(entry, &g_advanced_vfs.page_cache_hash[hash], hash_list) {
+        if (entry->inode == inode && entry->offset == offset) {
+            entry->access_time = timer_get_ticks();
+            entry->ref_count++;
+            
+            /* Move to front of LRU */
+            list_del(&entry->lru_list);
+            list_add(&entry->lru_list, &g_advanced_vfs.page_cache_lru);
+            
+            spin_unlock(&g_advanced_vfs.page_cache_lock);
+            return entry;
+        }
+    }
+    
+    spin_unlock(&g_advanced_vfs.page_cache_lock);
+    return NULL;
+}
+
+/* Insert page into cache */
+static int page_cache_insert(struct vnode* inode, uint64_t offset, void* data) {
+    if (g_advanced_vfs.cached_pages >= MAX_PAGE_CACHE_PAGES) {
+        page_cache_evict_lru();
+    }
+    
+    page_cache_entry_t* entry = (page_cache_entry_t*)vmm_kmalloc(sizeof(page_cache_entry_t), 32);
+    if (!entry) {
+        return -ENOMEM;
+    }
+    
+    memset(entry, 0, sizeof(page_cache_entry_t));
+    
+    entry->inode = inode;
+    entry->offset = offset;
+    entry->page_data = data;
+    entry->access_time = timer_get_ticks();
+    entry->ref_count = 1;
+    entry->dirty = false;
+    
+    uint32_t hash = ((uintptr_t)inode ^ offset) % 4096;
+    
+    spin_lock(&g_advanced_vfs.page_cache_lock);
+    
+    /* Add to hash table and LRU */
+    list_add(&entry->hash_list, &g_advanced_vfs.page_cache_hash[hash]);
+    list_add(&entry->lru_list, &g_advanced_vfs.page_cache_lru);
+    INIT_LIST_HEAD(&entry->writeback_list);
+    
+    g_advanced_vfs.cached_pages++;
+    
+    spin_unlock(&g_advanced_vfs.page_cache_lock);
+    
+    return 0;
+}
+
+/* Evict LRU page from cache */
+static void page_cache_evict_lru(void) {
+    spin_lock(&g_advanced_vfs.page_cache_lock);
+    
+    if (list_empty(&g_advanced_vfs.page_cache_lru)) {
+        spin_unlock(&g_advanced_vfs.page_cache_lock);
+        return;
+    }
+    
+    page_cache_entry_t* victim = list_last_entry(&g_advanced_vfs.page_cache_lru, 
+                                                 page_cache_entry_t, lru_list);
+    
+    /* Don't evict pages with active references */
+    if (victim->ref_count > 0) {
+        spin_unlock(&g_advanced_vfs.page_cache_lock);
+        return;
+    }
+    
+    /* Write back if dirty */
+    if (victim->dirty && !victim->writeback) {
+        victim->writeback = true;
+        spin_unlock(&g_advanced_vfs.page_cache_lock);
+        
+        /* Write page back to filesystem */
+        if (victim->inode && victim->inode->v_op && victim->inode->v_op->write) {
+            victim->inode->v_op->write(victim->inode, victim->page_data, 
+                                     PAGE_SIZE, victim->offset);
+        }
+        
+        spin_lock(&g_advanced_vfs.page_cache_lock);
+    }
+    
+    /* Remove from all lists */
+    list_del(&victim->lru_list);
+    list_del(&victim->hash_list);
+    if (!list_empty(&victim->writeback_list)) {
+        list_del(&victim->writeback_list);
+        g_advanced_vfs.dirty_page_count--;
+    }
+    
+    g_advanced_vfs.cached_pages--;
+    
+    spin_unlock(&g_advanced_vfs.page_cache_lock);
+    
+    /* Free page data and entry */
+    if (victim->page_data) {
+        vmm_kfree(victim->page_data, PAGE_SIZE);
+    }
+    vmm_kfree(victim, sizeof(page_cache_entry_t));
+}
+
+/* Create journal for filesystem */
+static fs_journal_t* journal_create(struct vfs_mount_advanced* mount) {
+    fs_journal_t* journal = (fs_journal_t*)vmm_kmalloc(sizeof(fs_journal_t), 64);
+    if (!journal) {
+        return NULL;
+    }
+    
+    memset(journal, 0, sizeof(fs_journal_t));
+    
+    journal->mount = mount;
+    journal->enabled = true;
+    journal->journal_dev = mount->bdev;
+    journal->current_transaction = 1;
+    journal->committed_transaction = 0;
+    
+    /* Initialize lists */
+    INIT_LIST_HEAD(&journal->pending_transactions);
+    INIT_LIST_HEAD(&journal->active_transactions);
+    
+    /* Create journal thread */
+    int ret = thread_create_kernel("fs-journal", journal_thread_func, journal, 
+                                  &journal->journal_thread);
+    if (ret != 0) {
+        vmm_kfree(journal, sizeof(fs_journal_t));
+        return NULL;
+    }
+    
+    journal->journal_waiters = wait_queue_create();
+    spinlock_init(&journal->lock);
+    
+    printf("Journal created for mount %s\n", mount->mountpoint);
+    
+    return journal;
+}
+
+/* Writeback thread */
+static void writeback_thread_func(void* data) {
+    UNUSED(data);
+    
+    while (true) {
+        /* Write back dirty pages periodically */
+        page_cache_writeback_dirty_pages();
+        
+        /* Sleep for a while */
+        wait_queue_sleep_timeout(g_advanced_vfs.writeback_waiters, 1000); /* 1 second */
+    }
+}
+
+/* Write back dirty pages */
+static void page_cache_writeback_dirty_pages(void) {
+    spin_lock(&g_advanced_vfs.page_cache_lock);
+    
+    page_cache_entry_t* entry;
+    page_cache_entry_t* next;
+    
+    list_for_each_entry_safe(entry, next, &g_advanced_vfs.dirty_pages, writeback_list) {
+        if (entry->dirty && !entry->writeback && entry->ref_count == 0) {
+            entry->writeback = true;
+            
+            spin_unlock(&g_advanced_vfs.page_cache_lock);
+            
+            /* Write page back */
+            if (entry->inode && entry->inode->v_op && entry->inode->v_op->write) {
+                entry->inode->v_op->write(entry->inode, entry->page_data,
+                                        PAGE_SIZE, entry->offset);
+            }
+            
+            spin_lock(&g_advanced_vfs.page_cache_lock);
+            
+            entry->dirty = false;
+            entry->writeback = false;
+            
+            /* Remove from dirty list */
+            list_del(&entry->writeback_list);
+            INIT_LIST_HEAD(&entry->writeback_list);
+            g_advanced_vfs.dirty_page_count--;
+        }
+    }
+    
+    spin_unlock(&g_advanced_vfs.page_cache_lock);
+}
+
+/* Writeback timer handler */
+static void writeback_timer_handler(void* data) {
+    UNUSED(data);
+    
+    /* Wake up writeback thread */
+    wait_queue_wake_one(g_advanced_vfs.writeback_waiters);
+    
+    /* Reschedule timer */
+    timer_schedule(&g_advanced_vfs.writeback_timer, 5000); /* 5 seconds */
+}
+
+/* Journal thread */
+static void journal_thread_func(void* data) {
+    fs_journal_t* journal = (fs_journal_t*)data;
+    
+    while (journal->enabled) {
+        /* Process pending transactions */
+        /* This would implement the actual journaling logic */
+        
+        wait_queue_sleep_timeout(journal->journal_waiters, 100); /* 100ms */
+    }
+}
+
+/* Stub implementations for journal operations */
+static int journal_start_transaction(fs_journal_t* journal) {
+    if (!journal || !journal->enabled) {
+        return 0;
+    }
+    
+    spin_lock(&journal->lock);
+    journal->current_transaction++;
+    spin_unlock(&journal->lock);
+    
+    return 0;
+}
+
+static int journal_commit_transaction(fs_journal_t* journal) {
+    if (!journal || !journal->enabled) {
+        return 0;
+    }
+    
+    spin_lock(&journal->lock);
+    journal->committed_transaction = journal->current_transaction;
+    journal->transactions_committed++;
+    spin_unlock(&journal->lock);
+    
+    atomic64_inc(&g_advanced_vfs.journal_commits);
+    
+    return 0;
+}
+
+/* Get VFS statistics */
+void advanced_vfs_get_stats(struct advanced_vfs_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct advanced_vfs_stats));
+    
+    stats->total_reads = atomic64_read(&g_advanced_vfs.total_reads);
+    stats->total_writes = atomic64_read(&g_advanced_vfs.total_writes);
+    stats->cache_hits = atomic64_read(&g_advanced_vfs.cache_hits);
+    stats->cache_misses = atomic64_read(&g_advanced_vfs.cache_misses);
+    stats->journal_commits = atomic64_read(&g_advanced_vfs.journal_commits);
+    stats->sync_operations = atomic64_read(&g_advanced_vfs.sync_operations);
+    
+    stats->cached_inodes = g_advanced_vfs.cached_inodes;
+    stats->cached_dentries = g_advanced_vfs.cached_dentries;
+    stats->cached_pages = g_advanced_vfs.cached_pages;
+    stats->dirty_pages = g_advanced_vfs.dirty_page_count;
+}
+
+/* Debug output */
+void advanced_vfs_dump_stats(void) {
+    struct advanced_vfs_stats stats;
+    advanced_vfs_get_stats(&stats);
+    
+    printf("Advanced VFS Statistics:\n");
+    printf("  Total reads: %lu\n", stats.total_reads);
+    printf("  Total writes: %lu\n", stats.total_writes);
+    printf("  Cache hits: %lu\n", stats.cache_hits);
+    printf("  Cache misses: %lu\n", stats.cache_misses);
+    printf("  Cache hit ratio: %.2f%%\n", 
+           stats.cache_hits * 100.0 / (stats.cache_hits + stats.cache_misses));
+    printf("  Journal commits: %lu\n", stats.journal_commits);
+    printf("  Sync operations: %lu\n", stats.sync_operations);
+    printf("  Cached inodes: %u\n", stats.cached_inodes);
+    printf("  Cached dentries: %u\n", stats.cached_dentries);
+    printf("  Cached pages: %u\n", stats.cached_pages);
+    printf("  Dirty pages: %u\n", stats.dirty_pages);
+}

@@ -1,0 +1,716 @@
+/*
+ * LimitlessOS Advanced System Services Implementation
+ * Systemd-compatible service management, logging, monitoring, and maintenance
+ */
+
+#include "system_services.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#include <syslog.h>
+#include <dirent.h>
+#include <time.h>
+#include <stdarg.h>
+
+/* Global service manager */
+service_manager_t service_manager = {0};
+
+/* Threading support */
+static pthread_mutex_t manager_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t monitoring_thread;
+static pthread_t maintenance_thread;
+static bool manager_running = false;
+
+/* System monitoring thread */
+static void *system_monitor_thread(void *arg) {
+    while (manager_running && service_manager.monitoring.enabled) {
+        pthread_mutex_lock(&service_manager.monitoring.metrics_mutex);
+        
+        system_metrics_t *metrics = &service_manager.monitoring.current;
+        memset(metrics, 0, sizeof(system_metrics_t));
+        metrics->timestamp = time(NULL);
+        
+        /* Collect CPU metrics */
+        FILE *stat_fp = fopen("/proc/stat", "r");
+        if (stat_fp) {
+            char line[256];
+            if (fgets(line, sizeof(line), stat_fp)) {
+                unsigned long user, nice, system, idle, iowait, irq, softirq;
+                sscanf(line, "cpu %lu %lu %lu %lu %lu %lu %lu",
+                       &user, &nice, &system, &idle, &iowait, &irq, &softirq);
+                
+                unsigned long total = user + nice + system + idle + iowait + irq + softirq;
+                unsigned long active = total - idle;
+                metrics->cpu_usage_percent = total > 0 ? (double)active / total * 100.0 : 0.0;
+            }
+            fclose(stat_fp);
+        }
+        
+        /* Collect load averages */
+        FILE *loadavg_fp = fopen("/proc/loadavg", "r");
+        if (loadavg_fp) {
+            fscanf(loadavg_fp, "%lf %lf %lf", 
+                   &metrics->cpu_load_1min, 
+                   &metrics->cpu_load_5min, 
+                   &metrics->cpu_load_15min);
+            fclose(loadavg_fp);
+        }
+        
+        /* Collect memory metrics */
+        FILE *meminfo_fp = fopen("/proc/meminfo", "r");
+        if (meminfo_fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), meminfo_fp)) {
+                if (strncmp(line, "MemTotal:", 9) == 0) {
+                    sscanf(line, "MemTotal: %lu kB", &metrics->memory_total);
+                    metrics->memory_total *= 1024;
+                } else if (strncmp(line, "MemAvailable:", 13) == 0) {
+                    sscanf(line, "MemAvailable: %lu kB", &metrics->memory_available);
+                    metrics->memory_available *= 1024;
+                } else if (strncmp(line, "Cached:", 7) == 0) {
+                    sscanf(line, "Cached: %lu kB", &metrics->memory_cached);
+                    metrics->memory_cached *= 1024;
+                } else if (strncmp(line, "Buffers:", 8) == 0) {
+                    sscanf(line, "Buffers: %lu kB", &metrics->memory_buffers);
+                    metrics->memory_buffers *= 1024;
+                } else if (strncmp(line, "SwapTotal:", 10) == 0) {
+                    sscanf(line, "SwapTotal: %lu kB", &metrics->swap_total);
+                    metrics->swap_total *= 1024;
+                } else if (strncmp(line, "SwapFree:", 9) == 0) {
+                    uint64_t swap_free;
+                    sscanf(line, "SwapFree: %lu kB", &swap_free);
+                    swap_free *= 1024;
+                    metrics->swap_used = metrics->swap_total - swap_free;
+                }
+            }
+            fclose(meminfo_fp);
+            
+            metrics->memory_used = metrics->memory_total - metrics->memory_available;
+        }
+        
+        /* Collect network statistics */
+        FILE *netdev_fp = fopen("/proc/net/dev", "r");
+        if (netdev_fp) {
+            char line[512];
+            metrics->network_rx_bytes = 0;
+            metrics->network_tx_bytes = 0;
+            
+            /* Skip header lines */
+            fgets(line, sizeof(line), netdev_fp);
+            fgets(line, sizeof(line), netdev_fp);
+            
+            while (fgets(line, sizeof(line), netdev_fp)) {
+                char interface[32];
+                uint64_t rx_bytes, tx_bytes;
+                
+                if (sscanf(line, "%s %lu %*u %*u %*u %*u %*u %*u %*u %lu",
+                          interface, &rx_bytes, &tx_bytes) == 3) {
+                    /* Skip loopback interface */
+                    if (strncmp(interface, "lo:", 3) != 0) {
+                        metrics->network_rx_bytes += rx_bytes;
+                        metrics->network_tx_bytes += tx_bytes;
+                    }
+                }
+            }
+            fclose(netdev_fp);
+        }
+        
+        /* Collect process count */
+        DIR *proc_dir = opendir("/proc");
+        if (proc_dir) {
+            struct dirent *entry;
+            metrics->processes_total = 0;
+            
+            while ((entry = readdir(proc_dir)) != NULL) {
+                if (strspn(entry->d_name, "0123456789") == strlen(entry->d_name)) {
+                    metrics->processes_total++;
+                }
+            }
+            closedir(proc_dir);
+        }
+        
+        /* Get system uptime */
+        FILE *uptime_fp = fopen("/proc/uptime", "r");
+        if (uptime_fp) {
+            fscanf(uptime_fp, "%lf", &metrics->uptime);
+            fclose(uptime_fp);
+        }
+        
+        /* Store in history */
+        if (service_manager.monitoring.history) {
+            uint32_t index = service_manager.monitoring.history_index;
+            service_manager.monitoring.history[index] = *metrics;
+            service_manager.monitoring.history_index = 
+                (index + 1) % service_manager.monitoring.history_size;
+        }
+        
+        /* Check alerting thresholds */
+        if (service_manager.monitoring.alerting.enabled) {
+            if (metrics->cpu_usage_percent > service_manager.monitoring.alerting.cpu_threshold) {
+                if (service_manager.monitoring.alerting.alert_callback) {
+                    char alert_msg[256];
+                    snprintf(alert_msg, sizeof(alert_msg), 
+                            "High CPU usage: %.1f%%", metrics->cpu_usage_percent);
+                    service_manager.monitoring.alerting.alert_callback("cpu", alert_msg);
+                }
+                service_manager.stats.alerts_triggered++;
+            }
+            
+            double memory_usage_percent = metrics->memory_total > 0 ? 
+                (double)metrics->memory_used / metrics->memory_total * 100.0 : 0.0;
+            
+            if (memory_usage_percent > service_manager.monitoring.alerting.memory_threshold) {
+                if (service_manager.monitoring.alerting.alert_callback) {
+                    char alert_msg[256];
+                    snprintf(alert_msg, sizeof(alert_msg), 
+                            "High memory usage: %.1f%%", memory_usage_percent);
+                    service_manager.monitoring.alerting.alert_callback("memory", alert_msg);
+                }
+                service_manager.stats.alerts_triggered++;
+            }
+        }
+        
+        service_manager.stats.monitoring_cycles++;
+        
+        pthread_mutex_unlock(&service_manager.monitoring.metrics_mutex);
+        
+        /* Sleep for collection interval */
+        sleep(service_manager.monitoring.collection_interval);
+    }
+    
+    return NULL;
+}
+
+/* Automatic maintenance thread */
+static void *auto_maintenance_thread(void *arg) {
+    while (manager_running && service_manager.maintenance.enabled) {
+        time_t current_time = time(NULL);
+        struct tm *tm_info = localtime(&current_time);
+        
+        /* Run maintenance at scheduled hour */
+        if (tm_info->tm_hour == service_manager.maintenance.maintenance_hour) {
+            /* Check if maintenance already ran today */
+            time_t last_maintenance = service_manager.maintenance.last_maintenance;
+            if (current_time - last_maintenance > 23 * 3600) { /* 23 hours */
+                printf("Running automatic system maintenance...\n");
+                maintenance_run();
+                service_manager.maintenance.last_maintenance = current_time;
+                service_manager.maintenance.maintenance_runs++;
+            }
+        }
+        
+        /* Sleep for 1 hour before checking again */
+        sleep(3600);
+    }
+    
+    return NULL;
+}
+
+/* Initialize service manager */
+int service_manager_init(void) {
+    memset(&service_manager, 0, sizeof(service_manager));
+    
+    printf("Initializing Advanced System Services...\n");
+    
+    /* Set up directories */
+    strcpy(service_manager.config_dir, "/etc/limitlessos/services");
+    strcpy(service_manager.runtime_dir, "/run/limitlessos");
+    strcpy(service_manager.log_dir, "/var/log/limitlessos");
+    
+    /* Create directories */
+    mkdir("/etc/limitlessos", 0755);
+    mkdir(service_manager.config_dir, 0755);
+    mkdir("/run/limitlessos", 0755);
+    mkdir("/var/log", 0755);
+    mkdir(service_manager.log_dir, 0755);
+    
+    /* Initialize mutexes */
+    pthread_mutex_init(&service_manager.services_mutex, NULL);
+    
+    /* Initialize logging */
+    logging_init();
+    
+    /* Initialize monitoring */
+    monitoring_init();
+    
+    /* Initialize maintenance */
+    maintenance_init();
+    
+    /* Start background threads */
+    manager_running = true;
+    pthread_create(&monitoring_thread, NULL, system_monitor_thread, NULL);
+    pthread_create(&maintenance_thread, NULL, auto_maintenance_thread, NULL);
+    
+    service_manager.initialized = true;
+    
+    printf("System services initialized\n");
+    printf("Configuration: %s\n", service_manager.config_dir);
+    printf("Runtime: %s\n", service_manager.runtime_dir);
+    printf("Logging: %s\n", service_manager.log_dir);
+    
+    return 0;
+}
+
+/* Cleanup service manager */
+void service_manager_exit(void) {
+    manager_running = false;
+    
+    /* Stop all services */
+    pthread_mutex_lock(&service_manager.services_mutex);
+    for (uint32_t i = 0; i < service_manager.service_count; i++) {
+        service_t *service = &service_manager.services[i];
+        if (service->state == SERVICE_STATE_ACTIVE) {
+            printf("Stopping service: %s\n", service->config.name);
+            service_stop(service->config.name);
+        }
+    }
+    pthread_mutex_unlock(&service_manager.services_mutex);
+    
+    /* Wait for threads to finish */
+    pthread_join(monitoring_thread, NULL);
+    pthread_join(maintenance_thread, NULL);
+    
+    /* Cleanup resources */
+    if (service_manager.logging.entries) {
+        free(service_manager.logging.entries);
+    }
+    
+    if (service_manager.monitoring.history) {
+        free(service_manager.monitoring.history);
+    }
+    
+    pthread_mutex_destroy(&service_manager.services_mutex);
+    pthread_mutex_destroy(&service_manager.logging.log_mutex);
+    pthread_mutex_destroy(&service_manager.monitoring.metrics_mutex);
+    
+    service_manager.initialized = false;
+    memset(&service_manager, 0, sizeof(service_manager));
+}
+
+/* Start service */
+int service_start(const char *service_name) {
+    if (!service_name || !service_manager.initialized) return -EINVAL;
+    
+    pthread_mutex_lock(&service_manager.services_mutex);
+    
+    /* Find service */
+    service_t *service = NULL;
+    for (uint32_t i = 0; i < service_manager.service_count; i++) {
+        if (strcmp(service_manager.services[i].config.name, service_name) == 0) {
+            service = &service_manager.services[i];
+            break;
+        }
+    }
+    
+    if (!service) {
+        pthread_mutex_unlock(&service_manager.services_mutex);
+        return -ENOENT;
+    }
+    
+    if (service->state == SERVICE_STATE_ACTIVE) {
+        pthread_mutex_unlock(&service_manager.services_mutex);
+        return 0; /* Already running */
+    }
+    
+    service->state = SERVICE_STATE_ACTIVATING;
+    service->state_change_time = time(NULL);
+    
+    /* Fork and execute service */
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child process */
+        
+        /* Set working directory */
+        if (strlen(service->config.working_directory) > 0) {
+            chdir(service->config.working_directory);
+        }
+        
+        /* Set user/group */
+        if (strlen(service->config.user) > 0) {
+            /* In a real implementation, switch to specified user */
+        }
+        
+        /* Set environment variables */
+        for (uint32_t i = 0; i < service->config.environment_count; i++) {
+            char *env_var = service->config.environment[i];
+            char *equals = strchr(env_var, '=');
+            if (equals) {
+                *equals = '\0';
+                setenv(env_var, equals + 1, 1);
+                *equals = '=';
+            }
+        }
+        
+        /* Execute service command */
+        char *args[64] = {0};
+        char *command = strdup(service->config.exec_start);
+        char *token = strtok(command, " ");
+        int arg_count = 0;
+        
+        while (token && arg_count < 63) {
+            args[arg_count++] = token;
+            token = strtok(NULL, " ");
+        }
+        
+        execvp(args[0], args);
+        
+        /* If we reach here, exec failed */
+        fprintf(stderr, "Failed to execute service: %s\n", service_name);
+        exit(EXIT_FAILURE);
+        
+    } else if (pid > 0) {
+        /* Parent process */
+        service->main_pid = pid;
+        service->state = SERVICE_STATE_ACTIVE;
+        service->active_enter_time = time(NULL);
+        service->exec_start_count++;
+        
+        service_manager.stats.services_started++;
+        
+        pthread_mutex_unlock(&service_manager.services_mutex);
+        
+        /* Log service start */
+        logging_write(LOG_LEVEL_INFO, "systemd", service_name, 
+                     "Service %s started (PID: %d)", service_name, pid);
+        
+        printf("Started service: %s (PID: %d)\n", service_name, pid);
+        
+        return 0;
+        
+    } else {
+        /* Fork failed */
+        service->state = SERVICE_STATE_FAILED;
+        pthread_mutex_unlock(&service_manager.services_mutex);
+        
+        logging_write(LOG_LEVEL_ERROR, "systemd", service_name, 
+                     "Failed to start service %s: %s", service_name, strerror(errno));
+        
+        return -errno;
+    }
+}
+
+/* Stop service */
+int service_stop(const char *service_name) {
+    if (!service_name || !service_manager.initialized) return -EINVAL;
+    
+    pthread_mutex_lock(&service_manager.services_mutex);
+    
+    /* Find service */
+    service_t *service = NULL;
+    for (uint32_t i = 0; i < service_manager.service_count; i++) {
+        if (strcmp(service_manager.services[i].config.name, service_name) == 0) {
+            service = &service_manager.services[i];
+            break;
+        }
+    }
+    
+    if (!service) {
+        pthread_mutex_unlock(&service_manager.services_mutex);
+        return -ENOENT;
+    }
+    
+    if (service->state != SERVICE_STATE_ACTIVE) {
+        pthread_mutex_unlock(&service_manager.services_mutex);
+        return 0; /* Not running */
+    }
+    
+    service->state = SERVICE_STATE_DEACTIVATING;
+    service->state_change_time = time(NULL);
+    service->stop_requested = true;
+    
+    /* Send termination signal */
+    if (service->main_pid > 0) {
+        kill(service->main_pid, SIGTERM);
+        
+        /* Wait for graceful shutdown */
+        for (int i = 0; i < service->config.timeout_stop_sec; i++) {
+            int status;
+            pid_t result = waitpid(service->main_pid, &status, WNOHANG);
+            
+            if (result == service->main_pid) {
+                /* Process exited */
+                service->exit_code = WEXITSTATUS(status);
+                service->exit_status = status;
+                break;
+            } else if (result == -1) {
+                /* Process no longer exists */
+                break;
+            }
+            
+            sleep(1);
+        }
+        
+        /* Force kill if still running */
+        if (kill(service->main_pid, 0) == 0) {
+            kill(service->main_pid, SIGKILL);
+            waitpid(service->main_pid, NULL, 0);
+        }
+    }
+    
+    service->state = SERVICE_STATE_INACTIVE;
+    service->active_exit_time = time(NULL);
+    service->main_pid = 0;
+    
+    service_manager.stats.services_stopped++;
+    
+    pthread_mutex_unlock(&service_manager.services_mutex);
+    
+    /* Log service stop */
+    logging_write(LOG_LEVEL_INFO, "systemd", service_name, 
+                 "Service %s stopped", service_name);
+    
+    printf("Stopped service: %s\n", service_name);
+    
+    return 0;
+}
+
+/* Get service state */
+service_state_t service_get_state(const char *service_name) {
+    if (!service_name || !service_manager.initialized) return SERVICE_STATE_FAILED;
+    
+    pthread_mutex_lock(&service_manager.services_mutex);
+    
+    for (uint32_t i = 0; i < service_manager.service_count; i++) {
+        if (strcmp(service_manager.services[i].config.name, service_name) == 0) {
+            service_state_t state = service_manager.services[i].state;
+            pthread_mutex_unlock(&service_manager.services_mutex);
+            return state;
+        }
+    }
+    
+    pthread_mutex_unlock(&service_manager.services_mutex);
+    return SERVICE_STATE_INACTIVE;
+}
+
+/* Initialize logging system */
+int logging_init(void) {
+    memset(&service_manager.logging, 0, sizeof(service_manager.logging));
+    
+    service_manager.logging.enabled = true;
+    service_manager.logging.min_level = LOG_LEVEL_INFO;
+    service_manager.logging.structured_logging = true;
+    service_manager.logging.persistent_logging = true;
+    service_manager.logging.max_log_size = 100 * 1024 * 1024; /* 100MB */
+    service_manager.logging.max_log_files = 10;
+    strcpy(service_manager.logging.log_format, "%Y-%m-%d %H:%M:%S");
+    
+    /* Allocate log entry buffer */
+    service_manager.logging.max_entries = 100000; /* 100K entries */
+    service_manager.logging.entries = calloc(service_manager.logging.max_entries, 
+                                           sizeof(log_entry_t));
+    if (!service_manager.logging.entries) {
+        return -ENOMEM;
+    }
+    
+    pthread_mutex_init(&service_manager.logging.log_mutex, NULL);
+    
+    /* Syslog integration */
+    service_manager.logging.syslog_enabled = true;
+    strcpy(service_manager.logging.syslog_facility, "daemon");
+    strcpy(service_manager.logging.syslog_identifier, "limitlessos");
+    
+    openlog(service_manager.logging.syslog_identifier, LOG_PID, LOG_DAEMON);
+    
+    return 0;
+}
+
+/* Write log entry */
+int logging_write(log_level_t level, const char *facility, const char *service_name, 
+                 const char *format, ...) {
+    if (!service_manager.logging.enabled || level > service_manager.logging.min_level) {
+        return 0;
+    }
+    
+    pthread_mutex_lock(&service_manager.logging.log_mutex);
+    
+    /* Create log entry */
+    log_entry_t *entry = &service_manager.logging.entries[service_manager.logging.entry_index];
+    memset(entry, 0, sizeof(log_entry_t));
+    
+    /* Fill basic information */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    entry->timestamp = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    entry->level = level;
+    entry->pid = getpid();
+    entry->tid = pthread_self();
+    gethostname(entry->hostname, sizeof(entry->hostname) - 1);
+    
+    if (facility) strncpy(entry->facility, facility, sizeof(entry->facility) - 1);
+    if (service_name) strncpy(entry->service_name, service_name, sizeof(entry->service_name) - 1);
+    
+    /* Format message */
+    va_list args;
+    va_start(args, format);
+    vsnprintf(entry->message, sizeof(entry->message), format, args);
+    va_end(args);
+    
+    /* Update buffer index */
+    service_manager.logging.entry_index = 
+        (service_manager.logging.entry_index + 1) % service_manager.logging.max_entries;
+    
+    if (service_manager.logging.entry_count < service_manager.logging.max_entries) {
+        service_manager.logging.entry_count++;
+    }
+    
+    service_manager.stats.log_entries_written++;
+    
+    pthread_mutex_unlock(&service_manager.logging.log_mutex);
+    
+    /* Write to syslog */
+    if (service_manager.logging.syslog_enabled) {
+        int syslog_level;
+        switch (level) {
+            case LOG_LEVEL_EMERGENCY: syslog_level = LOG_EMERG; break;
+            case LOG_LEVEL_ALERT: syslog_level = LOG_ALERT; break;
+            case LOG_LEVEL_CRITICAL: syslog_level = LOG_CRIT; break;
+            case LOG_LEVEL_ERROR: syslog_level = LOG_ERR; break;
+            case LOG_LEVEL_WARNING: syslog_level = LOG_WARNING; break;
+            case LOG_LEVEL_NOTICE: syslog_level = LOG_NOTICE; break;
+            case LOG_LEVEL_INFO: syslog_level = LOG_INFO; break;
+            case LOG_LEVEL_DEBUG: syslog_level = LOG_DEBUG; break;
+            default: syslog_level = LOG_INFO; break;
+        }
+        
+        syslog(syslog_level, "[%s] %s", service_name ? service_name : "system", entry->message);
+    }
+    
+    /* Write to console for important messages */
+    if (level <= LOG_LEVEL_WARNING) {
+        printf("[%s] %s: %s\n", 
+               log_level_name(level), 
+               service_name ? service_name : "system", 
+               entry->message);
+    }
+    
+    return 0;
+}
+
+/* Initialize monitoring */
+int monitoring_init(void) {
+    memset(&service_manager.monitoring, 0, sizeof(service_manager.monitoring));
+    
+    service_manager.monitoring.enabled = true;
+    service_manager.monitoring.collection_interval = 30; /* 30 seconds */
+    service_manager.monitoring.history_size = 2880; /* 24 hours at 30-second intervals */
+    
+    /* Allocate history buffer */
+    service_manager.monitoring.history = calloc(service_manager.monitoring.history_size,
+                                              sizeof(system_metrics_t));
+    if (!service_manager.monitoring.history) {
+        return -ENOMEM;
+    }
+    
+    pthread_mutex_init(&service_manager.monitoring.metrics_mutex, NULL);
+    
+    /* Configure alerting */
+    service_manager.monitoring.alerting.enabled = true;
+    service_manager.monitoring.alerting.cpu_threshold = 90.0;      /* 90% CPU */
+    service_manager.monitoring.alerting.memory_threshold = 90.0;   /* 90% Memory */
+    service_manager.monitoring.alerting.disk_threshold = 90.0;     /* 90% Disk */
+    service_manager.monitoring.alerting.load_threshold = 10;       /* Load average of 10 */
+    
+    return 0;
+}
+
+/* Initialize maintenance */
+int maintenance_init(void) {
+    memset(&service_manager.maintenance, 0, sizeof(service_manager.maintenance));
+    
+    service_manager.maintenance.enabled = true;
+    service_manager.maintenance.maintenance_hour = 3; /* 3 AM */
+    service_manager.maintenance.log_rotation = true;
+    service_manager.maintenance.cache_cleanup = true;
+    service_manager.maintenance.package_updates = false; /* Disabled by default */
+    service_manager.maintenance.system_optimization = true;
+    service_manager.maintenance.last_maintenance = 0;
+    
+    return 0;
+}
+
+/* Run maintenance tasks */
+int maintenance_run(void) {
+    printf("Starting system maintenance tasks...\n");
+    
+    /* Log rotation */
+    if (service_manager.maintenance.log_rotation) {
+        logging_rotate();
+        service_manager.maintenance.logs_rotated++;
+    }
+    
+    /* Cache cleanup */
+    if (service_manager.maintenance.cache_cleanup) {
+        system("find /tmp -type f -atime +7 -delete 2>/dev/null");
+        system("find /var/tmp -type f -atime +7 -delete 2>/dev/null");
+        service_manager.maintenance.cache_cleaned_mb += 100; /* Estimate */
+    }
+    
+    /* System optimization */
+    if (service_manager.maintenance.system_optimization) {
+        system("sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null");
+        system("systemctl daemon-reload 2>/dev/null");
+    }
+    
+    printf("System maintenance completed\n");
+    
+    return 0;
+}
+
+/* Utility functions */
+const char *service_state_name(service_state_t state) {
+    static const char *names[] = {
+        "inactive", "active", "activating", "deactivating", 
+        "failed", "reloading", "maintenance"
+    };
+    
+    if (state >= 0 && state < sizeof(names) / sizeof(names[0])) {
+        return names[state];
+    }
+    return "unknown";
+}
+
+const char *log_level_name(log_level_t level) {
+    static const char *names[] = {
+        "EMERGENCY", "ALERT", "CRITICAL", "ERROR", 
+        "WARNING", "NOTICE", "INFO", "DEBUG"
+    };
+    
+    if (level >= 0 && level < sizeof(names) / sizeof(names[0])) {
+        return names[level];
+    }
+    return "UNKNOWN";
+}
+
+/* Rotate logs */
+int logging_rotate(void) {
+    char old_log[512], new_log[512];
+    
+    /* Rotate numbered log files */
+    for (int i = service_manager.logging.max_log_files - 1; i > 0; i--) {
+        snprintf(old_log, sizeof(old_log), "%s/system.log.%d", 
+                service_manager.log_dir, i - 1);
+        snprintf(new_log, sizeof(new_log), "%s/system.log.%d", 
+                service_manager.log_dir, i);
+        
+        if (access(old_log, F_OK) == 0) {
+            rename(old_log, new_log);
+        }
+    }
+    
+    /* Move current log to .0 */
+    snprintf(old_log, sizeof(old_log), "%s/system.log", service_manager.log_dir);
+    snprintf(new_log, sizeof(new_log), "%s/system.log.0", service_manager.log_dir);
+    
+    if (access(old_log, F_OK) == 0) {
+        rename(old_log, new_log);
+    }
+    
+    return 0;
+}

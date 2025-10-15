@@ -1,0 +1,63 @@
+// Crash dump and panic handling
+#include "kernel.h"
+#include "vfs.h"
+#include "log.h"
+#include "ksym.h"
+
+/* Fallback minimal k_snprintf declaration if not already provided */
+#ifndef HAVE_K_SNPRINTF_DECL
+int k_snprintf(char* buf, size_t bufsz, const char* fmt, ...);
+#endif
+
+static void crash_symbolize_addr(u64 addr, char* out, size_t outsz){
+    (void)ksym_init();
+    if (ksym_resolve(addr, out, outsz) != 0){
+        k_snprintf(out, outsz, "0x%llx", (unsigned long long)addr);
+    }
+}
+
+static void crash_write_dump(const char* where_file, int where_line, const char* msg){
+    // Compose a simple text crash dump with timestamp and backtrace stub
+    char path[128];
+    u64 ticks = timer_get_ticks();
+    k_snprintf(path, sizeof(path), "/var/crash/panic-%llu.log", (unsigned long long)ticks);
+
+    file_t* f = NULL;
+    if (vfs_open(path, VFS_O_CREAT|VFS_O_WRONLY, &f) != 0) {
+        // If open fails (read-only FS), at least print to console
+        kprintf("[CRASH] Unable to open %s for writing\n", path);
+        return;
+    }
+
+    char buf[512];
+    int n = k_snprintf(buf, sizeof(buf), "KERNEL PANIC\nwhere: %s:%d\nmsg: %s\nticks: %llu\n",
+        where_file, where_line, msg?msg:"(null)", (unsigned long long)ticks);
+    u64 wr=0; vfs_write(f, buf, (u64)n, &wr);
+
+    // Minimal backtrace: walk frame pointer chain (x86_64 ABI)
+    n = k_snprintf(buf, sizeof(buf), "backtrace:\n");
+    wr=0; vfs_write(f, buf, (u64)n, &wr);
+    unsigned long long rbp = 0ULL;
+    __asm__ __volatile__("mov %%rbp, %0" : "=r"(rbp));
+    for (int i=0; i<16 && rbp; ++i){
+        u64* frame = (u64*)rbp;
+        u64 next = frame[0];
+        u64 ret  = frame[1];
+        char sym[128]; crash_symbolize_addr(ret, sym, sizeof(sym));
+        n = k_snprintf(buf, sizeof(buf), "  #%d %s\n", i, sym);
+        wr=0; vfs_write(f, buf, (u64)n, &wr);
+        if (next == 0 || next == rbp) break;
+        rbp = (unsigned long long)next;
+    }
+
+    vfs_close(f);
+}
+
+void kernel_panic(const char* file, int line, const char* msg){
+    hal_interrupt_disable();
+    // Attempt to write crash dump first
+    crash_write_dump(file, line, msg);
+    // Also push to klog/console
+    kprintf("\nKERNEL PANIC at %s:%d: %s\n", file, line, msg?msg:"(null)");
+    for(;;){ __asm__ __volatile__("hlt"); }
+}

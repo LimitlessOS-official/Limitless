@@ -1,0 +1,2 @@
+/* net_core.c deprecated. Provide a dummy translation unit to satisfy wildcard build rule. */
+int __net_core_deprecated_unit; /* prevent empty TU warning */

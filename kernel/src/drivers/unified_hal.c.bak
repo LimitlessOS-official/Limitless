@@ -1,0 +1,840 @@
+/*
+ * unified_hal.c - LimitlessOS Unified Hardware Abstraction Layer
+ * 
+ * Comprehensive HAL providing unified interface to all hardware components
+ * including device discovery, power management, and driver coordination.
+ */
+
+#include "kernel.h"
+#include "pci.h"
+#include "usb.h"
+#include "interrupt.h"
+#include "vmm.h"
+#include "timer.h"
+#include "acpi.h"
+
+#define MAX_HAL_DEVICES         2048
+#define MAX_DEVICE_CLASSES      64
+#define MAX_POWER_DOMAINS       32
+#define HAL_DISCOVERY_TIMEOUT   10000   /* 10 seconds */
+
+/* Device classes */
+#define HAL_CLASS_STORAGE       1
+#define HAL_CLASS_NETWORK       2
+#define HAL_CLASS_DISPLAY       3
+#define HAL_CLASS_AUDIO         4
+#define HAL_CLASS_INPUT         5
+#define HAL_CLASS_USB           6
+#define HAL_CLASS_BRIDGE        7
+#define HAL_CLASS_SYSTEM        8
+#define HAL_CLASS_WIRELESS      9
+#define HAL_CLASS_SECURITY      10
+
+/* Device states */
+#define HAL_DEVICE_STATE_UNKNOWN    0
+#define HAL_DEVICE_STATE_PRESENT    1
+#define HAL_DEVICE_STATE_CONFIGURED 2
+#define HAL_DEVICE_STATE_ACTIVE     3
+#define HAL_DEVICE_STATE_SUSPENDED  4
+#define HAL_DEVICE_STATE_ERROR      5
+#define HAL_DEVICE_STATE_REMOVED    6
+
+/* Power states */
+#define HAL_POWER_D0            0   /* Fully on */
+#define HAL_POWER_D1            1   /* Low power */
+#define HAL_POWER_D2            2   /* Lower power */
+#define HAL_POWER_D3hot         3   /* Off, context may be lost */
+#define HAL_POWER_D3cold        4   /* Off, power removed */
+
+/* Device capabilities */
+typedef struct hal_device_caps {
+    bool hotplug_capable;           /* Supports hot plug/unplug */
+    bool power_managed;             /* Supports power management */
+    bool dma_capable;               /* Can perform DMA */
+    bool msi_capable;               /* Supports MSI interrupts */
+    bool wakeup_capable;            /* Can wake system from sleep */
+    bool secure_capable;            /* Has security features */
+    
+    uint32_t max_dma_mask;          /* Maximum DMA address mask */
+    uint32_t alignment_requirement; /* DMA alignment requirement */
+    
+    uint32_t bandwidth_mbps;        /* Bandwidth in Mbps */
+    uint32_t latency_ns;            /* Typical latency in nanoseconds */
+    
+} hal_device_caps_t;
+
+/* Device resource */
+typedef struct hal_resource {
+    uint8_t type;                   /* Resource type */
+    uint64_t start;                 /* Start address/number */
+    uint64_t end;                   /* End address/number */
+    uint32_t flags;                 /* Resource flags */
+    
+    struct list_head list;          /* Resource list */
+    
+} hal_resource_t;
+
+/* Resource types */
+#define HAL_RESOURCE_MEM        1
+#define HAL_RESOURCE_IO         2
+#define HAL_RESOURCE_IRQ        3
+#define HAL_RESOURCE_DMA        4
+#define HAL_RESOURCE_BUS        5
+
+/* Device operations */
+struct hal_device_ops {
+    const char* name;               /* Operations name */
+    
+    int (*probe)(struct hal_device* dev);
+    int (*remove)(struct hal_device* dev);
+    int (*suspend)(struct hal_device* dev, uint32_t state);
+    int (*resume)(struct hal_device* dev);
+    int (*shutdown)(struct hal_device* dev);
+    
+    int (*reset)(struct hal_device* dev);
+    int (*configure)(struct hal_device* dev, void* config);
+    int (*get_info)(struct hal_device* dev, void* info, size_t size);
+    
+    int (*dma_alloc)(struct hal_device* dev, size_t size, void** virt, uint64_t* phys);
+    int (*dma_free)(struct hal_device* dev, size_t size, void* virt, uint64_t phys);
+    
+    void (*interrupt_handler)(struct hal_device* dev, uint32_t vector);
+};
+
+/* HAL device */
+typedef struct hal_device {
+    uint32_t id;                    /* Unique device ID */
+    char name[64];                  /* Device name */
+    uint8_t class;                  /* Device class */
+    uint8_t subclass;               /* Device subclass */
+    uint8_t state;                  /* Current state */
+    uint8_t power_state;            /* Current power state */
+    
+    /* Hardware identification */
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t subsystem_vendor_id;
+    uint32_t subsystem_device_id;
+    
+    /* Bus information */
+    uint8_t bus_type;               /* PCI, USB, etc. */
+    void* bus_device;               /* Bus-specific device structure */
+    
+    /* Device capabilities */
+    hal_device_caps_t caps;
+    
+    /* Resources */
+    struct list_head resources;     /* Device resources */
+    
+    /* Device operations */
+    const struct hal_device_ops* ops;
+    
+    /* Driver binding */
+    const char* driver_name;        /* Bound driver name */
+    void* driver_data;              /* Driver private data */
+    
+    /* Power management */
+    struct hal_power_domain* power_domain;
+    bool wakeup_enabled;
+    uint32_t wakeup_count;
+    
+    /* Parent/child relationships */
+    struct hal_device* parent;      /* Parent device */
+    struct list_head children;      /* Child devices */
+    struct list_head sibling;       /* Sibling list */
+    
+    /* Reference counting */
+    atomic_t refcount;
+    
+    /* Statistics */
+    uint64_t probe_time;            /* Probe timestamp */
+    uint32_t error_count;           /* Error count */
+    uint32_t reset_count;           /* Reset count */
+    uint64_t active_time;           /* Time in active state */
+    uint64_t suspend_time;          /* Time in suspended state */
+    
+    struct list_head list;          /* Global device list */
+    
+} hal_device_t;
+
+/* Power domain */
+typedef struct hal_power_domain {
+    uint32_t id;                    /* Domain ID */
+    char name[32];                  /* Domain name */
+    
+    /* Power state */
+    uint8_t power_state;            /* Current power state */
+    bool can_wakeup;                /* Can wake system */
+    
+    /* Device list */
+    struct list_head devices;       /* Devices in this domain */
+    uint32_t device_count;
+    
+    /* Power operations */
+    int (*set_power_state)(struct hal_power_domain* domain, uint8_t state);
+    int (*get_power_state)(struct hal_power_domain* domain);
+    
+    /* Statistics */
+    uint64_t transitions;           /* Power state transitions */
+    uint64_t active_time;           /* Time in active state */
+    uint64_t suspend_time;          /* Time in suspended state */
+    
+    struct list_head list;          /* Global domain list */
+    
+} hal_power_domain_t;
+
+/* Device class descriptor */
+typedef struct hal_device_class {
+    uint8_t class_id;               /* Class ID */
+    const char* name;               /* Class name */
+    const char* description;        /* Class description */
+    
+    /* Class operations */
+    int (*enumerate)(void);         /* Enumerate devices of this class */
+    int (*configure_default)(hal_device_t* dev); /* Default configuration */
+    
+    /* Statistics */
+    atomic32_t device_count;        /* Devices in this class */
+    
+    struct list_head list;          /* Class list */
+    
+} hal_device_class_t;
+
+/* HAL driver */
+typedef struct hal_driver {
+    const char* name;               /* Driver name */
+    const char* description;        /* Driver description */
+    uint32_t version;               /* Driver version */
+    
+    /* Supported device classes */
+    uint8_t supported_classes[8];
+    
+    /* Device matching */
+    struct hal_device_id* id_table; /* Supported device IDs */
+    
+    /* Driver operations */
+    int (*probe)(hal_device_t* dev);
+    void (*remove)(hal_device_t* dev);
+    int (*suspend)(hal_device_t* dev, uint32_t state);
+    int (*resume)(hal_device_t* dev);
+    void (*shutdown)(hal_device_t* dev);
+    
+    /* Statistics */
+    atomic32_t bound_devices;       /* Number of bound devices */
+    uint64_t load_time;             /* Driver load time */
+    
+    struct list_head list;          /* Driver list */
+    
+} hal_driver_t;
+
+/* Device matching structure */
+struct hal_device_id {
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t subsystem_vendor_id;
+    uint32_t subsystem_device_id;
+    uint8_t class;
+    uint8_t subclass;
+    uint32_t match_flags;
+    void* driver_data;
+};
+
+/* Match flags */
+#define HAL_MATCH_VENDOR            0x01
+#define HAL_MATCH_DEVICE            0x02
+#define HAL_MATCH_SUBSYS_VENDOR     0x04
+#define HAL_MATCH_SUBSYS_DEVICE     0x08
+#define HAL_MATCH_CLASS             0x10
+#define HAL_MATCH_SUBCLASS          0x20
+
+/* Global HAL state */
+static struct {
+    bool initialized;
+    
+    /* Device management */
+    struct list_head devices;       /* All HAL devices */
+    struct list_head device_classes; /* Device classes */
+    spinlock_t devices_lock;
+    uint32_t next_device_id;
+    
+    /* Driver management */
+    struct list_head drivers;       /* All HAL drivers */
+    spinlock_t drivers_lock;
+    
+    /* Power management */
+    struct list_head power_domains; /* Power domains */
+    spinlock_t power_lock;
+    uint32_t next_domain_id;
+    
+    /* Discovery state */
+    bool discovery_complete;
+    atomic32_t discovery_pending;
+    
+    /* Statistics */
+    atomic32_t total_devices;
+    atomic32_t active_devices;
+    atomic32_t suspended_devices;
+    atomic32_t error_devices;
+    atomic32_t registered_drivers;
+    atomic64_t power_transitions;
+    
+} g_hal = {0};
+
+/* Function prototypes */
+static int hal_register_device(hal_device_t* device);
+static void hal_unregister_device(hal_device_t* device);
+static int hal_bind_driver(hal_device_t* device);
+static hal_device_t* hal_create_device_from_pci(struct pci_device* pci_dev);
+static hal_device_t* hal_create_device_from_usb(struct usb_device* usb_dev);
+static int hal_enumerate_all_devices(void);
+static hal_power_domain_t* hal_create_power_domain(const char* name);
+static int hal_set_device_power_state(hal_device_t* device, uint8_t state);
+static void hal_device_state_changed(hal_device_t* device, uint8_t old_state, uint8_t new_state);
+
+/* Initialize HAL subsystem */
+int hal_init(void) {
+    if (g_hal.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing Hardware Abstraction Layer\n");
+    
+    memset(&g_hal, 0, sizeof(g_hal));
+    
+    INIT_LIST_HEAD(&g_hal.devices);
+    INIT_LIST_HEAD(&g_hal.device_classes);
+    INIT_LIST_HEAD(&g_hal.drivers);
+    INIT_LIST_HEAD(&g_hal.power_domains);
+    
+    spinlock_init(&g_hal.devices_lock);
+    spinlock_init(&g_hal.drivers_lock);
+    spinlock_init(&g_hal.power_lock);
+    
+    g_hal.next_device_id = 1;
+    g_hal.next_domain_id = 1;
+    
+    /* Register built-in device classes */
+    hal_device_class_t* storage_class = (hal_device_class_t*)vmm_kmalloc(sizeof(hal_device_class_t), 32);
+    if (storage_class) {
+        storage_class->class_id = HAL_CLASS_STORAGE;
+        storage_class->name = "Storage";
+        storage_class->description = "Storage devices (SATA, NVMe, etc.)";
+        list_add(&storage_class->list, &g_hal.device_classes);
+    }
+    
+    hal_device_class_t* network_class = (hal_device_class_t*)vmm_kmalloc(sizeof(hal_device_class_t), 32);
+    if (network_class) {
+        network_class->class_id = HAL_CLASS_NETWORK;
+        network_class->name = "Network";
+        network_class->description = "Network devices (Ethernet, WiFi, etc.)";
+        list_add(&network_class->list, &g_hal.device_classes);
+    }
+    
+    hal_device_class_t* usb_class = (hal_device_class_t*)vmm_kmalloc(sizeof(hal_device_class_t), 32);
+    if (usb_class) {
+        usb_class->class_id = HAL_CLASS_USB;
+        usb_class->name = "USB";
+        usb_class->description = "USB devices and controllers";
+        list_add(&usb_class->list, &g_hal.device_classes);
+    }
+    
+    /* Create default power domain */
+    hal_power_domain_t* default_domain = hal_create_power_domain("system");
+    if (!default_domain) {
+        printf("Failed to create default power domain\n");
+        return -ENOMEM;
+    }
+    
+    g_hal.initialized = true;
+    
+    /* Start device enumeration */
+    hal_enumerate_all_devices();
+    
+    printf("HAL initialized with %d devices\n", atomic32_read(&g_hal.total_devices));
+    
+    return 0;
+}
+
+/* Register HAL device */
+static int hal_register_device(hal_device_t* device) {
+    if (!device) {
+        return -EINVAL;
+    }
+    
+    /* Assign device ID */
+    device->id = g_hal.next_device_id++;
+    
+    /* Initialize device state */
+    device->state = HAL_DEVICE_STATE_PRESENT;
+    device->power_state = HAL_POWER_D0;
+    INIT_LIST_HEAD(&device->resources);
+    INIT_LIST_HEAD(&device->children);
+    atomic_set(&device->refcount, 1);
+    device->probe_time = timer_get_ticks();
+    
+    /* Add to global device list */
+    spin_lock(&g_hal.devices_lock);
+    list_add(&device->list, &g_hal.devices);
+    atomic32_inc(&g_hal.total_devices);
+    atomic32_inc(&g_hal.active_devices);
+    spin_unlock(&g_hal.devices_lock);
+    
+    /* Update device class statistics */
+    hal_device_class_t* dev_class;
+    list_for_each_entry(dev_class, &g_hal.device_classes, list) {
+        if (dev_class->class_id == device->class) {
+            atomic32_inc(&dev_class->device_count);
+            break;
+        }
+    }
+    
+    /* Try to bind driver */
+    hal_bind_driver(device);
+    
+    printf("HAL: Registered device %u: %s (class=%u)\n", 
+           device->id, device->name, device->class);
+    
+    return 0;
+}
+
+/* Bind driver to device */
+static int hal_bind_driver(hal_device_t* device) {
+    if (!device || device->driver_name) {
+        return 0; /* Already bound */
+    }
+    
+    spin_lock(&g_hal.drivers_lock);
+    
+    hal_driver_t* driver;
+    list_for_each_entry(driver, &g_hal.drivers, list) {
+        if (!driver->id_table) {
+            continue;
+        }
+        
+        /* Check if driver supports this device */
+        struct hal_device_id* id = driver->id_table;
+        while (id->match_flags || id->vendor_id || id->device_id) {
+            bool match = true;
+            
+            if (id->match_flags & HAL_MATCH_VENDOR) {
+                if (id->vendor_id != device->vendor_id) {
+                    match = false;
+                }
+            }
+            
+            if (id->match_flags & HAL_MATCH_DEVICE) {
+                if (id->device_id != device->device_id) {
+                    match = false;
+                }
+            }
+            
+            if (id->match_flags & HAL_MATCH_CLASS) {
+                if (id->class != device->class) {
+                    match = false;
+                }
+            }
+            
+            if (id->match_flags & HAL_MATCH_SUBCLASS) {
+                if (id->subclass != device->subclass) {
+                    match = false;
+                }
+            }
+            
+            if (match) {
+                /* Found matching driver */
+                printf("HAL: Binding driver '%s' to device %u\n", driver->name, device->id);
+                
+                device->driver_name = driver->name;
+                
+                if (driver->probe) {
+                    int result = driver->probe(device);
+                    if (result == 0) {
+                        atomic32_inc(&driver->bound_devices);
+                        device->state = HAL_DEVICE_STATE_CONFIGURED;
+                    } else {
+                        printf("HAL: Driver '%s' probe failed: %d\n", driver->name, result);
+                        device->driver_name = NULL;
+                        device->state = HAL_DEVICE_STATE_ERROR;
+                        device->error_count++;
+                    }
+                }
+                
+                spin_unlock(&g_hal.drivers_lock);
+                return 0;
+            }
+            
+            id++;
+        }
+    }
+    
+    spin_unlock(&g_hal.drivers_lock);
+    
+    printf("HAL: No driver found for device %u: %s\n", device->id, device->name);
+    return -ENODEV;
+}
+
+/* Create HAL device from PCI device */
+static hal_device_t* hal_create_device_from_pci(struct pci_device* pci_dev) {
+    hal_device_t* device = (hal_device_t*)vmm_kmalloc(sizeof(hal_device_t), 32);
+    if (!device) {
+        return NULL;
+    }
+    
+    memset(device, 0, sizeof(hal_device_t));
+    
+    /* Fill device information from PCI */
+    device->vendor_id = pci_dev->vendor_id;
+    device->device_id = pci_dev->device_id;
+    device->subsystem_vendor_id = pci_dev->subsystem_vendor_id;
+    device->subsystem_device_id = pci_dev->subsystem_device_id;
+    
+    device->bus_type = 1; /* PCI bus type */
+    device->bus_device = pci_dev;
+    
+    /* Determine device class from PCI class code */
+    switch (pci_dev->class_code) {
+        case 0x01: /* Mass storage */
+            device->class = HAL_CLASS_STORAGE;
+            break;
+        case 0x02: /* Network */
+            device->class = HAL_CLASS_NETWORK;
+            break;
+        case 0x03: /* Display */
+            device->class = HAL_CLASS_DISPLAY;
+            break;
+        case 0x04: /* Multimedia */
+            device->class = HAL_CLASS_AUDIO;
+            break;
+        case 0x0C: /* Serial bus (includes USB) */
+            if (pci_dev->subclass == 0x03) { /* USB */
+                device->class = HAL_CLASS_USB;
+            } else {
+                device->class = HAL_CLASS_SYSTEM;
+            }
+            break;
+        case 0x06: /* Bridge */
+            device->class = HAL_CLASS_BRIDGE;
+            break;
+        default:
+            device->class = HAL_CLASS_SYSTEM;
+            break;
+    }
+    
+    device->subclass = pci_dev->subclass;
+    
+    snprintf(device->name, sizeof(device->name), "PCI_%04x:%04x", 
+             pci_dev->vendor_id, pci_dev->device_id);
+    
+    /* Set capabilities based on PCI features */
+    device->caps.hotplug_capable = false; /* Most PCI devices are not hotpluggable */
+    device->caps.power_managed = true;    /* Most modern devices support PM */
+    device->caps.dma_capable = true;      /* Assume DMA capable */
+    device->caps.msi_capable = false;     /* Check MSI capability later */
+    
+    device->caps.max_dma_mask = 0xFFFFFFFF; /* 32-bit default */
+    device->caps.alignment_requirement = 4;  /* 4-byte alignment */
+    
+    /* Add memory and I/O resources */
+    for (int i = 0; i < 6; i++) {
+        if (pci_dev->bar[i] != 0) {
+            hal_resource_t* resource = (hal_resource_t*)vmm_kmalloc(sizeof(hal_resource_t), 32);
+            if (resource) {
+                resource->start = pci_dev->bar[i];
+                resource->end = pci_dev->bar[i] + pci_dev->bar_size[i] - 1;
+                
+                if (pci_dev->bar_type[i] == PCI_BAR_TYPE_IO) {
+                    resource->type = HAL_RESOURCE_IO;
+                } else {
+                    resource->type = HAL_RESOURCE_MEM;
+                }
+                
+                list_add(&resource->list, &device->resources);
+            }
+        }
+    }
+    
+    /* Add interrupt resource */
+    if (pci_dev->interrupt_line != 0xFF) {
+        hal_resource_t* irq_resource = (hal_resource_t*)vmm_kmalloc(sizeof(hal_resource_t), 32);
+        if (irq_resource) {
+            irq_resource->type = HAL_RESOURCE_IRQ;
+            irq_resource->start = pci_dev->interrupt_line;
+            irq_resource->end = pci_dev->interrupt_line;
+            
+            list_add(&irq_resource->list, &device->resources);
+        }
+    }
+    
+    return device;
+}
+
+/* Create HAL device from USB device */
+static hal_device_t* hal_create_device_from_usb(struct usb_device* usb_dev) {
+    hal_device_t* device = (hal_device_t*)vmm_kmalloc(sizeof(hal_device_t), 32);
+    if (!device) {
+        return NULL;
+    }
+    
+    memset(device, 0, sizeof(hal_device_t));
+    
+    /* Fill device information from USB */
+    device->vendor_id = usb_dev->device_desc.idVendor;
+    device->device_id = usb_dev->device_desc.idProduct;
+    device->class = HAL_CLASS_USB;
+    device->subclass = usb_dev->device_desc.bDeviceSubClass;
+    
+    device->bus_type = 2; /* USB bus type */
+    device->bus_device = usb_dev;
+    
+    snprintf(device->name, sizeof(device->name), "USB_%04x:%04x", 
+             usb_dev->device_desc.idVendor, usb_dev->device_desc.idProduct);
+    
+    /* Set USB-specific capabilities */
+    device->caps.hotplug_capable = true;  /* USB devices are hotpluggable */
+    device->caps.power_managed = true;    /* USB devices support power management */
+    device->caps.dma_capable = false;     /* USB devices don't do DMA directly */
+    device->caps.wakeup_capable = true;   /* USB devices can wake system */
+    
+    return device;
+}
+
+/* Enumerate all devices */
+static int hal_enumerate_all_devices(void) {
+    printf("HAL: Starting device enumeration\n");
+    
+    atomic32_set(&g_hal.discovery_pending, 0);
+    
+    /* Enumerate PCI devices */
+    /* This would integrate with the enhanced PCI subsystem */
+    atomic32_inc(&g_hal.discovery_pending);
+    
+    /* Enumerate USB devices */
+    /* This would integrate with the USB subsystem */
+    atomic32_inc(&g_hal.discovery_pending);
+    
+    /* Enumerate ACPI devices */
+    /* This would integrate with ACPI */
+    atomic32_inc(&g_hal.discovery_pending);
+    
+    /* Wait for discovery to complete or timeout */
+    uint64_t start_time = timer_get_ticks();
+    while (atomic32_read(&g_hal.discovery_pending) > 0 && 
+           (timer_get_ticks() - start_time) < HAL_DISCOVERY_TIMEOUT) {
+        timer_msleep(10);
+    }
+    
+    g_hal.discovery_complete = true;
+    
+    printf("HAL: Device enumeration completed\n");
+    return 0;
+}
+
+/* Create power domain */
+static hal_power_domain_t* hal_create_power_domain(const char* name) {
+    hal_power_domain_t* domain = (hal_power_domain_t*)vmm_kmalloc(sizeof(hal_power_domain_t), 32);
+    if (!domain) {
+        return NULL;
+    }
+    
+    memset(domain, 0, sizeof(hal_power_domain_t));
+    
+    domain->id = g_hal.next_domain_id++;
+    strncpy(domain->name, name, sizeof(domain->name) - 1);
+    domain->power_state = HAL_POWER_D0;
+    INIT_LIST_HEAD(&domain->devices);
+    
+    spin_lock(&g_hal.power_lock);
+    list_add(&domain->list, &g_hal.power_domains);
+    spin_unlock(&g_hal.power_lock);
+    
+    return domain;
+}
+
+/* Set device power state */
+static int hal_set_device_power_state(hal_device_t* device, uint8_t state) {
+    if (!device || state > HAL_POWER_D3cold) {
+        return -EINVAL;
+    }
+    
+    if (device->power_state == state) {
+        return 0; /* Already in requested state */
+    }
+    
+    uint8_t old_state = device->power_state;
+    
+    /* Call device-specific power management */
+    if (device->ops && device->ops->suspend && state > HAL_POWER_D0) {
+        int result = device->ops->suspend(device, state);
+        if (result != 0) {
+            return result;
+        }
+    } else if (device->ops && device->ops->resume && state == HAL_POWER_D0) {
+        int result = device->ops->resume(device);
+        if (result != 0) {
+            return result;
+        }
+    }
+    
+    device->power_state = state;
+    
+    /* Update device state */
+    if (state == HAL_POWER_D0) {
+        if (device->state == HAL_DEVICE_STATE_SUSPENDED) {
+            device->state = HAL_DEVICE_STATE_ACTIVE;
+        }
+    } else {
+        if (device->state == HAL_DEVICE_STATE_ACTIVE) {
+            device->state = HAL_DEVICE_STATE_SUSPENDED;
+        }
+    }
+    
+    hal_device_state_changed(device, old_state, state);
+    
+    atomic64_inc(&g_hal.power_transitions);
+    
+    printf("HAL: Device %u power state: D%u -> D%u\n", device->id, old_state, state);
+    
+    return 0;
+}
+
+/* Handle device state changes */
+static void hal_device_state_changed(hal_device_t* device, uint8_t old_state, uint8_t new_state) {
+    /* Update global statistics */
+    if (old_state == HAL_DEVICE_STATE_ACTIVE && new_state == HAL_DEVICE_STATE_SUSPENDED) {
+        atomic32_dec(&g_hal.active_devices);
+        atomic32_inc(&g_hal.suspended_devices);
+    } else if (old_state == HAL_DEVICE_STATE_SUSPENDED && new_state == HAL_DEVICE_STATE_ACTIVE) {
+        atomic32_dec(&g_hal.suspended_devices);
+        atomic32_inc(&g_hal.active_devices);
+    } else if (new_state == HAL_DEVICE_STATE_ERROR) {
+        if (old_state == HAL_DEVICE_STATE_ACTIVE) {
+            atomic32_dec(&g_hal.active_devices);
+        } else if (old_state == HAL_DEVICE_STATE_SUSPENDED) {
+            atomic32_dec(&g_hal.suspended_devices);
+        }
+        atomic32_inc(&g_hal.error_devices);
+    }
+}
+
+/* Register HAL driver */
+int hal_register_driver(hal_driver_t* driver) {
+    if (!driver || !driver->name) {
+        return -EINVAL;
+    }
+    
+    driver->load_time = timer_get_ticks();
+    atomic32_set(&driver->bound_devices, 0);
+    
+    spin_lock(&g_hal.drivers_lock);
+    list_add(&driver->list, &g_hal.drivers);
+    atomic32_inc(&g_hal.registered_drivers);
+    spin_unlock(&g_hal.drivers_lock);
+    
+    printf("HAL: Registered driver: %s\n", driver->name);
+    
+    /* Try to bind to existing devices */
+    spin_lock(&g_hal.devices_lock);
+    
+    hal_device_t* device;
+    list_for_each_entry(device, &g_hal.devices, list) {
+        if (!device->driver_name) {
+            hal_bind_driver(device);
+        }
+    }
+    
+    spin_unlock(&g_hal.devices_lock);
+    
+    return 0;
+}
+
+/* Suspend all devices */
+int hal_suspend_all_devices(void) {
+    printf("HAL: Suspending all devices\n");
+    
+    int suspended_count = 0;
+    
+    spin_lock(&g_hal.devices_lock);
+    
+    hal_device_t* device;
+    list_for_each_entry(device, &g_hal.devices, list) {
+        if (device->state == HAL_DEVICE_STATE_ACTIVE) {
+            int result = hal_set_device_power_state(device, HAL_POWER_D3hot);
+            if (result == 0) {
+                suspended_count++;
+            }
+        }
+    }
+    
+    spin_unlock(&g_hal.devices_lock);
+    
+    printf("HAL: Suspended %d devices\n", suspended_count);
+    return 0;
+}
+
+/* Resume all devices */
+int hal_resume_all_devices(void) {
+    printf("HAL: Resuming all devices\n");
+    
+    int resumed_count = 0;
+    
+    spin_lock(&g_hal.devices_lock);
+    
+    hal_device_t* device;
+    list_for_each_entry(device, &g_hal.devices, list) {
+        if (device->state == HAL_DEVICE_STATE_SUSPENDED) {
+            int result = hal_set_device_power_state(device, HAL_POWER_D0);
+            if (result == 0) {
+                resumed_count++;
+            }
+        }
+    }
+    
+    spin_unlock(&g_hal.devices_lock);
+    
+    printf("HAL: Resumed %d devices\n", resumed_count);
+    return 0;
+}
+
+/* Get HAL statistics */
+void hal_get_stats(struct hal_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct hal_stats));
+    
+    stats->total_devices = atomic32_read(&g_hal.total_devices);
+    stats->active_devices = atomic32_read(&g_hal.active_devices);
+    stats->suspended_devices = atomic32_read(&g_hal.suspended_devices);
+    stats->error_devices = atomic32_read(&g_hal.error_devices);
+    stats->registered_drivers = atomic32_read(&g_hal.registered_drivers);
+    stats->power_transitions = atomic64_read(&g_hal.power_transitions);
+    stats->discovery_complete = g_hal.discovery_complete;
+    
+    /* Count devices by class */
+    hal_device_class_t* dev_class;
+    list_for_each_entry(dev_class, &g_hal.device_classes, list) {
+        stats->devices_by_class[dev_class->class_id] = atomic32_read(&dev_class->device_count);
+    }
+}
+
+/* Debug output */
+void hal_dump_stats(void) {
+    struct hal_stats stats;
+    hal_get_stats(&stats);
+    
+    printf("Hardware Abstraction Layer Statistics:\n");
+    printf("  Total devices: %u\n", stats.total_devices);
+    printf("  Active devices: %u\n", stats.active_devices);
+    printf("  Suspended devices: %u\n", stats.suspended_devices);
+    printf("  Error devices: %u\n", stats.error_devices);
+    printf("  Registered drivers: %u\n", stats.registered_drivers);
+    printf("  Power transitions: %lu\n", stats.power_transitions);
+    printf("  Discovery complete: %s\n", stats.discovery_complete ? "Yes" : "No");
+    
+    printf("  Devices by class:\n");
+    printf("    Storage: %u\n", stats.devices_by_class[HAL_CLASS_STORAGE]);
+    printf("    Network: %u\n", stats.devices_by_class[HAL_CLASS_NETWORK]);
+    printf("    Display: %u\n", stats.devices_by_class[HAL_CLASS_DISPLAY]);
+    printf("    Audio: %u\n", stats.devices_by_class[HAL_CLASS_AUDIO]);
+    printf("    USB: %u\n", stats.devices_by_class[HAL_CLASS_USB]);
+    printf("    System: %u\n", stats.devices_by_class[HAL_CLASS_SYSTEM]);
+}

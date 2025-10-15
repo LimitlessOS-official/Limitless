@@ -1,0 +1,84 @@
+#include "exec.h"
+#include "vfs.h"
+#include "process.h"
+#include "scheduler.h"
+#include "kernel.h"
+#include "log.h"
+
+/* security hook interface */
+extern int __security_exec_check(const char* path, const char* const argv[]) __attribute__((weak));
+
+/* External APIs assumed from Phase 1 core */
+extern process_t* process_create_user(const char* name, vmm_aspace_t** out_as);
+extern thread_t*  thread_create_user(process_t* p, virt_addr_t entry, virt_addr_t user_sp, const char* const argv[], const char* const envp[]);
+extern int        scheduler_add_thread(thread_t* t);
+
+static int read_all(const char* path, void** out_buf, size_t* out_sz) {
+    file_t* f = NULL;
+    int rc = vfs_open(path, VFS_O_RDONLY, &f);
+    if (rc != 0) return rc;
+    vfs_seek(f, 0, VFS_SEEK_END);
+    u64 sz = vfs_tell(f);
+    vfs_seek(f, 0, VFS_SEEK_SET);
+    void* buf = vmm_kmalloc((size_t)sz, 16);
+    if (!buf) { vfs_close(f); return K_ENOMEM; }
+    u64 rd = 0;
+    rc = vfs_read(f, buf, sz, &rd);
+    vfs_close(f);
+    if (rc != 0 || rd != sz) { vmm_kfree(buf, (size_t)sz); return rc ? rc : K_EIO; }
+    *out_buf = buf; *out_sz = (size_t)sz;
+    return 0;
+}
+
+int exec_load_from_path(const char* path, vmm_aspace_t* as, elf_load_result_t* out_res) {
+    void* img = NULL; size_t sz = 0;
+    int rc = read_all(path, &img, &sz);
+    if (rc != 0) return rc;
+    elf_stack_hint_t sh = { .stack_vaddr = 0x00007fff00000000ULL, .stack_size = 1ull<<20 };
+    int lr = elf_load_into_aspace(img, sz, as, 0, &sh, out_res);
+    vmm_kfree(img, sz);
+    return lr == 0 ? 0 : K_EINVAL;
+}
+
+int exec_spawn(const char* path, const char* const argv[], const char* const envp[], u32* out_pid) {
+    if (!path) return K_EINVAL;
+    if (__security_exec_check) {
+        int s = __security_exec_check(path, argv);
+        if (s != 0) {
+            KLOG_WARN("sec", "exec denied path=%s rc=%d", path, s);
+            return s;
+        }
+    }
+    vmm_aspace_t* as = NULL;
+    process_t* p = process_create_user(path, &as);
+    if (!p || !as) return K_EBUSY;
+
+    elf_load_result_t lr;
+    int rc = exec_load_from_path(path, as, &lr);
+    if (rc != 0) return rc;
+
+    thread_t* th = thread_create_user(p, lr.entry, lr.user_stack, argv, envp);
+    if (!th) return K_EBUSY;
+    scheduler_add_thread(th);
+
+    if (out_pid) *out_pid = process_get_pid(p);
+    return 0;
+}
+
+int exec_start_pid1(const char* init_path) {
+    const char* path = init_path ? init_path : "/sbin/init";
+    const char* argv[] = { "init", NULL };
+    const char* envp[] = { "PATH=/bin:/sbin", NULL };
+    u32 pid = 0;
+    int rc = exec_spawn(path, argv, envp, &pid);
+    if (rc != 0) {
+        /* Fallback: try /bin/init */
+        rc = exec_spawn("/bin/init", argv, envp, &pid);
+    }
+    if (rc == 0) {
+        KLOG_INFO("exec", "PID1 started pid=%u", pid);
+    } else {
+        KLOG_ERROR("exec", "failed to start init rc=%d", rc);
+    }
+    return rc;
+}

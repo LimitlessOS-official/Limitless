@@ -1,0 +1,41 @@
+#include "wait.h"
+#include "kernel.h"
+#include "process.h"
+#include "scheduler.h"
+
+/* Simple process state table (Phase 1) */
+static proc_state_t g_proc_state[MAX_PROCS];
+static int g_proc_exit_code[MAX_PROCS];
+
+int process_waitpid(pid_t pid, int* status, int options) {
+    // Only support waiting for direct children in this phase
+    for (;;) {
+        process_t* p = process_lookup(pid);
+        if (!p) return K_EINVAL;
+        if (g_proc_state[pid % MAX_PROCS] == PROC_ZOMBIE) {
+            if (status) *status = g_proc_exit_code[pid % MAX_PROCS];
+            process_destroy(p);
+            g_proc_state[pid % MAX_PROCS] = PROC_EXITED;
+            return pid;
+        }
+        scheduler_yield();
+    }
+}
+
+void process_exit(process_t* p, int status) {
+    if (!p) return;
+    g_proc_state[p->pid % MAX_PROCS] = PROC_ZOMBIE;
+    g_proc_exit_code[p->pid % MAX_PROCS] = status;
+    // Wake up parent if waiting (not implemented: parent notification)
+    scheduler_schedule();
+}
+
+void process_reap_zombies(void) {
+    for (int i = 0; i < MAX_PROCS; ++i) {
+        if (g_proc_state[i] == PROC_ZOMBIE) {
+            process_t* p = process_lookup(i);
+            if (p) process_destroy(p);
+            g_proc_state[i] = PROC_EXITED;
+        }
+    }
+}

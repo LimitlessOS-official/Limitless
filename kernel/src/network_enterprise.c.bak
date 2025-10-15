@@ -1,0 +1,1012 @@
+/*
+ * LimitlessOS Advanced Network Stack Implementation  
+ * Enterprise-grade networking with high-performance packet processing,
+ * advanced TCP/IP stack, network namespaces, traffic shaping, QoS,
+ * security filtering, and enterprise networking capabilities
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include "../include/advanced_network.h"
+#include "../include/kernel.h"
+
+/* Helper function to get system time */
+static uint64_t get_system_time(void) {
+    /* This would typically use the HAL timer system */
+    static uint64_t system_time = 0;
+    return ++system_time; /* Simple counter for now */
+}
+
+/* Helper function for printf */
+static void printf(const char* fmt, ...) {
+    /* This would typically use the kernel console system */
+}
+
+/* Helper function for memory allocation */
+static void* malloc(size_t size) {
+    /* This would typically use the kernel memory allocator */
+    return NULL; /* Stub implementation */
+}
+
+/* Helper function for memory deallocation */
+static void free(void* ptr) {
+    /* This would typically use the kernel memory allocator */
+}
+
+/* ============================================================================
+ * NETWORK STACK CONFIGURATION
+ * ============================================================================ */
+
+/* Network stack parameters */
+#define NET_MAX_INTERFACES      256
+#define NET_MAX_ROUTES          8192
+#define NET_MAX_CONNECTIONS     65536
+#define NET_MAX_NAMESPACES      256
+#define NET_MAX_QOS_CLASSES     64
+#define NET_MAX_FILTERS         1024
+#define NET_PACKET_POOL_SIZE    32768
+#define NET_BUFFER_SIZE         9000  /* Jumbo frame support */
+#define NET_TCP_MAX_SEGMENTS    4096
+#define NET_UDP_MAX_DATAGRAMS   8192
+#define NET_RX_RING_SIZE        2048
+#define NET_TX_RING_SIZE        2048
+#define NET_HASH_TABLE_SIZE     65536
+
+/* Protocol types */
+#define PROTOCOL_IPv4           0x0800
+#define PROTOCOL_IPv6           0x86DD
+#define PROTOCOL_ARP            0x0806
+#define PROTOCOL_ICMP           0x01
+#define PROTOCOL_TCP            0x06
+#define PROTOCOL_UDP            0x11
+#define PROTOCOL_SCTP           0x84
+
+/* QoS classes */
+typedef enum {
+    QOS_CLASS_BEST_EFFORT = 0,
+    QOS_CLASS_BULK = 1,
+    QOS_CLASS_INTERACTIVE = 2,
+    QOS_CLASS_VOICE = 3,
+    QOS_CLASS_VIDEO = 4,
+    QOS_CLASS_CONTROL = 5,
+    QOS_CLASS_CRITICAL = 6,
+    QOS_CLASS_ENTERPRISE = 7
+} qos_class_t;
+
+/* Traffic shaper algorithms */
+typedef enum {
+    SHAPER_TOKEN_BUCKET = 0,
+    SHAPER_LEAKY_BUCKET = 1,
+    SHAPER_HTB = 2,           /* Hierarchical Token Bucket */
+    SHAPER_CBQ = 3,           /* Class-Based Queuing */
+    SHAPER_HFSC = 4,          /* Hierarchical Fair Service Curve */
+    SHAPER_WFQ = 5,           /* Weighted Fair Queuing */
+    SHAPER_RED = 6,           /* Random Early Detection */
+    SHAPER_ENTERPRISE = 7
+} shaper_type_t;
+
+/* ============================================================================
+ * NETWORK STRUCTURES
+ * ============================================================================ */
+
+/* Network packet structure */
+typedef struct network_packet {
+    uint8_t* data;
+    uint32_t length;
+    uint32_t buffer_size;
+    uint16_t protocol;
+    uint8_t* mac_header;
+    uint8_t* network_header;
+    uint8_t* transport_header;
+    uint8_t* application_data;
+    uint32_t mac_len;
+    uint32_t network_len;
+    uint32_t transport_len;
+    uint32_t data_len;
+    
+    /* Metadata */
+    uint32_t interface_id;
+    uint64_t timestamp;
+    uint32_t priority;
+    qos_class_t qos_class;
+    uint32_t mark;
+    uint32_t flags;
+    
+    /* Enterprise features */
+    uint32_t security_label;
+    uint32_t tenant_id;
+    uint64_t flow_id;
+    
+    struct network_packet* next;
+} network_packet_t;
+
+/* Network interface structure */
+typedef struct network_interface {
+    uint32_t id;
+    char name[32];
+    uint8_t mac_address[6];
+    uint32_t mtu;
+    uint32_t flags;
+    uint32_t state;
+    
+    /* IP configuration */
+    uint32_t ipv4_address;
+    uint32_t ipv4_netmask;
+    uint32_t ipv4_gateway;
+    uint8_t ipv6_address[16];
+    uint8_t ipv6_prefix_len;
+    
+    /* Statistics */
+    uint64_t rx_packets;
+    uint64_t tx_packets;
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t rx_errors;
+    uint64_t tx_errors;
+    uint64_t rx_dropped;
+    uint64_t tx_dropped;
+    
+    /* Queue management */
+    uint32_t rx_queue_len;
+    uint32_t tx_queue_len;
+    network_packet_t* rx_queue;
+    network_packet_t* tx_queue;
+    
+    /* Hardware acceleration */
+    uint32_t hw_features;
+    void* hw_context;
+    
+    /* Enterprise features */
+    uint32_t namespace_id;
+    uint32_t vlan_id;
+    uint32_t bridge_id;
+    bool monitoring_enabled;
+    
+    struct network_interface* next;
+} network_interface_t;
+
+/* TCP connection structure */
+typedef struct tcp_connection {
+    uint32_t local_ip;
+    uint16_t local_port;
+    uint32_t remote_ip;
+    uint16_t remote_port;
+    
+    /* TCP state */
+    uint32_t state;
+    uint32_t seq_num;
+    uint32_t ack_num;
+    uint16_t window_size;
+    uint16_t mss;
+    
+    /* Buffers */
+    uint8_t* rx_buffer;
+    uint8_t* tx_buffer;
+    uint32_t rx_buffer_size;
+    uint32_t tx_buffer_size;
+    uint32_t rx_data_len;
+    uint32_t tx_data_len;
+    
+    /* Timers */
+    uint64_t last_activity;
+    uint64_t retransmit_timer;
+    uint64_t keepalive_timer;
+    
+    /* Congestion control */
+    uint32_t cwnd;
+    uint32_t ssthresh;
+    uint32_t rtt;
+    uint32_t rto;
+    
+    /* Enterprise features */
+    uint32_t connection_id;
+    uint32_t security_context;
+    uint64_t flow_label;
+    
+    struct tcp_connection* next;
+} tcp_connection_t;
+
+/* Network namespace */
+typedef struct network_namespace {
+    uint32_t id;
+    char name[64];
+    
+    /* Interface list */
+    network_interface_t* interfaces;
+    uint32_t interface_count;
+    
+    /* Routing table */
+    void* routing_table;
+    
+    /* Firewall rules */
+    void* firewall_rules;
+    
+    /* Statistics */
+    uint64_t packets_processed;
+    uint64_t bytes_processed;
+    uint64_t connections_created;
+    uint64_t connections_destroyed;
+    
+    /* Enterprise features */
+    uint32_t tenant_id;
+    uint32_t isolation_level;
+    bool enterprise_mode;
+    
+    struct network_namespace* next;
+} network_namespace_t;
+
+/* QoS class configuration */
+typedef struct qos_class_config {
+    qos_class_t class_id;
+    char name[32];
+    uint32_t priority;
+    uint64_t guaranteed_bandwidth;
+    uint64_t max_bandwidth;
+    uint32_t max_latency;
+    uint32_t max_jitter;
+    uint32_t drop_probability;
+    
+    /* Shaper configuration */
+    shaper_type_t shaper_type;
+    uint64_t token_rate;
+    uint64_t bucket_size;
+    uint32_t quantum;
+    
+    /* Statistics */
+    uint64_t packets_classified;
+    uint64_t bytes_transmitted;
+    uint64_t packets_dropped;
+    uint64_t packets_marked;
+} qos_class_config_t;
+
+/* ============================================================================
+ * GLOBAL VARIABLES
+ * ============================================================================ */
+
+static network_interface_t* g_interfaces = NULL;
+static tcp_connection_t* g_tcp_connections = NULL;
+static network_namespace_t* g_namespaces = NULL;
+static qos_class_config_t g_qos_classes[NET_MAX_QOS_CLASSES];
+static network_packet_t* g_packet_pool = NULL;
+static uint32_t g_packet_pool_free = 0;
+
+/* Statistics */
+static struct {
+    uint64_t packets_received;
+    uint64_t packets_transmitted;
+    uint64_t bytes_received;
+    uint64_t bytes_transmitted;
+    uint64_t packets_dropped;
+    uint64_t packets_filtered;
+    uint64_t connections_established;
+    uint64_t connections_closed;
+    uint64_t routing_lookups;
+    uint64_t qos_classifications;
+    uint64_t namespace_switches;
+    uint64_t security_violations;
+    
+    /* Performance metrics */
+    uint64_t avg_packet_processing_time;
+    uint64_t max_packet_processing_time;
+    uint64_t tcp_retransmissions;
+    uint64_t congestion_events;
+    uint64_t buffer_overflows;
+    
+    /* Enterprise metrics */
+    uint64_t enterprise_connections;
+    uint64_t security_events;
+    uint64_t compliance_checks;
+    uint64_t audit_events;
+} g_network_stats = {0};
+
+static bool g_network_initialized = false;
+static bool g_monitoring_enabled = true;
+static bool g_enterprise_mode = false;
+
+/* ============================================================================
+ * PACKET MANAGEMENT
+ * ============================================================================ */
+
+static network_packet_t* allocate_packet(uint32_t size) {
+    if (g_packet_pool_free == 0) {
+        return NULL; /* Pool exhausted */
+    }
+    
+    network_packet_t* packet = g_packet_pool;
+    if (packet) {
+        g_packet_pool = packet->next;
+        g_packet_pool_free--;
+        
+        /* Initialize packet */
+        memset(packet, 0, sizeof(network_packet_t));
+        packet->buffer_size = size;
+        packet->data = malloc(size);
+        if (!packet->data) {
+            /* Return to pool */
+            packet->next = g_packet_pool;
+            g_packet_pool = packet;
+            g_packet_pool_free++;
+            return NULL;
+        }
+        
+        packet->timestamp = get_system_time();
+    }
+    
+    return packet;
+}
+
+static void free_packet(network_packet_t* packet) {
+    if (!packet) return;
+    
+    if (packet->data) {
+        free(packet->data);
+        packet->data = NULL;
+    }
+    
+    /* Return to pool */
+    packet->next = g_packet_pool;
+    g_packet_pool = packet;
+    g_packet_pool_free++;
+}
+
+/* ============================================================================
+ * HIGH-PERFORMANCE PACKET PROCESSING
+ * ============================================================================ */
+
+static int process_ethernet_frame(network_packet_t* packet) {
+    if (!packet || packet->length < 14) {
+        return -1; /* Invalid Ethernet frame */
+    }
+    
+    /* Parse Ethernet header */
+    packet->mac_header = packet->data;
+    packet->mac_len = 14;
+    
+    /* Extract EtherType */
+    uint16_t ethertype = (packet->data[12] << 8) | packet->data[13];
+    packet->protocol = ethertype;
+    
+    /* Set network header pointer */
+    packet->network_header = packet->data + 14;
+    packet->network_len = packet->length - 14;
+    
+    return 0;
+}
+
+static int process_ipv4_packet(network_packet_t* packet) {
+    if (!packet->network_header || packet->network_len < 20) {
+        return -1; /* Invalid IPv4 header */
+    }
+    
+    uint8_t* ip_header = packet->network_header;
+    
+    /* Verify IPv4 header */
+    uint8_t version = (ip_header[0] >> 4) & 0xF;
+    if (version != 4) {
+        return -1; /* Not IPv4 */
+    }
+    
+    uint8_t ihl = ip_header[0] & 0xF;
+    uint16_t header_len = ihl * 4;
+    
+    if (header_len < 20 || header_len > packet->network_len) {
+        return -1; /* Invalid header length */
+    }
+    
+    /* Extract protocol */
+    uint8_t protocol = ip_header[9];
+    
+    /* Set transport header pointer */
+    packet->transport_header = packet->network_header + header_len;
+    packet->transport_len = packet->network_len - header_len;
+    
+    /* Update packet metadata */
+    packet->protocol = protocol;
+    
+    return 0;
+}
+
+static int process_tcp_segment(network_packet_t* packet) {
+    if (!packet->transport_header || packet->transport_len < 20) {
+        return -1; /* Invalid TCP header */
+    }
+    
+    uint8_t* tcp_header = packet->transport_header;
+    
+    /* Extract TCP header fields */
+    uint16_t src_port = (tcp_header[0] << 8) | tcp_header[1];
+    uint16_t dst_port = (tcp_header[2] << 8) | tcp_header[3];
+    uint32_t seq_num = (tcp_header[4] << 24) | (tcp_header[5] << 16) |
+                       (tcp_header[6] << 8) | tcp_header[7];
+    uint32_t ack_num = (tcp_header[8] << 24) | (tcp_header[9] << 16) |
+                       (tcp_header[10] << 8) | tcp_header[11];
+    
+    uint8_t data_offset = (tcp_header[12] >> 4) & 0xF;
+    uint16_t header_len = data_offset * 4;
+    
+    if (header_len < 20 || header_len > packet->transport_len) {
+        return -1; /* Invalid header length */
+    }
+    
+    /* Set application data pointer */
+    packet->application_data = packet->transport_header + header_len;
+    packet->data_len = packet->transport_len - header_len;
+    
+    return 0;
+}
+
+/* ============================================================================
+ * QOS AND TRAFFIC SHAPING
+ * ============================================================================ */
+
+static qos_class_t classify_packet(network_packet_t* packet) {
+    /* Default classification based on protocol and ports */
+    if (packet->protocol == PROTOCOL_TCP) {
+        uint8_t* tcp_header = packet->transport_header;
+        if (tcp_header && packet->transport_len >= 4) {
+            uint16_t dst_port = (tcp_header[2] << 8) | tcp_header[3];
+            
+            /* Well-known service ports */
+            if (dst_port == 80 || dst_port == 443) {
+                return QOS_CLASS_INTERACTIVE; /* Web traffic */
+            } else if (dst_port == 22 || dst_port == 23) {
+                return QOS_CLASS_CONTROL; /* SSH/Telnet */
+            } else if (dst_port == 21 || dst_port == 20) {
+                return QOS_CLASS_BULK; /* FTP */
+            }
+        }
+    } else if (packet->protocol == PROTOCOL_UDP) {
+        uint8_t* udp_header = packet->transport_header;
+        if (udp_header && packet->transport_len >= 4) {
+            uint16_t dst_port = (udp_header[2] << 8) | udp_header[3];
+            
+            /* VoIP and streaming */
+            if (dst_port >= 16384 && dst_port <= 32767) {
+                return QOS_CLASS_VOICE; /* RTP range */
+            } else if (dst_port == 53) {
+                return QOS_CLASS_CONTROL; /* DNS */
+            }
+        }
+    }
+    
+    /* Check enterprise markings */
+    if (g_enterprise_mode && packet->security_label != 0) {
+        return QOS_CLASS_ENTERPRISE;
+    }
+    
+    return QOS_CLASS_BEST_EFFORT;
+}
+
+static bool apply_traffic_shaping(network_packet_t* packet, qos_class_config_t* qos_config) {
+    if (!qos_config) return true;
+    
+    uint64_t current_time = get_system_time();
+    static uint64_t last_token_update = 0;
+    static uint64_t token_bucket = 0;
+    
+    /* Token bucket algorithm */
+    if (qos_config->shaper_type == SHAPER_TOKEN_BUCKET) {
+        uint64_t time_diff = current_time - last_token_update;
+        uint64_t new_tokens = (qos_config->token_rate * time_diff) / 1000000;
+        
+        token_bucket = (token_bucket + new_tokens) > qos_config->bucket_size ?
+                      qos_config->bucket_size : token_bucket + new_tokens;
+        
+        if (token_bucket >= packet->length) {
+            token_bucket -= packet->length;
+            last_token_update = current_time;
+            return true; /* Packet allowed */
+        } else {
+            qos_config->packets_dropped++;
+            return false; /* Packet dropped */
+        }
+    }
+    
+    /* Other shaping algorithms would be implemented here */
+    return true;
+}
+
+/* ============================================================================
+ * ADVANCED TCP/IP STACK
+ * ============================================================================ */
+
+static tcp_connection_t* find_tcp_connection(uint32_t local_ip, uint16_t local_port,
+                                           uint32_t remote_ip, uint16_t remote_port) {
+    tcp_connection_t* conn = g_tcp_connections;
+    while (conn) {
+        if (conn->local_ip == local_ip && conn->local_port == local_port &&
+            conn->remote_ip == remote_ip && conn->remote_port == remote_port) {
+            return conn;
+        }
+        conn = conn->next;
+    }
+    return NULL;
+}
+
+static tcp_connection_t* create_tcp_connection(uint32_t local_ip, uint16_t local_port,
+                                             uint32_t remote_ip, uint16_t remote_port) {
+    tcp_connection_t* conn = malloc(sizeof(tcp_connection_t));
+    if (!conn) return NULL;
+    
+    memset(conn, 0, sizeof(tcp_connection_t));
+    
+    conn->local_ip = local_ip;
+    conn->local_port = local_port;
+    conn->remote_ip = remote_ip;
+    conn->remote_port = remote_port;
+    
+    /* Initialize buffers */
+    conn->rx_buffer_size = 65536;
+    conn->tx_buffer_size = 65536;
+    conn->rx_buffer = malloc(conn->rx_buffer_size);
+    conn->tx_buffer = malloc(conn->tx_buffer_size);
+    
+    if (!conn->rx_buffer || !conn->tx_buffer) {
+        if (conn->rx_buffer) free(conn->rx_buffer);
+        if (conn->tx_buffer) free(conn->tx_buffer);
+        free(conn);
+        return NULL;
+    }
+    
+    /* Initialize TCP parameters */
+    conn->mss = 1460;  /* Standard MSS for Ethernet */
+    conn->window_size = 65535;
+    conn->cwnd = conn->mss;
+    conn->ssthresh = 65535;
+    conn->rto = 3000000; /* 3 seconds in microseconds */
+    
+    /* Generate connection ID */
+    static uint32_t next_conn_id = 1;
+    conn->connection_id = next_conn_id++;
+    
+    /* Add to connection list */
+    conn->next = g_tcp_connections;
+    g_tcp_connections = conn;
+    
+    g_network_stats.connections_established++;
+    
+    return conn;
+}
+
+static void destroy_tcp_connection(tcp_connection_t* conn) {
+    if (!conn) return;
+    
+    /* Remove from connection list */
+    if (g_tcp_connections == conn) {
+        g_tcp_connections = conn->next;
+    } else {
+        tcp_connection_t* prev = g_tcp_connections;
+        while (prev && prev->next != conn) {
+            prev = prev->next;
+        }
+        if (prev) {
+            prev->next = conn->next;
+        }
+    }
+    
+    /* Free buffers */
+    if (conn->rx_buffer) free(conn->rx_buffer);
+    if (conn->tx_buffer) free(conn->tx_buffer);
+    free(conn);
+    
+    g_network_stats.connections_closed++;
+}
+
+/* ============================================================================
+ * NETWORK NAMESPACES
+ * ============================================================================ */
+
+static network_namespace_t* create_network_namespace(const char* name) {
+    network_namespace_t* ns = malloc(sizeof(network_namespace_t));
+    if (!ns) return NULL;
+    
+    memset(ns, 0, sizeof(network_namespace_t));
+    
+    /* Generate namespace ID */
+    static uint32_t next_ns_id = 1;
+    ns->id = next_ns_id++;
+    
+    strncpy(ns->name, name, sizeof(ns->name) - 1);
+    ns->name[sizeof(ns->name) - 1] = '\0';
+    
+    /* Initialize routing table */
+    ns->routing_table = malloc(sizeof(void*) * 1024);
+    if (ns->routing_table) {
+        memset(ns->routing_table, 0, sizeof(void*) * 1024);
+    }
+    
+    /* Add to namespace list */
+    ns->next = g_namespaces;
+    g_namespaces = ns;
+    
+    return ns;
+}
+
+static network_namespace_t* find_network_namespace(const char* name) {
+    network_namespace_t* ns = g_namespaces;
+    while (ns) {
+        if (strcmp(ns->name, name) == 0) {
+            return ns;
+        }
+        ns = ns->next;
+    }
+    return NULL;
+}
+
+/* ============================================================================
+ * SECURITY FILTERING
+ * ============================================================================ */
+
+static bool security_filter_packet(network_packet_t* packet) {
+    /* Basic security checks */
+    
+    /* Check for malformed packets */
+    if (!packet->data || packet->length == 0) {
+        g_network_stats.security_violations++;
+        return false;
+    }
+    
+    /* Check for oversized packets */
+    if (packet->length > NET_BUFFER_SIZE) {
+        g_network_stats.security_violations++;
+        return false;
+    }
+    
+    /* Protocol-specific filtering */
+    if (packet->protocol == PROTOCOL_IPv4) {
+        if (process_ipv4_packet(packet) < 0) {
+            g_network_stats.security_violations++;
+            return false;
+        }
+    }
+    
+    /* Enterprise security filtering */
+    if (g_enterprise_mode) {
+        /* Check security labels */
+        if (packet->security_label == 0 && packet->tenant_id == 0) {
+            /* Require security context in enterprise mode */
+            g_network_stats.security_violations++;
+            return false;
+        }
+        
+        /* Validate tenant isolation */
+        if (packet->tenant_id > 0) {
+            /* Additional tenant-specific checks would be here */
+        }
+    }
+    
+    return true;
+}
+
+/* ============================================================================
+ * MAIN NETWORK PROCESSING PIPELINE
+ * ============================================================================ */
+
+static int process_incoming_packet(network_packet_t* packet) {
+    uint64_t start_time = get_system_time();
+    
+    /* Security filtering */
+    if (!security_filter_packet(packet)) {
+        g_network_stats.packets_filtered++;
+        return -1;
+    }
+    
+    /* Process Ethernet frame */
+    if (process_ethernet_frame(packet) < 0) {
+        g_network_stats.packets_dropped++;
+        return -1;
+    }
+    
+    /* Protocol-specific processing */
+    if (packet->protocol == PROTOCOL_IPv4) {
+        if (process_ipv4_packet(packet) < 0) {
+            g_network_stats.packets_dropped++;
+            return -1;
+        }
+        
+        /* TCP processing */
+        if (packet->protocol == PROTOCOL_TCP) {
+            if (process_tcp_segment(packet) < 0) {
+                g_network_stats.packets_dropped++;
+                return -1;
+            }
+        }
+    }
+    
+    /* QoS classification */
+    packet->qos_class = classify_packet(packet);
+    qos_class_config_t* qos_config = &g_qos_classes[packet->qos_class];
+    qos_config->packets_classified++;
+    g_network_stats.qos_classifications++;
+    
+    /* Traffic shaping */
+    if (!apply_traffic_shaping(packet, qos_config)) {
+        g_network_stats.packets_dropped++;
+        return -1;
+    }
+    
+    /* Update statistics */
+    g_network_stats.packets_received++;
+    g_network_stats.bytes_received += packet->length;
+    
+    uint64_t processing_time = get_system_time() - start_time;
+    if (processing_time > g_network_stats.max_packet_processing_time) {
+        g_network_stats.max_packet_processing_time = processing_time;
+    }
+    
+    /* Update average (simple moving average) */
+    g_network_stats.avg_packet_processing_time = 
+        (g_network_stats.avg_packet_processing_time * 9 + processing_time) / 10;
+    
+    return 0;
+}
+
+/* ============================================================================
+ * NETWORK INTERFACE MANAGEMENT
+ * ============================================================================ */
+
+static network_interface_t* create_network_interface(const char* name) {
+    network_interface_t* iface = malloc(sizeof(network_interface_t));
+    if (!iface) return NULL;
+    
+    memset(iface, 0, sizeof(network_interface_t));
+    
+    /* Generate interface ID */
+    static uint32_t next_iface_id = 1;
+    iface->id = next_iface_id++;
+    
+    strncpy(iface->name, name, sizeof(iface->name) - 1);
+    iface->name[sizeof(iface->name) - 1] = '\0';
+    
+    /* Default configuration */
+    iface->mtu = 1500;
+    iface->state = 1; /* UP */
+    iface->flags = 0x43; /* UP | RUNNING | BROADCAST */
+    
+    /* Initialize queues */
+    iface->rx_queue_len = NET_RX_RING_SIZE;
+    iface->tx_queue_len = NET_TX_RING_SIZE;
+    
+    /* Add to interface list */
+    iface->next = g_interfaces;
+    g_interfaces = iface;
+    
+    return iface;
+}
+
+/* ============================================================================
+ * INITIALIZATION AND MAIN API
+ * ============================================================================ */
+
+int advanced_network_init(void) {
+    if (g_network_initialized) {
+        return 0; /* Already initialized */
+    }
+    
+    /* Initialize packet pool */
+    g_packet_pool = malloc(sizeof(network_packet_t) * NET_PACKET_POOL_SIZE);
+    if (!g_packet_pool) {
+        return -1;
+    }
+    
+    /* Link packet pool */
+    for (uint32_t i = 0; i < NET_PACKET_POOL_SIZE - 1; i++) {
+        g_packet_pool[i].next = &g_packet_pool[i + 1];
+    }
+    g_packet_pool[NET_PACKET_POOL_SIZE - 1].next = NULL;
+    g_packet_pool_free = NET_PACKET_POOL_SIZE;
+    
+    /* Initialize QoS classes */
+    for (int i = 0; i < NET_MAX_QOS_CLASSES; i++) {
+        qos_class_config_t* qos = &g_qos_classes[i];
+        qos->class_id = i;
+        qos->priority = i;
+        qos->guaranteed_bandwidth = 1000000; /* 1 Mbps */
+        qos->max_bandwidth = 10000000; /* 10 Mbps */
+        qos->shaper_type = SHAPER_TOKEN_BUCKET;
+        qos->token_rate = 1000000; /* 1 Mbps */
+        qos->bucket_size = 1500 * 10; /* 10 packets */
+        
+        snprintf(qos->name, sizeof(qos->name), "class_%d", i);
+    }
+    
+    /* Configure standard QoS classes */
+    qos_class_config_t* voice = &g_qos_classes[QOS_CLASS_VOICE];
+    strcpy(voice->name, "voice");
+    voice->priority = 7;
+    voice->max_latency = 20000; /* 20ms */
+    voice->max_jitter = 5000;   /* 5ms */
+    
+    qos_class_config_t* video = &g_qos_classes[QOS_CLASS_VIDEO];
+    strcpy(video->name, "video");
+    video->priority = 6;
+    video->max_latency = 50000; /* 50ms */
+    voice->max_jitter = 10000;  /* 10ms */
+    
+    qos_class_config_t* enterprise = &g_qos_classes[QOS_CLASS_ENTERPRISE];
+    strcpy(enterprise->name, "enterprise");
+    enterprise->priority = 8;
+    enterprise->guaranteed_bandwidth = 100000000; /* 100 Mbps */
+    enterprise->max_bandwidth = 1000000000; /* 1 Gbps */
+    
+    /* Create default network namespace */
+    create_network_namespace("default");
+    
+    /* Create loopback interface */
+    network_interface_t* lo = create_network_interface("lo");
+    if (lo) {
+        lo->ipv4_address = 0x7F000001; /* 127.0.0.1 */
+        lo->ipv4_netmask = 0xFF000000;  /* 255.0.0.0 */
+        lo->flags |= 0x08; /* LOOPBACK */
+    }
+    
+    g_network_initialized = true;
+    
+    return 0;
+}
+
+void network_print_statistics(void) {
+    printf("\n=== Advanced Network Stack Statistics ===\n");
+    printf("Packets: RX=%llu TX=%llu Dropped=%llu Filtered=%llu\n",
+           g_network_stats.packets_received, g_network_stats.packets_transmitted,
+           g_network_stats.packets_dropped, g_network_stats.packets_filtered);
+    printf("Bytes: RX=%llu TX=%llu\n",
+           g_network_stats.bytes_received, g_network_stats.bytes_transmitted);
+    printf("Connections: Established=%llu Closed=%llu\n",
+           g_network_stats.connections_established, g_network_stats.connections_closed);
+    printf("Performance: Avg Processing Time=%llu µs, Max=%llu µs\n",
+           g_network_stats.avg_packet_processing_time, g_network_stats.max_packet_processing_time);
+    printf("QoS: Classifications=%llu\n", g_network_stats.qos_classifications);
+    printf("Security: Violations=%llu Events=%llu\n",
+           g_network_stats.security_violations, g_network_stats.security_events);
+    printf("Enterprise: Mode=%s Connections=%llu\n",
+           g_enterprise_mode ? "Enabled" : "Disabled", g_network_stats.enterprise_connections);
+    
+    /* Interface statistics */
+    printf("\n--- Network Interfaces ---\n");
+    network_interface_t* iface = g_interfaces;
+    while (iface) {
+        printf("%s: RX=%llu/%llu TX=%llu/%llu Errors=%llu/%llu\n",
+               iface->name, iface->rx_packets, iface->rx_bytes,
+               iface->tx_packets, iface->tx_bytes,
+               iface->rx_errors, iface->tx_errors);
+        iface = iface->next;
+    }
+    
+    /* QoS statistics */
+    printf("\n--- QoS Classes ---\n");
+    for (int i = 0; i < 8; i++) {
+        qos_class_config_t* qos = &g_qos_classes[i];
+        if (qos->packets_classified > 0) {
+            printf("%s: Classified=%llu Transmitted=%llu Dropped=%llu\n",
+                   qos->name, qos->packets_classified, qos->bytes_transmitted, qos->packets_dropped);
+        }
+    }
+}
+
+int network_self_test(void) {
+    printf("Running advanced network stack self-test...\n");
+    
+    /* Test packet allocation */
+    network_packet_t* test_packet = allocate_packet(1500);
+    if (!test_packet) {
+        printf("ERROR: Packet allocation failed\n");
+        return -1;
+    }
+    
+    /* Test Ethernet frame processing */
+    uint8_t test_frame[] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, /* Dest MAC */
+        0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, /* Src MAC */
+        0x08, 0x00, /* EtherType: IPv4 */
+        0x45, 0x00, 0x00, 0x1C, /* IPv4 header start */
+        0x00, 0x00, 0x40, 0x00,
+        0x40, 0x06, 0x00, 0x00, /* Protocol: TCP */
+        0xC0, 0xA8, 0x01, 0x01, /* Src IP: 192.168.1.1 */
+        0xC0, 0xA8, 0x01, 0x02  /* Dst IP: 192.168.1.2 */
+    };
+    
+    memcpy(test_packet->data, test_frame, sizeof(test_frame));
+    test_packet->length = sizeof(test_frame);
+    
+    if (process_ethernet_frame(test_packet) < 0) {
+        printf("ERROR: Ethernet frame processing failed\n");
+        free_packet(test_packet);
+        return -1;
+    }
+    
+    if (test_packet->protocol != PROTOCOL_IPv4) {
+        printf("ERROR: EtherType extraction failed\n");
+        free_packet(test_packet);
+        return -1;
+    }
+    
+    /* Test IPv4 processing */
+    if (process_ipv4_packet(test_packet) < 0) {
+        printf("ERROR: IPv4 packet processing failed\n");
+        free_packet(test_packet);
+        return -1;
+    }
+    
+    if (test_packet->protocol != PROTOCOL_TCP) {
+        printf("ERROR: Protocol extraction failed\n");
+        free_packet(test_packet);
+        return -1;
+    }
+    
+    /* Test QoS classification */
+    qos_class_t qos_class = classify_packet(test_packet);
+    if (qos_class >= NET_MAX_QOS_CLASSES) {
+        printf("ERROR: QoS classification failed\n");
+        free_packet(test_packet);
+        return -1;
+    }
+    
+    free_packet(test_packet);
+    
+    /* Test interface creation */
+    network_interface_t* test_iface = create_network_interface("test0");
+    if (!test_iface) {
+        printf("ERROR: Interface creation failed\n");
+        return -1;
+    }
+    
+    /* Test namespace creation */
+    network_namespace_t* test_ns = create_network_namespace("test_ns");
+    if (!test_ns) {
+        printf("ERROR: Namespace creation failed\n");
+        return -1;
+    }
+    
+    printf("Advanced network stack self-test completed successfully!\n");
+    return 0;
+}
+
+void network_enable_enterprise_mode(bool enable) {
+    g_enterprise_mode = enable;
+    if (enable) {
+        printf("Advanced network stack: Enterprise mode enabled\n");
+    } else {
+        printf("Advanced network stack: Enterprise mode disabled\n");
+    }
+}
+
+void network_shutdown(void) {
+    /* Free all allocated memory and clean up */
+    
+    /* Free interfaces */
+    while (g_interfaces) {
+        network_interface_t* iface = g_interfaces;
+        g_interfaces = iface->next;
+        free(iface);
+    }
+    
+    /* Free connections */
+    while (g_tcp_connections) {
+        destroy_tcp_connection(g_tcp_connections);
+    }
+    
+    /* Free namespaces */
+    while (g_namespaces) {
+        network_namespace_t* ns = g_namespaces;
+        g_namespaces = ns->next;
+        if (ns->routing_table) free(ns->routing_table);
+        free(ns);
+    }
+    
+    /* Free packet pool */
+    if (g_packet_pool) {
+        /* Free any allocated packet data */
+        for (uint32_t i = 0; i < NET_PACKET_POOL_SIZE; i++) {
+            if (g_packet_pool[i].data) {
+                free(g_packet_pool[i].data);
+            }
+        }
+        free(g_packet_pool);
+        g_packet_pool = NULL;
+    }
+    
+    g_network_initialized = false;
+}

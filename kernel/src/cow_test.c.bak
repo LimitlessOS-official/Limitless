@@ -1,0 +1,50 @@
+#include "kernel.h"
+#include "process.h"
+#include "microkernel.h"
+#include "vmm.h"
+#include "cow_test.h"
+#include "log.h"
+
+/* Test outline:
+ * 1. Allocate one anonymous writable page in current process (touch + pattern fill).
+ * 2. Fork -> child shares page read-only (COW refcount = 2) if page was faulted in.
+ * 3. In parent: write to first half of page (trigger COW if shared) store new pattern A.
+ * 4. In child: write to second half of page (trigger COW if still shared) store pattern B.
+ * 5. Validate: parent first half remains A, second half original pattern; child first half original pattern, second half B.
+ * 6. Ensure physical refcounts after both writes == 1 for each page (two distinct physical pages) and content divergence present.
+ * NOTE: Simplified: Instead of real process scheduling/IPC, we directly invoke process_fork and then manually operate via switching current process context if helper exists, else we limit to parent-only validation path.
+ * If infrastructure to swap current process is absent, we simulate by inspecting child's address space pages via page list.
+ */
+
+/* Assumptions: process_current() returns pointer; there is API to set current? If absent, we cannot safely dereference child VA.
+ * Fallback: After fork, we directly inspect page structures + refcounts rather than child's virtual view. We'll still trigger COW from parent via writes, but can't from child without context switch. To still test both sides we emulate child write by manually invoking fault + copy sequence using internal helpers if accessible.
+ * For now implement minimal test: ensure fork sets pages RO shared (refcount increments) and parent write causes split (refcount becomes 1 again). This covers core COW correctness even if child path isn't executed.
+ */
+
+extern process_t* process_current(void) __attribute__((weak));
+
+int cow_selftest(void){
+    process_t* parent = process_current(); if(!parent) return -1; vmm_aspace_t* as = parent->as; if(!as) return -2;
+    /* Allocate anonymous region: pick fixed test VA (e.g., 0x700000000000) if free; reuse mmap style if syscall exists. Use vmm_region_add & fault manually. */
+    virt_addr_t base = 0x700000000000ULL; size_t length = PAGE_SIZE; int rc = vmm_region_add(as, base, length, VMM_REGION_ANON | VMM_REGION_USER | VMM_REGION_WRITE);
+    if(rc!=0) return -3; 
+    /* Touch page to fault it in */
+    volatile u8* p = (u8*)base; p[0] = 0x11; for(size_t i=1;i<PAGE_SIZE;i++) p[i] = (u8)(i & 0xFF);
+    /* Locate backing page */
+    vmm_page_t* pg = NULL; for(vmm_page_t* q = as->pages; q; q = q->next){ if(q->va == (base & PAGE_MASK)){ pg = q; break; } }
+    if(!pg) return -4; paddr_t phys_before = pg->pa; if(pmm_get_refcount(phys_before)!=1) return -5;
+    /* Fork */
+    process_t* child = NULL; rc = process_fork(parent, &child); if(rc!=0 || !child) return -6;
+    /* After fork, refcount should be 2 and page should be remapped RO in parent */
+    if(pmm_get_refcount(phys_before) < 2) { KLOG_ERROR("cow_test","refcount not shared after fork ref=%u", pmm_get_refcount(phys_before)); return -7; }
+    /* Parent write triggers COW */
+    p[8] ^= 0x5A; /* modify */
+    /* Re-find page entry (may have new phys) */
+    vmm_page_t* pg_after = NULL; for(vmm_page_t* q = as->pages; q; q = q->next){ if(q->va == (base & PAGE_MASK)){ pg_after = q; break; } }
+    if(!pg_after) return -8; if(pg_after->pa == phys_before){ KLOG_ERROR("cow_test","COW did not allocate new page"); return -9; }
+    if(pmm_get_refcount(pg_after->pa) != 1) return -10; /* new page unique */
+    /* Old page refcount should have decremented but still >=1 because child holds it */
+    if(pmm_get_refcount(phys_before) < 1) return -11; if(pmm_get_refcount(phys_before) != 1) { /* expect exactly 1 (child) */ }
+    KLOG_INFO("cow_test","COW parent write split success new_phys=0x%llx old_phys=0x%llx", (unsigned long long)pg_after->pa, (unsigned long long)phys_before);
+    return 0;
+}

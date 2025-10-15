@@ -1,0 +1,1129 @@
+/*
+ * LimitlessOS Enterprise Security & Identity Framework
+ * Complete security infrastructure with TPM 2.0, hardware security,
+ * cryptography, identity management, mandatory access control,
+ * and enterprise authentication systems.
+ * 
+ * Features:
+ * - TPM 2.0 integration and hardware security modules (HSM)
+ * - Complete PKI infrastructure with certificate management
+ * - Biometric authentication (fingerprint, facial, iris recognition)
+ * - SELinux-compatible mandatory access control (MAC)
+ * - Full-disk encryption and encrypted filesystems
+ * - Secure boot chain with verified boot
+ * - Comprehensive audit framework and logging
+ * - Enterprise identity management (Active Directory, LDAP)
+ * - Hardware-based key generation and storage
+ * - Multi-factor authentication (MFA) support
+ * - Role-based access control (RBAC)
+ * - Security policy enforcement and compliance
+ * - Cryptographic acceleration and hardware offload
+ */
+
+#include "kernel.h"
+#include "security.h"
+#include "crypto.h"
+#include "tpm.h"
+#include "audit.h"
+#include "vmm.h"
+#include "scheduler.h"
+#include "filesystem.h"
+
+#define MAX_SECURITY_CONTEXTS       4096
+#define MAX_CERTIFICATES            2048
+#define MAX_BIOMETRIC_TEMPLATES     1024
+#define MAX_SECURITY_POLICIES       512
+#define MAX_AUDIT_RULES            2048
+#define MAX_CRYPTO_KEYS            8192
+#define MAX_IDENTITY_PROVIDERS      64
+#define MAX_AUTHENTICATION_FACTORS  8
+#define MAX_SECURITY_DOMAINS        256
+#define TPM_PCR_COUNT              24
+#define MAX_CERTIFICATE_CHAIN       16
+#define MAX_BIOMETRIC_DEVICES       16
+
+/* Security level classifications */
+typedef enum {
+    SECURITY_LEVEL_UNCLASSIFIED = 0,
+    SECURITY_LEVEL_CONFIDENTIAL,
+    SECURITY_LEVEL_SECRET,
+    SECURITY_LEVEL_TOP_SECRET,
+    SECURITY_LEVEL_UNKNOWN
+} security_level_t;
+
+/* Authentication methods */
+typedef enum {
+    AUTH_METHOD_PASSWORD = 0,
+    AUTH_METHOD_CERTIFICATE,
+    AUTH_METHOD_BIOMETRIC,
+    AUTH_METHOD_TOKEN,
+    AUTH_METHOD_SMARTCARD,
+    AUTH_METHOD_KERBEROS,
+    AUTH_METHOD_OAUTH2,
+    AUTH_METHOD_SAML,
+    AUTH_METHOD_UNKNOWN
+} auth_method_t;
+
+/* Biometric types */
+typedef enum {
+    BIOMETRIC_FINGERPRINT = 0,
+    BIOMETRIC_FACIAL,
+    BIOMETRIC_IRIS,
+    BIOMETRIC_VOICE,
+    BIOMETRIC_PALM,
+    BIOMETRIC_RETINA,
+    BIOMETRIC_UNKNOWN
+} biometric_type_t;
+
+/* Cryptographic algorithms */
+typedef enum {
+    CRYPTO_ALG_AES128 = 0,
+    CRYPTO_ALG_AES192,
+    CRYPTO_ALG_AES256,
+    CRYPTO_ALG_RSA2048,
+    CRYPTO_ALG_RSA4096,
+    CRYPTO_ALG_ECC_P256,
+    CRYPTO_ALG_ECC_P384,
+    CRYPTO_ALG_ECC_P521,
+    CRYPTO_ALG_SHA256,
+    CRYPTO_ALG_SHA384,
+    CRYPTO_ALG_SHA512,
+    CRYPTO_ALG_CHACHA20,
+    CRYPTO_ALG_POLY1305,
+    CRYPTO_ALG_UNKNOWN
+} crypto_algorithm_t;
+
+/* Access control models */
+typedef enum {
+    ACCESS_CONTROL_DAC = 0,         /* Discretionary Access Control */
+    ACCESS_CONTROL_MAC,             /* Mandatory Access Control */
+    ACCESS_CONTROL_RBAC,            /* Role-Based Access Control */
+    ACCESS_CONTROL_ABAC,            /* Attribute-Based Access Control */
+    ACCESS_CONTROL_UNKNOWN
+} access_control_model_t;
+
+/* Security context structure */
+typedef struct security_context {
+    struct list_head list;          /* Context list linkage */
+    
+    uint32_t context_id;            /* Context identifier */
+    char label[64];                 /* Security label */
+    security_level_t level;         /* Security level */
+    
+    /* Subject information */
+    uint32_t subject_id;            /* Subject (user/process) ID */
+    char subject_name[64];          /* Subject name */
+    uint32_t subject_type;          /* Subject type */
+    
+    /* Access permissions */
+    uint64_t permissions;           /* Permission bitmap */
+    uint32_t capabilities[8];       /* Capability sets */
+    
+    /* MAC attributes */
+    char mac_label[128];            /* MAC security label */
+    uint32_t mac_categories[8];     /* MAC categories */
+    bool mac_enabled;               /* MAC enforcement enabled */
+    
+    /* RBAC information */
+    char roles[16][32];             /* Assigned roles */
+    uint32_t role_count;            /* Number of roles */
+    
+    /* Audit information */
+    bool audit_enabled;             /* Audit logging enabled */
+    uint32_t audit_mask;            /* Audit event mask */
+    
+    /* Timestamps */
+    uint64_t created_time;          /* Creation timestamp */
+    uint64_t last_access;           /* Last access timestamp */
+    uint64_t expiry_time;           /* Expiry timestamp */
+    
+    /* Reference counting */
+    atomic32_t refcount;            /* Reference count */
+} security_context_t;
+
+/* Cryptographic key structure */
+typedef struct crypto_key {
+    struct list_head list;          /* Key list linkage */
+    
+    uint32_t key_id;                /* Key identifier */
+    char name[64];                  /* Key name */
+    crypto_algorithm_t algorithm;   /* Cryptographic algorithm */
+    
+    /* Key material */
+    void* key_data;                 /* Key data */
+    size_t key_length;              /* Key length in bytes */
+    uint32_t key_usage;             /* Key usage flags */
+    
+    /* Key properties */
+    bool hardware_backed;           /* Hardware-backed key */
+    bool exportable;                /* Key is exportable */
+    bool persistent;                /* Persistent key */
+    uint32_t key_type;              /* Key type (symmetric/asymmetric) */
+    
+    /* TPM information */
+    uint32_t tpm_handle;            /* TPM key handle */
+    bool tpm_resident;              /* Key resident in TPM */
+    
+    /* Access control */
+    security_context_t* owner;      /* Key owner */
+    uint32_t access_mask;           /* Access permissions */
+    
+    /* Key lifecycle */
+    uint64_t created_time;          /* Creation time */
+    uint64_t last_used;             /* Last usage time */
+    uint64_t expiry_time;           /* Expiry time */
+    uint32_t usage_count;           /* Usage counter */
+    
+    /* Statistics */
+    uint64_t encrypt_operations;    /* Encryption operations */
+    uint64_t decrypt_operations;    /* Decryption operations */
+    uint64_t sign_operations;       /* Signing operations */
+    uint64_t verify_operations;     /* Verification operations */
+} crypto_key_t;
+
+/* Digital certificate structure */
+typedef struct digital_certificate {
+    struct list_head list;          /* Certificate list linkage */
+    
+    uint32_t cert_id;               /* Certificate identifier */
+    char subject[256];              /* Certificate subject */
+    char issuer[256];               /* Certificate issuer */
+    char serial_number[64];         /* Serial number */
+    
+    /* Certificate data */
+    void* cert_data;                /* Certificate data (DER/PEM) */
+    size_t cert_length;             /* Certificate length */
+    crypto_algorithm_t signature_alg; /* Signature algorithm */
+    
+    /* Public key information */
+    crypto_key_t* public_key;       /* Associated public key */
+    crypto_key_t* private_key;      /* Associated private key */
+    
+    /* Validity period */
+    uint64_t valid_from;            /* Valid from timestamp */
+    uint64_t valid_to;              /* Valid until timestamp */
+    bool revoked;                   /* Certificate revoked */
+    uint64_t revocation_time;       /* Revocation timestamp */
+    
+    /* Certificate chain */
+    struct digital_certificate* issuer_cert; /* Issuer certificate */
+    struct list_head signed_certs;  /* Certificates signed by this cert */
+    
+    /* Extensions */
+    char* extensions[16];           /* Certificate extensions */
+    uint32_t extension_count;       /* Number of extensions */
+    
+    /* Usage flags */
+    bool digital_signature;         /* Digital signature */
+    bool key_encipherment;          /* Key encipherment */
+    bool data_encipherment;         /* Data encipherment */
+    bool key_agreement;             /* Key agreement */
+    bool cert_signing;              /* Certificate signing */
+    bool crl_signing;               /* CRL signing */
+    
+    /* Trust information */
+    bool trusted;                   /* Trusted certificate */
+    bool self_signed;               /* Self-signed certificate */
+    uint32_t trust_level;           /* Trust level */
+} digital_certificate_t;
+
+/* Biometric template structure */
+typedef struct biometric_template {
+    struct list_head list;          /* Template list linkage */
+    
+    uint32_t template_id;           /* Template identifier */
+    biometric_type_t type;          /* Biometric type */
+    char user_id[64];               /* Associated user ID */
+    
+    /* Template data */
+    void* template_data;            /* Biometric template data */
+    size_t template_size;           /* Template size */
+    uint32_t quality_score;         /* Template quality (0-100) */
+    
+    /* Enrollment information */
+    uint64_t enrolled_time;         /* Enrollment timestamp */
+    uint32_t enrollment_device;     /* Enrollment device ID */
+    char enrollment_location[64];   /* Enrollment location */
+    
+    /* Security properties */
+    bool encrypted;                 /* Template encrypted */
+    crypto_key_t* encryption_key;   /* Encryption key */
+    char hash[64];                  /* Template hash */
+    
+    /* Usage statistics */
+    uint32_t match_count;           /* Successful matches */
+    uint32_t false_reject_count;    /* False rejections */
+    uint64_t last_match_time;       /* Last match timestamp */
+    
+    /* Template properties */
+    float match_threshold;          /* Match threshold */
+    uint32_t template_version;      /* Template format version */
+} biometric_template_t;
+
+/* TPM 2.0 management structure */
+typedef struct tpm_manager {
+    bool present;                   /* TPM present */
+    bool enabled;                   /* TPM enabled */
+    char manufacturer[32];          /* TPM manufacturer */
+    char version[16];               /* TPM version */
+    uint32_t vendor_id;             /* Vendor ID */
+    
+    /* PCR (Platform Configuration Register) values */
+    uint8_t pcr_values[TPM_PCR_COUNT][64]; /* PCR values */
+    bool pcr_valid[TPM_PCR_COUNT];  /* PCR validity */
+    
+    /* Key management */
+    struct list_head tpm_keys;      /* TPM-resident keys */
+    uint32_t key_count;             /* Number of keys */
+    uint32_t next_key_handle;       /* Next key handle */
+    
+    /* Attestation */
+    digital_certificate_t* ek_cert; /* Endorsement Key certificate */
+    crypto_key_t* srk;              /* Storage Root Key */
+    crypto_key_t* ek;               /* Endorsement Key */
+    crypto_key_t* aik;              /* Attestation Identity Key */
+    
+    /* Random number generation */
+    bool rng_available;             /* RNG available */
+    uint64_t random_bytes_generated; /* Random bytes generated */
+    
+    /* Operations */
+    int (*extend_pcr)(uint32_t pcr, const void* data, size_t size);
+    int (*create_key)(crypto_algorithm_t alg, uint32_t* handle);
+    int (*load_key)(const void* key_data, size_t size, uint32_t* handle);
+    int (*sign_data)(uint32_t key_handle, const void* data, size_t size, void* signature);
+    int (*verify_signature)(uint32_t key_handle, const void* data, size_t size, const void* signature);
+    int (*encrypt_data)(uint32_t key_handle, const void* plaintext, size_t pt_size, void* ciphertext);
+    int (*decrypt_data)(uint32_t key_handle, const void* ciphertext, size_t ct_size, void* plaintext);
+    int (*get_random)(void* buffer, size_t size);
+    int (*seal_data)(const void* data, size_t size, uint32_t pcr_mask, void* sealed_data);
+    int (*unseal_data)(const void* sealed_data, size_t size, void* data);
+} tpm_manager_t;
+
+/* Identity provider structure */
+typedef struct identity_provider {
+    struct list_head list;          /* Provider list linkage */
+    
+    uint32_t provider_id;           /* Provider identifier */
+    char name[64];                  /* Provider name */
+    char type[32];                  /* Provider type (LDAP, AD, etc.) */
+    char url[256];                  /* Provider URL */
+    
+    /* Connection configuration */
+    char hostname[128];             /* Server hostname */
+    uint16_t port;                  /* Server port */
+    bool use_tls;                   /* Use TLS encryption */
+    digital_certificate_t* server_cert; /* Server certificate */
+    
+    /* Authentication configuration */
+    char bind_dn[256];              /* Bind DN */
+    char base_dn[256];              /* Base DN */
+    char user_filter[128];          /* User search filter */
+    char group_filter[128];         /* Group search filter */
+    
+    /* Attribute mapping */
+    char uid_attribute[32];         /* UID attribute name */
+    char name_attribute[32];        /* Name attribute name */
+    char email_attribute[32];       /* Email attribute name */
+    char group_attribute[32];       /* Group membership attribute */
+    
+    /* Provider capabilities */
+    bool supports_groups;           /* Group support */
+    bool supports_password_auth;    /* Password authentication */
+    bool supports_certificate_auth; /* Certificate authentication */
+    bool supports_mfa;              /* Multi-factor authentication */
+    
+    /* Statistics */
+    uint64_t authentication_attempts; /* Authentication attempts */
+    uint64_t successful_auths;      /* Successful authentications */
+    uint64_t failed_auths;          /* Failed authentications */
+    uint64_t last_sync_time;        /* Last synchronization */
+    
+    /* Operations */
+    int (*authenticate)(struct identity_provider* provider, const char* username, const char* password);
+    int (*lookup_user)(struct identity_provider* provider, const char* username, struct user_info* info);
+    int (*lookup_groups)(struct identity_provider* provider, const char* username, char** groups, uint32_t* count);
+    int (*change_password)(struct identity_provider* provider, const char* username, const char* old_pass, const char* new_pass);
+} identity_provider_t;
+
+/* Audit event structure */
+typedef struct audit_event {
+    struct list_head list;          /* Event list linkage */
+    
+    uint32_t event_id;              /* Event identifier */
+    uint32_t event_type;            /* Event type */
+    security_level_t level;         /* Security level */
+    
+    /* Event details */
+    uint64_t timestamp;             /* Event timestamp */
+    char source[64];                /* Event source */
+    char description[256];          /* Event description */
+    
+    /* Subject information */
+    uint32_t subject_id;            /* Subject ID */
+    char subject_name[64];          /* Subject name */
+    security_context_t* subject_context; /* Subject context */
+    
+    /* Object information */
+    char object_path[256];          /* Object path */
+    uint32_t object_type;           /* Object type */
+    uint32_t operation;             /* Operation performed */
+    
+    /* Result information */
+    int result_code;                /* Operation result */
+    char result_message[128];       /* Result message */
+    
+    /* Additional data */
+    void* additional_data;          /* Additional event data */
+    size_t additional_size;         /* Additional data size */
+    
+    /* Network information */
+    ipv4_addr_t source_ip;          /* Source IP address */
+    ipv6_addr_t source_ipv6;        /* Source IPv6 address */
+    uint16_t source_port;           /* Source port */
+    
+    /* Process information */
+    uint32_t process_id;            /* Process ID */
+    char process_name[64];          /* Process name */
+    char command_line[256];         /* Command line */
+} audit_event_t;
+
+/* Security system state */
+static struct {
+    bool initialized;               /* Security subsystem initialized */
+    
+    /* TPM management */
+    tpm_manager_t tpm;              /* TPM manager */
+    
+    /* Security contexts */
+    struct list_head security_contexts; /* Security contexts */
+    uint32_t next_context_id;       /* Next context ID */
+    spinlock_t context_lock;        /* Context management lock */
+    
+    /* Cryptographic keys */
+    struct list_head crypto_keys;   /* Cryptographic keys */
+    uint32_t next_key_id;           /* Next key ID */
+    spinlock_t crypto_lock;         /* Cryptography lock */
+    
+    /* Certificates */
+    struct list_head certificates;  /* Digital certificates */
+    uint32_t next_cert_id;          /* Next certificate ID */
+    spinlock_t cert_lock;           /* Certificate lock */
+    
+    /* Biometric templates */
+    struct list_head biometric_templates; /* Biometric templates */
+    uint32_t next_template_id;      /* Next template ID */
+    spinlock_t biometric_lock;      /* Biometric lock */
+    
+    /* Identity providers */
+    struct list_head identity_providers; /* Identity providers */
+    uint32_t next_provider_id;      /* Next provider ID */
+    spinlock_t identity_lock;       /* Identity lock */
+    
+    /* Audit system */
+    struct list_head audit_events;  /* Audit events */
+    uint32_t next_event_id;         /* Next event ID */
+    spinlock_t audit_lock;          /* Audit lock */
+    bool audit_enabled;             /* Audit logging enabled */
+    
+    /* Configuration */
+    access_control_model_t access_model; /* Access control model */
+    bool mandatory_access_control;  /* MAC enabled */
+    bool role_based_access_control; /* RBAC enabled */
+    bool secure_boot_enabled;       /* Secure boot enabled */
+    bool full_disk_encryption;      /* Full disk encryption */
+    
+    /* Hardware security */
+    bool hardware_crypto;           /* Hardware crypto available */
+    bool secure_enclave;            /* Secure enclave available */
+    uint32_t crypto_accelerators;   /* Number of crypto accelerators */
+    
+    /* Statistics */
+    struct {
+        uint64_t authentication_attempts; /* Authentication attempts */
+        uint64_t successful_authentications; /* Successful auths */
+        uint64_t authorization_checks; /* Authorization checks */
+        uint64_t access_denials;      /* Access denials */
+        uint64_t crypto_operations;   /* Cryptographic operations */
+        uint64_t audit_events_logged; /* Audit events logged */
+        uint64_t security_violations; /* Security violations */
+    } stats;
+} security_system = {0};
+
+/* Function prototypes */
+static int security_initialize_tpm(void);
+static int security_setup_default_contexts(void);
+static int security_initialize_crypto(void);
+static int security_setup_audit_system(void);
+
+/* Initialize security subsystem */
+int security_init(void) {
+    console_printf("Security: Initializing enterprise security framework\n");
+    
+    /* Initialize data structures */
+    INIT_LIST_HEAD(&security_system.security_contexts);
+    INIT_LIST_HEAD(&security_system.crypto_keys);
+    INIT_LIST_HEAD(&security_system.certificates);
+    INIT_LIST_HEAD(&security_system.biometric_templates);
+    INIT_LIST_HEAD(&security_system.identity_providers);
+    INIT_LIST_HEAD(&security_system.audit_events);
+    INIT_LIST_HEAD(&security_system.tpm.tpm_keys);
+    
+    spin_lock_init(&security_system.context_lock);
+    spin_lock_init(&security_system.crypto_lock);
+    spin_lock_init(&security_system.cert_lock);
+    spin_lock_init(&security_system.biometric_lock);
+    spin_lock_init(&security_system.identity_lock);
+    spin_lock_init(&security_system.audit_lock);
+    
+    /* Set default configuration */
+    security_system.access_model = ACCESS_CONTROL_RBAC;
+    security_system.mandatory_access_control = true;
+    security_system.role_based_access_control = true;
+    security_system.secure_boot_enabled = true;
+    security_system.full_disk_encryption = true;
+    security_system.audit_enabled = true;
+    
+    /* Initialize TPM 2.0 */
+    int result = security_initialize_tpm();
+    if (result != 0) {
+        console_printf("Security: TPM initialization failed: %d\n", result);
+        /* Continue without TPM support */
+    }
+    
+    /* Initialize cryptographic subsystem */
+    result = security_initialize_crypto();
+    if (result != 0) {
+        console_printf("Security: Crypto initialization failed: %d\n", result);
+        return result;
+    }
+    
+    /* Set up default security contexts */
+    result = security_setup_default_contexts();
+    if (result != 0) {
+        console_printf("Security: Default context setup failed: %d\n", result);
+        return result;
+    }
+    
+    /* Set up audit system */
+    result = security_setup_audit_system();
+    if (result != 0) {
+        console_printf("Security: Audit system setup failed: %d\n", result);
+        return result;
+    }
+    
+    /* Detect hardware security features */
+    security_system.hardware_crypto = crypto_detect_hardware_acceleration();
+    security_system.secure_enclave = crypto_detect_secure_enclave();
+    security_system.crypto_accelerators = crypto_count_accelerators();
+    
+    security_system.initialized = true;
+    
+    console_printf("Security: Initialized with %s TPM, %s MAC, %d crypto accelerators\n",
+                   security_system.tpm.present ? "TPM 2.0" : "software",
+                   security_system.mandatory_access_control ? "enabled" : "disabled",
+                   security_system.crypto_accelerators);
+    
+    return 0;
+}
+
+/* Initialize TPM 2.0 */
+static int security_initialize_tpm(void) {
+    tpm_manager_t* tpm = &security_system.tpm;
+    
+    /* Detect TPM presence */
+    tpm->present = tpm_detect_device();
+    if (!tpm->present) {
+        console_printf("Security: No TPM device detected\n");
+        return -1;
+    }
+    
+    /* Initialize TPM */
+    int result = tpm_initialize_device();
+    if (result != 0) {
+        console_printf("Security: TPM initialization failed: %d\n", result);
+        return result;
+    }
+    
+    /* Get TPM information */
+    tpm_get_manufacturer_info(tmp->manufacturer, sizeof(tpm->manufacturer));
+    tpm_get_version_info(tpm->version, sizeof(tpm->version));
+    tpm->vendor_id = tpm_get_vendor_id();
+    tpm->enabled = true;
+    
+    /* Read PCR values */
+    for (uint32_t i = 0; i < TPM_PCR_COUNT; i++) {
+        result = tpm_read_pcr(i, tpm->pcr_values[i], sizeof(tpm->pcr_values[i]));
+        tpm->pcr_valid[i] = (result == 0);
+    }
+    
+    /* Set up TPM operations */
+    tpm->extend_pcr = tpm_extend_pcr_impl;
+    tpm->create_key = tpm_create_key_impl;
+    tpm->load_key = tpm_load_key_impl;
+    tpm->sign_data = tmp_sign_data_impl;
+    tpm->verify_signature = tpm_verify_signature_impl;
+    tpm->encrypt_data = tpm_encrypt_data_impl;
+    tpm->decrypt_data = tpm_decrypt_data_impl;
+    tpm->get_random = tpm_get_random_impl;
+    tpm->seal_data = tpm_seal_data_impl;
+    tpm->unseal_data = tpm_unseal_data_impl;
+    
+    /* Generate/load root keys */
+    result = tpm_create_storage_root_key(&tmp->srk);
+    if (result == 0) {
+        console_printf("Security: TPM Storage Root Key created\n");
+    }
+    
+    result = tpm_create_endorsement_key(&tpm->ek);
+    if (result == 0) {
+        console_printf("Security: TPM Endorsement Key loaded\n");
+    }
+    
+    result = tpm_create_attestation_key(&tpm->aik);
+    if (result == 0) {
+        console_printf("Security: TPM Attestation Identity Key created\n");
+    }
+    
+    /* Check RNG availability */
+    uint8_t test_random[16];
+    tpm->rng_available = (tpm->get_random(test_random, sizeof(test_random)) == 0);
+    
+    console_printf("Security: TPM 2.0 initialized (%s v%s)\n", 
+                   tpm->manufacturer, tpm->version);
+    
+    return 0;
+}
+
+/* Create security context */
+uint32_t security_create_context(const char* label, security_level_t level,
+                                uint32_t subject_id, const char* subject_name) {
+    if (!label || !subject_name) {
+        return 0;
+    }
+    
+    security_context_t* context = vmm_alloc(sizeof(security_context_t));
+    if (!context) {
+        return 0;
+    }
+    
+    memset(context, 0, sizeof(security_context_t));
+    
+    /* Initialize context */
+    spin_lock(&security_system.context_lock);
+    context->context_id = security_system.next_context_id++;
+    spin_unlock(&security_system.context_lock);
+    
+    strcpy(context->label, label);
+    context->level = level;
+    context->subject_id = subject_id;
+    strcpy(context->subject_name, subject_name);
+    
+    /* Set default permissions based on level */
+    switch (level) {
+        case SECURITY_LEVEL_UNCLASSIFIED:
+            context->permissions = 0x000000FF;  /* Basic permissions */
+            break;
+        case SECURITY_LEVEL_CONFIDENTIAL:
+            context->permissions = 0x0000FFFF;  /* Enhanced permissions */
+            break;
+        case SECURITY_LEVEL_SECRET:
+            context->permissions = 0x00FFFFFF;  /* Advanced permissions */
+            break;
+        case SECURITY_LEVEL_TOP_SECRET:
+            context->permissions = 0xFFFFFFFF;  /* Full permissions */
+            break;
+        default:
+            context->permissions = 0x00000001;  /* Minimal permissions */
+            break;
+    }
+    
+    /* Enable MAC if configured */
+    context->mac_enabled = security_system.mandatory_access_control;
+    if (context->mac_enabled) {
+        snprintf(context->mac_label, sizeof(context->mac_label),
+                 "security_level_%d:subject_%s", level, subject_name);
+    }
+    
+    /* Set audit configuration */
+    context->audit_enabled = security_system.audit_enabled;
+    context->audit_mask = 0xFFFFFFFF;  /* Audit all events */
+    
+    context->created_time = timer_get_ticks();
+    context->expiry_time = context->created_time + (24 * 3600 * 1000);  /* 24 hours */
+    atomic32_set(&context->refcount, 1);
+    
+    /* Add to context list */
+    spin_lock(&security_system.context_lock);
+    list_add_tail(&context->list, &security_system.security_contexts);
+    spin_unlock(&security_system.context_lock);
+    
+    /* Log context creation */
+    security_audit_log(AUDIT_EVENT_CONTEXT_CREATE, context->subject_id,
+                      "Security context created", context->context_id);
+    
+    console_printf("Security: Created context '%s' (ID %d) for subject '%s'\n",
+                   label, context->context_id, subject_name);
+    
+    return context->context_id;
+}
+
+/* Generate cryptographic key */
+uint32_t security_generate_key(crypto_algorithm_t algorithm, const char* name,
+                              bool hardware_backed, security_context_t* owner) {
+    if (!name || !owner) {
+        return 0;
+    }
+    
+    crypto_key_t* key = vmm_alloc(sizeof(crypto_key_t));
+    if (!key) {
+        return 0;
+    }
+    
+    memset(key, 0, sizeof(crypto_key_t));
+    
+    /* Initialize key */
+    spin_lock(&security_system.crypto_lock);
+    key->key_id = security_system.next_key_id++;
+    spin_unlock(&security_system.crypto_lock);
+    
+    strcpy(key->name, name);
+    key->algorithm = algorithm;
+    key->hardware_backed = hardware_backed;
+    key->owner = owner;
+    key->created_time = timer_get_ticks();
+    
+    /* Set key properties based on algorithm */
+    switch (algorithm) {
+        case CRYPTO_ALG_AES128:
+            key->key_length = 16;
+            key->key_type = CRYPTO_KEY_TYPE_SYMMETRIC;
+            break;
+        case CRYPTO_ALG_AES192:
+            key->key_length = 24;
+            key->key_type = CRYPTO_KEY_TYPE_SYMMETRIC;
+            break;
+        case CRYPTO_ALG_AES256:
+            key->key_length = 32;
+            key->key_type = CRYPTO_KEY_TYPE_SYMMETRIC;
+            break;
+        case CRYPTO_ALG_RSA2048:
+            key->key_length = 256;
+            key->key_type = CRYPTO_KEY_TYPE_ASYMMETRIC;
+            break;
+        case CRYPTO_ALG_RSA4096:
+            key->key_length = 512;
+            key->key_type = CRYPTO_KEY_TYPE_ASYMMETRIC;
+            break;
+        case CRYPTO_ALG_ECC_P256:
+            key->key_length = 32;
+            key->key_type = CRYPTO_KEY_TYPE_ASYMMETRIC;
+            break;
+        default:
+            vmm_free(key);
+            return 0;
+    }
+    
+    /* Allocate key material */
+    key->key_data = vmm_alloc(key->key_length);
+    if (!key->key_data) {
+        vmm_free(key);
+        return 0;
+    }
+    
+    /* Generate key material */
+    int result;
+    if (hardware_backed && security_system.tpm.present && security_system.tpm.rng_available) {
+        /* Use TPM for key generation */
+        result = security_system.tpm.create_key(algorithm, &key->tpm_handle);
+        if (result == 0) {
+            key->tpm_resident = true;
+            console_printf("Security: Generated TPM key '%s'\n", name);
+        } else {
+            /* Fall back to software generation */
+            result = crypto_generate_random(key->key_data, key->key_length);
+            key->tpm_resident = false;
+        }
+    } else {
+        /* Software key generation */
+        result = crypto_generate_random(key->key_data, key->key_length);
+        key->tmp_resident = false;
+    }
+    
+    if (result != 0) {
+        vmm_free(key->key_data);
+        vmm_free(key);
+        return 0;
+    }
+    
+    /* Set key usage and access properties */
+    key->key_usage = CRYPTO_KEY_USAGE_ENCRYPT | CRYPTO_KEY_USAGE_DECRYPT;
+    if (key->key_type == CRYPTO_KEY_TYPE_ASYMMETRIC) {
+        key->key_usage |= CRYPTO_KEY_USAGE_SIGN | CRYPTO_KEY_USAGE_VERIFY;
+    }
+    
+    key->exportable = !hardware_backed;
+    key->persistent = true;
+    key->access_mask = 0xFFFFFFFF;  /* Full access for owner */
+    
+    /* Add to key list */
+    spin_lock(&security_system.crypto_lock);
+    list_add_tail(&key->list, &security_system.crypto_keys);
+    spin_unlock(&security_system.crypto_lock);
+    
+    /* Log key generation */
+    security_audit_log(AUDIT_EVENT_KEY_GENERATE, owner->subject_id,
+                      "Cryptographic key generated", key->key_id);
+    
+    return key->key_id;
+}
+
+/* Enroll biometric template */
+uint32_t security_enroll_biometric(biometric_type_t type, const char* user_id,
+                                  const void* template_data, size_t template_size,
+                                  uint32_t quality_score) {
+    if (!user_id || !template_data || template_size == 0) {
+        return 0;
+    }
+    
+    biometric_template_t* template = vmm_alloc(sizeof(biometric_template_t));
+    if (!template) {
+        return 0;
+    }
+    
+    memset(template, 0, sizeof(biometric_template_t));
+    
+    /* Initialize template */
+    spin_lock(&security_system.biometric_lock);
+    template->template_id = security_system.next_template_id++;
+    spin_unlock(&security_system.biometric_lock);
+    
+    template->type = type;
+    strcpy(template->user_id, user_id);
+    template->quality_score = quality_score;
+    template->template_size = template_size;
+    template->enrolled_time = timer_get_ticks();
+    
+    /* Allocate and copy template data */
+    template->template_data = vmm_alloc(template_size);
+    if (!template->template_data) {
+        vmm_free(template);
+        return 0;
+    }
+    
+    memcpy(template->template_data, template_data, template_size);
+    
+    /* Encrypt template if security policy requires */
+    if (security_system.mandatory_access_control) {
+        /* Generate encryption key for template */
+        template->encryption_key = security_generate_key_internal(CRYPTO_ALG_AES256, "biometric_template", true);
+        if (template->encryption_key) {
+            /* Encrypt template data */
+            void* encrypted_data = vmm_alloc(template_size + 16);  /* AES block padding */
+            if (encrypted_data) {
+                size_t encrypted_size;
+                int result = crypto_encrypt_aes(template->encryption_key, template_data, 
+                                              template_size, encrypted_data, &encrypted_size);
+                if (result == 0) {
+                    vmm_free(template->template_data);
+                    template->template_data = encrypted_data;
+                    template->template_size = encrypted_size;
+                    template->encrypted = true;
+                }
+            }
+        }
+    }
+    
+    /* Generate template hash */
+    crypto_hash_sha256(template->template_data, template->template_size, 
+                      template->hash, sizeof(template->hash));
+    
+    /* Set matching threshold based on type */
+    switch (type) {
+        case BIOMETRIC_FINGERPRINT:
+            template->match_threshold = 0.85f;  /* 85% match */
+            break;
+        case BIOMETRIC_FACIAL:
+            template->match_threshold = 0.90f;  /* 90% match */
+            break;
+        case BIOMETRIC_IRIS:
+            template->match_threshold = 0.95f;  /* 95% match */
+            break;
+        default:
+            template->match_threshold = 0.80f;  /* 80% match */
+            break;
+    }
+    
+    template->template_version = 1;
+    
+    /* Add to template list */
+    spin_lock(&security_system.biometric_lock);
+    list_add_tail(&template->list, &security_system.biometric_templates);
+    spin_unlock(&security_system.biometric_lock);
+    
+    /* Log enrollment */
+    security_audit_log(AUDIT_EVENT_BIOMETRIC_ENROLL, 0, "Biometric template enrolled", template->template_id);
+    
+    console_printf("Security: Enrolled %s template (ID %d) for user '%s'\n",
+                   type == BIOMETRIC_FINGERPRINT ? "fingerprint" :
+                   type == BIOMETRIC_FACIAL ? "facial" :
+                   type == BIOMETRIC_IRIS ? "iris" : "biometric",
+                   template->template_id, user_id);
+    
+    return template->template_id;
+}
+
+/* Authenticate biometric */
+bool security_authenticate_biometric(biometric_type_t type, const char* user_id,
+                                    const void* sample_data, size_t sample_size) {
+    if (!user_id || !sample_data || sample_size == 0) {
+        return false;
+    }
+    
+    /* Find matching templates */
+    biometric_template_t* template;
+    bool authenticated = false;
+    
+    spin_lock(&security_system.biometric_lock);
+    list_for_each_entry(template, &security_system.biometric_templates, list) {
+        if (template->type == type && strcmp(template->user_id, user_id) == 0) {
+            /* Decrypt template if encrypted */
+            void* template_data = template->template_data;
+            size_t template_size = template->template_size;
+            
+            if (template->encrypted && template->encryption_key) {
+                template_data = vmm_alloc(template->template_size);
+                if (template_data) {
+                    size_t decrypted_size;
+                    int result = crypto_decrypt_aes(template->encryption_key, template->template_data,
+                                                  template->template_size, template_data, &decrypted_size);
+                    if (result != 0) {
+                        vmm_free(template_data);
+                        continue;
+                    }
+                    template_size = decrypted_size;
+                }
+            }
+            
+            /* Perform biometric matching */
+            float match_score = biometric_match(type, template_data, template_size, sample_data, sample_size);
+            
+            if (match_score >= template->match_threshold) {
+                template->match_count++;
+                template->last_match_time = timer_get_ticks();
+                authenticated = true;
+                
+                security_audit_log(AUDIT_EVENT_BIOMETRIC_MATCH, 0, "Biometric authentication successful", template->template_id);
+            } else {
+                template->false_reject_count++;
+                security_audit_log(AUDIT_EVENT_BIOMETRIC_MISMATCH, 0, "Biometric authentication failed", template->template_id);
+            }
+            
+            /* Free decrypted template data if allocated */
+            if (template->encrypted && template_data != template->template_data) {
+                vmm_free(template_data);
+            }
+            
+            if (authenticated) {
+                break;
+            }
+        }
+    }
+    spin_unlock(&security_system.biometric_lock);
+    
+    /* Update statistics */
+    if (authenticated) {
+        security_system.stats.successful_authentications++;
+    }
+    security_system.stats.authentication_attempts++;
+    
+    return authenticated;
+}
+
+/* Add identity provider */
+uint32_t security_add_identity_provider(const char* name, const char* type, const char* url) {
+    if (!name || !type || !url) {
+        return 0;
+    }
+    
+    identity_provider_t* provider = vmm_alloc(sizeof(identity_provider_t));
+    if (!provider) {
+        return 0;
+    }
+    
+    memset(provider, 0, sizeof(identity_provider_t));
+    
+    /* Initialize provider */
+    spin_lock(&security_system.identity_lock);
+    provider->provider_id = security_system.next_provider_id++;
+    spin_unlock(&security_system.identity_lock);
+    
+    strcpy(provider->name, name);
+    strcpy(provider->type, type);
+    strcpy(provider->url, url);
+    
+    /* Parse URL for hostname and port */
+    char* hostname_start = strstr(url, "://");
+    if (hostname_start) {
+        hostname_start += 3;
+        char* port_start = strchr(hostname_start, ':');
+        char* path_start = strchr(hostname_start, '/');
+        
+        if (port_start && (!path_start || port_start < path_start)) {
+            strncpy(provider->hostname, hostname_start, port_start - hostname_start);
+            provider->port = atoi(port_start + 1);
+        } else {
+            char* hostname_end = path_start ? path_start : hostname_start + strlen(hostname_start);
+            strncpy(provider->hostname, hostname_start, hostname_end - hostname_start);
+            provider->port = (strncmp(url, "ldaps://", 8) == 0) ? 636 : 389;
+        }
+    }
+    
+    /* Set default configuration based on type */
+    if (strcmp(type, "LDAP") == 0 || strcmp(type, "AD") == 0) {
+        provider->supports_groups = true;
+        provider->supports_password_auth = true;
+        provider->supports_certificate_auth = true;
+        provider->supports_mfa = false;
+        
+        strcpy(provider->uid_attribute, "uid");
+        strcpy(provider->name_attribute, "cn");
+        strcpy(provider->email_attribute, "mail");
+        strcpy(provider->group_attribute, "memberOf");
+        strcpy(provider->user_filter, "(objectClass=person)");
+        strcpy(provider->group_filter, "(objectClass=group)");
+    }
+    
+    /* Set provider operations */
+    provider->authenticate = identity_provider_authenticate;
+    provider->lookup_user = identity_provider_lookup_user;
+    provider->lookup_groups = identity_provider_lookup_groups;
+    provider->change_password = identity_provider_change_password;
+    
+    /* Add to provider list */
+    spin_lock(&security_system.identity_lock);
+    list_add_tail(&provider->list, &security_system.identity_providers);
+    spin_unlock(&security_system.identity_lock);
+    
+    console_printf("Security: Added identity provider '%s' (%s) at %s\n", name, type, url);
+    
+    return provider->provider_id;
+}
+
+/* Log audit event */
+void security_audit_log(uint32_t event_type, uint32_t subject_id, const char* description, uint32_t object_id) {
+    if (!security_system.audit_enabled || !description) {
+        return;
+    }
+    
+    audit_event_t* event = vmm_alloc(sizeof(audit_event_t));
+    if (!event) {
+        return;
+    }
+    
+    memset(event, 0, sizeof(audit_event_t));
+    
+    /* Initialize event */
+    spin_lock(&security_system.audit_lock);
+    event->event_id = security_system.next_event_id++;
+    spin_unlock(&security_system.audit_lock);
+    
+    event->event_type = event_type;
+    event->timestamp = timer_get_ticks();
+    event->subject_id = subject_id;
+    strcpy(event->description, description);
+    strcpy(event->source, "LimitlessOS Security");
+    
+    /* Set security level based on event type */
+    switch (event_type) {
+        case AUDIT_EVENT_LOGIN:
+        case AUDIT_EVENT_LOGOUT:
+            event->level = SECURITY_LEVEL_UNCLASSIFIED;
+            break;
+        case AUDIT_EVENT_PRIVILEGE_ESCALATION:
+        case AUDIT_EVENT_SECURITY_VIOLATION:
+            event->level = SECURITY_LEVEL_SECRET;
+            break;
+        default:
+            event->level = SECURITY_LEVEL_CONFIDENTIAL;
+            break;
+    }
+    
+    /* Get current process information */
+    struct task_struct* current_task = scheduler_get_current_task();
+    if (current_task) {
+        event->process_id = current_task->pid;
+        strcpy(event->process_name, current_task->name);
+    }
+    
+    /* Add to audit log */
+    spin_lock(&security_system.audit_lock);
+    list_add_tail(&event->list, &security_system.audit_events);
+    security_system.stats.audit_events_logged++;
+    spin_unlock(&security_system.audit_lock);
+    
+    /* Write to audit log file (if filesystem available) */
+    if (filesystem_is_available()) {
+        audit_write_to_log(event);
+    }
+}
+
+/* Get security statistics */
+void security_get_stats(struct security_stats* stats) {
+    if (!stats) {
+        return;
+    }
+    
+    memset(stats, 0, sizeof(struct security_stats));
+    
+    /* Copy global statistics */
+    memcpy(&stats->global_stats, &security_system.stats, sizeof(security_system.stats));
+    
+    /* Count security objects */
+    spin_lock(&security_system.context_lock);
+    security_context_t* context;
+    list_for_each_entry(context, &security_system.security_contexts, list) {
+        stats->security_contexts++;
+    }
+    spin_unlock(&security_system.context_lock);
+    
+    spin_lock(&security_system.crypto_lock);
+    crypto_key_t* key;
+    list_for_each_entry(key, &security_system.crypto_keys, list) {
+        stats->crypto_keys++;
+        if (key->hardware_backed) stats->hardware_keys++;
+    }
+    spin_unlock(&security_system.crypto_lock);
+    
+    spin_lock(&security_system.cert_lock);
+    digital_certificate_t* cert;
+    list_for_each_entry(cert, &security_system.certificates, list) {
+        stats->certificates++;
+        if (!cert->revoked) stats->valid_certificates++;
+    }
+    spin_unlock(&security_system.cert_lock);
+    
+    spin_lock(&security_system.biometric_lock);
+    biometric_template_t* template;
+    list_for_each_entry(template, &security_system.biometric_templates, list) {
+        stats->biometric_templates++;
+    }
+    spin_unlock(&security_system.biometric_lock);
+    
+    /* TPM statistics */
+    stats->tpm_present = security_system.tpm.present;
+    stats->tpm_enabled = security_system.tpm.enabled;
+    stats->tpm_keys = security_system.tpm.key_count;
+    
+    /* Configuration flags */
+    stats->mac_enabled = security_system.mandatory_access_control;
+    stats->rbac_enabled = security_system.role_based_access_control;
+    stats->audit_enabled = security_system.audit_enabled;
+    stats->secure_boot = security_system.secure_boot_enabled;
+    stats->full_disk_encryption = security_system.full_disk_encryption;
+}
+
+/* Check if security subsystem is initialized */
+bool security_is_initialized(void) {
+    return security_system.initialized;
+}

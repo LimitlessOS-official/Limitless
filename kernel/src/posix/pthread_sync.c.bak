@@ -1,0 +1,802 @@
+/*
+ * pthread_sync.c - LimitlessOS POSIX Thread Synchronization Primitives
+ * 
+ * Implementation of mutexes, condition variables, read-write locks,
+ * semaphores, barriers, and other pthread synchronization mechanisms.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "scheduler.h"
+#include "vmm.h"
+#include "timer.h"
+#include "pthreads.h"
+
+#define PTHREAD_MUTEX_MAGIC     0x4D555458  /* "MUTX" */
+#define PTHREAD_COND_MAGIC      0x434F4E44  /* "COND" */
+#define PTHREAD_RWLOCK_MAGIC    0x52574C4B  /* "RWLK" */
+#define PTHREAD_SEM_MAGIC       0x53454D41  /* "SEMA" */
+#define PTHREAD_BARRIER_MAGIC   0x42415252  /* "BARR" */
+
+/* Mutex implementation */
+
+/* Initialize mutex */
+int pthread_mutex_init(pthread_mutex_t* mutex, const pthread_mutexattr_t* attr) {
+    if (!mutex) {
+        return EINVAL;
+    }
+    
+    memset(mutex, 0, sizeof(pthread_mutex_t));
+    
+    mutex->magic = PTHREAD_MUTEX_MAGIC;
+    mutex->type = attr ? attr->type : PTHREAD_MUTEX_DEFAULT;
+    atomic32_set(&mutex->count, 0);
+    mutex->owner = 0;
+    atomic32_set(&mutex->lock_state, 0);
+    
+    INIT_LIST_HEAD(&mutex->waiters);
+    spinlock_init(&mutex->wait_lock);
+    atomic32_set(&mutex->waiter_count, 0);
+    
+    mutex->original_priority = -1;
+    mutex->ceiling_priority = -1;
+    
+    printf("pthreads: Initialized mutex %p (type=%d)\n", mutex, mutex->type);
+    
+    return 0;
+}
+
+/* Destroy mutex */
+int pthread_mutex_destroy(pthread_mutex_t* mutex) {
+    if (!mutex || mutex->magic != PTHREAD_MUTEX_MAGIC) {
+        return EINVAL;
+    }
+    
+    if (atomic32_read(&mutex->lock_state) != 0) {
+        return EBUSY;
+    }
+    
+    if (atomic32_read(&mutex->waiter_count) > 0) {
+        return EBUSY;
+    }
+    
+    mutex->magic = 0;
+    
+    return 0;
+}
+
+/* Lock mutex */
+int pthread_mutex_lock(pthread_mutex_t* mutex) {
+    if (!mutex || mutex->magic != PTHREAD_MUTEX_MAGIC) {
+        return EINVAL;
+    }
+    
+    pthread_t self = pthread_self();
+    
+    while (true) {
+        int old_state = atomic32_cmpxchg(&mutex->lock_state, 0, 1);
+        
+        if (old_state == 0) {
+            /* Successfully acquired lock */
+            mutex->owner = self;
+            atomic32_inc(&mutex->count);
+            atomic64_inc(&mutex->lock_count);
+            return 0;
+        }
+        
+        /* Check for recursive locking */
+        if (mutex->type == PTHREAD_MUTEX_RECURSIVE && mutex->owner == self) {
+            atomic32_inc(&mutex->count);
+            atomic64_inc(&mutex->lock_count);
+            return 0;
+        }
+        
+        /* Check for error conditions */
+        if (mutex->type == PTHREAD_MUTEX_ERRORCHECK && mutex->owner == self) {
+            return EDEADLK;
+        }
+        
+        /* Add to wait queue */
+        atomic64_inc(&mutex->contention_count);
+        atomic64_inc(&g_pthread_system.mutex_contentions);
+        
+        struct mutex_waiter {
+            pthread_t thread;
+            struct list_head list;
+            bool woken;
+        } waiter;
+        
+        waiter.thread = self;
+        waiter.woken = false;
+        
+        spin_lock(&mutex->wait_lock);
+        list_add_tail(&waiter.list, &mutex->waiters);
+        atomic32_inc(&mutex->waiter_count);
+        spin_unlock(&mutex->wait_lock);
+        
+        /* Wait for lock to become available */
+        while (!waiter.woken && atomic32_read(&mutex->lock_state) != 0) {
+            scheduler_yield();
+        }
+        
+        /* Remove from wait queue if still there */
+        spin_lock(&mutex->wait_lock);
+        if (!waiter.woken) {
+            list_del(&waiter.list);
+            atomic32_dec(&mutex->waiter_count);
+        }
+        spin_unlock(&mutex->wait_lock);
+    }
+}
+
+/* Try to lock mutex */
+int pthread_mutex_trylock(pthread_mutex_t* mutex) {
+    if (!mutex || mutex->magic != PTHREAD_MUTEX_MAGIC) {
+        return EINVAL;
+    }
+    
+    pthread_t self = pthread_self();
+    
+    int old_state = atomic32_cmpxchg(&mutex->lock_state, 0, 1);
+    
+    if (old_state == 0) {
+        /* Successfully acquired lock */
+        mutex->owner = self;
+        atomic32_inc(&mutex->count);
+        atomic64_inc(&mutex->lock_count);
+        return 0;
+    }
+    
+    /* Check for recursive locking */
+    if (mutex->type == PTHREAD_MUTEX_RECURSIVE && mutex->owner == self) {
+        atomic32_inc(&mutex->count);
+        atomic64_inc(&mutex->lock_count);
+        return 0;
+    }
+    
+    return EBUSY;
+}
+
+/* Unlock mutex */
+int pthread_mutex_unlock(pthread_mutex_t* mutex) {
+    if (!mutex || mutex->magic != PTHREAD_MUTEX_MAGIC) {
+        return EINVAL;
+    }
+    
+    pthread_t self = pthread_self();
+    
+    if (mutex->owner != self) {
+        return EPERM;
+    }
+    
+    atomic32_dec(&mutex->count);
+    
+    if (atomic32_read(&mutex->count) > 0) {
+        /* Still recursively locked */
+        atomic64_inc(&mutex->unlock_count);
+        return 0;
+    }
+    
+    mutex->owner = 0;
+    atomic32_set(&mutex->lock_state, 0);
+    atomic64_inc(&mutex->unlock_count);
+    
+    /* Wake up a waiting thread */
+    spin_lock(&mutex->wait_lock);
+    
+    if (!list_empty(&mutex->waiters)) {
+        struct mutex_waiter* waiter = list_first_entry(&mutex->waiters, 
+                                                      struct mutex_waiter, list);
+        waiter->woken = true;
+        list_del(&waiter->list);
+        atomic32_dec(&mutex->waiter_count);
+        
+        /* TODO: Wake up the specific thread */
+    }
+    
+    spin_unlock(&mutex->wait_lock);
+    
+    return 0;
+}
+
+/* Condition Variable implementation */
+
+/* Initialize condition variable */
+int pthread_cond_init(pthread_cond_t* cond, const pthread_condattr_t* attr) {
+    if (!cond) {
+        return EINVAL;
+    }
+    
+    memset(cond, 0, sizeof(pthread_cond_t));
+    
+    cond->magic = PTHREAD_COND_MAGIC;
+    spinlock_init(&cond->lock);
+    INIT_LIST_HEAD(&cond->waiters);
+    atomic32_set(&cond->waiter_count, 0);
+    
+    printf("pthreads: Initialized condition variable %p\n", cond);
+    
+    return 0;
+}
+
+/* Destroy condition variable */
+int pthread_cond_destroy(pthread_cond_t* cond) {
+    if (!cond || cond->magic != PTHREAD_COND_MAGIC) {
+        return EINVAL;
+    }
+    
+    if (atomic32_read(&cond->waiter_count) > 0) {
+        return EBUSY;
+    }
+    
+    cond->magic = 0;
+    
+    return 0;
+}
+
+/* Wait on condition variable */
+int pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {
+    if (!cond || cond->magic != PTHREAD_COND_MAGIC ||
+        !mutex || mutex->magic != PTHREAD_MUTEX_MAGIC) {
+        return EINVAL;
+    }
+    
+    pthread_t self = pthread_self();
+    
+    if (mutex->owner != self) {
+        return EPERM;
+    }
+    
+    struct cond_waiter {
+        pthread_t thread;
+        struct list_head list;
+        bool signaled;
+    } waiter;
+    
+    waiter.thread = self;
+    waiter.signaled = false;
+    
+    /* Add to condition variable wait queue */
+    spin_lock(&cond->lock);
+    list_add_tail(&waiter.list, &cond->waiters);
+    atomic32_inc(&cond->waiter_count);
+    atomic64_inc(&cond->wait_count);
+    spin_unlock(&cond->lock);
+    
+    /* Unlock the mutex */
+    int unlock_result = pthread_mutex_unlock(mutex);
+    if (unlock_result != 0) {
+        /* Remove from wait queue */
+        spin_lock(&cond->lock);
+        list_del(&waiter.list);
+        atomic32_dec(&cond->waiter_count);
+        spin_unlock(&cond->lock);
+        return unlock_result;
+    }
+    
+    /* Wait for signal */
+    while (!waiter.signaled) {
+        scheduler_yield();
+    }
+    
+    /* Re-acquire the mutex */
+    int lock_result = pthread_mutex_lock(mutex);
+    
+    return lock_result;
+}
+
+/* Signal condition variable */
+int pthread_cond_signal(pthread_cond_t* cond) {
+    if (!cond || cond->magic != PTHREAD_COND_MAGIC) {
+        return EINVAL;
+    }
+    
+    spin_lock(&cond->lock);
+    
+    if (!list_empty(&cond->waiters)) {
+        struct cond_waiter* waiter = list_first_entry(&cond->waiters,
+                                                     struct cond_waiter, list);
+        waiter->signaled = true;
+        list_del(&waiter->list);
+        atomic32_dec(&cond->waiter_count);
+        
+        atomic64_inc(&cond->signal_count);
+        atomic64_inc(&g_pthread_system.cond_signals);
+    }
+    
+    spin_unlock(&cond->lock);
+    
+    return 0;
+}
+
+/* Broadcast condition variable */
+int pthread_cond_broadcast(pthread_cond_t* cond) {
+    if (!cond || cond->magic != PTHREAD_COND_MAGIC) {
+        return EINVAL;
+    }
+    
+    spin_lock(&cond->lock);
+    
+    struct cond_waiter* waiter;
+    struct cond_waiter* tmp;
+    
+    list_for_each_entry_safe(waiter, tmp, &cond->waiters, list) {
+        waiter->signaled = true;
+        list_del(&waiter->list);
+        atomic32_dec(&cond->waiter_count);
+    }
+    
+    if (!list_empty(&cond->waiters)) {
+        atomic64_inc(&cond->broadcast_count);
+    }
+    
+    spin_unlock(&cond->lock);
+    
+    return 0;
+}
+
+/* Read-Write Lock implementation */
+
+/* Initialize read-write lock */
+int pthread_rwlock_init(pthread_rwlock_t* rwlock, const pthread_rwlockattr_t* attr) {
+    if (!rwlock) {
+        return EINVAL;
+    }
+    
+    memset(rwlock, 0, sizeof(pthread_rwlock_t));
+    
+    rwlock->magic = PTHREAD_RWLOCK_MAGIC;
+    atomic32_set(&rwlock->readers, 0);
+    atomic32_set(&rwlock->writers, 0);
+    rwlock->writer_owner = 0;
+    
+    spinlock_init(&rwlock->lock);
+    INIT_LIST_HEAD(&rwlock->reader_waiters);
+    INIT_LIST_HEAD(&rwlock->writer_waiters);
+    atomic32_set(&rwlock->reader_waiter_count, 0);
+    atomic32_set(&rwlock->writer_waiter_count, 0);
+    
+    rwlock->writer_preferred = attr ? attr->writer_preferred : false;
+    
+    printf("pthreads: Initialized read-write lock %p\n", rwlock);
+    
+    return 0;
+}
+
+/* Destroy read-write lock */
+int pthread_rwlock_destroy(pthread_rwlock_t* rwlock) {
+    if (!rwlock || rwlock->magic != PTHREAD_RWLOCK_MAGIC) {
+        return EINVAL;
+    }
+    
+    if (atomic32_read(&rwlock->readers) > 0 || atomic32_read(&rwlock->writers) > 0) {
+        return EBUSY;
+    }
+    
+    rwlock->magic = 0;
+    
+    return 0;
+}
+
+/* Read lock */
+int pthread_rwlock_rdlock(pthread_rwlock_t* rwlock) {
+    if (!rwlock || rwlock->magic != PTHREAD_RWLOCK_MAGIC) {
+        return EINVAL;
+    }
+    
+    while (true) {
+        spin_lock(&rwlock->lock);
+        
+        /* Can acquire read lock if no writers and (no writer preference or no waiting writers) */
+        if (atomic32_read(&rwlock->writers) == 0 && 
+            (!rwlock->writer_preferred || atomic32_read(&rwlock->writer_waiter_count) == 0)) {
+            
+            atomic32_inc(&rwlock->readers);
+            atomic64_inc(&rwlock->read_locks);
+            spin_unlock(&rwlock->lock);
+            return 0;
+        }
+        
+        /* Add to reader wait queue */
+        struct rwlock_waiter {
+            pthread_t thread;
+            struct list_head list;
+            bool woken;
+        } waiter;
+        
+        waiter.thread = pthread_self();
+        waiter.woken = false;
+        
+        list_add_tail(&waiter.list, &rwlock->reader_waiters);
+        atomic32_inc(&rwlock->reader_waiter_count);
+        atomic64_inc(&rwlock->read_contention);
+        
+        spin_unlock(&rwlock->lock);
+        
+        /* Wait for lock */
+        while (!waiter.woken) {
+            scheduler_yield();
+        }
+        
+        /* Remove from wait queue if still there */
+        spin_lock(&rwlock->lock);
+        if (!waiter.woken) {
+            list_del(&waiter.list);
+            atomic32_dec(&rwlock->reader_waiter_count);
+        }
+        spin_unlock(&rwlock->lock);
+    }
+}
+
+/* Write lock */
+int pthread_rwlock_wrlock(pthread_rwlock_t* rwlock) {
+    if (!rwlock || rwlock->magic != PTHREAD_RWLOCK_MAGIC) {
+        return EINVAL;
+    }
+    
+    pthread_t self = pthread_self();
+    
+    while (true) {
+        spin_lock(&rwlock->lock);
+        
+        /* Can acquire write lock if no readers and no writers */
+        if (atomic32_read(&rwlock->readers) == 0 && atomic32_read(&rwlock->writers) == 0) {
+            atomic32_set(&rwlock->writers, 1);
+            rwlock->writer_owner = self;
+            atomic64_inc(&rwlock->write_locks);
+            spin_unlock(&rwlock->lock);
+            return 0;
+        }
+        
+        /* Add to writer wait queue */
+        struct rwlock_waiter {
+            pthread_t thread;
+            struct list_head list;
+            bool woken;
+        } waiter;
+        
+        waiter.thread = self;
+        waiter.woken = false;
+        
+        list_add_tail(&waiter.list, &rwlock->writer_waiters);
+        atomic32_inc(&rwlock->writer_waiter_count);
+        atomic64_inc(&rwlock->write_contention);
+        
+        spin_unlock(&rwlock->lock);
+        
+        /* Wait for lock */
+        while (!waiter.woken) {
+            scheduler_yield();
+        }
+        
+        /* Remove from wait queue if still there */
+        spin_lock(&rwlock->lock);
+        if (!waiter.woken) {
+            list_del(&waiter.list);
+            atomic32_dec(&rwlock->writer_waiter_count);
+        }
+        spin_unlock(&rwlock->lock);
+    }
+}
+
+/* Unlock read-write lock */
+int pthread_rwlock_unlock(pthread_rwlock_t* rwlock) {
+    if (!rwlock || rwlock->magic != PTHREAD_RWLOCK_MAGIC) {
+        return EINVAL;
+    }
+    
+    pthread_t self = pthread_self();
+    
+    spin_lock(&rwlock->lock);
+    
+    if (atomic32_read(&rwlock->writers) > 0) {
+        /* Write unlock */
+        if (rwlock->writer_owner != self) {
+            spin_unlock(&rwlock->lock);
+            return EPERM;
+        }
+        
+        atomic32_set(&rwlock->writers, 0);
+        rwlock->writer_owner = 0;
+        
+        /* Wake up waiting writers first (if writer preferred) or readers */
+        if (rwlock->writer_preferred && !list_empty(&rwlock->writer_waiters)) {
+            struct rwlock_waiter* waiter = list_first_entry(&rwlock->writer_waiters,
+                                                          struct rwlock_waiter, list);
+            waiter->woken = true;
+            list_del(&waiter->list);
+            atomic32_dec(&rwlock->writer_waiter_count);
+        } else if (!list_empty(&rwlock->reader_waiters)) {
+            /* Wake up all waiting readers */
+            struct rwlock_waiter* waiter;
+            struct rwlock_waiter* tmp;
+            
+            list_for_each_entry_safe(waiter, tmp, &rwlock->reader_waiters, list) {
+                waiter->woken = true;
+                list_del(&waiter->list);
+                atomic32_dec(&rwlock->reader_waiter_count);
+            }
+        }
+        
+    } else if (atomic32_read(&rwlock->readers) > 0) {
+        /* Read unlock */
+        atomic32_dec(&rwlock->readers);
+        
+        /* If no more readers, wake up a waiting writer */
+        if (atomic32_read(&rwlock->readers) == 0 && !list_empty(&rwlock->writer_waiters)) {
+            struct rwlock_waiter* waiter = list_first_entry(&rwlock->writer_waiters,
+                                                          struct rwlock_waiter, list);
+            waiter->woken = true;
+            list_del(&waiter->list);
+            atomic32_dec(&rwlock->writer_waiter_count);
+        }
+    } else {
+        spin_unlock(&rwlock->lock);
+        return EPERM;
+    }
+    
+    spin_unlock(&rwlock->lock);
+    
+    return 0;
+}
+
+/* Semaphore implementation */
+
+/* Initialize semaphore */
+int pthread_sem_init(pthread_sem_t* sem, int pshared, unsigned int value) {
+    if (!sem) {
+        return EINVAL;
+    }
+    
+    memset(sem, 0, sizeof(pthread_sem_t));
+    
+    sem->magic = PTHREAD_SEM_MAGIC;
+    atomic32_set(&sem->value, value);
+    atomic32_set(&sem->max_value, INT_MAX);
+    
+    spinlock_init(&sem->lock);
+    INIT_LIST_HEAD(&sem->waiters);
+    atomic32_set(&sem->waiter_count, 0);
+    
+    printf("pthreads: Initialized semaphore %p (value=%u)\n", sem, value);
+    
+    return 0;
+}
+
+/* Destroy semaphore */
+int pthread_sem_destroy(pthread_sem_t* sem) {
+    if (!sem || sem->magic != PTHREAD_SEM_MAGIC) {
+        return EINVAL;
+    }
+    
+    if (atomic32_read(&sem->waiter_count) > 0) {
+        return EBUSY;
+    }
+    
+    sem->magic = 0;
+    
+    return 0;
+}
+
+/* Wait on semaphore */
+int pthread_sem_wait(pthread_sem_t* sem) {
+    if (!sem || sem->magic != PTHREAD_SEM_MAGIC) {
+        return EINVAL;
+    }
+    
+    while (true) {
+        int old_value = atomic32_read(&sem->value);
+        
+        if (old_value > 0) {
+            if (atomic32_cmpxchg(&sem->value, old_value, old_value - 1) == old_value) {
+                atomic64_inc(&sem->wait_count);
+                return 0;
+            }
+        } else {
+            /* Add to wait queue */
+            struct sem_waiter {
+                pthread_t thread;
+                struct list_head list;
+                bool signaled;
+            } waiter;
+            
+            waiter.thread = pthread_self();
+            waiter.signaled = false;
+            
+            spin_lock(&sem->lock);
+            list_add_tail(&waiter.list, &sem->waiters);
+            atomic32_inc(&sem->waiter_count);
+            spin_unlock(&sem->lock);
+            
+            /* Wait for signal */
+            while (!waiter.signaled && atomic32_read(&sem->value) == 0) {
+                scheduler_yield();
+            }
+            
+            /* Remove from wait queue if still there */
+            spin_lock(&sem->lock);
+            if (!waiter.signaled) {
+                list_del(&waiter.list);
+                atomic32_dec(&sem->waiter_count);
+            }
+            spin_unlock(&sem->lock);
+        }
+    }
+}
+
+/* Try wait on semaphore */
+int pthread_sem_trywait(pthread_sem_t* sem) {
+    if (!sem || sem->magic != PTHREAD_SEM_MAGIC) {
+        return EINVAL;
+    }
+    
+    int old_value = atomic32_read(&sem->value);
+    
+    if (old_value > 0) {
+        if (atomic32_cmpxchg(&sem->value, old_value, old_value - 1) == old_value) {
+            atomic64_inc(&sem->wait_count);
+            return 0;
+        }
+    }
+    
+    return EAGAIN;
+}
+
+/* Post to semaphore */
+int pthread_sem_post(pthread_sem_t* sem) {
+    if (!sem || sem->magic != PTHREAD_SEM_MAGIC) {
+        return EINVAL;
+    }
+    
+    atomic32_inc(&sem->value);
+    atomic64_inc(&sem->post_count);
+    
+    /* Wake up a waiting thread */
+    spin_lock(&sem->lock);
+    
+    if (!list_empty(&sem->waiters)) {
+        struct sem_waiter* waiter = list_first_entry(&sem->waiters,
+                                                    struct sem_waiter, list);
+        waiter->signaled = true;
+        list_del(&waiter->list);
+        atomic32_dec(&sem->waiter_count);
+    }
+    
+    spin_unlock(&sem->lock);
+    
+    return 0;
+}
+
+/* Get semaphore value */
+int pthread_sem_getvalue(pthread_sem_t* sem, int* sval) {
+    if (!sem || sem->magic != PTHREAD_SEM_MAGIC || !sval) {
+        return EINVAL;
+    }
+    
+    *sval = atomic32_read(&sem->value);
+    
+    return 0;
+}
+
+/* Barrier implementation */
+
+/* Initialize barrier */
+int pthread_barrier_init(pthread_barrier_t* barrier, const pthread_barrierattr_t* attr, 
+                         unsigned int count) {
+    if (!barrier || count == 0) {
+        return EINVAL;
+    }
+    
+    memset(barrier, 0, sizeof(pthread_barrier_t));
+    
+    barrier->magic = PTHREAD_BARRIER_MAGIC;
+    barrier->count = count;
+    atomic32_set(&barrier->current_count, 0);
+    barrier->generation = 0;
+    
+    spinlock_init(&barrier->lock);
+    INIT_LIST_HEAD(&barrier->waiters);
+    
+    printf("pthreads: Initialized barrier %p (count=%u)\n", barrier, count);
+    
+    return 0;
+}
+
+/* Destroy barrier */
+int pthread_barrier_destroy(pthread_barrier_t* barrier) {
+    if (!barrier || barrier->magic != PTHREAD_BARRIER_MAGIC) {
+        return EINVAL;
+    }
+    
+    if (atomic32_read(&barrier->current_count) > 0) {
+        return EBUSY;
+    }
+    
+    barrier->magic = 0;
+    
+    return 0;
+}
+
+/* Wait on barrier */
+int pthread_barrier_wait(pthread_barrier_t* barrier) {
+    if (!barrier || barrier->magic != PTHREAD_BARRIER_MAGIC) {
+        return EINVAL;
+    }
+    
+    spin_lock(&barrier->lock);
+    
+    uint32_t generation = barrier->generation;
+    uint32_t current = atomic32_inc_return(&barrier->current_count);
+    
+    if (current == barrier->count) {
+        /* Last thread - wake up all waiters */
+        barrier->generation++;
+        atomic32_set(&barrier->current_count, 0);
+        
+        struct barrier_waiter {
+            pthread_t thread;
+            struct list_head list;
+            uint32_t generation;
+            bool released;
+        } *waiter, *tmp;
+        
+        list_for_each_entry_safe(waiter, tmp, &barrier->waiters, list) {
+            if (waiter->generation == generation) {
+                waiter->released = true;
+                list_del(&waiter->list);
+            }
+        }
+        
+        spin_unlock(&barrier->lock);
+        
+        return PTHREAD_BARRIER_SERIAL_THREAD;
+    } else {
+        /* Wait for barrier release */
+        struct barrier_waiter waiter;
+        waiter.thread = pthread_self();
+        waiter.generation = generation;
+        waiter.released = false;
+        
+        list_add_tail(&waiter.list, &barrier->waiters);
+        
+        spin_unlock(&barrier->lock);
+        
+        /* Wait for release */
+        while (!waiter.released && barrier->generation == generation) {
+            scheduler_yield();
+        }
+        
+        return 0;
+    }
+}
+
+/* Get synchronization statistics */
+void pthread_sync_get_stats(struct pthread_sync_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct pthread_sync_stats));
+    
+    /* These would be accumulated from all sync objects */
+    stats->mutex_locks = 0;
+    stats->mutex_contentions = atomic64_read(&g_pthread_system.mutex_contentions);
+    stats->cond_signals = atomic64_read(&g_pthread_system.cond_signals);
+    stats->rwlock_reads = 0;
+    stats->rwlock_writes = 0;
+    stats->sem_posts = 0;
+    stats->barrier_waits = 0;
+}
+
+/* Debug synchronization statistics */
+void pthread_sync_dump_stats(void) {
+    struct pthread_sync_stats stats;
+    pthread_sync_get_stats(&stats);
+    
+    printf("pthread Synchronization Statistics:\n");
+    printf("  Mutex locks: %lu\n", stats.mutex_locks);
+    printf("  Mutex contentions: %lu\n", stats.mutex_contentions);
+    printf("  Condition signals: %lu\n", stats.cond_signals);
+    printf("  RWLock reads: %lu\n", stats.rwlock_reads);
+    printf("  RWLock writes: %lu\n", stats.rwlock_writes);
+    printf("  Semaphore posts: %lu\n", stats.sem_posts);
+    printf("  Barrier waits: %lu\n", stats.barrier_waits);
+}

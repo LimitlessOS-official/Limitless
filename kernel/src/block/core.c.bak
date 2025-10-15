@@ -1,0 +1,44 @@
+#include "block.h"
+#include "kernel.h"
+
+#define MAX_BLOCK 16
+static block_dev_t* g_blk[MAX_BLOCK];
+static u32 g_blk_count = 0;
+
+int block_register(block_dev_t* dev) {
+    if (!dev || !dev->ops.read || !dev->ops.write) return K_EINVAL;
+    if (g_blk_count >= MAX_BLOCK) return K_EBUSY;
+    dev->index = g_blk_count;
+    if (!dev->sector_sz) dev->sector_sz = dev->ops.sector_size ? dev->ops.sector_size(dev) : 512;
+    if (!dev->sectors) dev->sectors = dev->ops.capacity_sectors ? dev->ops.capacity_sectors(dev) : 0;
+    g_blk[g_blk_count++] = dev;
+    kprintf("block: registered %s (%u) sector=%u cap=%llu\n", dev->name, dev->index, dev->sector_sz, (unsigned long long)dev->sectors);
+    return 0;
+}
+
+int block_count(void) { return (int)g_blk_count; }
+block_dev_t* block_get(int idx) { if (idx < 0 || (u32)idx >= g_blk_count) return NULL; return g_blk[idx]; }
+
+block_dev_t* block_find_by_name(const char* name) {
+    if (!name) return NULL;
+    for (u32 i=0;i<g_blk_count;i++) {
+        if (k_strcmp(g_blk[i]->name, name)==0) return g_blk[i];
+    }
+    return NULL;
+}
+
+int block_read(block_dev_t* dev, u64 lba, void* buf, u32 bytes) {
+    if (!dev || !buf) return K_EINVAL;
+    u32 sec = dev->sector_sz ? dev->sector_sz : 512;
+    u32 sectors = (bytes + sec - 1) / sec;
+    blk_io_t io = { .lba = lba, .count = sectors, .buf = buf };
+    return dev->ops.read(dev, &io);
+}
+
+int block_write(block_dev_t* dev, u64 lba, const void* buf, u32 bytes) {
+    if (!dev || !buf) return K_EINVAL;
+    u32 sec = dev->sector_sz ? dev->sector_sz : 512;
+    u32 sectors = (bytes + sec - 1) / sec;
+    blk_io_t io = { .lba = lba, .count = sectors, .buf = (void*)buf };
+    return dev->ops.write(dev, &io);
+}

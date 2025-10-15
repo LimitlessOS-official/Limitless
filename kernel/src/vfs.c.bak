@@ -1,0 +1,651 @@
+/*
+ * Virtual File System Implementation
+ * Unified filesystem interface
+ */
+
+#include "vfs.h"
+#include "kernel.h"
+#include "process.h"
+
+/* Forward prototype for builtin fs registration */
+void vfs_register_builtin_fs(void);
+
+#define MAX_FS 8
+#define MAX_MOUNTS 8
+
+static const fs_type_t* g_fs[MAX_FS];
+static vfs_mount_t g_mounts[MAX_MOUNTS];
+static const fs_type_t* g_mount_fs[MAX_MOUNTS]; /* parallel mapping to fs type */
+
+static int path_is_root(const char* p) { return p && p[0]=='/' && p[1]=='\0'; }
+
+void vfs_init(void) {
+    for (int i=0;i<MAX_FS;i++) g_fs[i]=NULL;
+    for (int i=0;i<MAX_MOUNTS;i++){ g_mounts[i].mountpoint[0]='\0'; g_mounts[i].fstype[0]='\0'; g_mounts[i].sb=NULL; g_mount_fs[i]=NULL; }
+    /* Register builtin tmpfs and mount as root immediately. */
+    vfs_register_builtin_fs();
+    vfs_mount_root("tmpfs", NULL);
+    
+    /* Create essential directories */
+    vfs_init_dirs();
+}
+
+int vfs_register_fs(const fs_type_t* fs) {
+    if(!fs||!fs->name) return K_EINVAL;
+    for(int i=0;i<MAX_FS;i++){ if(!g_fs[i]) { g_fs[i]=fs; return 0; } }
+    return K_EBUSY;
+}
+
+static const fs_type_t* find_fs(const char* name) {
+    for (int i=0;i<MAX_FS;i++) {
+        if (g_fs[i] && g_fs[i]->name) {
+            const char* a = g_fs[i]->name;
+            const char* b = name;
+            bool eq = true;
+            while (*a && *b) { if (*a++ != *b++) { eq=false; break; } }
+            if (eq && *a=='\0' && *b=='\0') return g_fs[i];
+        }
+    }
+    return NULL;
+}
+int vfs_mount_at(const char* fsname, block_dev_t* bdev, const char* path){
+    if(!fsname||!path) return K_EINVAL;
+    const fs_type_t* fs = find_fs(fsname); if(!fs) return K_ENOENT;
+    for(int i=0;i<MAX_MOUNTS;i++){
+        if(g_mounts[i].mountpoint[0]==0){
+            /* allocate superblock */
+            static vfs_super_t supers[MAX_MOUNTS];
+            vfs_super_t* sb = &supers[i]; k_memset(sb,0,sizeof(*sb)); sb->bdev=bdev; sb->ops=NULL;
+            g_mounts[i].sb = sb;
+            /* copy mountpoint and fsname */
+            int j=0; for(; path[j] && j<(int)sizeof(g_mounts[i].mountpoint)-1; ++j) g_mounts[i].mountpoint[j]=path[j]; g_mounts[i].mountpoint[j]='\0';
+            j=0; for(; fs->name[j] && j<(int)sizeof(g_mounts[i].fstype)-1; ++j) g_mounts[i].fstype[j]=fs->name[j]; g_mounts[i].fstype[j]='\0';
+            g_mount_fs[i]=fs;
+            /* call mount callback */
+            if(fs->mount){ vfs_super_t* newsb=NULL; int mrc = fs->mount(bdev, &newsb); if(mrc!=0) return mrc; if(newsb) g_mounts[i].sb = newsb; }
+            return 0;
+        }
+    }
+    return K_EBUSY;
+}
+
+int vfs_mount_root(const char* fsname, block_dev_t* bdev){ return vfs_mount_at(fsname, bdev, "/"); }
+
+/* Forward tmpfs structures (moved earlier for symlink handling) */
+#define TMPFS_MAX_NODES 128
+#define TMPFS_NAME_MAX   48
+typedef struct tmpfs_node tmpfs_node_t;
+struct tmpfs_node {
+    vnode_t v;                /* must be first */
+    tmpfs_node_t* parent;
+    tmpfs_node_t* next_sibling;
+    tmpfs_node_t* first_child; /* for directories */
+    char name[TMPFS_NAME_MAX];
+    size_t used;
+    char* heap_data;          /* allocated for file contents */
+    size_t cap;               /* capacity of heap_data */
+    char* symlink_target;     /* for symlink nodes */
+};
+typedef struct tmpfs_state { tmpfs_node_t* root; size_t node_count; } tmpfs_state_t;
+static tmpfs_state_t g_tmpfs_state;
+
+static vfs_mount_t* mount_for_path(const char* path, const char** rel_out) {
+    /* Phase 1: single root mount */
+    if (!path) return NULL;
+    if (path_is_root(path)) { if (rel_out) *rel_out = "/"; return &g_mounts[0]; }
+    if (path[0]=='/') { if (rel_out) *rel_out = path + 1; return &g_mounts[0]; }
+    return NULL;
+}
+
+int vfs_lookup(const char* path, vnode_t** out) {
+    if (!path || !out) return K_EINVAL; *out=NULL;
+    const char* rel=NULL; vfs_mount_t* m = mount_for_path(path, &rel); if(!m||!m->sb||!m->sb->ops||!m->sb->ops->get_root) return K_ENOENT;
+    vnode_t* root = m->sb->ops->get_root(m->sb); if(!root) return K_ENOENT;
+    if (!rel || rel[0]=='\0' || (rel[0]=='/' && rel[1]=='\0')) { *out = root; return 0; }
+    /* Skip leading slash if present */
+    if (rel[0]=='/') rel++;
+    vnode_t* cur = root;
+    const char* p = rel;
+    while (*p) {
+        const char* start=p; while(*p && *p!='/') p++; size_t clen = (size_t)(p-start);
+        if (clen==0) { if (*p=='/') { p++; continue; } else break; }
+        if (!cur->ops || !cur->ops->lookup) return K_ENOTSUP;
+        vnode_t* next = cur->ops->lookup(cur, start, clen);
+        if (!next) return K_ENOENT;
+        cur = next;
+        if (*p=='/') p++;
+    }
+    /* If final node is a symlink, resolve one level (no recursive chain to prevent complexity) */
+    /* Symlink resolution temporarily disabled pending generalized implementation */
+    *out = cur; return 0;
+}
+
+long vfs_read_path(const char* path, u64 off, void* buf, size_t len) {
+    vnode_t* node = NULL;
+    int r = vfs_lookup(path, &node);
+    if (r) return r;
+    if (!node->ops || !node->ops->read) return K_ENOTSUP;
+    return node->ops->read(node, off, buf, len);
+}
+
+/* ---------------- file API shim ---------------- */
+extern int __security_open_check(const char* path,int flags) __attribute__((weak));
+/* Page cache integration */
+#include "page_cache.h"
+extern void __vfs_emit_open_event(const char* path,int flags,int rc) __attribute__((weak));
+int vfs_open(const char* path, int flags, file_t** out) {
+    if (!path || !out) { if(__vfs_emit_open_event) __vfs_emit_open_event(path,flags,-K_EINVAL); return K_EINVAL; }
+    if (__security_open_check) {
+        int sec = __security_open_check(path, flags);
+        if (sec != 0) { if(__vfs_emit_open_event) __vfs_emit_open_event(path,flags,-sec); return sec; }
+    }
+    vnode_t* vn=NULL; int rc = vfs_lookup(path, &vn);
+    if (rc!=0) {
+        if ((flags & VFS_O_CREAT) && rc==K_ENOENT) {
+            rc = vfs_create_file(path, 0666, NULL);
+            if (rc!=0) { if(__vfs_emit_open_event) __vfs_emit_open_event(path,flags,-rc); return rc; }
+            rc = vfs_lookup(path, &vn);
+            if (rc!=0) { if(__vfs_emit_open_event) __vfs_emit_open_event(path,flags,-rc); return rc; }
+        } else { if(__vfs_emit_open_event) __vfs_emit_open_event(path,flags,-rc); return rc; }
+    }
+    file_t* f = (file_t*)vmm_kmalloc(sizeof(file_t), 16); if(!f) { if(__vfs_emit_open_event) __vfs_emit_open_event(path,flags,-K_ENOMEM); return K_ENOMEM; }
+    f->vn = vn; f->offset = 0; f->flags = flags; *out = f;
+    if(__vfs_emit_open_event) __vfs_emit_open_event(path,flags,0);
+    return 0;
+}
+
+int vfs_close(file_t* f) { if(!f) return K_EINVAL; vmm_kfree(f, sizeof(file_t)); return 0; }
+
+int vfs_read(file_t* f, void* buf, u64 len, u64* out_rd) {
+    if(!f||!buf) return K_EINVAL; if(!f->vn) return K_EINVAL; if(f->vn->type != VNODE_FILE) return K_EISDIR;
+    u64 total=0; u64 remaining=len; u8* dst=(u8*)buf; while(remaining){ u64 page_index = f->offset / PAGE_SIZE; u64 in_page_off = f->offset % PAGE_SIZE; u64 to_copy = PAGE_SIZE - in_page_off; if(to_copy > remaining) to_copy = remaining; page_cache_page_t* pg=NULL; bool newload=false; int rc = page_cache_get(f->vn,page_index,&pg,&newload); if(rc!=0){ return rc; }
+        /* copy from cached page */
+        k_memcpy(dst, (void*)(uintptr_t)(pg->pa + in_page_off), (size_t)to_copy);
+        page_cache_release(pg);
+        dst += to_copy; remaining -= to_copy; total += to_copy; f->offset += to_copy;
+        if(f->offset >= f->vn->size) break; /* EOF */
+    }
+    if(out_rd) *out_rd = total; return 0;
+}
+
+int vfs_write(file_t* f, const void* buf, u64 len, u64* out_wr) {
+    if(!f||!buf) return K_EINVAL; if(!(f->flags & (VFS_O_WRONLY|VFS_O_RDWR))) return K_EPERM; if(!f->vn) return K_EINVAL; if(f->vn->type != VNODE_FILE) return K_EISDIR; if(!f->vn->ops||!f->vn->ops->write) return K_ENOTSUP;
+    const u8* src=(const u8*)buf; u64 remaining=len; u64 written=0; while(remaining){ u64 page_index = f->offset / PAGE_SIZE; u64 in_page_off = f->offset % PAGE_SIZE; u64 to_copy = PAGE_SIZE - in_page_off; if(to_copy > remaining) to_copy = remaining; page_cache_page_t* pg=NULL; bool newload=false; int rc = page_cache_get(f->vn,page_index,&pg,&newload); if(rc!=0) return rc; /* If newly loaded and writing partial page beyond EOF ensure zero fill handled already */
+        k_memcpy((void*)(uintptr_t)(pg->pa + in_page_off), src, (size_t)to_copy);
+        page_cache_mark_dirty(pg);
+        page_cache_release(pg);
+        src += to_copy; remaining -= to_copy; written += to_copy; f->offset += to_copy;
+        if(f->offset > f->vn->size) f->vn->size = f->offset; /* extend file size */
+    }
+    if(out_wr) *out_wr = written; return 0;
+}
+
+int vfs_seek(file_t* f, s64 off, int whence) {
+    if(!f) return K_EINVAL; s64 base=0; if(whence==VFS_SEEK_SET) base=0; else if(whence==VFS_SEEK_CUR) base=(s64)f->offset; else if(whence==VFS_SEEK_END) base=(s64)f->vn->size; else return K_EINVAL; s64 noff=base+off; if(noff<0) return K_EINVAL; f->offset=(u64)noff; return 0;
+}
+
+u64 vfs_tell(file_t* f){ return f?f->offset:0; }
+
+/* ---------------- tmpfs (multi-node minimal) ---------------- */
+/* Symlink limitations:
+ * - Only one level of terminal symlink resolution plus limited chain (depth<=4) to avoid loops.
+ * - Intermediate symlinks in the middle of a path are only resolved if final component; full POSIX behavior (every component) deferred.
+ * - Relative symlinks are resolved against parent directory of the link.
+ */
+
+/* (definitions moved earlier) */
+
+static int tmpfs_perm_can_write(tmpfs_node_t* n) {
+    extern long sys_getuid(void) __attribute__((weak));
+    extern long sys_getgid(void) __attribute__((weak));
+    u32 mode = n->v.mode;
+    long uid = sys_getuid ? sys_getuid() : 0;
+    long gid = sys_getgid ? sys_getgid() : 0;
+    if (uid == 0) return 1;
+    if (uid == (long)n->v.uid) return (mode & 0200) != 0;
+    if (gid == (long)n->v.gid) return (mode & 0020) != 0;
+    return (mode & 0002) != 0;
+}
+
+static int tmpfs_perm_can_exec_dir(tmpfs_node_t* n) {
+    if (!n) return 0;
+    if (n->v.type != VNODE_DIR) return 0;
+    extern long sys_getuid(void) __attribute__((weak));
+    extern long sys_getgid(void) __attribute__((weak));
+    long uid = sys_getuid ? sys_getuid() : 0;
+    long gid = sys_getgid ? sys_getgid() : 0;
+    if (uid == 0) return 1;
+    u32 mode = n->v.mode;
+    if (uid == (long)n->v.uid) return (mode & 0100) != 0; /* owner execute */
+    if (gid == (long)n->v.gid) return (mode & 0010) != 0; /* group execute */
+    return (mode & 0001) != 0; /* other */
+}
+
+static tmpfs_node_t* tmpfs_alloc_node(const char* name, vnode_type_t type, u32 mode) {
+    if (g_tmpfs_state.node_count >= TMPFS_MAX_NODES) return NULL;
+    tmpfs_node_t* n = (tmpfs_node_t*)vmm_kmalloc(sizeof(tmpfs_node_t), 64);
+    if (!n) return NULL;
+    k_memset(n, 0, sizeof(*n));
+    n->v.type = type;
+    n->v.mode = mode;
+    n->v.uid = 0;
+    n->v.gid = 0;
+    n->v.ops = NULL; /* set later */
+    if (name) {
+        size_t l = 0; while (name[l] && l < TMPFS_NAME_MAX-1) { n->name[l] = name[l]; l++; }
+        n->name[l] = '\0';
+    }
+    g_tmpfs_state.node_count++;
+    return n;
+}
+
+static long tmpfs_vn_read(struct vnode* vn, u64 off, void* buf, size_t len) {
+    tmpfs_node_t* n = (tmpfs_node_t*)vn;
+    if (n->v.type != VNODE_FILE) return -K_EISDIR;
+    /* Read permission check */
+    extern long sys_getuid(void) __attribute__((weak));
+    extern long sys_getgid(void) __attribute__((weak));
+    long uid = sys_getuid ? sys_getuid() : 0;
+    long gid = sys_getgid ? sys_getgid() : 0;
+    if (uid != 0) {
+        u32 mode = n->v.mode;
+        int allowed = 0;
+        if (uid == (long)n->v.uid) allowed = (mode & 0400)!=0; else if (gid == (long)n->v.gid) allowed = (mode & 0040)!=0; else allowed = (mode & 0004)!=0;
+        if (!allowed) return -K_EPERM;
+    }
+    if (off >= n->used) return 0;
+    if (off + len > n->used) len = n->used - (size_t)off;
+    k_memcpy(buf, n->heap_data + off, len);
+    return (long)len;
+}
+
+static int tmpfs_ensure_capacity(tmpfs_node_t* n, size_t need) {
+    if (need <= n->cap) return 0;
+    size_t newcap = n->cap ? n->cap : 512;
+    while (newcap < need) newcap *= 2;
+    char* newdata = (char*)vmm_kmalloc(newcap, 16);
+    if (!newdata) return K_ENOMEM;
+    if (n->heap_data && n->used) k_memcpy(newdata, n->heap_data, n->used);
+    if (n->heap_data) vmm_kfree(n->heap_data, n->cap);
+    n->heap_data = newdata;
+    n->cap = newcap;
+    return 0;
+}
+
+static long tmpfs_vn_write(struct vnode* vn, u64 off, const void* buf, size_t len) {
+    tmpfs_node_t* n = (tmpfs_node_t*)vn;
+    if (n->v.type != VNODE_FILE) return -K_EISDIR;
+    if (!tmpfs_perm_can_write(n)) return -K_EPERM;
+    size_t end = (size_t)off + len;
+    int rc = tmpfs_ensure_capacity(n, end);
+    if (rc) return -rc;
+    k_memcpy(n->heap_data + off, buf, len);
+    if (end > n->used) n->used = end;
+    n->v.size = n->used;
+    return (long)len;
+}
+
+static int __attribute__((unused)) tmpfs_dir_iter_cb(const char* name, size_t namelen, int is_dir, void* ctx) {
+    (void)name; (void)namelen; (void)is_dir; (void)ctx; return 0;
+}
+
+static int tmpfs_vn_readdir(struct vnode* vn, vfs_dirent_cb cb, void* ctx) {
+    tmpfs_node_t* d = (tmpfs_node_t*)vn;
+    if (d->v.type != VNODE_DIR) return -K_ENOTDIR;
+    if (!tmpfs_perm_can_exec_dir(d)) return K_EPERM; /* need search/exec */
+    for (tmpfs_node_t* c = d->first_child; c; c = c->next_sibling) {
+        cb(c->name, k_strlen(c->name), c->v.type == VNODE_DIR, ctx);
+    }
+    return 0;
+}
+
+static struct vnode* tmpfs_vn_lookup(struct vnode* dir, const char* name, size_t namelen) {
+    tmpfs_node_t* d = (tmpfs_node_t*)dir;
+    if (d->v.type != VNODE_DIR) return NULL;
+    for (tmpfs_node_t* c = d->first_child; c; c = c->next_sibling) {
+        if (k_strncmp(c->name, name, namelen)==0 && c->name[namelen]=='\0') return &c->v;
+    }
+    return NULL;
+}
+
+static void tmpfs_vn_release(struct vnode* vn) { (void)vn; /* no-op (no refcount yet) */ }
+
+static vnode_ops_t g_tmpfs_vn_ops = {
+    .read = tmpfs_vn_read,
+    .write = tmpfs_vn_write,
+    .readdir = tmpfs_vn_readdir,
+    .lookup = tmpfs_vn_lookup,
+    .release = tmpfs_vn_release,
+};
+
+static tmpfs_node_t* tmpfs_path_resolve(const char* relpath, int create_dirs, int* err_out) {
+    if (err_out) *err_out = 0;
+    if (!relpath || !g_tmpfs_state.root) { if (err_out) *err_out = K_EINVAL; return NULL; }
+    if (relpath[0]=='\0') return g_tmpfs_state.root;
+    tmpfs_node_t* cur = g_tmpfs_state.root;
+    const char* p = relpath;
+    char comp[ TMPFS_NAME_MAX ];
+    while (*p) {
+        size_t l=0; while (*p && *p!='/') { if (l < TMPFS_NAME_MAX-1) comp[l++] = *p; p++; }
+        comp[l]='\0';
+        if (*p=='/') p++;
+        vnode_t* found = tmpfs_vn_lookup(&cur->v, comp, l);
+        if (!found) {
+            if (!create_dirs) { if (err_out) *err_out = K_ENOENT; return NULL; }
+            tmpfs_node_t* neu = tmpfs_alloc_node(comp, VNODE_DIR, 0755);
+            if (!neu) { if (err_out) *err_out = K_ENOMEM; return NULL; }
+            neu->parent = cur;
+            neu->next_sibling = cur->first_child;
+            cur->first_child = neu;
+            neu->v.ops = &g_tmpfs_vn_ops;
+            cur = neu;
+        } else {
+            cur = (tmpfs_node_t*)found;
+            if (cur->v.type != VNODE_DIR && *p) { if (err_out) *err_out = K_ENOTDIR; return NULL; }
+        }
+        /* Require execute/search permission on directory before descending further */
+        if (*p && !tmpfs_perm_can_exec_dir(cur)) { if (err_out) *err_out = K_EPERM; return NULL; }
+    }
+    return cur;
+}
+
+static tmpfs_node_t* tmpfs_create_file_at(tmpfs_node_t* dir, const char* name, u32 mode, int* err) {
+    if (err) *err = 0;
+    if (!dir || dir->v.type != VNODE_DIR) { if(err) *err=K_ENOTDIR; return NULL; }
+    size_t l = k_strlen(name);
+    if (l==0) { if(err) *err=K_EINVAL; return NULL; }
+    if (tmpfs_vn_lookup(&dir->v, name, l)) { if(err) *err=K_EEXIST; return NULL; }
+    tmpfs_node_t* n = tmpfs_alloc_node(name, VNODE_FILE, mode);
+    if (!n) { if(err) *err=K_ENOMEM; return NULL; }
+    n->parent = dir;
+    n->next_sibling = dir->first_child;
+    dir->first_child = n;
+    n->v.ops = &g_tmpfs_vn_ops;
+    return n;
+}
+
+static tmpfs_node_t* tmpfs_create_symlink_at(tmpfs_node_t* dir, const char* name, const char* target, int* err) {
+    if (err) *err = 0;
+    if (!dir || dir->v.type != VNODE_DIR) { if(err) *err=K_ENOTDIR; return NULL; }
+    size_t l = k_strlen(name);
+    if (l==0) { if(err) *err=K_EINVAL; return NULL; }
+    if (tmpfs_vn_lookup(&dir->v, name, l)) { if(err) *err=K_EEXIST; return NULL; }
+    tmpfs_node_t* n = tmpfs_alloc_node(name, VNODE_SYMLINK, 0777); /* symlink permissions often 0777 masked by umask semantics */
+    if (!n) { if(err) *err=K_ENOMEM; return NULL; }
+    n->parent = dir;
+    n->next_sibling = dir->first_child;
+    dir->first_child = n;
+    n->v.ops = &g_tmpfs_vn_ops;
+    size_t tlen = k_strlen(target);
+    n->symlink_target = (char*)vmm_kmalloc(tlen+1, 16);
+    if (!n->symlink_target) { if(err) *err=K_ENOMEM; return NULL; }
+    for (size_t i=0;i<tlen;i++) n->symlink_target[i]=target[i]; n->symlink_target[tlen]='\0';
+    n->used = tlen;
+    n->v.size = tlen;
+    return n;
+}
+
+/* Public helper implementations (declared in vfs.h) */
+int vfs_create_file(const char* path, u32 mode, file_t** opt_file) {
+    if (!path) return K_EINVAL;
+    if (path[0] != '/') return K_EINVAL; /* only root mount supported */
+    const char* rel = path + 1;
+    int err=0;
+    /* Resolve parent dir */
+    const char* last_slash = NULL; for (const char* p=rel; *p; ++p) if (*p=='/') last_slash = p;
+    char parent_path[256];
+    if (last_slash) {
+        size_t plen = (size_t)(last_slash - rel);
+        if (plen >= sizeof(parent_path)) return K_ENAMETOOLONG;
+        k_memcpy(parent_path, rel, plen); parent_path[plen]='\0';
+    } else {
+        parent_path[0]='\0';
+    }
+    tmpfs_node_t* dir = tmpfs_path_resolve(parent_path, 0, &err);
+    if (!dir) return err ? err : K_ENOENT;
+    /* Ensure directory is searchable and writable */
+    if (!tmpfs_perm_can_exec_dir(dir) || !tmpfs_perm_can_write(dir)) return K_EPERM;
+    extern process_t* process_current(void) __attribute__((weak));
+    process_t* p = process_current ? process_current() : NULL;
+    if (p) mode &= ~(p->umask);
+    tmpfs_node_t* n = tmpfs_create_file_at(dir, last_slash? last_slash+1 : rel, mode, &err);
+    if (!n) return err?err:K_EIO;
+    n->heap_data = NULL; n->cap = 0; n->used = 0; n->v.size = 0;
+    if (opt_file) {
+        file_t* f = (file_t*)vmm_kmalloc(sizeof(file_t), 16); if(!f) return K_ENOMEM;
+        f->vn = &n->v; f->offset=0; f->flags = VFS_O_RDWR;
+        *opt_file = f;
+    }
+    return 0;
+}
+
+int vfs_mkdir_path(const char* path, u32 mode) {
+    if (!path || path[0]!='/') return K_EINVAL;
+    const char* rel = path + 1; if (!*rel) return K_EEXIST; /* root */
+    int err=0;
+    /* Find parent path */
+    const char* last_slash=NULL; for(const char* p=rel; *p; ++p) if(*p=='/') last_slash=p;
+    char parent_path[256];
+    const char* new_name = rel;
+    if (last_slash) {
+        size_t plen = (size_t)(last_slash - rel);
+        if (plen >= sizeof(parent_path)) return K_ENAMETOOLONG;
+        k_memcpy(parent_path, rel, plen); parent_path[plen]='\0';
+        new_name = last_slash + 1;
+    } else parent_path[0]='\0';
+    if (*new_name=='\0') return K_EINVAL;
+    tmpfs_node_t* parent = tmpfs_path_resolve(parent_path, 0, &err);
+    if (!parent) return err?err:K_ENOENT;
+    if (!tmpfs_perm_can_exec_dir(parent) || !tmpfs_perm_can_write(parent)) return K_EPERM;
+    /* Ensure does not already exist */
+    if (tmpfs_vn_lookup(&parent->v, new_name, k_strlen(new_name))) return K_EEXIST;
+    extern process_t* process_current(void) __attribute__((weak));
+    process_t* p = process_current ? process_current() : NULL;
+    if (p) mode &= ~(p->umask);
+    tmpfs_node_t* neu = tmpfs_alloc_node(new_name, VNODE_DIR, mode);
+    if (!neu) return K_ENOMEM;
+    neu->parent = parent;
+    neu->next_sibling = parent->first_child;
+    parent->first_child = neu;
+    neu->v.ops = &g_tmpfs_vn_ops;
+    return 0;
+}
+
+int vfs_unlink_path(const char* path) {
+    if (!path || path[0]!='/') return K_EINVAL;
+    const char* rel = path+1; if(!*rel) return K_EPERM; /* can't remove root */
+    /* Find parent */
+    const char* last_slash=NULL; for(const char* p=rel; *p; ++p) if(*p=='/') last_slash=p;
+    char parent_path[256];
+    if (last_slash) { size_t plen=(size_t)(last_slash-rel); if(plen>=sizeof(parent_path)) return K_ENAMETOOLONG; k_memcpy(parent_path, rel, plen); parent_path[plen]='\0'; }
+    else parent_path[0]='\0';
+    int err=0; tmpfs_node_t* dir = tmpfs_path_resolve(parent_path, 0, &err); if(!dir) return err?err:K_ENOENT;
+    if (!tmpfs_perm_can_write(dir)) return K_EPERM;
+    const char* name = last_slash? last_slash+1 : rel;
+    size_t namelen = k_strlen(name);
+    tmpfs_node_t* prev=NULL; for(tmpfs_node_t* c=dir->first_child; c; c=c->next_sibling){
+        if (k_strncmp(c->name, name, namelen)==0 && c->name[namelen]=='\0') {
+            if (c->v.type==VNODE_DIR && c->first_child) return K_ENOTEMPTY;
+            if (prev) prev->next_sibling = c->next_sibling; else dir->first_child = c->next_sibling;
+            if (c->heap_data) vmm_kfree(c->heap_data, c->cap);
+            vmm_kfree(c, sizeof(*c));
+            return 0;
+        }
+        prev = c;
+    }
+    return K_ENOENT;
+}
+
+int vfs_symlink_path(const char* target, const char* linkpath, u32 mode) {
+    (void)mode; /* mode currently ignored except via umask on future enhancement */
+    if (!target || !linkpath || linkpath[0]!='/') return K_EINVAL;
+    const char* rel = linkpath + 1; if(!*rel) return K_EINVAL;
+    const char* last_slash=NULL; for(const char* p=rel; *p; ++p) if(*p=='/') last_slash=p;
+    char parent_path[256];
+    const char* name = rel;
+    if (last_slash) {
+        size_t plen=(size_t)(last_slash-rel); if(plen>=sizeof(parent_path)) return K_ENAMETOOLONG;
+        k_memcpy(parent_path, rel, plen); parent_path[plen]='\0';
+        name = last_slash+1;
+    } else parent_path[0]='\0';
+    if (*name=='\0') return K_EINVAL;
+    int err=0; tmpfs_node_t* parent = tmpfs_path_resolve(parent_path, 0, &err); if(!parent) return err?err:K_ENOENT;
+    if (!tmpfs_perm_can_exec_dir(parent) || !tmpfs_perm_can_write(parent)) return K_EPERM;
+    /* Apply umask to default mode for symlink? Typically symlink mode ignored; we skip */
+    tmpfs_node_t* n = tmpfs_create_symlink_at(parent, name, target, &err);
+    if(!n) return err?err:K_EIO;
+    return 0;
+}
+
+int vfs_readlink_path(const char* path, char* buf, size_t buflen, u64* out_len) {
+    if (!path || !buf) return K_EINVAL;
+    vnode_t* vn=NULL; int rc = vfs_lookup(path, &vn); if(rc!=0) return rc;
+    if (vn->type != VNODE_SYMLINK) return K_EINVAL;
+    tmpfs_node_t* n = (tmpfs_node_t*)vn;
+    /* Parent directory execute permission already required for lookup; optionally re-check */
+    if (n->parent && !tmpfs_perm_can_exec_dir(n->parent)) return K_EPERM;
+    size_t tlen = n->symlink_target ? k_strlen(n->symlink_target) : 0;
+    if (tlen >= buflen) tlen = buflen - 1;
+    for (size_t i=0;i<tlen;i++) buf[i]=n->symlink_target[i];
+    buf[tlen] = '\0';
+    if (out_len) *out_len = tlen;
+    return 0;
+}
+
+/* ---------------- fs_type implementations ---------------- */
+
+static vnode_t* tmpfs_get_root(struct vfs_super* sb) {
+    (void)sb; if(!g_tmpfs_state.root) return NULL; return &g_tmpfs_state.root->v; }
+static const vfs_super_ops_t g_tmpfs_super_ops = { .get_root = tmpfs_get_root, .put_super = NULL };
+
+static int tmpfs_mount_fs(block_dev_t* bdev, vfs_super_t** out_sb) {
+    (void)bdev; if(!out_sb) return K_EINVAL; k_memset(&g_tmpfs_state,0,sizeof(g_tmpfs_state));
+    tmpfs_node_t* root = tmpfs_alloc_node("", VNODE_DIR, 0755); if(!root) return K_ENOMEM; root->v.ops=&g_tmpfs_vn_ops; g_tmpfs_state.root=root;
+    static vfs_super_t tmp_super; k_memset(&tmp_super,0,sizeof(tmp_super)); tmp_super.ops = &g_tmpfs_super_ops; tmp_super.fs_priv=&g_tmpfs_state; tmp_super.block_size=4096; *out_sb=&tmp_super; return 0; }
+
+static const fs_type_t g_tmpfs_type = { .name = "tmpfs", .mount = tmpfs_mount_fs };
+
+const fs_type_t* vfs_find_fs(const char* name); /* ensure prototype if not present */
+
+/* Forward declarations for filesystem types */
+extern const fs_type_t g_fat32_type;
+extern const fs_type_t g_ext4_type;
+
+/* Expose registration helper for bootstrap code elsewhere */
+void vfs_register_builtin_fs(void) {
+    vfs_register_fs(&g_tmpfs_type);
+    vfs_register_fs(&g_fat32_type);
+    vfs_register_fs(&g_ext4_type);
+}
+
+/* Stubs for ext4/fat32 (not yet implemented). They can be added similarly when ready. */
+
+/* Mount device by name */
+int vfs_mount_device_by_name(const char* fstype, const char* device, const char* mountpoint) {
+    if (!fstype || !device || !mountpoint) return K_EINVAL;
+    
+    /* Find filesystem type */
+    const fs_type_t* fs = find_fs(fstype);
+    if (!fs) {
+        KLOG_ERROR("vfs", "Unknown filesystem type: %s", fstype);
+        return K_ENOENT;
+    }
+    
+    /* Find block device */
+    block_dev_t* bdev = block_find_by_name(device);
+    if (!bdev) {
+        KLOG_ERROR("vfs", "Block device not found: %s", device);
+        return K_ENOENT;
+    }
+    
+    /* Mount the filesystem */
+    return vfs_mount_at(fstype, bdev, mountpoint);
+}
+
+/* Directory listing */
+int vfs_listdir(const char* path, vfs_dirent_cb cb, void* ctx) {
+    if (!path || !cb) return K_EINVAL;
+    
+    vnode_t* vn = NULL;
+    int rc = vfs_lookup(path, &vn);
+    if (rc != 0) return rc;
+    
+    if (vn->type != VNODE_DIR) {
+        return K_ENOTDIR;
+    }
+    
+    if (vn->ops && vn->ops->readdir) {
+        return vn->ops->readdir(vn, cb, ctx);
+    }
+    
+    /* Fallback for filesystems without readdir implementation */
+    return 0; /* Success - no entries */
+}
+
+/* Block device helper functions */
+int bdev_read_bytes(block_dev_t* bdev, u64 off_bytes, void* buf, size_t len) {
+    if (!bdev || !buf) return K_EINVAL;
+    
+    u32 sector_size = bdev->sector_sz;
+    u64 start_lba = off_bytes / sector_size;
+    u32 start_offset = off_bytes % sector_size;
+    u32 total_sectors = (start_offset + len + sector_size - 1) / sector_size;
+    
+    if (start_offset == 0 && (len % sector_size) == 0) {
+        /* Aligned read - direct */
+        return block_read(bdev, start_lba, buf, len);
+    }
+    
+    /* Unaligned read - use temporary buffer */
+    char* temp_buf = (char*)vmm_kmalloc(total_sectors * sector_size, sector_size);
+    if (!temp_buf) return K_ENOMEM;
+    
+    int rc = block_read(bdev, start_lba, temp_buf, total_sectors * sector_size);
+    if (rc == 0) {
+        k_memcpy(buf, temp_buf + start_offset, len);
+    }
+    
+    vmm_kfree(temp_buf, total_sectors * sector_size);
+    return rc;
+}
+
+int bdev_write_bytes(block_dev_t* bdev, u64 off_bytes, const void* buf, size_t len) {
+    if (!bdev || !buf) return K_EINVAL;
+    
+    u32 sector_size = bdev->sector_sz;
+    u64 start_lba = off_bytes / sector_size;
+    u32 start_offset = off_bytes % sector_size;
+    u32 total_sectors = (start_offset + len + sector_size - 1) / sector_size;
+    
+    if (start_offset == 0 && (len % sector_size) == 0) {
+        /* Aligned write - direct */
+        return block_write(bdev, start_lba, buf, len);
+    }
+    
+    /* Unaligned write - read-modify-write */
+    char* temp_buf = (char*)vmm_kmalloc(total_sectors * sector_size, sector_size);
+    if (!temp_buf) return K_ENOMEM;
+    
+    int rc = block_read(bdev, start_lba, temp_buf, total_sectors * sector_size);
+    if (rc == 0) {
+        k_memcpy(temp_buf + start_offset, buf, len);
+        rc = block_write(bdev, start_lba, temp_buf, total_sectors * sector_size);
+    }
+    
+    vmm_kfree(temp_buf, total_sectors * sector_size);
+    return rc;
+}
+
+/* Extended VFS initialization - create essential directories */
+void vfs_init_dirs(void) {
+    /* Create essential directories */
+    vfs_mkdir_path("/dev", 0755);
+    vfs_mkdir_path("/tmp", 0755);  
+    vfs_mkdir_path("/proc", 0755);
+    vfs_mkdir_path("/sys", 0755);
+    vfs_mkdir_path("/home", 0755);
+    vfs_mkdir_path("/bin", 0755);
+    vfs_mkdir_path("/usr", 0755);
+    vfs_mkdir_path("/etc", 0755);
+    vfs_mkdir_path("/var", 0755);
+}

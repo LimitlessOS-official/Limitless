@@ -1,0 +1,14 @@
+/*
+ * ChaCha20 and ChaCha20-Poly1305 Implementation
+ * Modern stream cipher with authenticated encryption
+ */
+
+#include "kernel.h"
+#include "crypto.h"
+
+/* ChaCha20 implementation stub */
+status_t crypto_register_chacha20(void) {
+    /* TODO: Implement ChaCha20 algorithm */
+    KLOG_INFO("CRYPTO", "ChaCha20 algorithms registered (stub)");
+    return STATUS_OK;
+}

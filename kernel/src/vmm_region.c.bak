@@ -1,0 +1,12 @@
+#include "kernel.h"
+#include "process.h"
+#include "vmm.h"
+
+/* Weakly linked helper for vmm to get current process address space */
+vmm_aspace_t* process_current_aspace(void) {
+    extern process_t* process_current(void) __attribute__((weak));
+    if (!process_current) return NULL;
+    process_t* p = process_current();
+    if (!p) return NULL;
+    return (vmm_aspace_t*)p->as; /* assumes process->as is vmm_aspace_t compatible */
+}

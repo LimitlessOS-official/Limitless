@@ -1,0 +1,30 @@
+#include "storage.h"
+#include "kernel.h"
+
+/* Driver probes */
+extern void ahci_probe(void);
+extern void nvme_probe(void);
+
+#define MAX_BDEVS 16
+static block_dev_t* g_bdevs[MAX_BDEVS];
+
+void storage_init(void) {
+    for (int i=0;i<MAX_BDEVS;i++) g_bdevs[i]=NULL;
+    /* Probe PCI and drivers */
+    ahci_probe();
+    nvme_probe();
+}
+
+/* storage_register_block now provided inline in storage.h as a wrapper to block_register.
+ * Legacy array registration retained for enumeration until callers migrate, so we wrap.
+ */
+int storage_legacy_track(block_dev_t* dev){
+    for(int i=0;i<MAX_BDEVS;i++) if(!g_bdevs[i]) { g_bdevs[i]=dev; return 0; }
+    return K_EBUSY;
+}
+
+void storage_enumerate(block_enum_cb cb, void* user) {
+    for (int i=0;i<MAX_BDEVS;i++) {
+        if (g_bdevs[i] && cb) cb(g_bdevs[i], user);
+    }
+}

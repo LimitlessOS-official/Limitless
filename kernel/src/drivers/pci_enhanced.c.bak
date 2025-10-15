@@ -1,0 +1,799 @@
+/*
+ * pci_enhanced.c - LimitlessOS Enhanced PCI/PCIe Management System
+ * 
+ * Comprehensive PCI/PCIe device enumeration, configuration, and management
+ * with MSI/MSI-X support, power management, and advanced features.
+ */
+
+#include "kernel.h"
+#include "pci.h"
+#include "interrupt.h"
+#include "vmm.h"
+#include "timer.h"
+#include "acpi.h"
+
+#define MAX_PCI_DEVICES         1024
+#define MAX_PCI_BUSES           256
+#define MAX_PCI_FUNCTIONS       8
+#define MAX_PCI_SLOTS           32
+#define MAX_MSI_VECTORS         32
+#define MAX_MSIX_VECTORS        2048
+
+/* PCI Express configuration space size */
+#define PCIE_CONFIG_SPACE_SIZE  4096
+#define PCI_CONFIG_SPACE_SIZE   256
+
+/* PCIe capability IDs */
+#define PCI_CAP_ID_PM           0x01    /* Power Management */
+#define PCI_CAP_ID_MSI          0x05    /* Message Signaled Interrupts */
+#define PCI_CAP_ID_VENDOR       0x09    /* Vendor Specific */
+#define PCI_CAP_ID_DEBUG        0x0A    /* Debug */
+#define PCI_CAP_ID_CPCI         0x0B    /* CompactPCI Central Resource Control */
+#define PCI_CAP_ID_HOTPLUG      0x0C    /* Hot-Plug */
+#define PCI_CAP_ID_SSVID        0x0D    /* Subsystem vendor ID */
+#define PCI_CAP_ID_AGP3         0x0E    /* AGP 8x */
+#define PCI_CAP_ID_SECURE       0x0F    /* Secure Device */
+#define PCI_CAP_ID_EXP          0x10    /* PCI Express */
+#define PCI_CAP_ID_MSIX         0x11    /* MSI-X */
+#define PCI_CAP_ID_SATA         0x12    /* Serial ATA Data/Index Configuration */
+#define PCI_CAP_ID_AF           0x13    /* Advanced Features */
+
+/* PCIe Extended Capability IDs */
+#define PCI_EXT_CAP_ID_ERR      0x0001  /* Advanced Error Reporting */
+#define PCI_EXT_CAP_ID_VC       0x0002  /* Virtual Channel */
+#define PCI_EXT_CAP_ID_DSN      0x0003  /* Device Serial Number */
+#define PCI_EXT_CAP_ID_PWR      0x0004  /* Power Budgeting */
+#define PCI_EXT_CAP_ID_RCLINK   0x0005  /* Root Complex Link Declaration */
+#define PCI_EXT_CAP_ID_RCILINK  0x0006  /* Root Complex Internal Link Control */
+#define PCI_EXT_CAP_ID_RCEC     0x0007  /* Root Complex Event Collector */
+#define PCI_EXT_CAP_ID_MFVC     0x0008  /* Multi-Function Virtual Channel */
+#define PCI_EXT_CAP_ID_VC9      0x0009  /* Virtual Channel (9) */
+#define PCI_EXT_CAP_ID_RCRB     0x000A  /* Root Complex Register Block */
+#define PCI_EXT_CAP_ID_VNDR     0x000B  /* Vendor Specific Extended Capability */
+#define PCI_EXT_CAP_ID_CAC      0x000C  /* Configuration Access Correlation */
+#define PCI_EXT_CAP_ID_ACS      0x000D  /* Access Control Services */
+#define PCI_EXT_CAP_ID_ARI      0x000E  /* Alternative Routing-ID Interpretation */
+#define PCI_EXT_CAP_ID_ATS      0x000F  /* Address Translation Services */
+#define PCI_EXT_CAP_ID_SRIOV    0x0010  /* Single Root I/O Virtualization */
+#define PCI_EXT_CAP_ID_MRIOV    0x0011  /* Multi Root I/O Virtualization */
+#define PCI_EXT_CAP_ID_MCAST    0x0012  /* Multicast */
+#define PCI_EXT_CAP_ID_PRI      0x0013  /* Page Request Interface */
+#define PCI_EXT_CAP_ID_AMD_XXX  0x0014  /* Reserved for AMD */
+#define PCI_EXT_CAP_ID_REBAR    0x0015  /* Resizable BAR */
+#define PCI_EXT_CAP_ID_DPA      0x0016  /* Dynamic Power Allocation */
+#define PCI_EXT_CAP_ID_TPH      0x0017  /* TPH Requester */
+#define PCI_EXT_CAP_ID_LTR      0x0018  /* Latency Tolerance Reporting */
+#define PCI_EXT_CAP_ID_SECPCI   0x0019  /* Secondary PCIe Capability */
+#define PCI_EXT_CAP_ID_PMUX     0x001A  /* Protocol Multiplexing */
+#define PCI_EXT_CAP_ID_PASID    0x001B  /* Process Address Space ID */
+
+/* PCI power states */
+#define PCI_D0                  0
+#define PCI_D1                  1
+#define PCI_D2                  2
+#define PCI_D3hot               3
+#define PCI_D3cold              4
+
+/* MSI-X table entry */
+typedef struct msix_entry {
+    uint64_t msg_addr;              /* Message address */
+    uint32_t msg_data;              /* Message data */
+    uint32_t vector_control;        /* Vector control */
+} msix_entry_t;
+
+/* PCI capability structure */
+typedef struct pci_capability {
+    uint8_t cap_id;                 /* Capability ID */
+    uint8_t next_cap;               /* Next capability offset */
+    uint16_t offset;                /* Capability offset in config space */
+    uint16_t size;                  /* Capability size */
+    
+    struct list_head list;          /* List linkage */
+} pci_capability_t;
+
+/* Enhanced PCI device structure */
+typedef struct pci_device_enhanced {
+    /* Basic PCI information */
+    uint8_t bus;
+    uint8_t device;
+    uint8_t function;
+    
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t subsystem_vendor_id;
+    uint16_t subsystem_device_id;
+    
+    uint8_t class_code;
+    uint8_t subclass;
+    uint8_t prog_interface;
+    uint8_t revision_id;
+    
+    uint8_t header_type;
+    uint8_t multifunction;
+    
+    /* Configuration space */
+    void* config_space;             /* Mapped configuration space */
+    size_t config_space_size;       /* Configuration space size */
+    
+    /* Base Address Registers */
+    uint64_t bar[6];                /* BAR values */
+    uint64_t bar_size[6];           /* BAR sizes */
+    uint8_t bar_type[6];            /* BAR types */
+    
+    /* Interrupt configuration */
+    uint8_t interrupt_line;
+    uint8_t interrupt_pin;
+    
+    /* MSI/MSI-X support */
+    bool msi_enabled;
+    bool msix_enabled;
+    uint8_t msi_vectors;            /* Number of MSI vectors */
+    uint16_t msix_vectors;          /* Number of MSI-X vectors */
+    msix_entry_t* msix_table;       /* MSI-X table */
+    void* msix_table_virt;          /* Virtual address of MSI-X table */
+    
+    /* Power management */
+    uint8_t power_state;            /* Current power state */
+    bool power_managed;             /* Device supports power management */
+    uint16_t pm_cap_offset;         /* Power management capability offset */
+    
+    /* PCIe specific */
+    bool is_pcie;                   /* Device is PCIe */
+    uint8_t pcie_type;              /* PCIe device type */
+    uint8_t pcie_cap_version;       /* PCIe capability version */
+    uint16_t pcie_cap_offset;       /* PCIe capability offset */
+    uint16_t max_link_speed;        /* Maximum link speed */
+    uint8_t max_link_width;         /* Maximum link width */
+    uint16_t current_link_speed;    /* Current link speed */
+    uint8_t current_link_width;     /* Current link width */
+    
+    /* Device capabilities */
+    struct list_head capabilities;  /* Standard capabilities */
+    struct list_head ext_capabilities; /* Extended capabilities */
+    
+    /* Driver binding */
+    const char* driver_name;        /* Bound driver name */
+    void* driver_data;              /* Driver private data */
+    
+    /* Device tree linkage */
+    struct pci_device_enhanced* parent; /* Parent bridge device */
+    struct list_head children;      /* Child devices */
+    struct list_head sibling;       /* Sibling list */
+    
+    /* Global device list */
+    struct list_head list;
+    
+    /* Reference counting */
+    atomic_t refcount;
+    
+} pci_device_enhanced_t;
+
+/* PCI driver structure */
+typedef struct pci_driver {
+    const char* name;               /* Driver name */
+    
+    /* Device ID table */
+    struct pci_device_id* id_table;
+    
+    /* Driver operations */
+    int (*probe)(pci_device_enhanced_t* dev);
+    void (*remove)(pci_device_enhanced_t* dev);
+    int (*suspend)(pci_device_enhanced_t* dev, uint32_t state);
+    int (*resume)(pci_device_enhanced_t* dev);
+    void (*shutdown)(pci_device_enhanced_t* dev);
+    
+    struct list_head list;          /* Driver list */
+    
+} pci_driver_t;
+
+/* Global PCI subsystem state */
+static struct {
+    bool initialized;
+    
+    /* Device management */
+    struct list_head devices;       /* All PCI devices */
+    struct list_head drivers;       /* All PCI drivers */
+    spinlock_t devices_lock;
+    spinlock_t drivers_lock;
+    
+    /* Configuration access */
+    uint32_t config_method;         /* Configuration access method */
+    void* ecam_base;                /* ECAM base address */
+    size_t ecam_size;               /* ECAM size */
+    
+    /* MSI management */
+    uint32_t msi_base_vector;       /* Base MSI vector */
+    uint32_t msi_next_vector;       /* Next available MSI vector */
+    spinlock_t msi_lock;
+    
+    /* Statistics */
+    atomic32_t device_count;
+    atomic32_t driver_count;
+    atomic64_t config_reads;
+    atomic64_t config_writes;
+    atomic32_t msi_allocations;
+    atomic32_t msix_allocations;
+    
+} g_pci_enhanced = {0};
+
+/* Function prototypes */
+static int pci_enhanced_enumerate_bus(uint8_t bus);
+static pci_device_enhanced_t* pci_enhanced_create_device(uint8_t bus, uint8_t device, uint8_t function);
+static int pci_enhanced_probe_capabilities(pci_device_enhanced_t* dev);
+static int pci_enhanced_setup_msi(pci_device_enhanced_t* dev, uint8_t vectors);
+static int pci_enhanced_setup_msix(pci_device_enhanced_t* dev);
+static uint32_t pci_enhanced_read_config32(pci_device_enhanced_t* dev, uint16_t offset);
+static void pci_enhanced_write_config32(pci_device_enhanced_t* dev, uint16_t offset, uint32_t value);
+static int pci_enhanced_set_power_state(pci_device_enhanced_t* dev, uint8_t state);
+static void pci_enhanced_bind_driver(pci_device_enhanced_t* dev);
+
+/* Initialize enhanced PCI subsystem */
+int pci_enhanced_init(void) {
+    if (g_pci_enhanced.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing enhanced PCI subsystem\n");
+    
+    memset(&g_pci_enhanced, 0, sizeof(g_pci_enhanced));
+    
+    INIT_LIST_HEAD(&g_pci_enhanced.devices);
+    INIT_LIST_HEAD(&g_pci_enhanced.drivers);
+    spinlock_init(&g_pci_enhanced.devices_lock);
+    spinlock_init(&g_pci_enhanced.drivers_lock);
+    spinlock_init(&g_pci_enhanced.msi_lock);
+    
+    /* Detect configuration access method */
+    g_pci_enhanced.config_method = 1; /* Configuration mechanism 1 */
+    
+    /* Try to map ECAM if available */
+    /* This would use ACPI MCFG table to find ECAM base */
+    
+    g_pci_enhanced.msi_base_vector = 128; /* Start MSI vectors at 128 */
+    g_pci_enhanced.msi_next_vector = g_pci_enhanced.msi_base_vector;
+    
+    /* Enumerate all PCI buses */
+    for (int bus = 0; bus < MAX_PCI_BUSES; bus++) {
+        pci_enhanced_enumerate_bus(bus);
+    }
+    
+    g_pci_enhanced.initialized = true;
+    
+    printf("Enhanced PCI subsystem initialized: %d devices found\n", 
+           atomic32_read(&g_pci_enhanced.device_count));
+    
+    return 0;
+}
+
+/* Enumerate PCI bus */
+static int pci_enhanced_enumerate_bus(uint8_t bus) {
+    for (uint8_t device = 0; device < MAX_PCI_SLOTS; device++) {
+        for (uint8_t function = 0; function < MAX_PCI_FUNCTIONS; function++) {
+            /* Read vendor ID to check if device exists */
+            uint32_t vendor_device = pci_read_config32_raw(bus, device, function, PCI_VENDOR_ID);
+            
+            if ((vendor_device & 0xFFFF) == 0xFFFF) {
+                /* No device present */
+                if (function == 0) {
+                    break; /* Skip remaining functions */
+                }
+                continue;
+            }
+            
+            /* Create device structure */
+            pci_device_enhanced_t* pci_dev = pci_enhanced_create_device(bus, device, function);
+            if (pci_dev) {
+                /* Add to device list */
+                spin_lock(&g_pci_enhanced.devices_lock);
+                list_add(&pci_dev->list, &g_pci_enhanced.devices);
+                atomic32_inc(&g_pci_enhanced.device_count);
+                spin_unlock(&g_pci_enhanced.devices_lock);
+                
+                printf("PCI %02x:%02x.%x: %04x:%04x [%02x%02x]\n",
+                       bus, device, function,
+                       pci_dev->vendor_id, pci_dev->device_id,
+                       pci_dev->class_code, pci_dev->subclass);
+                
+                /* Try to bind driver */
+                pci_enhanced_bind_driver(pci_dev);
+            }
+            
+            /* If this is function 0 and not multifunction, skip other functions */
+            if (function == 0) {
+                uint8_t header_type = pci_read_config8_raw(bus, device, function, PCI_HEADER_TYPE);
+                if (!(header_type & 0x80)) {
+                    break;
+                }
+            }
+        }
+    }
+    
+    return 0;
+}
+
+/* Create PCI device structure */
+static pci_device_enhanced_t* pci_enhanced_create_device(uint8_t bus, uint8_t device, uint8_t function) {
+    pci_device_enhanced_t* dev = (pci_device_enhanced_t*)vmm_kmalloc(sizeof(pci_device_enhanced_t), 32);
+    if (!dev) {
+        return NULL;
+    }
+    
+    memset(dev, 0, sizeof(pci_device_enhanced_t));
+    
+    /* Basic device information */
+    dev->bus = bus;
+    dev->device = device;
+    dev->function = function;
+    
+    /* Read configuration space header */
+    uint32_t vendor_device = pci_read_config32_raw(bus, device, function, PCI_VENDOR_ID);
+    dev->vendor_id = vendor_device & 0xFFFF;
+    dev->device_id = (vendor_device >> 16) & 0xFFFF;
+    
+    uint32_t class_rev = pci_read_config32_raw(bus, device, function, PCI_CLASS_REVISION);
+    dev->revision_id = class_rev & 0xFF;
+    dev->prog_interface = (class_rev >> 8) & 0xFF;
+    dev->subclass = (class_rev >> 16) & 0xFF;
+    dev->class_code = (class_rev >> 24) & 0xFF;
+    
+    dev->header_type = pci_read_config8_raw(bus, device, function, PCI_HEADER_TYPE) & 0x7F;
+    dev->multifunction = (pci_read_config8_raw(bus, device, function, PCI_HEADER_TYPE) & 0x80) != 0;
+    
+    uint32_t subsystem = pci_read_config32_raw(bus, device, function, PCI_SUBSYSTEM_VENDOR_ID);
+    dev->subsystem_vendor_id = subsystem & 0xFFFF;
+    dev->subsystem_device_id = (subsystem >> 16) & 0xFFFF;
+    
+    dev->interrupt_line = pci_read_config8_raw(bus, device, function, PCI_INTERRUPT_LINE);
+    dev->interrupt_pin = pci_read_config8_raw(bus, device, function, PCI_INTERRUPT_PIN);
+    
+    /* Read and decode BARs */
+    for (int i = 0; i < 6; i++) {
+        uint32_t bar_reg = PCI_BASE_ADDRESS_0 + (i * 4);
+        uint32_t bar_value = pci_read_config32_raw(bus, device, function, bar_reg);
+        
+        if (bar_value == 0) {
+            continue;
+        }
+        
+        /* Determine BAR size by writing all 1s and reading back */
+        pci_write_config32_raw(bus, device, function, bar_reg, 0xFFFFFFFF);
+        uint32_t bar_size = pci_read_config32_raw(bus, device, function, bar_reg);
+        pci_write_config32_raw(bus, device, function, bar_reg, bar_value);
+        
+        if (bar_value & PCI_BASE_ADDRESS_SPACE_IO) {
+            /* I/O BAR */
+            dev->bar[i] = bar_value & PCI_BASE_ADDRESS_IO_MASK;
+            dev->bar_size[i] = (~(bar_size & PCI_BASE_ADDRESS_IO_MASK)) + 1;
+            dev->bar_type[i] = PCI_BAR_TYPE_IO;
+        } else {
+            /* Memory BAR */
+            dev->bar_type[i] = PCI_BAR_TYPE_MEM;
+            
+            if ((bar_value & PCI_BASE_ADDRESS_MEM_TYPE_MASK) == PCI_BASE_ADDRESS_MEM_TYPE_64) {
+                /* 64-bit BAR */
+                if (i < 5) {
+                    uint32_t bar_high = pci_read_config32_raw(bus, device, function, bar_reg + 4);
+                    dev->bar[i] = ((uint64_t)bar_high << 32) | (bar_value & PCI_BASE_ADDRESS_MEM_MASK);
+                    
+                    pci_write_config32_raw(bus, device, function, bar_reg + 4, 0xFFFFFFFF);
+                    uint32_t size_high = pci_read_config32_raw(bus, device, function, bar_reg + 4);
+                    pci_write_config32_raw(bus, device, function, bar_reg + 4, bar_high);
+                    
+                    uint64_t size_mask = ((uint64_t)size_high << 32) | (bar_size & PCI_BASE_ADDRESS_MEM_MASK);
+                    dev->bar_size[i] = (~size_mask) + 1;
+                    dev->bar_type[i] = PCI_BAR_TYPE_MEM64;
+                    
+                    i++; /* Skip next BAR as it's part of this 64-bit BAR */
+                }
+            } else {
+                /* 32-bit BAR */
+                dev->bar[i] = bar_value & PCI_BASE_ADDRESS_MEM_MASK;
+                dev->bar_size[i] = (~(bar_size & PCI_BASE_ADDRESS_MEM_MASK)) + 1;
+                
+                if (bar_value & PCI_BASE_ADDRESS_MEM_PREFETCH) {
+                    dev->bar_type[i] = PCI_BAR_TYPE_MEM_PREFETCH;
+                }
+            }
+        }
+    }
+    
+    /* Initialize capability lists */
+    INIT_LIST_HEAD(&dev->capabilities);
+    INIT_LIST_HEAD(&dev->ext_capabilities);
+    INIT_LIST_HEAD(&dev->children);
+    
+    /* Probe for capabilities */
+    pci_enhanced_probe_capabilities(dev);
+    
+    /* Allocate and map configuration space */
+    if (dev->is_pcie) {
+        dev->config_space_size = PCIE_CONFIG_SPACE_SIZE;
+    } else {
+        dev->config_space_size = PCI_CONFIG_SPACE_SIZE;
+    }
+    
+    atomic_set(&dev->refcount, 1);
+    
+    return dev;
+}
+
+/* Probe device capabilities */
+static int pci_enhanced_probe_capabilities(pci_device_enhanced_t* dev) {
+    uint16_t status = pci_read_config16_raw(dev->bus, dev->device, dev->function, PCI_STATUS);
+    
+    if (!(status & PCI_STATUS_CAP_LIST)) {
+        /* Device has no capabilities */
+        return 0;
+    }
+    
+    /* Walk capability list */
+    uint8_t cap_ptr = pci_read_config8_raw(dev->bus, dev->device, dev->function, PCI_CAPABILITY_LIST);
+    
+    while (cap_ptr != 0 && cap_ptr != 0xFF) {
+        uint16_t cap_header = pci_read_config16_raw(dev->bus, dev->device, dev->function, cap_ptr);
+        uint8_t cap_id = cap_header & 0xFF;
+        uint8_t next_cap = (cap_header >> 8) & 0xFF;
+        
+        /* Create capability structure */
+        pci_capability_t* cap = (pci_capability_t*)vmm_kmalloc(sizeof(pci_capability_t), 32);
+        if (cap) {
+            cap->cap_id = cap_id;
+            cap->next_cap = next_cap;
+            cap->offset = cap_ptr;
+            
+            /* Determine capability size based on ID */
+            switch (cap_id) {
+                case PCI_CAP_ID_PM:
+                    cap->size = 8;
+                    dev->power_managed = true;
+                    dev->pm_cap_offset = cap_ptr;
+                    break;
+                case PCI_CAP_ID_MSI:
+                    cap->size = 24; /* Maximum MSI capability size */
+                    break;
+                case PCI_CAP_ID_MSIX:
+                    cap->size = 12;
+                    break;
+                case PCI_CAP_ID_EXP:
+                    cap->size = 60; /* PCIe capability size */
+                    dev->is_pcie = true;
+                    dev->pcie_cap_offset = cap_ptr;
+                    
+                    /* Read PCIe capability details */
+                    uint16_t pcie_cap = pci_read_config16_raw(dev->bus, dev->device, dev->function, cap_ptr + 2);
+                    dev->pcie_cap_version = pcie_cap & 0x000F;
+                    dev->pcie_type = (pcie_cap >> 4) & 0x000F;
+                    break;
+                default:
+                    cap->size = 4; /* Minimum capability size */
+                    break;
+            }
+            
+            list_add(&cap->list, &dev->capabilities);
+        }
+        
+        cap_ptr = next_cap;
+    }
+    
+    /* Probe extended capabilities for PCIe devices */
+    if (dev->is_pcie) {
+        uint32_t ext_cap = pci_enhanced_read_config32(dev, 0x100);
+        
+        while (ext_cap != 0 && ext_cap != 0xFFFFFFFF) {
+            uint16_t ext_cap_id = ext_cap & 0xFFFF;
+            uint16_t next_ext_cap = (ext_cap >> 20) & 0xFFF;
+            
+            if (ext_cap_id != 0) {
+                pci_capability_t* ext_cap_struct = (pci_capability_t*)vmm_kmalloc(sizeof(pci_capability_t), 32);
+                if (ext_cap_struct) {
+                    ext_cap_struct->cap_id = ext_cap_id;
+                    ext_cap_struct->offset = 0x100 + ((ext_cap >> 20) & 0xFFC);
+                    ext_cap_struct->size = 16; /* Default extended capability size */
+                    
+                    list_add(&ext_cap_struct->list, &dev->ext_capabilities);
+                }
+            }
+            
+            if (next_ext_cap == 0) {
+                break;
+            }
+            
+            ext_cap = pci_enhanced_read_config32(dev, next_ext_cap);
+        }
+    }
+    
+    return 0;
+}
+
+/* Enhanced configuration space access */
+static uint32_t pci_enhanced_read_config32(pci_device_enhanced_t* dev, uint16_t offset) {
+    atomic64_inc(&g_pci_enhanced.config_reads);
+    
+    if (dev->config_space && offset < dev->config_space_size) {
+        return *((uint32_t*)((char*)dev->config_space + offset));
+    }
+    
+    return pci_read_config32_raw(dev->bus, dev->device, dev->function, offset);
+}
+
+static void pci_enhanced_write_config32(pci_device_enhanced_t* dev, uint16_t offset, uint32_t value) {
+    atomic64_inc(&g_pci_enhanced.config_writes);
+    
+    if (dev->config_space && offset < dev->config_space_size) {
+        *((uint32_t*)((char*)dev->config_space + offset)) = value;
+    } else {
+        pci_write_config32_raw(dev->bus, dev->device, dev->function, offset, value);
+    }
+}
+
+/* Setup MSI interrupts */
+static int pci_enhanced_setup_msi(pci_device_enhanced_t* dev, uint8_t vectors) {
+    if (dev->msi_enabled || vectors == 0 || vectors > MAX_MSI_VECTORS) {
+        return -EINVAL;
+    }
+    
+    /* Find MSI capability */
+    pci_capability_t* msi_cap = NULL;
+    
+    list_for_each_entry(msi_cap, &dev->capabilities, list) {
+        if (msi_cap->cap_id == PCI_CAP_ID_MSI) {
+            break;
+        }
+    }
+    
+    if (!msi_cap) {
+        return -ENODEV;
+    }
+    
+    spin_lock(&g_pci_enhanced.msi_lock);
+    
+    /* Check if we have enough MSI vectors */
+    if (g_pci_enhanced.msi_next_vector + vectors > g_pci_enhanced.msi_base_vector + 256) {
+        spin_unlock(&g_pci_enhanced.msi_lock);
+        return -ENOSPC;
+    }
+    
+    uint32_t base_vector = g_pci_enhanced.msi_next_vector;
+    g_pci_enhanced.msi_next_vector += vectors;
+    
+    spin_unlock(&g_pci_enhanced.msi_lock);
+    
+    /* Configure MSI capability */
+    uint16_t msi_control = pci_enhanced_read_config32(dev, msi_cap->offset + 2) & 0xFFFF;
+    
+    /* Set number of vectors */
+    uint8_t vectors_encoded = 0;
+    while ((1 << vectors_encoded) < vectors) {
+        vectors_encoded++;
+    }
+    
+    msi_control &= ~(0x07 << 4); /* Clear MME field */
+    msi_control |= (vectors_encoded << 4); /* Set MME field */
+    msi_control |= 0x01; /* Enable MSI */
+    
+    pci_enhanced_write_config32(dev, msi_cap->offset + 2, msi_control);
+    
+    /* Configure message address and data */
+    uint64_t msg_addr = 0xFEE00000ULL; /* Standard MSI address */
+    uint32_t msg_data = base_vector;
+    
+    pci_enhanced_write_config32(dev, msi_cap->offset + 4, (uint32_t)msg_addr);
+    
+    if (msi_control & 0x80) { /* 64-bit address capable */
+        pci_enhanced_write_config32(dev, msi_cap->offset + 8, (uint32_t)(msg_addr >> 32));
+        pci_enhanced_write_config32(dev, msi_cap->offset + 12, msg_data);
+    } else {
+        pci_enhanced_write_config32(dev, msi_cap->offset + 8, msg_data);
+    }
+    
+    dev->msi_enabled = true;
+    dev->msi_vectors = vectors;
+    
+    atomic32_inc(&g_pci_enhanced.msi_allocations);
+    
+    printf("PCI %02x:%02x.%x: Enabled MSI with %u vectors starting at %u\n",
+           dev->bus, dev->device, dev->function, vectors, base_vector);
+    
+    return base_vector;
+}
+
+/* Setup MSI-X interrupts */
+static int pci_enhanced_setup_msix(pci_device_enhanced_t* dev) {
+    if (dev->msix_enabled) {
+        return -EINVAL;
+    }
+    
+    /* Find MSI-X capability */
+    pci_capability_t* msix_cap = NULL;
+    
+    list_for_each_entry(msix_cap, &dev->capabilities, list) {
+        if (msix_cap->cap_id == PCI_CAP_ID_MSIX) {
+            break;
+        }
+    }
+    
+    if (!msix_cap) {
+        return -ENODEV;
+    }
+    
+    /* Read MSI-X table information */
+    uint16_t msix_control = pci_enhanced_read_config32(dev, msix_cap->offset + 2) & 0xFFFF;
+    uint32_t table_info = pci_enhanced_read_config32(dev, msix_cap->offset + 4);
+    uint32_t pba_info = pci_enhanced_read_config32(dev, msix_cap->offset + 8);
+    
+    uint16_t table_size = (msix_control & 0x7FF) + 1;
+    uint8_t table_bir = table_info & 0x07;
+    uint32_t table_offset = table_info & ~0x07;
+    
+    /* Map MSI-X table */
+    if (table_bir >= 6 || dev->bar[table_bir] == 0) {
+        return -EINVAL;
+    }
+    
+    size_t table_map_size = table_size * sizeof(msix_entry_t);
+    dev->msix_table_virt = vmm_map_mmio(dev->bar[table_bir] + table_offset, table_map_size);
+    if (!dev->msix_table_virt) {
+        return -ENOMEM;
+    }
+    
+    dev->msix_table = (msix_entry_t*)dev->msix_table_virt;
+    dev->msix_vectors = table_size;
+    
+    /* Enable MSI-X */
+    msix_control |= 0x8000; /* MSI-X Enable */
+    pci_enhanced_write_config32(dev, msix_cap->offset + 2, msix_control);
+    
+    dev->msix_enabled = true;
+    
+    atomic32_inc(&g_pci_enhanced.msix_allocations);
+    
+    printf("PCI %02x:%02x.%x: Enabled MSI-X with %u vectors\n",
+           dev->bus, dev->device, dev->function, table_size);
+    
+    return 0;
+}
+
+/* Set device power state */
+static int pci_enhanced_set_power_state(pci_device_enhanced_t* dev, uint8_t state) {
+    if (!dev->power_managed || state > PCI_D3cold) {
+        return -EINVAL;
+    }
+    
+    if (state == dev->power_state) {
+        return 0; /* Already in requested state */
+    }
+    
+    /* Read current power management control/status */
+    uint16_t pmcsr = pci_enhanced_read_config32(dev, dev->pm_cap_offset + 4) & 0xFFFF;
+    
+    /* Clear power state bits and set new state */
+    pmcsr &= ~0x03;
+    pmcsr |= (state & 0x03);
+    
+    /* Write new power state */
+    pci_enhanced_write_config32(dev, dev->pm_cap_offset + 4, pmcsr);
+    
+    /* Wait for transition to complete */
+    timer_msleep(10);
+    
+    dev->power_state = state;
+    
+    printf("PCI %02x:%02x.%x: Power state changed to D%u\n",
+           dev->bus, dev->device, dev->function, state);
+    
+    return 0;
+}
+
+/* Bind driver to device */
+static void pci_enhanced_bind_driver(pci_device_enhanced_t* dev) {
+    spin_lock(&g_pci_enhanced.drivers_lock);
+    
+    pci_driver_t* driver;
+    list_for_each_entry(driver, &g_pci_enhanced.drivers, list) {
+        if (!driver->id_table) {
+            continue;
+        }
+        
+        /* Check if driver supports this device */
+        struct pci_device_id* id = driver->id_table;
+        while (id->vendor || id->device || id->class) {
+            bool match = true;
+            
+            if (id->vendor != PCI_ANY_ID && id->vendor != dev->vendor_id) {
+                match = false;
+            }
+            if (id->device != PCI_ANY_ID && id->device != dev->device_id) {
+                match = false;
+            }
+            if (id->subvendor != PCI_ANY_ID && id->subvendor != dev->subsystem_vendor_id) {
+                match = false;
+            }
+            if (id->subdevice != PCI_ANY_ID && id->subdevice != dev->subsystem_device_id) {
+                match = false;
+            }
+            if (id->class && (id->class != ((dev->class_code << 16) | (dev->subclass << 8) | dev->prog_interface))) {
+                match = false;
+            }
+            
+            if (match) {
+                /* Found matching driver */
+                printf("PCI %02x:%02x.%x: Binding driver '%s'\n",
+                       dev->bus, dev->device, dev->function, driver->name);
+                
+                dev->driver_name = driver->name;
+                
+                if (driver->probe) {
+                    int result = driver->probe(dev);
+                    if (result != 0) {
+                        printf("PCI %02x:%02x.%x: Driver '%s' probe failed: %d\n",
+                               dev->bus, dev->device, dev->function, driver->name, result);
+                        dev->driver_name = NULL;
+                    }
+                }
+                
+                spin_unlock(&g_pci_enhanced.drivers_lock);
+                return;
+            }
+            
+            id++;
+        }
+    }
+    
+    spin_unlock(&g_pci_enhanced.drivers_lock);
+}
+
+/* Register PCI driver */
+int pci_enhanced_register_driver(pci_driver_t* driver) {
+    if (!driver || !driver->name) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&g_pci_enhanced.drivers_lock);
+    list_add(&driver->list, &g_pci_enhanced.drivers);
+    atomic32_inc(&g_pci_enhanced.driver_count);
+    spin_unlock(&g_pci_enhanced.drivers_lock);
+    
+    printf("Registered PCI driver: %s\n", driver->name);
+    
+    /* Try to bind to existing devices */
+    spin_lock(&g_pci_enhanced.devices_lock);
+    
+    pci_device_enhanced_t* dev;
+    list_for_each_entry(dev, &g_pci_enhanced.devices, list) {
+        if (!dev->driver_name) {
+            pci_enhanced_bind_driver(dev);
+        }
+    }
+    
+    spin_unlock(&g_pci_enhanced.devices_lock);
+    
+    return 0;
+}
+
+/* Get PCI statistics */
+void pci_enhanced_get_stats(struct pci_enhanced_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct pci_enhanced_stats));
+    
+    stats->device_count = atomic32_read(&g_pci_enhanced.device_count);
+    stats->driver_count = atomic32_read(&g_pci_enhanced.driver_count);
+    stats->config_reads = atomic64_read(&g_pci_enhanced.config_reads);
+    stats->config_writes = atomic64_read(&g_pci_enhanced.config_writes);
+    stats->msi_allocations = atomic32_read(&g_pci_enhanced.msi_allocations);
+    stats->msix_allocations = atomic32_read(&g_pci_enhanced.msix_allocations);
+}
+
+/* Debug output */
+void pci_enhanced_dump_stats(void) {
+    struct pci_enhanced_stats stats;
+    pci_enhanced_get_stats(&stats);
+    
+    printf("Enhanced PCI Statistics:\n");
+    printf("  Devices: %u\n", stats.device_count);
+    printf("  Drivers: %u\n", stats.driver_count);
+    printf("  Config reads: %lu\n", stats.config_reads);
+    printf("  Config writes: %lu\n", stats.config_writes);
+    printf("  MSI allocations: %u\n", stats.msi_allocations);
+    printf("  MSI-X allocations: %u\n", stats.msix_allocations);
+}

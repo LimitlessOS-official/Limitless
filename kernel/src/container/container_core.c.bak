@@ -1,0 +1,1120 @@
+/*
+ * LimitlessOS Container Framework
+ * Linux-compatible containers with namespace isolation, cgroups, and runtime support
+ * 
+ * Features:
+ * - Process namespace isolation (PID, mount, network, UTS, IPC, user)
+ * - Resource management via cgroups (CPU, memory, I/O)
+ * - Docker-compatible runtime interface
+ * - Image management and layered filesystems
+ * - Security policies and AppArmor/SELinux integration
+ */
+
+#include "kernel.h"
+#include "container.h"
+#include "process.h"
+#include "vfs.h"
+#include "kmem.h"
+
+// Logging macros
+#define KLOG_INFO(tag, fmt, ...) kprintf("[INFO] %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define KLOG_WARN(tag, fmt, ...) kprintf("[WARN] %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define KLOG_ERROR(tag, fmt, ...) kprintf("[ERROR] %s: " fmt "\n", tag, ##__VA_ARGS__)
+
+// Placeholder functions
+static inline uint64_t get_system_time(void) {
+    return 0; // TODO: Implement proper timer function
+}
+
+static inline void spinlock_acquire(volatile uint32_t* lock) {
+    (void)lock; // TODO: Implement proper spinlock
+}
+
+static inline void spinlock_release(volatile uint32_t* lock) {
+    (void)lock; // TODO: Implement proper spinlock
+}
+
+/* Container namespace types */
+#define CLONE_NEWNS     0x00020000  /* Mount namespace */
+#define CLONE_NEWUTS    0x04000000  /* UTS namespace */
+#define CLONE_NEWIPC    0x08000000  /* IPC namespace */
+#define CLONE_NEWPID    0x20000000  /* PID namespace */
+#define CLONE_NEWNET    0x40000000  /* Network namespace */
+#define CLONE_NEWUSER   0x10000000  /* User namespace */
+#define CLONE_NEWCGROUP 0x02000000  /* CGroup namespace */
+
+/* Global container state */
+static struct {
+    bool initialized;
+    container_t containers[MAX_CONTAINERS];
+    uint32_t container_count;
+    container_image_t images[MAX_CONTAINER_IMAGES];
+    uint32_t image_count;
+    cgroup_hierarchy_t cgroup_root;
+    spinlock_t lock;
+} container_state = {0};
+
+/* Container ID counter */
+static uint64_t next_container_id = 1;
+
+/* Initialize container subsystem */
+status_t container_init(void) {
+    if (container_state.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    KLOG_INFO("CONTAINER", "Initializing container subsystem");
+    
+    k_memset(&container_state, 0, sizeof(container_state));
+    spinlock_init(&container_state.lock);
+    
+    /* Initialize cgroup hierarchy */
+    status_t result = cgroup_init_hierarchy(&container_state.cgroup_root);
+    if (FAILED(result)) {
+        KLOG_ERROR("CONTAINER", "Failed to initialize cgroup hierarchy: %d", result);
+        return result;
+    }
+    
+    /* Create default cgroup controllers */
+    cgroup_create_controller(&container_state.cgroup_root, "cpu");
+    cgroup_create_controller(&container_state.cgroup_root, "memory");
+    cgroup_create_controller(&container_state.cgroup_root, "blkio");
+    cgroup_create_controller(&container_state.cgroup_root, "devices");
+    cgroup_create_controller(&container_state.cgroup_root, "freezer");
+    
+    /* Initialize namespace support */
+    result = namespace_init();
+    if (FAILED(result)) {
+        KLOG_ERROR("CONTAINER", "Failed to initialize namespaces: %d", result);
+        return result;
+    }
+    
+    container_state.initialized = true;
+    
+    KLOG_INFO("CONTAINER", "Container subsystem initialized");
+    return STATUS_OK;
+}
+
+/* Create new container */
+status_t container_create(const container_config_t* config, container_t** container_out) {
+    if (!container_state.initialized || !config || !container_out) {
+        return STATUS_INVALID;
+    }
+    
+    if (container_state.container_count >= MAX_CONTAINERS) {
+        return STATUS_NOMEM;
+    }
+    
+    spinlock_acquire(&container_state.lock);
+    
+    container_t* container = &container_state.containers[container_state.container_count];
+    k_memset(container, 0, sizeof(container_t));
+    
+    /* Initialize container */
+    container->id = next_container_id++;
+    strncpy(container->name, config->name, sizeof(container->name) - 1);
+    strncpy(container->image_name, config->image_name, sizeof(container->image_name) - 1);
+    container->state = CONTAINER_STATE_CREATED;
+    container->config = *config;
+    
+    /* Initialize timestamps */
+    container->created_time = get_system_time();
+    
+    /* Create namespaces */
+    status_t result = container_create_namespaces(container);
+    if (FAILED(result)) {
+        spinlock_release(&container_state.lock);
+        return result;
+    }
+    
+    /* Create cgroup */
+    result = container_create_cgroup(container);
+    if (FAILED(result)) {
+        container_destroy_namespaces(container);
+        spinlock_release(&container_state.lock);
+        return result;
+    }
+    
+    /* Set up filesystem */
+    result = container_setup_filesystem(container);
+    if (FAILED(result)) {
+        container_destroy_cgroup(container);
+        container_destroy_namespaces(container);
+        spinlock_release(&container_state.lock);
+        return result;
+    }
+    
+    /* Apply security policies */
+    result = container_apply_security(container);
+    if (FAILED(result)) {
+        KLOG_WARN("CONTAINER", "Failed to apply security policies: %d", result);
+        /* Continue without security policies for now */
+    }
+    
+    container_state.container_count++;
+    *container_out = container;
+    
+    spinlock_release(&container_state.lock);
+    
+    KLOG_INFO("CONTAINER", "Created container '%s' (ID: %llu)", 
+             container->name, container->id);
+    
+    return STATUS_OK;
+}
+
+/* Start container */
+status_t container_start(container_t* container) {
+    if (!container || container->state != CONTAINER_STATE_CREATED) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_INFO("CONTAINER", "Starting container '%s'", container->name);
+    
+    container->state = CONTAINER_STATE_STARTING;
+    
+    /* Create init process for container */
+    status_t result = container_create_init_process(container);
+    if (FAILED(result)) {
+        container->state = CONTAINER_STATE_EXITED;
+        return result;
+    }
+    
+    /* Apply resource limits */
+    result = container_apply_resource_limits(container);
+    if (FAILED(result)) {
+        KLOG_WARN("CONTAINER", "Failed to apply resource limits: %d", result);
+    }
+    
+    /* Set up networking */
+    result = container_setup_network(container);
+    if (FAILED(result)) {
+        KLOG_WARN("CONTAINER", "Failed to setup networking: %d", result);
+    }
+    
+    container->state = CONTAINER_STATE_RUNNING;
+    container->started_time = get_system_time();
+    
+    KLOG_INFO("CONTAINER", "Container '%s' started successfully", container->name);
+    
+    return STATUS_OK;
+}
+
+/* Stop container */
+status_t container_stop(container_t* container, uint32_t timeout_seconds) {
+    if (!container) {
+        return STATUS_INVALID;
+    }
+    
+    if (container->state != CONTAINER_STATE_RUNNING) {
+        return STATUS_OK; /* Already stopped */
+    }
+    
+    KLOG_INFO("CONTAINER", "Stopping container '%s'", container->name);
+    
+    container->state = CONTAINER_STATE_STOPPING;
+    
+    /* Send SIGTERM to init process */
+    if (container->init_process) {
+        process_terminate(container->init_process, SIGTERM);
+    }
+    
+    /* Wait for graceful shutdown */
+    uint64_t start_time = get_system_time();
+    uint64_t timeout_us = timeout_seconds * 1000000;
+    
+    while (container->init_process && 
+           container->init_process->state != PROC_STATE_ZOMBIE &&
+           (get_system_time() - start_time) < timeout_us) {
+        
+        scheduler_yield();
+    }
+    
+    /* Force kill if still running */
+    if (container->init_process && 
+        container->init_process->state != PROC_STATE_ZOMBIE) {
+        
+        KLOG_INFO("CONTAINER", "Force killing container '%s'", container->name);
+        process_terminate(container->init_process, SIGKILL);
+    }
+    
+    /* Clean up processes in container */
+    container_kill_all_processes(container);
+    
+    container->state = CONTAINER_STATE_EXITED;
+    container->stopped_time = get_system_time();
+    
+    KLOG_INFO("CONTAINER", "Container '%s' stopped", container->name);
+    
+    return STATUS_OK;
+}
+
+/* Create container namespaces */
+status_t container_create_namespaces(container_t* container) {
+    /* Create PID namespace */
+    if (container->config.namespaces & CONTAINER_NS_PID) {
+        status_t result = namespace_create(NS_TYPE_PID, &container->namespaces.pid_ns);
+        if (FAILED(result)) {
+            return result;
+        }
+    }
+    
+    /* Create mount namespace */
+    if (container->config.namespaces & CONTAINER_NS_MOUNT) {
+        status_t result = namespace_create(NS_TYPE_MOUNT, &container->namespaces.mount_ns);
+        if (FAILED(result)) {
+            return result;
+        }
+    }
+    
+    /* Create network namespace */
+    if (container->config.namespaces & CONTAINER_NS_NETWORK) {
+        status_t result = namespace_create(NS_TYPE_NETWORK, &container->namespaces.net_ns);
+        if (FAILED(result)) {
+            return result;
+        }
+    }
+    
+    /* Create UTS namespace */
+    if (container->config.namespaces & CONTAINER_NS_UTS) {
+        status_t result = namespace_create(NS_TYPE_UTS, &container->namespaces.uts_ns);
+        if (FAILED(result)) {
+            return result;
+        }
+        
+        /* Set container hostname */
+        if (strlen(container->config.hostname) > 0) {
+            namespace_set_hostname(container->namespaces.uts_ns, container->config.hostname);
+        }
+    }
+    
+    /* Create IPC namespace */
+    if (container->config.namespaces & CONTAINER_NS_IPC) {
+        status_t result = namespace_create(NS_TYPE_IPC, &container->namespaces.ipc_ns);
+        if (FAILED(result)) {
+            return result;
+        }
+    }
+    
+    /* Create user namespace */
+    if (container->config.namespaces & CONTAINER_NS_USER) {
+        status_t result = namespace_create(NS_TYPE_USER, &container->namespaces.user_ns);
+        if (FAILED(result)) {
+            return result;
+        }
+        
+        /* Set up user mappings */
+        namespace_map_user(container->namespaces.user_ns, 
+                          container->config.user_id, 0);
+        namespace_map_group(container->namespaces.user_ns, 
+                           container->config.group_id, 0);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Create container cgroup */
+status_t container_create_cgroup(container_t* container) {
+    char cgroup_path[256];
+    snprintf(cgroup_path, sizeof(cgroup_path), "/containers/%s", container->name);
+    
+    status_t result = cgroup_create(&container_state.cgroup_root, 
+                                   cgroup_path, &container->cgroup);
+    if (FAILED(result)) {
+        return result;
+    }
+    
+    /* Set resource limits */
+    if (container->config.memory_limit > 0) {
+        cgroup_set_memory_limit(container->cgroup, container->config.memory_limit);
+    }
+    
+    if (container->config.cpu_shares > 0) {
+        cgroup_set_cpu_shares(container->cgroup, container->config.cpu_shares);
+    }
+    
+    if (container->config.cpu_period > 0 && container->config.cpu_quota > 0) {
+        cgroup_set_cpu_cfs(container->cgroup, 
+                          container->config.cpu_period, 
+                          container->config.cpu_quota);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Set up container filesystem */
+status_t container_setup_filesystem(container_t* container) {
+    /* Create container root directory */
+    char container_root[256];
+    snprintf(container_root, sizeof(container_root), 
+             "/var/lib/containers/%llu", container->id);
+    
+    status_t result = vfs_mkdir(container_root, 0755);
+    if (FAILED(result) && result != STATUS_EXISTS) {
+        return result;
+    }
+    
+    /* Mount image layers if using layered filesystem */
+    if (container->config.use_overlay_fs) {
+        result = container_mount_overlay_fs(container, container_root);
+        if (FAILED(result)) {
+            return result;
+        }
+    }
+    
+    /* Set up bind mounts */
+    for (uint32_t i = 0; i < container->config.mount_count; i++) {
+        const container_mount_t* mount = &container->config.mounts[i];
+        
+        char target_path[512];
+        snprintf(target_path, sizeof(target_path), 
+                 "%s%s", container_root, mount->target);
+        
+        result = vfs_bind_mount(mount->source, target_path, mount->flags);
+        if (FAILED(result)) {
+            KLOG_WARN("CONTAINER", "Failed to bind mount %s -> %s: %d",
+                     mount->source, target_path, result);
+        }
+    }
+    
+    strncpy(container->root_path, container_root, sizeof(container->root_path) - 1);
+    
+    return STATUS_OK;
+}
+
+/* Create container init process */
+status_t container_create_init_process(container_t* container) {
+    /* Create process with container namespaces */
+    process_t* init_proc = NULL;
+    
+    security_context_t security = {
+        .uid = container->config.user_id,
+        .gid = container->config.group_id,
+        .euid = container->config.user_id,
+        .egid = container->config.group_id,
+        .capabilities = container->config.capabilities,
+        .is_privileged = (container->config.user_id == 0),
+    };
+    
+    resource_limits_t limits = {
+        .max_memory = container->config.memory_limit,
+        .max_cpu_time = UINT64_MAX,
+        .max_open_files = container->config.max_open_files,
+        .max_threads = container->config.max_threads,
+        .max_processes = container->config.max_processes,
+    };
+    
+    status_t result = process_create_advanced(&init_proc, 
+                                            container->config.command[0],
+                                            container->config.command[0],
+                                            &security, &limits);
+    if (FAILED(result)) {
+        return result;
+    }
+    
+    /* Set process namespaces */
+    result = process_set_namespaces(init_proc, &container->namespaces);
+    if (FAILED(result)) {
+        process_destroy(init_proc);
+        return result;
+    }
+    
+    /* Add process to cgroup */
+    result = cgroup_add_process(container->cgroup, init_proc->pid);
+    if (FAILED(result)) {
+        process_destroy(init_proc);
+        return result;
+    }
+    
+    /* Change root directory */
+    result = process_chroot(init_proc, container->root_path);
+    if (FAILED(result)) {
+        process_destroy(init_proc);
+        return result;
+    }
+    
+    /* Set working directory */
+    if (strlen(container->config.working_dir) > 0) {
+        process_set_cwd(init_proc, container->config.working_dir);
+    }
+    
+    /* Set environment variables */
+    for (uint32_t i = 0; i < container->config.env_count; i++) {
+        process_set_env(init_proc, 
+                       container->config.environment[i].name,
+                       container->config.environment[i].value);
+    }
+    
+    container->init_process = init_proc;
+    
+    /* Execute the command */
+    result = process_exec(init_proc, 
+                         container->config.command[0],
+                         (char* const*)container->config.command,
+                         NULL);
+    if (FAILED(result)) {
+        process_destroy(init_proc);
+        container->init_process = NULL;
+        return result;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Docker-compatible runtime interface */
+status_t container_runtime_create(const char* name, const char* image, 
+                                const char** command, const char* const* env) {
+    if (!name || !image || !command) {
+        return STATUS_INVALID;
+    }
+    
+    container_config_t config = {0};
+    
+    strncpy(config.name, name, sizeof(config.name) - 1);
+    strncpy(config.image_name, image, sizeof(config.image_name) - 1);
+    
+    /* Copy command */
+    uint32_t cmd_count = 0;
+    while (command[cmd_count] && cmd_count < MAX_CONTAINER_COMMAND_ARGS) {
+        strncpy(config.command[cmd_count], command[cmd_count], 
+               sizeof(config.command[0]) - 1);
+        cmd_count++;
+    }
+    
+    /* Copy environment */
+    config.env_count = 0;
+    if (env) {
+        while (env[config.env_count] && config.env_count < MAX_CONTAINER_ENV_VARS) {
+            const char* env_var = env[config.env_count];
+            const char* equals = strchr(env_var, '=');
+            
+            if (equals) {
+                size_t name_len = equals - env_var;
+                if (name_len < sizeof(config.environment[0].name)) {
+                    strncpy(config.environment[config.env_count].name, 
+                           env_var, name_len);
+                    config.environment[config.env_count].name[name_len] = '\0';
+                    
+                    strncpy(config.environment[config.env_count].value, 
+                           equals + 1, 
+                           sizeof(config.environment[0].value) - 1);
+                }
+            }
+            
+            config.env_count++;
+        }
+    }
+    
+    /* Default configuration */
+    config.namespaces = CONTAINER_NS_ALL;
+    config.user_id = 1000;
+    config.group_id = 1000;
+    config.memory_limit = 512 * 1024 * 1024; /* 512 MB default */
+    config.cpu_shares = 1024;
+    config.max_open_files = 1024;
+    config.max_threads = 256;
+    config.max_processes = 100;
+    config.use_overlay_fs = true;
+    
+    strncpy(config.working_dir, "/", sizeof(config.working_dir) - 1);
+    
+    container_t* container = NULL;
+    status_t result = container_create(&config, &container);
+    if (FAILED(result)) {
+        return result;
+    }
+    
+    return container_start(container);
+}
+
+/* Get container by name */
+container_t* container_find_by_name(const char* name) {
+    if (!name || !container_state.initialized) {
+        return NULL;
+    }
+    
+    for (uint32_t i = 0; i < container_state.container_count; i++) {
+        if (strcmp(container_state.containers[i].name, name) == 0) {
+            return &container_state.containers[i];
+        }
+    }
+    
+    return NULL;
+}
+
+/* List all containers */
+status_t container_list(container_info_t** containers, uint32_t* count) {
+    if (!containers || !count) {
+        return STATUS_INVALID;
+    }
+    
+    if (!container_state.initialized) {
+        *containers = NULL;
+        *count = 0;
+        return STATUS_OK;
+    }
+    
+    *count = container_state.container_count;
+    
+    if (*count == 0) {
+        *containers = NULL;
+        return STATUS_OK;
+    }
+    
+    container_info_t* info_list = kalloc(sizeof(container_info_t) * (*count));
+    if (!info_list) {
+        return STATUS_NOMEM;
+    }
+    
+    for (uint32_t i = 0; i < *count; i++) {
+        const container_t* container = &container_state.containers[i];
+        container_info_t* info = &info_list[i];
+        
+        info->id = container->id;
+        strncpy(info->name, container->name, sizeof(info->name) - 1);
+        strncpy(info->image, container->image_name, sizeof(info->image) - 1);
+        info->state = container->state;
+        info->created_time = container->created_time;
+        info->started_time = container->started_time;
+        info->stopped_time = container->stopped_time;
+        
+        /* Get resource usage from cgroup */
+        if (container->cgroup) {
+            cgroup_get_memory_usage(container->cgroup, &info->memory_usage);
+            cgroup_get_cpu_usage(container->cgroup, &info->cpu_usage);
+        }
+    }
+    
+    *containers = info_list;
+    return STATUS_OK;
+}
+
+/* Container cleanup on process exit */
+void container_on_process_exit(process_t* process) {
+    if (!process) {
+        return;
+    }
+    
+    /* Find container with this init process */
+    for (uint32_t i = 0; i < container_state.container_count; i++) {
+        container_t* container = &container_state.containers[i];
+        
+        if (container->init_process == process) {
+            KLOG_INFO("CONTAINER", "Container '%s' init process exited", container->name);
+            
+            /* Stop the container */
+            container_stop(container, 5); /* 5 second timeout */
+            
+            break;
+        }
+    }
+}
+
+/* ============== Namespace Management Implementation ============== */
+
+/* Global namespace state */
+static namespace_t* global_namespaces[NS_TYPE_CGROUP + 1] = {NULL};
+static uint32_t next_namespace_id = 1;
+static spinlock_t namespace_lock = SPINLOCK_INIT;
+
+status_t namespace_init(void) {
+    /* Create initial global namespaces */
+    for (int i = 0; i <= NS_TYPE_CGROUP; i++) {
+        namespace_t* ns = (namespace_t*)kalloc(sizeof(namespace_t));
+        if (!ns) {
+            return STATUS_NO_MEMORY;
+        }
+        
+        k_memset(ns, 0, sizeof(namespace_t));
+        ns->type = (namespace_type_t)i;
+        ns->id = next_namespace_id++;
+        ns->ref_count = 1;
+        spinlock_init(&ns->lock);
+        
+        /* Initialize type-specific data */
+        switch (ns->type) {
+            case NS_TYPE_PID:
+                ns->data.pid_ns.next_pid = 1;
+                ns->data.pid_ns.max_pid = 32768;
+                break;
+            case NS_TYPE_UTS:
+                strncpy(ns->data.uts_ns.hostname, "limitless", sizeof(ns->data.uts_ns.hostname) - 1);
+                strncpy(ns->data.uts_ns.domainname, "local", sizeof(ns->data.uts_ns.domainname) - 1);
+                break;
+            case NS_TYPE_USER:
+                /* Default identity mapping for root namespace */
+                ns->data.user_ns.uid_map[0][0] = 0;  /* inside */
+                ns->data.user_ns.uid_map[0][1] = 0;  /* outside */
+                ns->data.user_ns.uid_map[0][2] = 65536; /* length */
+                ns->data.user_ns.gid_map[0][0] = 0;
+                ns->data.user_ns.gid_map[0][1] = 0;
+                ns->data.user_ns.gid_map[0][2] = 65536;
+                ns->data.user_ns.uid_map_count = 1;
+                ns->data.user_ns.gid_map_count = 1;
+                break;
+            case NS_TYPE_MOUNT:
+                /* Mount namespace setup */
+                break;
+            case NS_TYPE_NETWORK:
+                /* Network namespace setup */
+                break;
+            case NS_TYPE_IPC:
+                /* IPC namespace setup */
+                break;
+            case NS_TYPE_CGROUP:
+                /* CGroup namespace setup */
+                break;
+        }
+        
+        global_namespaces[i] = ns;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+status_t namespace_create(namespace_type_t type, namespace_t** ns_out) {
+    if (!ns_out || type < 0 || type > NS_TYPE_CGROUP) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    namespace_t* ns = (namespace_t*)kalloc(sizeof(namespace_t));
+    if (!ns) {
+        return STATUS_NO_MEMORY;
+    }
+    
+    spinlock_lock(&namespace_lock);
+    
+    k_memset(ns, 0, sizeof(namespace_t));
+    ns->type = type;
+    ns->id = next_namespace_id++;
+    ns->ref_count = 1;
+    spinlock_init(&ns->lock);
+    
+    /* Initialize type-specific data */
+    switch (type) {
+        case NS_TYPE_PID:
+            ns->data.pid_ns.next_pid = 1;
+            ns->data.pid_ns.max_pid = 32768;
+            break;
+            
+        case NS_TYPE_UTS:
+            /* Copy from global namespace */
+            strncpy(ns->data.uts_ns.hostname, 
+                   global_namespaces[NS_TYPE_UTS]->data.uts_ns.hostname,
+                   sizeof(ns->data.uts_ns.hostname) - 1);
+            strncpy(ns->data.uts_ns.domainname,
+                   global_namespaces[NS_TYPE_UTS]->data.uts_ns.domainname,
+                   sizeof(ns->data.uts_ns.domainname) - 1);
+            break;
+            
+        case NS_TYPE_USER:
+            /* Empty mapping initially - must be configured */
+            ns->data.user_ns.uid_map_count = 0;
+            ns->data.user_ns.gid_map_count = 0;
+            break;
+            
+        case NS_TYPE_MOUNT:
+        case NS_TYPE_NETWORK:
+        case NS_TYPE_IPC:
+        case NS_TYPE_CGROUP:
+            /* Type-specific initialization would go here */
+            break;
+    }
+    
+    spinlock_unlock(&namespace_lock);
+    
+    *ns_out = ns;
+    return STATUS_SUCCESS;
+}
+
+status_t namespace_destroy(namespace_t* ns) {
+    if (!ns) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&ns->lock);
+    
+    if (--ns->ref_count > 0) {
+        spinlock_unlock(&ns->lock);
+        return STATUS_SUCCESS;
+    }
+    
+    spinlock_unlock(&ns->lock);
+    
+    /* Cleanup type-specific resources */
+    switch (ns->type) {
+        case NS_TYPE_MOUNT:
+            /* Cleanup mount tree */
+            break;
+        case NS_TYPE_NETWORK:
+            /* Cleanup network stack */
+            break;
+        case NS_TYPE_IPC:
+            /* Cleanup IPC objects */
+            break;
+        default:
+            break;
+    }
+    
+    kfree(ns);
+    return STATUS_SUCCESS;
+}
+
+status_t namespace_enter(namespace_t* ns) {
+    if (!ns) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Switch current process to this namespace */
+    switch (ns->type) {
+        case NS_TYPE_UTS:
+            /* Update current hostname/domainname */
+            break;
+        case NS_TYPE_PID:
+            /* Switch PID namespace */
+            break;
+        case NS_TYPE_MOUNT:
+            /* Switch mount namespace */
+            break;
+        case NS_TYPE_NETWORK:
+            /* Switch network namespace */
+            break;
+        case NS_TYPE_IPC:
+            /* Switch IPC namespace */
+            break;
+        case NS_TYPE_USER:
+            /* Switch user namespace */
+            break;
+        default:
+            return STATUS_NOT_SUPPORTED;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+status_t namespace_set_hostname(namespace_t* ns, const char* hostname) {
+    if (!ns || !hostname || ns->type != NS_TYPE_UTS) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&ns->lock);
+    strncpy(ns->data.uts_ns.hostname, hostname, sizeof(ns->data.uts_ns.hostname) - 1);
+    ns->data.uts_ns.hostname[sizeof(ns->data.uts_ns.hostname) - 1] = '\0';
+    spinlock_unlock(&ns->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t namespace_map_user(namespace_t* ns, uid_t inside_uid, uid_t outside_uid) {
+    if (!ns || ns->type != NS_TYPE_USER) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&ns->lock);
+    
+    if (ns->data.user_ns.uid_map_count >= 32) {
+        spinlock_unlock(&ns->lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    uint32_t index = ns->data.user_ns.uid_map_count++;
+    ns->data.user_ns.uid_map[index][0] = inside_uid;
+    ns->data.user_ns.uid_map[index][1] = outside_uid;
+    ns->data.user_ns.uid_map[index][2] = 1; /* length */
+    
+    spinlock_unlock(&ns->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t namespace_map_group(namespace_t* ns, gid_t inside_gid, gid_t outside_gid) {
+    if (!ns || ns->type != NS_TYPE_USER) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&ns->lock);
+    
+    if (ns->data.user_ns.gid_map_count >= 32) {
+        spinlock_unlock(&ns->lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    uint32_t index = ns->data.user_ns.gid_map_count++;
+    ns->data.user_ns.gid_map[index][0] = inside_gid;
+    ns->data.user_ns.gid_map[index][1] = outside_gid;
+    ns->data.user_ns.gid_map[index][2] = 1; /* length */
+    
+    spinlock_unlock(&ns->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/* ============== CGroup Management Implementation ============== */
+
+/* Global cgroup hierarchies */
+static cgroup_hierarchy_t __attribute__((unused)) cgroup_hierarchies[8];
+static uint32_t __attribute__((unused)) cgroup_hierarchy_count = 0;
+static spinlock_t __attribute__((unused)) cgroup_global_lock = SPINLOCK_INIT;
+
+status_t cgroup_init_hierarchy(cgroup_hierarchy_t* hierarchy) {
+    if (!hierarchy) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    k_memset(hierarchy, 0, sizeof(cgroup_hierarchy_t));
+    
+    /* Initialize root cgroup */
+    cgroup_t* root = &hierarchy->root;
+    strcpy(root->path, "/");
+    root->hierarchy = hierarchy;
+    root->memory_limit = UINT64_MAX;
+    root->cpu_shares = 1024;
+    root->cpu_period = 100000; /* 100ms default */
+    root->cpu_quota = 0; /* No limit */
+    root->max_pids = 32768;
+    spinlock_init(&root->lock);
+    
+    /* Setup default controllers */
+    const char* default_controllers[] = {"memory", "cpu", "cpuset", "pids"};
+    for (uint32_t i = 0; i < 4; i++) {
+        if (hierarchy->controller_count < 8) {
+            cgroup_controller_t* ctrl = &hierarchy->root.controllers[hierarchy->controller_count];
+            strncpy(ctrl->name, default_controllers[i], sizeof(ctrl->name) - 1);
+            ctrl->enabled = true;
+            hierarchy->controller_count++;
+            hierarchy->root.controller_count++;
+        }
+    }
+    
+    spinlock_init(&hierarchy->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_create_controller(cgroup_hierarchy_t* hierarchy, const char* name) {
+    if (!hierarchy || !name || hierarchy->controller_count >= 8) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&hierarchy->lock);
+    
+    /* Check if controller already exists */
+    for (uint32_t i = 0; i < hierarchy->controller_count; i++) {
+        if (strcmp(hierarchy->root.controllers[i].name, name) == 0) {
+            spinlock_unlock(&hierarchy->lock);
+            return STATUS_ALREADY_EXISTS;
+        }
+    }
+    
+    /* Add new controller */
+    cgroup_controller_t* ctrl = &hierarchy->root.controllers[hierarchy->controller_count];
+    strncpy(ctrl->name, name, sizeof(ctrl->name) - 1);
+    ctrl->enabled = true;
+    ctrl->private_data = NULL;
+    
+    hierarchy->controller_count++;
+    hierarchy->root.controller_count++;
+    
+    spinlock_unlock(&hierarchy->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_create(cgroup_hierarchy_t* hierarchy, const char* path, cgroup_t** cgroup_out) {
+    if (!hierarchy || !path || !cgroup_out) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    cgroup_t* cgroup = (cgroup_t*)kalloc(sizeof(cgroup_t));
+    if (!cgroup) {
+        return STATUS_NO_MEMORY;
+    }
+    
+    k_memset(cgroup, 0, sizeof(cgroup_t));
+    
+    strncpy(cgroup->path, path, sizeof(cgroup->path) - 1);
+    cgroup->hierarchy = hierarchy;
+    
+    /* Inherit settings from parent/root */
+    cgroup->memory_limit = hierarchy->root.memory_limit;
+    cgroup->cpu_shares = hierarchy->root.cpu_shares;
+    cgroup->cpu_period = hierarchy->root.cpu_period;
+    cgroup->cpu_quota = hierarchy->root.cpu_quota;
+    cgroup->max_pids = hierarchy->root.max_pids;
+    
+    /* Copy controllers */
+    cgroup->controller_count = hierarchy->controller_count;
+    for (uint32_t i = 0; i < hierarchy->controller_count; i++) {
+        cgroup->controllers[i] = hierarchy->root.controllers[i];
+    }
+    
+    spinlock_init(&cgroup->lock);
+    
+    *cgroup_out = cgroup;
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_destroy(cgroup_t* cgroup) {
+    if (!cgroup) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Remove all processes first */
+    spinlock_lock(&cgroup->lock);
+    
+    if (cgroup->pids) {
+        kfree(cgroup->pids);
+    }
+    
+    spinlock_unlock(&cgroup->lock);
+    
+    kfree(cgroup);
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_add_process(cgroup_t* cgroup, pid_t pid) {
+    if (!cgroup || pid <= 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&cgroup->lock);
+    
+    /* Check if process already exists */
+    for (uint32_t i = 0; i < cgroup->pid_count; i++) {
+        if (cgroup->pids[i] == pid) {
+            spinlock_unlock(&cgroup->lock);
+            return STATUS_SUCCESS; /* Already added */
+        }
+    }
+    
+    /* Check limits */
+    if (cgroup->pid_count >= cgroup->max_pids) {
+        spinlock_unlock(&cgroup->lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    /* Reallocate PID array if needed */
+    if (cgroup->pid_count == 0) {
+        cgroup->pids = (pid_t*)kalloc(sizeof(pid_t) * 16);
+        if (!cgroup->pids) {
+            spinlock_unlock(&cgroup->lock);
+            return STATUS_NO_MEMORY;
+        }
+    } else if (cgroup->pid_count % 16 == 0) {
+        pid_t* new_pids = (pid_t*)kalloc(sizeof(pid_t) * (cgroup->pid_count + 16));
+        if (new_pids) {
+            for (uint32_t i = 0; i < cgroup->pid_count; i++) {
+                new_pids[i] = cgroup->pids[i];
+            }
+            kfree(cgroup->pids);
+        }
+        if (!new_pids) {
+            spinlock_unlock(&cgroup->lock);
+            return STATUS_NO_MEMORY;
+        }
+        cgroup->pids = new_pids;
+    }
+    
+    /* Add process */
+    cgroup->pids[cgroup->pid_count++] = pid;
+    
+    spinlock_unlock(&cgroup->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_remove_process(cgroup_t* cgroup, pid_t pid) {
+    if (!cgroup || pid <= 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&cgroup->lock);
+    
+    /* Find and remove process */
+    for (uint32_t i = 0; i < cgroup->pid_count; i++) {
+        if (cgroup->pids[i] == pid) {
+            /* Shift remaining processes */
+            for (uint32_t j = i; j < cgroup->pid_count - 1; j++) {
+                cgroup->pids[j] = cgroup->pids[j + 1];
+            }
+            cgroup->pid_count--;
+            break;
+        }
+    }
+    
+    spinlock_unlock(&cgroup->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_set_memory_limit(cgroup_t* cgroup, uint64_t limit) {
+    if (!cgroup) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&cgroup->lock);
+    cgroup->memory_limit = limit;
+    spinlock_unlock(&cgroup->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_set_cpu_shares(cgroup_t* cgroup, uint32_t shares) {
+    if (!cgroup || shares == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&cgroup->lock);
+    cgroup->cpu_shares = shares;
+    spinlock_unlock(&cgroup->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_set_cpu_cfs(cgroup_t* cgroup, uint32_t period, uint32_t quota) {
+    if (!cgroup || period == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_lock(&cgroup->lock);
+    cgroup->cpu_period = period;
+    cgroup->cpu_quota = quota;
+    spinlock_unlock(&cgroup->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_get_memory_usage(cgroup_t* cgroup, uint64_t* usage) {
+    if (!cgroup || !usage) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* TODO: Calculate actual memory usage from all processes in cgroup */
+    *usage = 0;
+    
+    spinlock_lock(&cgroup->lock);
+    
+    /* For now, return placeholder calculation */
+    *usage = cgroup->pid_count * (4 * 1024 * 1024); /* Estimate 4MB per process */
+    
+    spinlock_unlock(&cgroup->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+status_t cgroup_get_cpu_usage(cgroup_t* cgroup, uint64_t* usage) {
+    if (!cgroup || !usage) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* TODO: Calculate actual CPU usage from all processes in cgroup */
+    *usage = 0;
+    
+    spinlock_lock(&cgroup->lock);
+    
+    /* For now, return placeholder */
+    *usage = cgroup->pid_count * 1000000; /* 1ms per process estimate */
+    
+    spinlock_unlock(&cgroup->lock);
+    
+    return STATUS_SUCCESS;
+}

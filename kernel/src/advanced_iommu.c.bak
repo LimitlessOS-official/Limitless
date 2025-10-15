@@ -1,0 +1,962 @@
+/*
+ * LimitlessOS Advanced Memory Management with IOMMU Support
+ * Enterprise-grade memory management featuring IOMMU/SMMU support,
+ * advanced DMA protection, device memory isolation, and secure
+ * memory operations for virtualization and high-security environments.
+ * 
+ * Features:
+ * - Intel VT-d and AMD-Vi IOMMU support
+ * - ARM SMMU (System Memory Management Unit) support
+ * - DMA remapping and address translation
+ * - Device memory isolation and protection
+ * - Secure DMA operations with IOMMU page tables
+ * - Memory encryption and integrity protection
+ * - IOMMU fault handling and recovery
+ * - Pass-through and identity mapping modes
+ * - Interrupt remapping and isolation
+ * - Performance monitoring and optimization
+ */
+
+#include "kernel.h"
+#include "vmm.h"
+#include "pci.h"
+#include "interrupt.h"
+#include "hal.h"
+
+#define MAX_IOMMU_UNITS         16
+#define MAX_IOMMU_DOMAINS       1024
+#define MAX_DEVICES_PER_DOMAIN  256
+#define IOMMU_PAGE_SIZE         4096
+#define IOMMU_PAGE_MASK         (~(IOMMU_PAGE_SIZE - 1))
+#define IOMMU_MAX_ADDRESS_WIDTH 48
+#define IOMMU_FAULT_QUEUE_SIZE  1024
+
+/* IOMMU types */
+typedef enum {
+    IOMMU_TYPE_INTEL_VTD = 0,       /* Intel Virtualization Technology for Directed I/O */
+    IOMMU_TYPE_AMD_VI,              /* AMD I/O Virtualization */
+    IOMMU_TYPE_ARM_SMMU_V2,         /* ARM System MMU v2 */
+    IOMMU_TYPE_ARM_SMMU_V3,         /* ARM System MMU v3 */
+    IOMMU_TYPE_UNKNOWN
+} iommu_type_t;
+
+/* IOMMU capabilities */
+typedef enum {
+    IOMMU_CAP_DMA_REMAPPING     = (1 << 0),
+    IOMMU_CAP_INTERRUPT_REMAP   = (1 << 1),
+    IOMMU_CAP_POSTED_INTERRUPTS = (1 << 2),
+    IOMMU_CAP_MEMORY_ENCRYPTION = (1 << 3),
+    IOMMU_CAP_NESTED_TRANSLATION = (1 << 4),
+    IOMMU_CAP_FAULT_REPORTING   = (1 << 5),
+    IOMMU_CAP_COHERENT_WALK     = (1 << 6),
+    IOMMU_CAP_LARGE_PAGES       = (1 << 7),
+} iommu_capabilities_t;
+
+/* IOMMU domain types */
+typedef enum {
+    IOMMU_DOMAIN_UNMANAGED = 0,     /* Pass-through, no translation */
+    IOMMU_DOMAIN_DMA,               /* DMA API domain with IOVA allocation */
+    IOMMU_DOMAIN_IDENTITY,          /* 1:1 mapping domain */
+    IOMMU_DOMAIN_DMA_FQ,            /* DMA domain with flush queues */
+    IOMMU_DOMAIN_SVA,               /* Shared Virtual Addressing */
+} iommu_domain_type_t;
+
+/* IOMMU page table entry flags */
+typedef enum {
+    IOMMU_PTE_PRESENT       = (1ULL << 0),
+    IOMMU_PTE_READ          = (1ULL << 1),
+    IOMMU_PTE_WRITE         = (1ULL << 2),
+    IOMMU_PTE_EXECUTE       = (1ULL << 3),
+    IOMMU_PTE_SNOOP         = (1ULL << 4),  /* Coherent access */
+    IOMMU_PTE_LARGE_PAGE    = (1ULL << 7),  /* Large page entry */
+    IOMMU_PTE_GLOBAL        = (1ULL << 8),  /* Global translation */
+    IOMMU_PTE_NO_EXECUTE    = (1ULL << 63), /* Execute disable */
+} iommu_pte_flags_t;
+
+/* IOMMU fault types */
+typedef enum {
+    IOMMU_FAULT_DMA_READ = 0,
+    IOMMU_FAULT_DMA_WRITE,
+    IOMMU_FAULT_PAGE_NOT_PRESENT,
+    IOMMU_FAULT_ACCESS_VIOLATION,
+    IOMMU_FAULT_INTERRUPT_REMAP,
+    IOMMU_FAULT_DEVICE_TLB_INVALIDATION,
+    IOMMU_FAULT_UNKNOWN
+} iommu_fault_type_t;
+
+/* Forward declarations */
+struct iommu_unit;
+struct iommu_domain;
+struct iommu_device;
+
+/* IOMMU operations */
+typedef struct iommu_ops {
+    /* Domain management */
+    struct iommu_domain* (*domain_alloc)(iommu_domain_type_t type);
+    void (*domain_free)(struct iommu_domain* domain);
+    
+    /* Device attachment */
+    int (*attach_device)(struct iommu_domain* domain, struct iommu_device* device);
+    int (*detach_device)(struct iommu_domain* domain, struct iommu_device* device);
+    
+    /* Address translation */
+    int (*map)(struct iommu_domain* domain, uint64_t iova, uint64_t paddr, 
+               size_t size, uint32_t flags);
+    int (*unmap)(struct iommu_domain* domain, uint64_t iova, size_t size);
+    uint64_t (*iova_to_phys)(struct iommu_domain* domain, uint64_t iova);
+    
+    /* TLB management */
+    void (*flush_tlb)(struct iommu_domain* domain);
+    void (*flush_tlb_range)(struct iommu_domain* domain, uint64_t start, uint64_t end);
+    
+    /* Interrupt remapping */
+    int (*setup_irq_remapping)(struct iommu_unit* iommu, uint32_t irq, 
+                               struct irq_remap_entry* entry);
+    int (*disable_irq_remapping)(struct iommu_unit* iommu, uint32_t irq);
+    
+    /* Fault handling */
+    int (*enable_fault_reporting)(struct iommu_unit* iommu);
+    int (*disable_fault_reporting)(struct iommu_unit* iommu);
+    
+    /* Power management */
+    int (*suspend)(struct iommu_unit* iommu);
+    int (*resume)(struct iommu_unit* iommu);
+} iommu_ops_t;
+
+/* IOMMU device structure */
+typedef struct iommu_device {
+    struct list_head list;          /* List linkage */
+    
+    /* Device identification */
+    uint16_t segment;               /* PCI segment */
+    uint8_t bus;                    /* PCI bus */
+    uint8_t device;                 /* PCI device */
+    uint8_t function;               /* PCI function */
+    uint32_t device_id;             /* Unique device identifier */
+    
+    /* IOMMU context */
+    struct iommu_unit* iommu;       /* Associated IOMMU unit */
+    struct iommu_domain* domain;    /* Current domain */
+    void* priv_data;                /* Device-specific private data */
+    
+    /* Capabilities and configuration */
+    uint32_t requester_id;          /* PCIe requester ID */
+    bool ats_enabled;               /* Address Translation Services */
+    bool pasid_enabled;             /* Process Address Space ID */
+    bool pri_enabled;               /* Page Request Interface */
+    uint32_t max_pasids;            /* Maximum PASID count */
+    
+    /* Statistics */
+    uint64_t dma_requests;          /* Total DMA requests */
+    uint64_t page_faults;           /* IOMMU page faults */
+    uint64_t tlb_misses;            /* TLB miss count */
+} iommu_device_t;
+
+/* IOMMU domain structure */
+typedef struct iommu_domain {
+    struct list_head list;          /* List linkage */
+    
+    uint32_t domain_id;             /* Domain identifier */
+    iommu_domain_type_t type;       /* Domain type */
+    struct iommu_unit* iommu;       /* Associated IOMMU unit */
+    
+    /* Page tables */
+    void* page_table_root;          /* Root page table */
+    uint32_t address_width;         /* Address width in bits */
+    size_t page_table_size;         /* Total page table size */
+    
+    /* Device list */
+    struct list_head devices;       /* Attached devices */
+    uint32_t device_count;          /* Number of attached devices */
+    spinlock_t device_lock;         /* Device list lock */
+    
+    /* Address space management */
+    uint64_t iova_start;            /* IOVA space start */
+    uint64_t iova_end;              /* IOVA space end */
+    void* iova_allocator;           /* IOVA allocator */
+    
+    /* Security and isolation */
+    uint32_t security_level;        /* Security isolation level */
+    bool encrypted;                 /* Memory encryption enabled */
+    bool integrity_protected;       /* Memory integrity protection */
+    
+    /* Statistics */
+    uint64_t mappings_created;      /* Total mappings created */
+    uint64_t mappings_destroyed;    /* Total mappings destroyed */
+    uint64_t tlb_flushes;           /* TLB flush operations */
+    
+    /* Reference counting */
+    atomic32_t refcount;            /* Reference count */
+    struct completion destroy_completion; /* Domain destruction sync */
+} iommu_domain_t;
+
+/* IOMMU fault information */
+typedef struct iommu_fault {
+    iommu_fault_type_t type;        /* Fault type */
+    uint32_t device_id;             /* Faulting device */
+    uint64_t fault_addr;            /* Fault address */
+    uint32_t fault_reason;          /* Hardware-specific reason */
+    uint32_t pasid;                 /* Process Address Space ID */
+    uint64_t timestamp;             /* Fault timestamp */
+    
+    /* Fault context */
+    bool read_fault;                /* Read access fault */
+    bool write_fault;               /* Write access fault */
+    bool execute_fault;             /* Execute access fault */
+    bool privilege_fault;           /* Privilege violation */
+} iommu_fault_t;
+
+/* IOMMU unit structure */
+typedef struct iommu_unit {
+    struct list_head list;          /* List linkage */
+    
+    uint32_t unit_id;               /* IOMMU unit identifier */
+    iommu_type_t type;              /* IOMMU type */
+    const iommu_ops_t* ops;         /* IOMMU operations */
+    
+    /* Hardware information */
+    phys_addr_t base_addr;          /* Base physical address */
+    size_t size;                    /* Memory region size */
+    void* mapped_base;              /* Virtual mapping */
+    uint32_t version;               /* Hardware version */
+    uint32_t capabilities;          /* Capability flags */
+    
+    /* Domain management */
+    struct list_head domains;       /* Managed domains */
+    uint32_t domain_count;          /* Number of domains */
+    spinlock_t domain_lock;         /* Domain list lock */
+    
+    /* Device management */
+    struct list_head devices;       /* Managed devices */
+    uint32_t device_count;          /* Number of devices */
+    spinlock_t device_lock;         /* Device list lock */
+    
+    /* Interrupt remapping */
+    bool irq_remapping_enabled;     /* Interrupt remapping active */
+    void* irq_remap_table;          /* Interrupt remapping table */
+    uint32_t irq_remap_entries;     /* Number of remapping entries */
+    
+    /* Fault handling */
+    bool fault_reporting_enabled;   /* Fault reporting active */
+    struct ring_buffer* fault_queue; /* Fault event queue */
+    struct work_struct fault_work;  /* Fault handling work */
+    uint64_t total_faults;          /* Total fault count */
+    
+    /* Performance monitoring */
+    uint64_t translations_performed; /* Total translations */
+    uint64_t tlb_hit_count;         /* TLB hit count */
+    uint64_t tlb_miss_count;        /* TLB miss count */
+    
+    /* Power management state */
+    uint32_t power_state;           /* Current power state */
+    bool suspended;                 /* Suspended flag */
+    
+    /* Private data */
+    void* priv_data;                /* Implementation-specific data */
+} iommu_unit_t;
+
+/* Global IOMMU management */
+static struct {
+    bool initialized;               /* IOMMU subsystem initialized */
+    uint32_t num_units;             /* Number of IOMMU units */
+    struct list_head iommu_units;   /* List of IOMMU units */
+    spinlock_t units_lock;          /* Units list lock */
+    
+    /* Domain management */
+    uint32_t next_domain_id;        /* Next available domain ID */
+    struct list_head domains;       /* All domains */
+    spinlock_t domains_lock;        /* Domains lock */
+    
+    /* Device management */
+    struct list_head devices;       /* All IOMMU devices */
+    spinlock_t devices_lock;        /* Devices lock */
+    struct hash_table* device_hash; /* Device lookup hash table */
+    
+    /* Default domains */
+    iommu_domain_t* default_domain; /* Default DMA domain */
+    iommu_domain_t* identity_domain; /* Identity mapping domain */
+    
+    /* Configuration */
+    bool strict_mode;               /* Strict IOMMU mode */
+    bool lazy_unmapping;            /* Lazy TLB invalidation */
+    bool large_pages_enabled;       /* Large page support */
+    uint32_t default_domain_type;   /* Default domain type */
+    
+    /* Statistics */
+    uint64_t total_mappings;        /* System-wide mappings */
+    uint64_t total_unmappings;      /* System-wide unmappings */
+    uint64_t total_faults;          /* System-wide faults */
+    
+    /* Memory pools */
+    void* domain_pool;              /* Domain allocation pool */
+    void* device_pool;              /* Device allocation pool */
+} iommu_system = {0};
+
+/* Function prototypes */
+static int iommu_detect_units(void);
+static int iommu_initialize_unit(iommu_unit_t* unit);
+static iommu_domain_t* iommu_create_default_domain(iommu_domain_type_t type);
+static int iommu_setup_device(struct pci_device* pci_dev);
+static void iommu_fault_handler(struct work_struct* work);
+static int iommu_setup_identity_domain(void);
+
+/* Intel VT-d specific operations */
+extern const iommu_ops_t intel_vtd_ops;
+static int intel_vtd_init(iommu_unit_t* unit);
+
+/* AMD-Vi specific operations */
+extern const iommu_ops_t amd_vi_ops;
+static int amd_vi_init(iommu_unit_t* unit);
+
+/* ARM SMMU specific operations */
+extern const iommu_ops_t arm_smmu_ops;
+static int arm_smmu_init(iommu_unit_t* unit);
+
+/* Initialize IOMMU subsystem */
+int iommu_init(void) {
+    console_printf("IOMMU: Initializing I/O Memory Management Unit subsystem\n");
+    
+    /* Initialize data structures */
+    INIT_LIST_HEAD(&iommu_system.iommu_units);
+    INIT_LIST_HEAD(&iommu_system.domains);
+    INIT_LIST_HEAD(&iommu_system.devices);
+    
+    spin_lock_init(&iommu_system.units_lock);
+    spin_lock_init(&iommu_system.domains_lock);
+    spin_lock_init(&iommu_system.devices_lock);
+    
+    /* Create memory pools */
+    iommu_system.domain_pool = slab_create_cache("iommu_domain", 
+                                                sizeof(iommu_domain_t), 64);
+    if (!iommu_system.domain_pool) {
+        console_printf("IOMMU: Failed to create domain pool\n");
+        return -1;
+    }
+    
+    iommu_system.device_pool = slab_create_cache("iommu_device", 
+                                                sizeof(iommu_device_t), 64);
+    if (!iommu_system.device_pool) {
+        console_printf("IOMMU: Failed to create device pool\n");
+        slab_destroy_cache(iommu_system.domain_pool);
+        return -1;
+    }
+    
+    /* Create device hash table */
+    iommu_system.device_hash = hash_table_create(256, hash_int32);
+    if (!iommu_system.device_hash) {
+        console_printf("IOMMU: Failed to create device hash table\n");
+        return -1;
+    }
+    
+    /* Detect and initialize IOMMU units */
+    int result = iommu_detect_units();
+    if (result != 0) {
+        console_printf("IOMMU: Failed to detect IOMMU units: %d\n", result);
+        return result;
+    }
+    
+    /* Set up default configuration */
+    iommu_system.strict_mode = false;
+    iommu_system.lazy_unmapping = true;
+    iommu_system.large_pages_enabled = true;
+    iommu_system.default_domain_type = IOMMU_DOMAIN_DMA;
+    
+    /* Create default domains */
+    iommu_system.default_domain = iommu_create_default_domain(IOMMU_DOMAIN_DMA);
+    if (!iommu_system.default_domain) {
+        console_printf("IOMMU: Failed to create default DMA domain\n");
+        return -1;
+    }
+    
+    result = iommu_setup_identity_domain();
+    if (result != 0) {
+        console_printf("IOMMU: Failed to setup identity domain: %d\n", result);
+        return result;
+    }
+    
+    iommu_system.initialized = true;
+    console_printf("IOMMU: Initialized %d IOMMU units\n", iommu_system.num_units);
+    
+    return 0;
+}
+
+/* Detect IOMMU units in the system */
+static int iommu_detect_units(void) {
+    /* Scan for Intel VT-d units via ACPI DMAR table */
+    struct acpi_table* dmar_table = acpi_find_table("DMAR");
+    if (dmar_table) {
+        console_printf("IOMMU: Found Intel VT-d DMAR table\n");
+        
+        /* Parse DMAR table and create VT-d units */
+        uint8_t* dmar_data = (uint8_t*)dmar_table + sizeof(struct acpi_table);
+        uint8_t* dmar_end = (uint8_t*)dmar_table + dmar_table->length;
+        
+        while (dmar_data < dmar_end) {
+            struct dmar_header {
+                uint16_t type;
+                uint16_t length;
+            } *header = (struct dmar_header*)dmar_data;
+            
+            if (header->type == 0) { /* DMA Remapping Hardware Unit */
+                struct drhd_unit {
+                    struct dmar_header header;
+                    uint8_t flags;
+                    uint8_t reserved;
+                    uint16_t segment;
+                    uint64_t register_base;
+                } *drhd = (struct drhd_unit*)dmar_data;
+                
+                /* Create IOMMU unit */
+                iommu_unit_t* unit = slab_alloc(sizeof(iommu_unit_t));
+                if (!unit) {
+                    console_printf("IOMMU: Failed to allocate VT-d unit\n");
+                    continue;
+                }
+                
+                memset(unit, 0, sizeof(iommu_unit_t));
+                unit->unit_id = iommu_system.num_units++;
+                unit->type = IOMMU_TYPE_INTEL_VTD;
+                unit->base_addr = drhd->register_base;
+                unit->size = 4096; /* Standard VT-d register size */
+                unit->ops = &intel_vtd_ops;
+                
+                /* Initialize the unit */
+                if (iommu_initialize_unit(unit) == 0) {
+                    spin_lock(&iommu_system.units_lock);
+                    list_add_tail(&unit->list, &iommu_system.iommu_units);
+                    spin_unlock(&iommu_system.units_lock);
+                    
+                    console_printf("IOMMU: Initialized Intel VT-d unit %d at 0x%lx\n",
+                                   unit->unit_id, unit->base_addr);
+                } else {
+                    console_printf("IOMMU: Failed to initialize VT-d unit at 0x%lx\n",
+                                   drhd->register_base);
+                    slab_free(unit);
+                }
+            }
+            
+            dmar_data += header->length;
+        }
+    }
+    
+    /* Scan for AMD-Vi units via ACPI IVRS table */
+    struct acpi_table* ivrs_table = acpi_find_table("IVRS");
+    if (ivrs_table) {
+        console_printf("IOMMU: Found AMD-Vi IVRS table\n");
+        
+        /* Parse IVRS table and create AMD-Vi units */
+        /* Implementation would go here... */
+    }
+    
+    /* Scan for ARM SMMU units in device tree or ACPI */
+    if (hal_get_platform_type() == PLATFORM_ARM64) {
+        /* ARM SMMU detection implementation */
+        console_printf("IOMMU: Scanning for ARM SMMU units\n");
+        
+        /* Device tree or ACPI IORT parsing would go here... */
+    }
+    
+    if (iommu_system.num_units == 0) {
+        console_printf("IOMMU: No IOMMU units found in system\n");
+        return 0; /* Not an error - system may not have IOMMU */
+    }
+    
+    return 0;
+}
+
+/* Initialize a specific IOMMU unit */
+static int iommu_initialize_unit(iommu_unit_t* unit) {
+    /* Map IOMMU registers */
+    unit->mapped_base = vmm_map_device(unit->base_addr, unit->size, VMM_MAP_NOCACHE);
+    if (!unit->mapped_base) {
+        console_printf("IOMMU: Failed to map unit %d registers\n", unit->unit_id);
+        return -1;
+    }
+    
+    /* Initialize lists and locks */
+    INIT_LIST_HEAD(&unit->domains);
+    INIT_LIST_HEAD(&unit->devices);
+    spin_lock_init(&unit->domain_lock);
+    spin_lock_init(&unit->device_lock);
+    
+    /* Create fault handling work */
+    INIT_WORK(&unit->fault_work, iommu_fault_handler);
+    
+    /* Type-specific initialization */
+    int result = 0;
+    switch (unit->type) {
+        case IOMMU_TYPE_INTEL_VTD:
+            result = intel_vtd_init(unit);
+            break;
+            
+        case IOMMU_TYPE_AMD_VI:
+            result = amd_vi_init(unit);
+            break;
+            
+        case IOMMU_TYPE_ARM_SMMU_V2:
+        case IOMMU_TYPE_ARM_SMMU_V3:
+            result = arm_smmu_init(unit);
+            break;
+            
+        default:
+            console_printf("IOMMU: Unknown IOMMU type %d\n", unit->type);
+            result = -1;
+            break;
+    }
+    
+    if (result != 0) {
+        vmm_unmap_device(unit->mapped_base, unit->size);
+        return result;
+    }
+    
+    /* Enable fault reporting if supported */
+    if (unit->capabilities & IOMMU_CAP_FAULT_REPORTING) {
+        unit->fault_queue = ring_buffer_create(IOMMU_FAULT_QUEUE_SIZE * sizeof(iommu_fault_t));
+        if (unit->fault_queue) {
+            unit->ops->enable_fault_reporting(unit);
+            unit->fault_reporting_enabled = true;
+        }
+    }
+    
+    return 0;
+}
+
+/* Create domain */
+iommu_domain_t* iommu_domain_alloc(iommu_domain_type_t type) {
+    iommu_domain_t* domain = slab_alloc_from_cache(iommu_system.domain_pool);
+    if (!domain) {
+        return NULL;
+    }
+    
+    memset(domain, 0, sizeof(iommu_domain_t));
+    
+    spin_lock(&iommu_system.domains_lock);
+    domain->domain_id = iommu_system.next_domain_id++;
+    spin_unlock(&iommu_system.domains_lock);
+    
+    domain->type = type;
+    INIT_LIST_HEAD(&domain->devices);
+    spin_lock_init(&domain->device_lock);
+    atomic32_set(&domain->refcount, 1);
+    init_completion(&domain->destroy_completion);
+    
+    /* Set up address space based on type */
+    switch (type) {
+        case IOMMU_DOMAIN_DMA:
+        case IOMMU_DOMAIN_DMA_FQ:
+            domain->iova_start = 0x1000;  /* Skip NULL page */
+            domain->iova_end = (1ULL << IOMMU_MAX_ADDRESS_WIDTH) - 1;
+            domain->iova_allocator = iova_allocator_create(domain->iova_start, 
+                                                          domain->iova_end);
+            break;
+            
+        case IOMMU_DOMAIN_IDENTITY:
+            domain->iova_start = 0;
+            domain->iova_end = UINT64_MAX;
+            break;
+            
+        default:
+            break;
+    }
+    
+    spin_lock(&iommu_system.domains_lock);
+    list_add_tail(&domain->list, &iommu_system.domains);
+    spin_unlock(&iommu_system.domains_lock);
+    
+    return domain;
+}
+
+/* Free domain */
+void iommu_domain_free(iommu_domain_t* domain) {
+    if (!domain) {
+        return;
+    }
+    
+    /* Decrease reference count */
+    if (!atomic32_dec_and_test(&domain->refcount)) {
+        return; /* Still has references */
+    }
+    
+    /* Detach all devices */
+    spin_lock(&domain->device_lock);
+    while (!list_empty(&domain->devices)) {
+        iommu_device_t* device = (iommu_device_t*)((char*)domain->devices.next - offsetof(iommu_device_t, list));
+        spin_unlock(&domain->device_lock);
+        
+        if (domain->iommu && domain->iommu->ops->detach_device) {
+            domain->iommu->ops->detach_device(domain, device);
+        }
+        
+        spin_lock(&domain->device_lock);
+    }
+    spin_unlock(&domain->device_lock);
+    
+    /* Free page tables */
+    if (domain->iommu && domain->iommu->ops->domain_free) {
+        domain->iommu->ops->domain_free(domain);
+    }
+    
+    /* Free IOVA allocator */
+    if (domain->iova_allocator) {
+        iova_allocator_destroy(domain->iova_allocator);
+    }
+    
+    /* Remove from global list */
+    spin_lock(&iommu_system.domains_lock);
+    list_del(&domain->list);
+    spin_unlock(&iommu_system.domains_lock);
+    
+    /* Signal completion for any waiters */
+    complete_all(&domain->destroy_completion);
+    
+    /* Free the domain */
+    slab_free_to_cache(iommu_system.domain_pool, domain);
+}
+
+/* Attach device to domain */
+int iommu_attach_device(iommu_domain_t* domain, iommu_device_t* device) {
+    if (!domain || !device || !device->iommu) {
+        return -1;
+    }
+    
+    /* Check if device is already attached to a domain */
+    if (device->domain) {
+        if (device->domain == domain) {
+            return 0; /* Already attached to this domain */
+        }
+        
+        /* Detach from current domain first */
+        iommu_detach_device(device->domain, device);
+    }
+    
+    /* Attach to new domain */
+    int result = 0;
+    if (device->iommu->ops->attach_device) {
+        result = device->iommu->ops->attach_device(domain, device);
+    }
+    
+    if (result == 0) {
+        /* Update device and domain state */
+        device->domain = domain;
+        domain->iommu = device->iommu;
+        
+        spin_lock(&domain->device_lock);
+        list_add_tail(&device->list, &domain->devices);
+        domain->device_count++;
+        spin_unlock(&domain->device_lock);
+        
+        atomic32_inc(&domain->refcount);
+    }
+    
+    return result;
+}
+
+/* Detach device from domain */
+int iommu_detach_device(iommu_domain_t* domain, iommu_device_t* device) {
+    if (!domain || !device || device->domain != domain) {
+        return -1;
+    }
+    
+    /* Detach from hardware */
+    int result = 0;
+    if (device->iommu->ops->detach_device) {
+        result = device->iommu->ops->detach_device(domain, device);
+    }
+    
+    /* Update device and domain state */
+    device->domain = NULL;
+    
+    spin_lock(&domain->device_lock);
+    list_del(&device->list);
+    domain->device_count--;
+    spin_unlock(&domain->device_lock);
+    
+    atomic32_dec(&domain->refcount);
+    
+    return result;
+}
+
+/* Map memory region in IOMMU domain */
+int iommu_map(iommu_domain_t* domain, uint64_t iova, uint64_t paddr, 
+              size_t size, uint32_t flags) {
+    if (!domain || !domain->iommu || !domain->iommu->ops->map) {
+        return -1;
+    }
+    
+    /* Align addresses and size to page boundaries */
+    uint64_t aligned_iova = iova & IOMMU_PAGE_MASK;
+    uint64_t aligned_paddr = paddr & IOMMU_PAGE_MASK;
+    size_t aligned_size = ALIGN_UP(size + (iova - aligned_iova), IOMMU_PAGE_SIZE);
+    
+    /* Perform the mapping */
+    int result = domain->iommu->ops->map(domain, aligned_iova, aligned_paddr, 
+                                        aligned_size, flags);
+    
+    if (result == 0) {
+        domain->mappings_created++;
+        iommu_system.total_mappings++;
+    }
+    
+    return result;
+}
+
+/* Unmap memory region from IOMMU domain */
+int iommu_unmap(iommu_domain_t* domain, uint64_t iova, size_t size) {
+    if (!domain || !domain->iommu || !domain->iommu->ops->unmap) {
+        return -1;
+    }
+    
+    /* Align address and size to page boundaries */
+    uint64_t aligned_iova = iova & IOMMU_PAGE_MASK;
+    size_t aligned_size = ALIGN_UP(size + (iova - aligned_iova), IOMMU_PAGE_SIZE);
+    
+    /* Perform the unmapping */
+    int result = domain->iommu->ops->unmap(domain, aligned_iova, aligned_size);
+    
+    if (result == 0) {
+        domain->mappings_destroyed++;
+        iommu_system.total_unmappings++;
+        
+        /* Flush TLB if not using lazy unmapping */
+        if (!iommu_system.lazy_unmapping) {
+            if (domain->iommu->ops->flush_tlb_range) {
+                domain->iommu->ops->flush_tlb_range(domain, aligned_iova, 
+                                                   aligned_iova + aligned_size);
+            }
+        }
+    }
+    
+    return result;
+}
+
+/* Translate IOVA to physical address */
+uint64_t iommu_iova_to_phys(iommu_domain_t* domain, uint64_t iova) {
+    if (!domain || !domain->iommu || !domain->iommu->ops->iova_to_phys) {
+        return 0;
+    }
+    
+    return domain->iommu->ops->iova_to_phys(domain, iova);
+}
+
+/* Flush IOMMU TLB */
+void iommu_flush_tlb(iommu_domain_t* domain) {
+    if (!domain || !domain->iommu || !domain->iommu->ops->flush_tlb) {
+        return;
+    }
+    
+    domain->iommu->ops->flush_tlb(domain);
+    domain->tlb_flushes++;
+}
+
+/* Setup device for IOMMU usage */
+static int iommu_setup_device(struct pci_device* pci_dev) {
+    /* Find appropriate IOMMU unit for this device */
+    iommu_unit_t* iommu_unit = NULL;
+    
+    spin_lock(&iommu_system.units_lock);
+    /* Search through IOMMU units - simplified loop */
+    struct list_head* pos;
+    for (pos = iommu_system.iommu_units.next; pos != &iommu_system.iommu_units; pos = pos->next) {
+        iommu_unit_t* iommu_unit = (iommu_unit_t*)((char*)pos - offsetof(iommu_unit_t, list));
+        /* Check if this IOMMU can handle the device */
+        /* Implementation depends on IOMMU type and device location */
+        break; /* For now, use first available IOMMU */
+    }
+    spin_unlock(&iommu_system.units_lock);
+    
+    if (!iommu_unit) {
+        return -1; /* No suitable IOMMU found */
+    }
+    
+    /* Create IOMMU device structure */
+    iommu_device_t* iommu_dev = slab_alloc_from_cache(iommu_system.device_pool);
+    if (!iommu_dev) {
+        return -1;
+    }
+    
+    memset(iommu_dev, 0, sizeof(iommu_device_t));
+    
+    /* Fill device information */
+    struct pci_device_ext* pci_ext = (struct pci_device_ext*)pci_dev;
+    iommu_dev->segment = pci_ext->segment;
+    iommu_dev->bus = pci_dev->bus;
+    iommu_dev->device = pci_dev->device;
+    iommu_dev->function = pci_dev->function;
+    iommu_dev->device_id = (pci_dev->bus << 8) | (pci_dev->device << 3) | pci_dev->function;
+    iommu_dev->requester_id = iommu_dev->device_id;
+    iommu_dev->iommu = iommu_unit;
+    
+    /* Check device capabilities */
+    if (pci_ext->capabilities & PCI_CAP_ATS) {
+        iommu_dev->ats_enabled = true;
+    }
+    if (pci_ext->capabilities & PCI_CAP_PASID) {
+        iommu_dev->pasid_enabled = true;
+        iommu_dev->max_pasids = pci_get_max_pasids(pci_dev);
+    }
+    if (pci_ext->capabilities & PCI_CAP_PRI) {
+        iommu_dev->pri_enabled = true;
+    }
+    
+    /* Attach to default domain */
+    int result = iommu_attach_device(iommu_system.default_domain, iommu_dev);
+    if (result != 0) {
+        console_printf("IOMMU: Failed to attach device %02x:%02x.%d to default domain\n",
+                       pci_dev->bus, pci_dev->device, pci_dev->function);
+        slab_free_to_cache(iommu_system.device_pool, iommu_dev);
+        return result;
+    }
+    
+    /* Add to global device list */
+    spin_lock(&iommu_system.devices_lock);
+    list_add_tail(&iommu_dev->list, &iommu_system.devices);
+    hash_table_insert(iommu_system.device_hash, &iommu_dev->device_id, iommu_dev);
+    spin_unlock(&iommu_system.devices_lock);
+    
+    /* Store IOMMU device in PCI device */
+    pci_ext->iommu_device = iommu_dev;
+    
+    console_printf("IOMMU: Set up device %02x:%02x.%d with IOMMU unit %d\n",
+                   pci_dev->bus, pci_dev->device, pci_dev->function, 
+                   iommu_unit->unit_id);
+    
+    return 0;
+}
+
+/* Fault handler work function */
+static void iommu_fault_handler(struct work_struct* work) {
+    iommu_unit_t* unit = container_of(work, iommu_unit_t, fault_work);
+    
+    /* Process faults from the fault queue */
+    iommu_fault_t fault;
+    while (ring_buffer_read(unit->fault_queue, &fault, sizeof(fault)) == sizeof(fault)) {
+        unit->total_faults++;
+        iommu_system.total_faults++;
+        
+        console_printf("IOMMU: Fault on unit %d - device %04x, addr 0x%lx, type %d\n",
+                       unit->unit_id, fault.device_id, fault.fault_addr, fault.type);
+        
+        /* Find faulting device */
+        iommu_device_t* device = hash_table_lookup(iommu_system.device_hash, 
+                                                  &fault.device_id);
+        if (device) {
+            device->page_faults++;
+            
+            /* Handle specific fault types */
+            switch (fault.type) {
+                case IOMMU_FAULT_PAGE_NOT_PRESENT:
+                    /* Could implement demand paging here */
+                    console_printf("IOMMU: Page not present fault - device may need memory mapped\n");
+                    break;
+                    
+                case IOMMU_FAULT_ACCESS_VIOLATION:
+                    console_printf("IOMMU: Access violation - device attempted unauthorized access\n");
+                    break;
+                    
+                default:
+                    console_printf("IOMMU: Unhandled fault type %d\n", fault.type);
+                    break;
+            }
+        }
+    }
+}
+
+/* Create default domain */
+static iommu_domain_t* iommu_create_default_domain(iommu_domain_type_t type) {
+    iommu_domain_t* domain = iommu_domain_alloc(type);
+    if (!domain) {
+        return NULL;
+    }
+    
+    /* Configure domain parameters */
+    domain->address_width = IOMMU_MAX_ADDRESS_WIDTH;
+    domain->security_level = 1; /* Basic security */
+    
+    return domain;
+}
+
+/* Set up identity mapping domain */
+static int iommu_setup_identity_domain(void) {
+    iommu_system.identity_domain = iommu_create_default_domain(IOMMU_DOMAIN_IDENTITY);
+    if (!iommu_system.identity_domain) {
+        return -1;
+    }
+    
+    /* Identity domain maps physical addresses 1:1 */
+    console_printf("IOMMU: Created identity mapping domain\n");
+    return 0;
+}
+
+/* Get IOMMU system statistics */
+void iommu_get_stats(struct iommu_stats* stats) {
+    if (!stats) {
+        return;
+    }
+    
+    memset(stats, 0, sizeof(struct iommu_stats));
+    
+    stats->num_units = iommu_system.num_units;
+    stats->total_mappings = iommu_system.total_mappings;
+    stats->total_unmappings = iommu_system.total_unmappings;
+    stats->total_faults = iommu_system.total_faults;
+    
+    /* Count domains and devices */
+    spin_lock(&iommu_system.domains_lock);
+    struct list_head* pos;
+    for (pos = iommu_system.domains.next; pos != &iommu_system.domains; pos = pos->next) {
+        stats->num_domains++;
+    }
+    spin_unlock(&iommu_system.domains_lock);
+    
+    spin_lock(&iommu_system.devices_lock);
+    for (pos = iommu_system.devices.next; pos != &iommu_system.devices; pos = pos->next) {
+        stats->num_devices++;
+    }
+    spin_unlock(&iommu_system.devices_lock);
+}
+
+/* Find device by ID */
+iommu_device_t* iommu_find_device(uint32_t device_id) {
+    return hash_table_lookup(iommu_system.device_hash, &device_id);
+}
+
+/* Check if IOMMU is available */
+bool iommu_present(void) {
+    return iommu_system.initialized && iommu_system.num_units > 0;
+}
+
+/* PCI device integration */
+int iommu_add_pci_device(struct pci_device* pci_dev) {
+    if (!iommu_present() || !pci_dev) {
+        return -1;
+    }
+    
+    return iommu_setup_device(pci_dev);
+}
+
+/* Remove PCI device */
+int iommu_remove_pci_device(struct pci_device* pci_dev) {
+    struct pci_device_ext* pci_ext = (struct pci_device_ext*)pci_dev;
+    if (!pci_dev || !pci_ext->iommu_device) {
+        return -1;
+    }
+    
+    iommu_device_t* iommu_dev = (iommu_device_t*)pci_ext->iommu_device;
+    
+    /* Detach from domain */
+    if (iommu_dev->domain) {
+        iommu_detach_device(iommu_dev->domain, iommu_dev);
+    }
+    
+    /* Remove from global lists */
+    spin_lock(&iommu_system.devices_lock);
+    list_del(&iommu_dev->list);
+    hash_table_remove(iommu_system.device_hash, &iommu_dev->device_id);
+    spin_unlock(&iommu_system.devices_lock);
+    
+    /* Free device structure */
+    slab_free_to_cache(iommu_system.device_pool, iommu_dev);
+    pci_ext->iommu_device = NULL;
+    
+    return 0;
+}

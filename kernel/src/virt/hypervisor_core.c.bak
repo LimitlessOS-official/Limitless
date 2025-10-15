@@ -1,0 +1,660 @@
+/*
+ * LimitlessOS Hypervisor Core Implementation
+ * Type-1 hypervisor with hardware virtualization support
+ */
+
+#include "hypervisor_core.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <signal.h>
+#include <time.h>
+
+/* Global hypervisor system */
+hypervisor_system_t hypervisor_system = {0};
+
+/* Threading support */
+static pthread_mutex_t hypervisor_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Hardware feature detection */
+static bool detect_intel_vtx(void) {
+    uint32_t eax, ebx, ecx, edx;
+    
+    /* Check CPUID for VMX support */
+    __asm__ __volatile__("cpuid"
+                        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                        : "a"(1));
+    
+    return (ecx & (1 << 5)) != 0; /* VMX bit */
+}
+
+static bool detect_amd_svm(void) {
+    uint32_t eax, ebx, ecx, edx;
+    
+    /* Check CPUID for SVM support */
+    __asm__ __volatile__("cpuid"
+                        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                        : "a"(0x80000001));
+    
+    return (ecx & (1 << 2)) != 0; /* SVM bit */
+}
+
+static bool detect_iommu(void) {
+    /* Check for IOMMU support via /sys */
+    struct stat st;
+    return (stat("/sys/class/iommu", &st) == 0);
+}
+
+static bool detect_sr_iov(void) {
+    /* Check for SR-IOV capability */
+    FILE *fp = fopen("/proc/bus/pci/devices", "r");
+    if (!fp) return false;
+    
+    char line[256];
+    bool sr_iov_found = false;
+    
+    while (fgets(line, sizeof(line), fp)) {
+        /* Look for SR-IOV capability in PCI devices */
+        if (strstr(line, "10de") || strstr(line, "8086") || strstr(line, "1002")) {
+            sr_iov_found = true;
+            break;
+        }
+    }
+    
+    fclose(fp);
+    return sr_iov_found;
+}
+
+/* Initialize hypervisor system */
+int hypervisor_init(void) {
+    memset(&hypervisor_system, 0, sizeof(hypervisor_system));
+    
+    printf("Initializing LimitlessOS Hypervisor...\n");
+    
+    /* Detect virtualization features */
+    hypervisor_detect_features();
+    
+    if (hypervisor_system.virt_features == VIRT_FEATURE_NONE) {
+        printf("Error: No hardware virtualization support detected\n");
+        return -1;
+    }
+    
+    /* Initialize VM mutex */
+    pthread_mutex_init(&hypervisor_system.vm_mutex, NULL);
+    
+    /* Get system resources */
+    FILE *meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo) {
+        char line[256];
+        while (fgets(line, sizeof(line), meminfo)) {
+            if (strncmp(line, "MemTotal:", 9) == 0) {
+                sscanf(line, "MemTotal: %lu kB", &hypervisor_system.total_memory);
+                hypervisor_system.total_memory *= 1024; /* Convert to bytes */
+                break;
+            }
+        }
+        fclose(meminfo);
+    }
+    
+    /* Get CPU count */
+    hypervisor_system.total_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    hypervisor_system.available_cpus = hypervisor_system.total_cpus;
+    hypervisor_system.available_memory = hypervisor_system.total_memory;
+    
+    /* Default configuration */
+    hypervisor_system.container_support = true;
+    strcpy(hypervisor_system.container_runtime, "docker");
+    strcpy(hypervisor_system.default_bridge, "virbr0");
+    hypervisor_system.nat_enabled = true;
+    hypervisor_system.bridge_enabled = true;
+    
+    /* Migration settings */
+    hypervisor_system.migration_enabled = true;
+    hypervisor_system.migration_port = 49152;
+    strcpy(hypervisor_system.migration_interface, "eth0");
+    
+    /* Security settings */
+    hypervisor_system.secure_boot_required = false;
+    hypervisor_system.tpm_required = false;
+    hypervisor_system.encryption_required = false;
+    
+    /* Create default storage pool */
+    strcpy(hypervisor_system.storage_pools[0].name, "default");
+    strcpy(hypervisor_system.storage_pools[0].path, "/var/lib/limitlessos/vms");
+    strcpy(hypervisor_system.storage_pools[0].format, "dir");
+    hypervisor_system.storage_pools[0].capacity = hypervisor_system.total_memory / 2;
+    hypervisor_system.storage_pools[0].available = hypervisor_system.storage_pools[0].capacity;
+    hypervisor_system.storage_pool_count = 1;
+    
+    /* Create VM directory */
+    mkdir("/var/lib/limitlessos", 0755);
+    mkdir("/var/lib/limitlessos/vms", 0755);
+    
+    hypervisor_system.initialized = true;
+    
+    printf("Hypervisor initialized successfully\n");
+    printf("Hardware features: ");
+    if (hypervisor_system.virt_features & VIRT_FEATURE_VT_X) printf("VT-x ");
+    if (hypervisor_system.virt_features & VIRT_FEATURE_AMD_V) printf("AMD-V ");
+    if (hypervisor_system.virt_features & VIRT_FEATURE_IOMMU) printf("IOMMU ");
+    if (hypervisor_system.virt_features & VIRT_FEATURE_SR_IOV) printf("SR-IOV ");
+    printf("\n");
+    printf("System resources: %u CPUs, %lu MB RAM\n", 
+           hypervisor_system.total_cpus, hypervisor_system.total_memory / (1024 * 1024));
+    
+    return 0;
+}
+
+/* Cleanup hypervisor */
+void hypervisor_exit(void) {
+    if (!hypervisor_system.initialized) return;
+    
+    printf("Shutting down hypervisor...\n");
+    
+    /* Stop all running VMs */
+    for (uint32_t i = 0; i < hypervisor_system.vm_count; i++) {
+        vm_instance_t *vm = &hypervisor_system.vms[i];
+        if (vm->config.state == VM_STATE_RUNNING) {
+            printf("Stopping VM: %s\n", vm->config.name);
+            vm_stop(vm->config.name, false);
+        }
+    }
+    
+    pthread_mutex_destroy(&hypervisor_system.vm_mutex);
+    
+    hypervisor_system.initialized = false;
+    memset(&hypervisor_system, 0, sizeof(hypervisor_system));
+}
+
+/* Detect virtualization features */
+int hypervisor_detect_features(void) {
+    hypervisor_system.virt_features = VIRT_FEATURE_NONE;
+    
+    /* Check Intel VT-x */
+    if (detect_intel_vtx()) {
+        hypervisor_system.virt_features |= VIRT_FEATURE_VT_X;
+        
+        /* Check for EPT support */
+        uint32_t eax, ebx, ecx, edx;
+        __asm__ __volatile__("cpuid"
+                            : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                            : "a"(0x48000010));
+        if (eax & (1 << 6)) {
+            hypervisor_system.virt_features |= VIRT_FEATURE_EPT;
+        }
+    }
+    
+    /* Check AMD SVM */
+    if (detect_amd_svm()) {
+        hypervisor_system.virt_features |= VIRT_FEATURE_AMD_V;
+        
+        /* AMD NPT support is usually available with SVM */
+        hypervisor_system.virt_features |= VIRT_FEATURE_NPT;
+    }
+    
+    /* Check IOMMU */
+    if (detect_iommu()) {
+        hypervisor_system.virt_features |= VIRT_FEATURE_IOMMU;
+    }
+    
+    /* Check SR-IOV */
+    if (detect_sr_iov()) {
+        hypervisor_system.virt_features |= VIRT_FEATURE_SR_IOV;
+    }
+    
+    /* Check for nested virtualization support */
+    if (access("/sys/module/kvm_intel/parameters/nested", F_OK) == 0 ||
+        access("/sys/module/kvm_amd/parameters/nested", F_OK) == 0) {
+        hypervisor_system.virt_features |= VIRT_FEATURE_NESTED_VIRT;
+    }
+    
+    /* Check for memory encryption (SEV/TXT) */
+    if (access("/dev/sev", F_OK) == 0) {
+        hypervisor_system.virt_features |= VIRT_FEATURE_ENCRYPTED_MEM;
+    }
+    
+    return hypervisor_system.virt_features;
+}
+
+/* Check if feature is available */
+bool hypervisor_feature_available(virtualization_feature_t feature) {
+    return (hypervisor_system.virt_features & feature) != 0;
+}
+
+/* Create new VM */
+int vm_create(const vm_config_t *config) {
+    if (!config || !hypervisor_system.initialized) return -EINVAL;
+    
+    pthread_mutex_lock(&hypervisor_system.vm_mutex);
+    
+    /* Check if VM already exists */
+    for (uint32_t i = 0; i < hypervisor_system.vm_count; i++) {
+        if (strcmp(hypervisor_system.vms[i].config.name, config->name) == 0) {
+            pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+            return -EEXIST;
+        }
+    }
+    
+    /* Check resource limits */
+    if (hypervisor_system.vm_count >= 256) {
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        return -ENOMEM;
+    }
+    
+    /* Validate configuration */
+    if (vm_config_validate(config) != 0) {
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        return -EINVAL;
+    }
+    
+    /* Create VM instance */
+    vm_instance_t *vm = &hypervisor_system.vms[hypervisor_system.vm_count];
+    memset(vm, 0, sizeof(vm_instance_t));
+    
+    vm->config = *config;
+    vm->config.state = VM_STATE_STOPPED;
+    vm->process_id = 0;
+    vm->start_time = 0;
+    vm->last_heartbeat = time(NULL);
+    
+    /* Initialize mutex */
+    pthread_mutex_init(&vm->state_mutex, NULL);
+    
+    /* Create VM directory */
+    char vm_dir[512];
+    snprintf(vm_dir, sizeof(vm_dir), "/var/lib/limitlessos/vms/%s", config->name);
+    mkdir(vm_dir, 0755);
+    
+    /* Save VM configuration */
+    char config_file[512];
+    snprintf(config_file, sizeof(config_file), "%s/config.xml", vm_dir);
+    vm_config_to_file(config, config_file);
+    
+    hypervisor_system.vm_count++;
+    hypervisor_system.metrics.total_vms_created++;
+    
+    pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+    
+    printf("Created VM: %s (type: %s)\n", config->name, vm_type_name(config->type));
+    return 0;
+}
+
+/* Start VM */
+int vm_start(const char *vm_name) {
+    if (!vm_name || !hypervisor_system.initialized) return -EINVAL;
+    
+    pthread_mutex_lock(&hypervisor_system.vm_mutex);
+    
+    /* Find VM */
+    vm_instance_t *vm = NULL;
+    for (uint32_t i = 0; i < hypervisor_system.vm_count; i++) {
+        if (strcmp(hypervisor_system.vms[i].config.name, vm_name) == 0) {
+            vm = &hypervisor_system.vms[i];
+            break;
+        }
+    }
+    
+    if (!vm) {
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        return -ENOENT;
+    }
+    
+    if (vm->config.state != VM_STATE_STOPPED) {
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        return -EINVAL;
+    }
+    
+    vm->config.state = VM_STATE_STARTING;
+    
+    /* Build VM command based on type */
+    char cmd[2048];
+    switch (vm->config.type) {
+        case VM_TYPE_HVM:
+        case VM_TYPE_GPU_VM:
+            /* Use QEMU/KVM for hardware VMs */
+            snprintf(cmd, sizeof(cmd), 
+                "qemu-system-x86_64 "
+                "-enable-kvm "
+                "-name %s "
+                "-uuid %s "
+                "-smp %u,cores=%u,threads=%u "
+                "-m %luM "
+                "-daemonize "
+                "-pidfile /var/lib/limitlessos/vms/%s/qemu.pid",
+                vm->config.name,
+                vm->config.uuid,
+                vm->config.cpu.vcpu_count,
+                vm->config.cpu.cores_per_socket,
+                vm->config.cpu.threads_per_core,
+                vm->config.memory.memory_size / (1024 * 1024),
+                vm->config.name);
+            
+            /* Add storage devices */
+            for (uint32_t i = 0; i < vm->config.storage_device_count; i++) {
+                vm_storage_device_t *storage = &vm->config.storage_devices[i];
+                char storage_arg[256];
+                snprintf(storage_arg, sizeof(storage_arg), 
+                    " -drive file=%s,format=%s,if=%s",
+                    storage->device_path,
+                    storage->format,
+                    (storage->interface == STORAGE_INTERFACE_VIRTIO_BLK) ? "virtio" : "ide");
+                strncat(cmd, storage_arg, sizeof(cmd) - strlen(cmd) - 1);
+            }
+            
+            /* Add network devices */
+            for (uint32_t i = 0; i < vm->config.network_device_count; i++) {
+                vm_network_device_t *net = &vm->config.network_devices[i];
+                char net_arg[256];
+                snprintf(net_arg, sizeof(net_arg),
+                    " -netdev tap,id=net%u,ifname=%s,script=no,downscript=no "
+                    "-device virtio-net-pci,netdev=net%u,mac=%s",
+                    i, net->interface_name, i, net->mac_address);
+                strncat(cmd, net_arg, sizeof(cmd) - strlen(cmd) - 1);
+            }
+            
+            /* GPU configuration */
+            if (vm->config.gpu.type == GPU_VIRT_PASSTHROUGH) {
+                char gpu_arg[256];
+                snprintf(gpu_arg, sizeof(gpu_arg), " -vga none -device vfio-pci,host=%s", 
+                    vm->config.gpu.gpu_device);
+                strncat(cmd, gpu_arg, sizeof(cmd) - strlen(cmd) - 1);
+            }
+            break;
+            
+        case VM_TYPE_CONTAINER:
+            /* Use Docker/Podman for containers */
+            snprintf(cmd, sizeof(cmd), "docker run -d --name %s", vm->config.name);
+            
+            /* Add resource limits */
+            char resource_args[256];
+            snprintf(resource_args, sizeof(resource_args), 
+                " --cpus=%u --memory=%luM", 
+                vm->config.cpu.vcpu_count,
+                vm->config.memory.memory_size / (1024 * 1024));
+            strncat(cmd, resource_args, sizeof(cmd) - strlen(cmd) - 1);
+            
+            /* Add the container image */
+            strncat(cmd, " ubuntu:latest", sizeof(cmd) - strlen(cmd) - 1);
+            break;
+            
+        case VM_TYPE_MICROVM:
+            /* Use Firecracker for microVMs */
+            snprintf(cmd, sizeof(cmd), 
+                "firecracker --api-sock /var/lib/limitlessos/vms/%s/firecracker.sock",
+                vm->config.name);
+            break;
+            
+        default:
+            pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+            return -ENOTSUP;
+    }
+    
+    /* Execute VM start command */
+    int result = system(cmd);
+    
+    if (WIFEXITED(result) && WEXITSTATUS(result) == 0) {
+        vm->config.state = VM_STATE_RUNNING;
+        vm->start_time = time(NULL);
+        
+        /* Get process ID */
+        char pid_file[512];
+        snprintf(pid_file, sizeof(pid_file), "/var/lib/limitlessos/vms/%s/qemu.pid", vm_name);
+        FILE *fp = fopen(pid_file, "r");
+        if (fp) {
+            fscanf(fp, "%d", &vm->process_id);
+            fclose(fp);
+        }
+        
+        /* Update resource usage */
+        hypervisor_system.available_memory -= vm->config.memory.memory_size;
+        hypervisor_system.available_cpus -= vm->config.cpu.vcpu_count;
+        
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        
+        printf("Started VM: %s (PID: %d)\n", vm_name, vm->process_id);
+        return 0;
+    } else {
+        vm->config.state = VM_STATE_CRASHED;
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        return -1;
+    }
+}
+
+/* Stop VM */
+int vm_stop(const char *vm_name, bool force) {
+    if (!vm_name || !hypervisor_system.initialized) return -EINVAL;
+    
+    pthread_mutex_lock(&hypervisor_system.vm_mutex);
+    
+    /* Find VM */
+    vm_instance_t *vm = NULL;
+    for (uint32_t i = 0; i < hypervisor_system.vm_count; i++) {
+        if (strcmp(hypervisor_system.vms[i].config.name, vm_name) == 0) {
+            vm = &hypervisor_system.vms[i];
+            break;
+        }
+    }
+    
+    if (!vm) {
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        return -ENOENT;
+    }
+    
+    if (vm->config.state != VM_STATE_RUNNING && vm->config.state != VM_STATE_PAUSED) {
+        pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+        return -EINVAL;
+    }
+    
+    vm->config.state = VM_STATE_STOPPING;
+    
+    /* Stop VM based on type */
+    char cmd[256];
+    switch (vm->config.type) {
+        case VM_TYPE_HVM:
+        case VM_TYPE_GPU_VM:
+        case VM_TYPE_MICROVM:
+            if (force) {
+                if (vm->process_id > 0) {
+                    kill(vm->process_id, SIGKILL);
+                }
+            } else {
+                /* Try graceful shutdown via QEMU monitor */
+                snprintf(cmd, sizeof(cmd), 
+                    "echo 'system_powerdown' | socat - UNIX-CONNECT:/var/lib/limitlessos/vms/%s/monitor.sock",
+                    vm_name);
+                system(cmd);
+                
+                /* Wait up to 30 seconds for graceful shutdown */
+                for (int i = 0; i < 30; i++) {
+                    if (kill(vm->process_id, 0) != 0) break;
+                    sleep(1);
+                }
+                
+                /* Force kill if still running */
+                if (kill(vm->process_id, 0) == 0) {
+                    kill(vm->process_id, SIGKILL);
+                }
+            }
+            break;
+            
+        case VM_TYPE_CONTAINER:
+            snprintf(cmd, sizeof(cmd), "docker %s %s", force ? "kill" : "stop", vm_name);
+            system(cmd);
+            snprintf(cmd, sizeof(cmd), "docker rm %s", vm_name);
+            system(cmd);
+            break;
+            
+        default:
+            break;
+    }
+    
+    /* Update state and resources */
+    vm->config.state = VM_STATE_STOPPED;
+    vm->process_id = 0;
+    
+    hypervisor_system.available_memory += vm->config.memory.memory_size;
+    hypervisor_system.available_cpus += vm->config.cpu.vcpu_count;
+    
+    pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+    
+    printf("%s VM: %s\n", force ? "Killed" : "Stopped", vm_name);
+    return 0;
+}
+
+/* Get VM state */
+vm_state_t vm_get_state(const char *vm_name) {
+    if (!vm_name || !hypervisor_system.initialized) return VM_STATE_STOPPED;
+    
+    pthread_mutex_lock(&hypervisor_system.vm_mutex);
+    
+    for (uint32_t i = 0; i < hypervisor_system.vm_count; i++) {
+        if (strcmp(hypervisor_system.vms[i].config.name, vm_name) == 0) {
+            vm_state_t state = hypervisor_system.vms[i].config.state;
+            pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+            return state;
+        }
+    }
+    
+    pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+    return VM_STATE_STOPPED;
+}
+
+/* List VMs */
+int vm_list(char vm_names[][64], int max_vms) {
+    if (!vm_names || max_vms <= 0) return -EINVAL;
+    
+    pthread_mutex_lock(&hypervisor_system.vm_mutex);
+    
+    int count = 0;
+    for (uint32_t i = 0; i < hypervisor_system.vm_count && count < max_vms; i++) {
+        strcpy(vm_names[count], hypervisor_system.vms[i].config.name);
+        count++;
+    }
+    
+    pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+    return count;
+}
+
+/* Count running VMs */
+int vm_count_running(void) {
+    pthread_mutex_lock(&hypervisor_system.vm_mutex);
+    
+    int count = 0;
+    for (uint32_t i = 0; i < hypervisor_system.vm_count; i++) {
+        if (hypervisor_system.vms[i].config.state == VM_STATE_RUNNING) {
+            count++;
+        }
+    }
+    
+    pthread_mutex_unlock(&hypervisor_system.vm_mutex);
+    return count;
+}
+
+/* Validate VM configuration */
+int vm_config_validate(const vm_config_t *config) {
+    if (!config) return -EINVAL;
+    
+    /* Check name */
+    if (strlen(config->name) == 0 || strlen(config->name) >= 64) {
+        return -EINVAL;
+    }
+    
+    /* Check CPU configuration */
+    if (config->cpu.vcpu_count == 0 || config->cpu.vcpu_count > hypervisor_system.total_cpus) {
+        return -EINVAL;
+    }
+    
+    /* Check memory configuration */
+    if (config->memory.memory_size == 0 || 
+        config->memory.memory_size > hypervisor_system.total_memory) {
+        return -EINVAL;
+    }
+    
+    /* Validate storage devices */
+    for (uint32_t i = 0; i < config->storage_device_count; i++) {
+        const vm_storage_device_t *storage = &config->storage_devices[i];
+        if (strlen(storage->device_path) == 0) {
+            return -EINVAL;
+        }
+    }
+    
+    return 0;
+}
+
+/* Utility functions */
+const char *vm_state_name(vm_state_t state) {
+    static const char *names[] = {
+        "Stopped", "Starting", "Running", "Paused", "Suspended",
+        "Stopping", "Crashed", "Migrating", "Snapshotting", "Restoring"
+    };
+    
+    if (state >= 0 && state < sizeof(names) / sizeof(names[0])) {
+        return names[state];
+    }
+    return "Unknown";
+}
+
+const char *vm_type_name(vm_type_t type) {
+    static const char *names[] = {
+        "HVM", "Container", "Unikernel", "MicroVM", "GPU-VM", "Real-time"
+    };
+    
+    if (type >= 0 && type < sizeof(names) / sizeof(names[0])) {
+        return names[type];
+    }
+    return "Unknown";
+}
+
+const char *virtualization_feature_name(virtualization_feature_t feature) {
+    switch (feature) {
+        case VIRT_FEATURE_VT_X: return "Intel VT-x";
+        case VIRT_FEATURE_AMD_V: return "AMD-V";
+        case VIRT_FEATURE_EPT: return "EPT";
+        case VIRT_FEATURE_NPT: return "NPT";
+        case VIRT_FEATURE_IOMMU: return "IOMMU";
+        case VIRT_FEATURE_SR_IOV: return "SR-IOV";
+        case VIRT_FEATURE_GPU_PV: return "GPU Paravirtualization";
+        case VIRT_FEATURE_NESTED_VIRT: return "Nested Virtualization";
+        case VIRT_FEATURE_SECURE_BOOT: return "Secure Boot";
+        case VIRT_FEATURE_ENCRYPTED_MEM: return "Memory Encryption";
+        default: return "Unknown";
+    }
+}
+
+/* Save VM configuration to file */
+int vm_config_to_file(const vm_config_t *config, const char *config_file) {
+    if (!config || !config_file) return -EINVAL;
+    
+    FILE *fp = fopen(config_file, "w");
+    if (!fp) return -errno;
+    
+    /* Write XML configuration */
+    fprintf(fp, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    fprintf(fp, "<vm>\n");
+    fprintf(fp, "  <name>%s</name>\n", config->name);
+    fprintf(fp, "  <uuid>%s</uuid>\n", config->uuid);
+    fprintf(fp, "  <type>%s</type>\n", vm_type_name(config->type));
+    
+    fprintf(fp, "  <cpu>\n");
+    fprintf(fp, "    <vcpus>%u</vcpus>\n", config->cpu.vcpu_count);
+    fprintf(fp, "    <cores_per_socket>%u</cores_per_socket>\n", config->cpu.cores_per_socket);
+    fprintf(fp, "    <threads_per_core>%u</threads_per_core>\n", config->cpu.threads_per_core);
+    fprintf(fp, "  </cpu>\n");
+    
+    fprintf(fp, "  <memory>\n");
+    fprintf(fp, "    <size>%lu</size>\n", config->memory.memory_size);
+    fprintf(fp, "    <max_size>%lu</max_size>\n", config->memory.max_memory_size);
+    fprintf(fp, "  </memory>\n");
+    
+    fprintf(fp, "</vm>\n");
+    
+    fclose(fp);
+    return 0;
+}

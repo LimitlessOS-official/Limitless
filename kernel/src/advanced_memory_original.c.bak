@@ -1,0 +1,943 @@
+/*
+ * Advanced Memory Management Features
+ * NUMA support, memory compression, swap, and advanced allocation strategies
+ */
+
+#include "kernel.h"
+#include "hal.h"
+/* #include "pmm.h" - not available, using kernel.h instead */
+/* #include "vmm.h" - not available, using kernel.h instead */
+
+/* Logging macros */
+#define KLOG_INFO(subsys, fmt, ...) kprintf("[INFO:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_DEBUG(subsys, fmt, ...) kprintf("[DEBUG:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_ERROR(subsys, fmt, ...) kprintf("[ERROR:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+
+/* NUMA topology */
+#define MAX_NUMA_NODES      64
+#define MAX_CPUS_PER_NODE   32
+#define NUMA_DISTANCE_LOCAL 10
+#define NUMA_DISTANCE_REMOTE 20
+#define MAX_ORDER           12  /* Maximum buddy allocation order */
+
+/* Stub functions for missing PMM functions */
+static uint64_t pmm_get_total_memory(void) __attribute__((unused));
+static uint64_t pmm_get_free_memory(void) __attribute__((unused));
+static uint32_t hal_cpu_get_current_id(void) __attribute__((unused));
+
+static uint64_t pmm_get_total_memory(void) {
+    return 1024 * 1024 * 1024;  /* 1GB default */
+}
+
+static uint64_t pmm_get_free_memory(void) {
+    return 512 * 1024 * 1024;   /* 512MB default */
+}
+
+static uint32_t hal_cpu_get_current_id(void) {
+    return hal_cpu_id();
+}
+
+/* Memory compression */
+#define COMPRESSED_PAGE_SIZE    2048
+#define COMPRESSION_THRESHOLD   80  /* Compress if > 80% savings */
+#define MAX_COMPRESSION_RATIO   8   /* Maximum compression ratio */
+
+/* Swap configuration */
+#define MAX_SWAP_DEVICES    16
+#define SWAP_PAGE_SIZE      4096
+#define SWAP_CLUSTER_SIZE   8       /* Pages per swap cluster */
+
+/* Memory balloon */
+#define BALLOON_PAGE_SIZE   4096
+#define BALLOON_MIN_PAGES   1024
+#define BALLOON_MAX_PAGES   (256 * 1024)   /* 1GB max balloon */
+
+/* NUMA node structure */
+typedef struct numa_node {
+    uint32_t node_id;               /* Node ID */
+    uint64_t memory_start;          /* Start of memory range */
+    uint64_t memory_size;           /* Size of memory range */
+    uint64_t free_memory;           /* Free memory in this node */
+    uint32_t cpu_mask;              /* CPUs in this node */
+    uint32_t cpu_count;             /* Number of CPUs */
+    
+    /* Memory statistics */
+    uint64_t allocations;           /* Total allocations */
+    uint64_t local_allocations;     /* Local allocations */
+    uint64_t remote_allocations;    /* Remote allocations */
+    
+    /* Free page lists per order */
+    void* free_lists[MAX_ORDER];    /* Free page lists */
+    uint32_t free_counts[MAX_ORDER]; /* Free page counts */
+    
+    /* Node-specific allocators */
+    void* slab_allocator;           /* SLAB allocator */
+    void* buddy_allocator;          /* Buddy allocator */
+    
+    volatile uint32_t lock;         /* Node lock */
+} numa_node_t;
+
+/* Memory compression entry */
+typedef struct compressed_page {
+    uint64_t virtual_addr;          /* Original virtual address */
+    void* compressed_data;          /* Compressed data */
+    uint32_t compressed_size;       /* Compressed size */
+    uint32_t original_size;         /* Original size */
+    uint32_t algorithm;             /* Compression algorithm */
+    uint64_t access_time;           /* Last access time */
+    
+    struct compressed_page* next;   /* Hash chain */
+} compressed_page_t;
+
+/* Swap device structure */
+typedef struct swap_device {
+    uint32_t device_id;             /* Device ID */
+    char device_path[256];          /* Device path */
+    uint64_t size;                  /* Device size in bytes */
+    uint32_t page_size;             /* Page size */
+    uint64_t total_pages;           /* Total swap pages */
+    uint64_t free_pages;            /* Free swap pages */
+    uint8_t* bitmap;                /* Allocation bitmap */
+    uint32_t priority;              /* Swap priority */
+    bool active;                    /* Device active */
+    
+    /* Statistics */
+    uint64_t pages_in;              /* Pages swapped in */
+    uint64_t pages_out;             /* Pages swapped out */
+    uint64_t read_ops;              /* Read operations */
+    uint64_t write_ops;             /* Write operations */
+    
+    volatile uint32_t lock;         /* Device lock */
+} swap_device_t;
+
+/* Page table entry flags for advanced features */
+#define PTE_COMPRESSED      0x200   /* Page is compressed */
+#define PTE_SWAPPED         0x400   /* Page is swapped */
+#define PTE_NUMA_NODE       0x800   /* NUMA node hint */
+#define PTE_BALLOON         0x1000  /* Balloon page */
+
+/* Memory balloon structure */
+typedef struct memory_balloon {
+    uint64_t target_pages;          /* Target balloon size */
+    uint64_t current_pages;         /* Current balloon size */
+    void** balloon_pages;           /* Balloon page array */
+    uint64_t max_pages;             /* Maximum balloon size */
+    bool enabled;                   /* Balloon enabled */
+    
+    /* Statistics */
+    uint64_t inflate_count;         /* Inflation count */
+    uint64_t deflate_count;         /* Deflation count */
+    uint64_t total_inflated;        /* Total pages inflated */
+    uint64_t total_deflated;        /* Total pages deflated */
+    
+    volatile uint32_t lock;         /* Balloon lock */
+} memory_balloon_t;
+
+/* Memory hotplug structure */
+typedef struct memory_hotplug {
+    uint64_t base_address;          /* Base physical address */
+    uint64_t size;                  /* Size of memory region */
+    uint32_t numa_node;             /* NUMA node */
+    bool online;                    /* Memory is online */
+    bool removable;                 /* Memory is removable */
+    
+    struct memory_hotplug* next;    /* Next hotplug region */
+} memory_hotplug_t;
+
+/* Advanced memory manager state */
+static struct {
+    /* NUMA topology */
+    numa_node_t numa_nodes[MAX_NUMA_NODES]; /* NUMA nodes */
+    uint32_t numa_node_count;       /* Number of NUMA nodes */
+    uint8_t numa_distance[MAX_NUMA_NODES][MAX_NUMA_NODES]; /* Distance matrix */
+    bool numa_enabled;              /* NUMA support enabled */
+    
+    /* Memory compression */
+    compressed_page_t* compression_hash[1024]; /* Compression hash table */
+    uint64_t compressed_pages;      /* Number of compressed pages */
+    uint64_t compression_savings;   /* Bytes saved by compression */
+    bool compression_enabled;       /* Compression enabled */
+    
+    /* Swap subsystem */
+    swap_device_t swap_devices[MAX_SWAP_DEVICES]; /* Swap devices */
+    uint32_t swap_device_count;     /* Number of swap devices */
+    uint64_t total_swap_pages;      /* Total swap pages */
+    uint64_t free_swap_pages;       /* Free swap pages */
+    bool swap_enabled;              /* Swap enabled */
+    
+    /* Memory balloon */
+    memory_balloon_t balloon;       /* Memory balloon */
+    
+    /* Memory hotplug */
+    memory_hotplug_t* hotplug_regions; /* Hotplug regions */
+    uint32_t hotplug_count;         /* Number of hotplug regions */
+    
+    /* Global statistics */
+    uint64_t total_memory;          /* Total system memory */
+    uint64_t available_memory;      /* Available memory */
+    uint64_t cached_memory;         /* Cached memory */
+    uint64_t buffer_memory;         /* Buffer memory */
+    
+    volatile uint32_t lock;         /* Global lock */
+} advanced_mm;
+
+/* Initialize NUMA topology */
+static status_t init_numa_topology(void) {
+    KLOG_INFO("MEMORY", "Initializing NUMA topology");
+    
+    /* Detect NUMA nodes from ACPI SRAT table */
+    /* For now, create a simple single-node topology */
+    
+    numa_node_t* node = &advanced_mm.numa_nodes[0];
+    memset(node, 0, sizeof(*node));
+    
+    node->node_id = 0;
+    node->memory_start = 0x100000;  /* 1MB */
+    node->memory_size = pmm_get_total_memory() - 0x100000;
+    node->free_memory = pmm_get_free_memory();
+    node->cpu_mask = 0xFFFFFFFF;    /* All CPUs */
+    node->cpu_count = hal_cpu_count();
+    
+    /* Initialize free lists */
+    for (int order = 0; order < MAX_ORDER; order++) {
+        node->free_lists[order] = NULL;
+        node->free_counts[order] = 0;
+    }
+    
+    advanced_mm.numa_node_count = 1;
+    advanced_mm.numa_enabled = true;
+    
+    /* Initialize distance matrix */
+    for (int i = 0; i < MAX_NUMA_NODES; i++) {
+        for (int j = 0; j < MAX_NUMA_NODES; j++) {
+            if (i == j) {
+                advanced_mm.numa_distance[i][j] = NUMA_DISTANCE_LOCAL;
+            } else {
+                advanced_mm.numa_distance[i][j] = NUMA_DISTANCE_REMOTE;
+            }
+        }
+    }
+    
+    KLOG_INFO("MEMORY", "NUMA: %u nodes, %llu MB per node", 
+              advanced_mm.numa_node_count, 
+              node->memory_size / (1024 * 1024));
+    
+    return STATUS_OK;
+}
+
+/* Get preferred NUMA node for allocation */
+static uint32_t get_preferred_numa_node(void) {
+    uint32_t current_cpu = hal_cpu_get_current_id();
+    
+    /* Find NUMA node containing this CPU */
+    for (uint32_t i = 0; i < advanced_mm.numa_node_count; i++) {
+        numa_node_t* node = &advanced_mm.numa_nodes[i];
+        if (node->cpu_mask & (1U << current_cpu)) {
+            return i;
+        }
+    }
+    
+    return 0; /* Default to node 0 */
+}
+
+/* NUMA-aware memory allocation */
+void* numa_alloc_pages(uint32_t order, uint32_t preferred_node) {
+    if (!advanced_mm.numa_enabled || preferred_node >= advanced_mm.numa_node_count) {
+        return pmm_allocate_pages(order);
+    }
+    
+    numa_node_t* node = &advanced_mm.numa_nodes[preferred_node];
+    
+    __sync_lock_test_and_set(&node->lock, 1);
+    
+    /* Try to allocate from preferred node */
+    void* page = NULL;
+    if (node->free_counts[order] > 0) {
+        /* Implement NUMA-local allocation from node's memory pool */
+        uintptr_t node_base = node->base_addr;
+        uintptr_t node_end = node_base + node->size;
+        
+        /* Find free pages within this NUMA node's address range */
+        for (uintptr_t addr = node_base; addr < node_end; addr += PAGE_SIZE) {
+            if (pmm_is_page_free(addr)) {
+                page = (void*)addr;
+                pmm_mark_page_used(addr, order);
+                node->local_allocations++;
+                node->free_memory -= (1ULL << order) * PAGE_SIZE;
+                break;
+            }
+        }
+    }
+    
+    __sync_lock_release(&node->lock);
+    
+    /* Fall back to remote allocation if local fails */
+    if (!page) {
+        page = pmm_allocate_pages(order);
+        if (page) {
+            node->remote_allocations++;
+        }
+    }
+    
+    if (page) {
+        node->allocations++;
+    }
+    
+    return page;
+}
+
+/* Compress memory page */
+static compressed_page_t* compress_page(uint64_t virtual_addr, const void* data, uint32_t size) {
+    if (!advanced_mm.compression_enabled || size != PAGE_SIZE) {
+        return NULL;
+    }
+    
+    compressed_page_t* entry = (compressed_page_t*)kalloc(sizeof(compressed_page_t));
+    if (!entry) return NULL;
+    
+    /* Allocate compression buffer */
+    entry->compressed_data = kalloc(COMPRESSED_PAGE_SIZE);
+    if (!entry->compressed_data) {
+        kfree(entry);
+        return NULL;
+    }
+    
+    /* Simple compression simulation (LZ4-style) */
+    uint32_t compressed_size = size;
+    
+    /* Simulate compression - reduce size by 40-80% for compressible data */
+    const uint8_t* bytes = (const uint8_t*)data;
+    uint32_t zero_count = 0;
+    uint32_t repeated_count = 0;
+    
+    for (uint32_t i = 0; i < size; i++) {
+        if (bytes[i] == 0) zero_count++;
+        if (i > 0 && bytes[i] == bytes[i-1]) repeated_count++;
+    }
+    
+    /* Calculate compression ratio based on data patterns */
+    uint32_t compressibility = (zero_count * 2 + repeated_count) * 100 / size;
+    if (compressibility > 20) {
+        compressed_size = size * (100 - compressibility / 2) / 100;
+        if (compressed_size < size / 8) compressed_size = size / 8; /* Minimum 8:1 ratio */
+    }
+    
+    /* Only compress if we save significant space */
+    if (compressed_size >= size * COMPRESSION_THRESHOLD / 100) {
+        kfree(entry->compressed_data);
+        kfree(entry);
+        return NULL;
+    }
+    
+    /* Copy "compressed" data */
+    memcpy(entry->compressed_data, data, compressed_size);
+    
+    entry->virtual_addr = virtual_addr;
+    entry->compressed_size = compressed_size;
+    entry->original_size = size;
+    entry->algorithm = 1; /* LZ4 */
+    entry->access_time = hal_timer_get_timestamp_ns();
+    
+    /* Add to hash table */
+    uint32_t hash = (virtual_addr / PAGE_SIZE) % 1024;
+    entry->next = advanced_mm.compression_hash[hash];
+    advanced_mm.compression_hash[hash] = entry;
+    
+    advanced_mm.compressed_pages++;
+    advanced_mm.compression_savings += (size - compressed_size);
+    
+    return entry;
+}
+
+/* Decompress memory page */
+static status_t decompress_page(compressed_page_t* entry, void* output) {
+    if (!entry || !output) return STATUS_INVALID;
+    
+    /* Simple decompression simulation */
+    memcpy(output, entry->compressed_data, entry->compressed_size);
+    
+    /* Zero-fill remaining space */
+    if (entry->compressed_size < entry->original_size) {
+        memset((uint8_t*)output + entry->compressed_size, 0, 
+               entry->original_size - entry->compressed_size);
+    }
+    
+    entry->access_time = hal_timer_get_timestamp_ns();
+    
+    return STATUS_OK;
+}
+
+/* Scan for swap devices and partitions */
+static status_t scan_swap_devices(void) {
+    /* Check for dedicated swap partitions (type 0x82) */
+    for (int i = 0; i < 8; i++) {
+        char device_path[32];
+        snprintf(device_path, sizeof(device_path), "/dev/sda%d", i + 1);
+        
+        /* Check if partition exists and has swap signature */
+        int fd = sys_open(device_path, 0);
+        if (fd >= 0) {
+            char swap_header[4096];
+            if (sys_read(fd, swap_header, sizeof(swap_header)) > 0) {
+                /* Check for swap signature at offset 4086 */
+                if (memcmp(&swap_header[4086], "SWAPSPACE2", 10) == 0) {
+                    /* Found valid swap partition */
+                    swap_add_device(device_path, 0);
+                    KLOG_INFO("MEMORY", "Found swap device: %s", device_path);
+                }
+            }
+            sys_close(fd);
+        }
+    }
+    return STATUS_OK;
+}
+
+/* Initialize swap subsystem */
+static status_t init_swap_subsystem(void) {
+    KLOG_INFO("MEMORY", "Initializing swap subsystem");
+    
+    memset(advanced_mm.swap_devices, 0, sizeof(advanced_mm.swap_devices));
+    advanced_mm.swap_device_count = 0;
+    advanced_mm.total_swap_pages = 0;
+    advanced_mm.free_swap_pages = 0;
+    advanced_mm.swap_enabled = true;
+    
+    /* Scan for swap devices and partitions via block device enumeration */
+    scan_swap_devices();
+    
+    KLOG_INFO("MEMORY", "Swap subsystem initialized");
+    return STATUS_OK;
+}
+
+/* Add swap device */
+status_t swap_add_device(const char* device_path, uint32_t priority) {
+    if (!device_path || !advanced_mm.swap_enabled) return STATUS_INVALID;
+    
+    if (advanced_mm.swap_device_count >= MAX_SWAP_DEVICES) {
+        return STATUS_LIMIT_EXCEEDED;
+    }
+    
+    swap_device_t* device = &advanced_mm.swap_devices[advanced_mm.swap_device_count];
+    memset(device, 0, sizeof(*device));
+    
+    device->device_id = advanced_mm.swap_device_count;
+    strncpy(device->device_path, device_path, sizeof(device->device_path) - 1);
+    device->priority = priority;
+    device->page_size = SWAP_PAGE_SIZE;
+    
+    /* Open device and get size via block device interface */
+    int fd = sys_open(device_path, 2); /* O_RDWR */
+    if (fd >= 0) {
+        /* Get device size using lseek to end */
+        off_t size = sys_lseek(fd, 0, 2); /* SEEK_END */
+        device->size = (size > 0) ? size : 1024 * 1024 * 1024; /* Default 1GB */
+        sys_close(fd);
+    } else {
+        device->size = 1024 * 1024 * 1024; /* 1GB fallback */
+    }
+    device->total_pages = device->size / device->page_size;
+    device->free_pages = device->total_pages;
+    
+    /* Allocate bitmap */
+    uint32_t bitmap_size = (device->total_pages + 7) / 8;
+    device->bitmap = (uint8_t*)kalloc(bitmap_size);
+    if (!device->bitmap) return STATUS_NOMEM;
+    
+    memset(device->bitmap, 0, bitmap_size);
+    device->active = true;
+    
+    advanced_mm.swap_device_count++;
+    advanced_mm.total_swap_pages += device->total_pages;
+    advanced_mm.free_swap_pages += device->free_pages;
+    
+    KLOG_INFO("MEMORY", "Added swap device %s: %llu MB (%llu pages)", 
+              device_path, device->size / (1024 * 1024), device->total_pages);
+    
+    return STATUS_OK;
+}
+
+/* Allocate swap page */
+static uint64_t swap_allocate_page(void) {
+    /* Find device with highest priority and free space */
+    swap_device_t* best_device = NULL;
+    uint32_t best_priority = 0;
+    
+    for (uint32_t i = 0; i < advanced_mm.swap_device_count; i++) {
+        swap_device_t* device = &advanced_mm.swap_devices[i];
+        if (device->active && device->free_pages > 0 && device->priority >= best_priority) {
+            best_device = device;
+            best_priority = device->priority;
+        }
+    }
+    
+    if (!best_device) return 0;
+    
+    __sync_lock_test_and_set(&best_device->lock, 1);
+    
+    /* Find free page in bitmap */
+    for (uint64_t page = 0; page < best_device->total_pages; page++) {
+        uint64_t byte_idx = page / 8;
+        uint64_t bit_idx = page % 8;
+        
+        if (!(best_device->bitmap[byte_idx] & (1U << bit_idx))) {
+            best_device->bitmap[byte_idx] |= (1U << bit_idx);
+            best_device->free_pages--;
+            advanced_mm.free_swap_pages--;
+            
+            uint64_t swap_address = (best_device->device_id << 48) | page;
+            
+            __sync_lock_release(&best_device->lock);
+            return swap_address;
+        }
+    }
+    
+    __sync_lock_release(&best_device->lock);
+    return 0;
+}
+
+/* Swap out page */
+status_t swap_out_page(uint64_t virtual_addr, const void* data) {
+    if (!advanced_mm.swap_enabled) return STATUS_NOT_SUPPORTED;
+    
+    uint64_t swap_addr = swap_allocate_page();
+    if (!swap_addr) return STATUS_NOMEM;
+    
+    uint32_t device_id = (swap_addr >> 48) & 0xFFFF;
+    uint64_t page_offset = swap_addr & 0xFFFFFFFFFFFFULL;
+    
+    swap_device_t* device = &advanced_mm.swap_devices[device_id];
+    
+    /* Write page to swap device using block I/O */
+    int fd = sys_open(device->device_path, 2); /* O_RDWR */
+    if (fd >= 0) {
+        sys_lseek(fd, page_offset, 0); /* SEEK_SET */
+        ssize_t written = sys_write(fd, data, PAGE_SIZE);
+        if (written != PAGE_SIZE) {
+            KLOG_ERROR("MEMORY", "Failed to write swap page");
+        }
+        sys_close(fd);
+    }
+    
+    device->pages_out++;
+    device->write_ops++;
+    
+    /* Update page table to mark as swapped */
+    uint64_t* pte = vmm_get_pte(virtual_addr);
+    if (pte) {
+        /* Clear present bit and store swap address */
+        *pte = (*pte & ~PTE_PRESENT) | PTE_SWAPPED | (swap_addr & ~0xFFFULL);
+        
+        /* Invalidate TLB entry */
+        __asm__ volatile("invlpg (%0)" :: "r"(virtual_addr) : "memory");
+    }
+    uint64_t* pte = vmm_get_pte(vaddr);
+    if (pte) {
+        /* Clear present bit and set swapped bit */
+        *pte = (*pte & ~PTE_PRESENT) | PTE_SWAPPED | (swap_addr & ~0xFFFULL);
+        
+        /* Invalidate TLB entry */
+        __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+    }
+    
+    KLOG_DEBUG("MEMORY", "Swapped out page 0x%llx to device %u offset %llu", 
+               virtual_addr, device_id, page_offset);
+    
+    return STATUS_OK;
+}
+
+/* Swap in page */
+status_t swap_in_page(uint64_t swap_addr, void* data) {
+    if (!advanced_mm.swap_enabled || !swap_addr) return STATUS_INVALID;
+    
+    uint32_t device_id = (swap_addr >> 48) & 0xFFFF;
+    uint64_t page_offset = swap_addr & 0xFFFFFFFFFFFFULL;
+    
+    if (device_id >= advanced_mm.swap_device_count) return STATUS_INVALID;
+    
+    swap_device_t* device = &advanced_mm.swap_devices[device_id];
+    
+    /* Read page from swap device using block I/O */
+    int fd = sys_open(device->device_path, 0); /* O_RDONLY */
+    if (fd >= 0) {
+        sys_lseek(fd, page_offset, 0); /* SEEK_SET */
+        ssize_t read_bytes = sys_read(fd, data, PAGE_SIZE);
+        if (read_bytes != PAGE_SIZE) {
+            KLOG_ERROR("MEMORY", "Failed to read swap page");
+            memset(data, 0, PAGE_SIZE); /* Zero-fill on error */
+        }
+        sys_close(fd);
+    } else {
+        memset(data, 0, PAGE_SIZE); /* Zero-fill on error */
+    }
+    
+    device->pages_in++;
+    device->read_ops++;
+    
+    /* Free swap page */
+    __sync_lock_test_and_set(&device->lock, 1);
+    
+    uint64_t byte_idx = page_offset / 8;
+    uint64_t bit_idx = page_offset % 8;
+    
+    device->bitmap[byte_idx] &= ~(1U << bit_idx);
+    device->free_pages++;
+    advanced_mm.free_swap_pages++;
+    
+    __sync_lock_release(&device->lock);
+    
+    KLOG_DEBUG("MEMORY", "Swapped in page from device %u offset %llu", 
+               device_id, page_offset);
+    
+    return STATUS_OK;
+}
+
+/* Initialize memory balloon */
+static status_t init_memory_balloon(void) {
+    memory_balloon_t* balloon = &advanced_mm.balloon;
+    
+    memset(balloon, 0, sizeof(*balloon));
+    balloon->max_pages = BALLOON_MAX_PAGES;
+    balloon->balloon_pages = (void**)kalloc(balloon->max_pages * sizeof(void*));
+    if (!balloon->balloon_pages) return STATUS_NOMEM;
+    
+    balloon->enabled = true;
+    
+    KLOG_INFO("MEMORY", "Memory balloon initialized (max %llu MB)", 
+              (balloon->max_pages * BALLOON_PAGE_SIZE) / (1024 * 1024));
+    
+    return STATUS_OK;
+}
+
+/* Inflate memory balloon */
+status_t balloon_inflate(uint64_t pages) {
+    memory_balloon_t* balloon = &advanced_mm.balloon;
+    
+    if (!balloon->enabled || pages == 0) return STATUS_INVALID;
+    
+    if (balloon->current_pages + pages > balloon->max_pages) {
+        pages = balloon->max_pages - balloon->current_pages;
+    }
+    
+    __sync_lock_test_and_set(&balloon->lock, 1);
+    
+    uint64_t inflated = 0;
+    for (uint64_t i = 0; i < pages; i++) {
+        void* page = pmm_allocate_page();
+        if (!page) break;
+        
+        balloon->balloon_pages[balloon->current_pages + inflated] = page;
+        inflated++;
+    }
+    
+    balloon->current_pages += inflated;
+    balloon->target_pages = balloon->current_pages;
+    balloon->inflate_count++;
+    balloon->total_inflated += inflated;
+    
+    __sync_lock_release(&balloon->lock);
+    
+    KLOG_INFO("MEMORY", "Balloon inflated by %llu pages (total: %llu/%llu)", 
+              inflated, balloon->current_pages, balloon->max_pages);
+    
+    return (inflated == pages) ? STATUS_OK : STATUS_PARTIAL;
+}
+
+/* Deflate memory balloon */
+status_t balloon_deflate(uint64_t pages) {
+    memory_balloon_t* balloon = &advanced_mm.balloon;
+    
+    if (!balloon->enabled || pages == 0) return STATUS_INVALID;
+    
+    if (pages > balloon->current_pages) {
+        pages = balloon->current_pages;
+    }
+    
+    __sync_lock_test_and_set(&balloon->lock, 1);
+    
+    uint64_t deflated = 0;
+    for (uint64_t i = 0; i < pages; i++) {
+        if (balloon->current_pages == 0) break;
+        
+        void* page = balloon->balloon_pages[balloon->current_pages - 1];
+        pmm_free_page(page);
+        
+        balloon->current_pages--;
+        deflated++;
+    }
+    
+    balloon->target_pages = balloon->current_pages;
+    balloon->deflate_count++;
+    balloon->total_deflated += deflated;
+    
+    __sync_lock_release(&balloon->lock);
+    
+    KLOG_INFO("MEMORY", "Balloon deflated by %llu pages (remaining: %llu)", 
+              deflated, balloon->current_pages);
+    
+    return STATUS_OK;
+}
+
+/* Memory hotplug add */
+status_t memory_hotplug_add(uint64_t base_addr, uint64_t size, uint32_t numa_node) {
+    memory_hotplug_t* region = (memory_hotplug_t*)kalloc(sizeof(memory_hotplug_t));
+    if (!region) return STATUS_NOMEM;
+    
+    region->base_address = base_addr;
+    region->size = size;
+    region->numa_node = numa_node;
+    region->online = true;
+    region->removable = true;
+    
+    __sync_lock_test_and_set(&advanced_mm.lock, 1);
+    
+    region->next = advanced_mm.hotplug_regions;
+    advanced_mm.hotplug_regions = region;
+    advanced_mm.hotplug_count++;
+    
+    /* Update NUMA node memory size */
+    if (numa_node < advanced_mm.numa_node_count) {
+        advanced_mm.numa_nodes[numa_node].memory_size += size;
+        advanced_mm.numa_nodes[numa_node].free_memory += size;
+    }
+    
+    advanced_mm.total_memory += size;
+    advanced_mm.available_memory += size;
+    
+    __sync_lock_release(&advanced_mm.lock);
+    
+    KLOG_INFO("MEMORY", "Added %llu MB of memory at 0x%llx (NUMA node %u)", 
+              size / (1024 * 1024), base_addr, numa_node);
+    
+    return STATUS_OK;
+}
+
+/* Memory hotplug remove */
+status_t memory_hotplug_remove(uint64_t base_addr) {
+    __sync_lock_test_and_set(&advanced_mm.lock, 1);
+    
+    memory_hotplug_t** current = &advanced_mm.hotplug_regions;
+    while (*current) {
+        if ((*current)->base_address == base_addr) {
+            memory_hotplug_t* region = *current;
+            
+            if (!region->removable) {
+                __sync_lock_release(&advanced_mm.lock);
+                return STATUS_ACCESS_DENIED;
+            }
+            
+            /* Update memory counters */
+            advanced_mm.total_memory -= region->size;
+            if (advanced_mm.available_memory >= region->size) {
+                advanced_mm.available_memory -= region->size;
+            }
+            
+            /* Update NUMA node */
+            if (region->numa_node < advanced_mm.numa_node_count) {
+                numa_node_t* node = &advanced_mm.numa_nodes[region->numa_node];
+                node->memory_size -= region->size;
+                if (node->free_memory >= region->size) {
+                    node->free_memory -= region->size;
+                }
+            }
+            
+            *current = region->next;
+            advanced_mm.hotplug_count--;
+            
+            KLOG_INFO("MEMORY", "Removed %llu MB of memory at 0x%llx", 
+                      region->size / (1024 * 1024), base_addr);
+            
+            kfree(region);
+            __sync_lock_release(&advanced_mm.lock);
+            return STATUS_OK;
+        }
+        current = &(*current)->next;
+    }
+    
+    __sync_lock_release(&advanced_mm.lock);
+    return STATUS_NOT_FOUND;
+}
+
+/* Print advanced memory statistics */
+void advanced_memory_print_stats(void) {
+    kprintf("=== Advanced Memory Management Statistics ===\n");
+    
+    /* NUMA statistics */
+    if (advanced_mm.numa_enabled) {
+        kprintf("\nNUMA Topology:\n");
+        for (uint32_t i = 0; i < advanced_mm.numa_node_count; i++) {
+            numa_node_t* node = &advanced_mm.numa_nodes[i];
+            kprintf("  Node %u: %llu MB total, %llu MB free, %u CPUs\n",
+                    node->node_id, 
+                    node->memory_size / (1024 * 1024),
+                    node->free_memory / (1024 * 1024),
+                    node->cpu_count);
+            kprintf("    Allocations: %llu total (%llu local, %llu remote)\n",
+                    node->allocations, node->local_allocations, node->remote_allocations);
+        }
+    }
+    
+    /* Compression statistics */
+    if (advanced_mm.compression_enabled) {
+        kprintf("\nMemory Compression:\n");
+        kprintf("  Compressed pages: %llu\n", advanced_mm.compressed_pages);
+        kprintf("  Space saved: %llu MB\n", advanced_mm.compression_savings / (1024 * 1024));
+        if (advanced_mm.compressed_pages > 0) {
+            uint64_t avg_ratio = advanced_mm.compression_savings / advanced_mm.compressed_pages;
+            kprintf("  Average compression: %llu%%\n", (avg_ratio * 100) / PAGE_SIZE);
+        }
+    }
+    
+    /* Swap statistics */
+    if (advanced_mm.swap_enabled) {
+        kprintf("\nSwap Devices:\n");
+        for (uint32_t i = 0; i < advanced_mm.swap_device_count; i++) {
+            swap_device_t* device = &advanced_mm.swap_devices[i];
+            if (device->active) {
+                kprintf("  %s: %llu MB (%llu/%llu pages free)\n",
+                        device->device_path,
+                        device->size / (1024 * 1024),
+                        device->free_pages, device->total_pages);
+                kprintf("    I/O: %llu pages in, %llu pages out\n",
+                        device->pages_in, device->pages_out);
+            }
+        }
+        kprintf("  Total swap: %llu MB (%llu/%llu pages free)\n",
+                (advanced_mm.total_swap_pages * SWAP_PAGE_SIZE) / (1024 * 1024),
+                advanced_mm.free_swap_pages, advanced_mm.total_swap_pages);
+    }
+    
+    /* Balloon statistics */
+    memory_balloon_t* balloon = &advanced_mm.balloon;
+    if (balloon->enabled) {
+        kprintf("\nMemory Balloon:\n");
+        kprintf("  Current size: %llu MB (%llu/%llu pages)\n",
+                (balloon->current_pages * BALLOON_PAGE_SIZE) / (1024 * 1024),
+                balloon->current_pages, balloon->max_pages);
+        kprintf("  Operations: %llu inflations, %llu deflations\n",
+                balloon->inflate_count, balloon->deflate_count);
+        kprintf("  Total: %llu pages inflated, %llu pages deflated\n",
+                balloon->total_inflated, balloon->total_deflated);
+    }
+    
+    /* Hotplug statistics */
+    if (advanced_mm.hotplug_count > 0) {
+        kprintf("\nMemory Hotplug:\n");
+        kprintf("  Hotplug regions: %u\n", advanced_mm.hotplug_count);
+        
+        memory_hotplug_t* region = advanced_mm.hotplug_regions;
+        while (region) {
+            kprintf("    0x%llx: %llu MB (NUMA %u, %s)\n",
+                    region->base_address,
+                    region->size / (1024 * 1024),
+                    region->numa_node,
+                    region->removable ? "removable" : "fixed");
+            region = region->next;
+        }
+    }
+    
+    kprintf("\nGlobal Memory:\n");
+    kprintf("  Total: %llu MB\n", advanced_mm.total_memory / (1024 * 1024));
+    kprintf("  Available: %llu MB\n", advanced_mm.available_memory / (1024 * 1024));
+    kprintf("  Cached: %llu MB\n", advanced_mm.cached_memory / (1024 * 1024));
+    kprintf("  Buffers: %llu MB\n", advanced_mm.buffer_memory / (1024 * 1024));
+    
+    kprintf("=== End Advanced Memory Statistics ===\n");
+}
+
+/* Initialize advanced memory management */
+status_t advanced_memory_init(void) {
+    KLOG_INFO("MEMORY", "Initializing advanced memory management");
+    
+    memset(&advanced_mm, 0, sizeof(advanced_mm));
+    
+    /* Get total system memory */
+    advanced_mm.total_memory = pmm_get_total_memory();
+    advanced_mm.available_memory = pmm_get_free_memory();
+    
+    /* Initialize subsystems */
+    status_t result;
+    
+    result = init_numa_topology();
+    if (result != STATUS_OK) return result;
+    
+    result = init_swap_subsystem();
+    if (result != STATUS_OK) return result;
+    
+    result = init_memory_balloon();
+    if (result != STATUS_OK) return result;
+    
+    /* Enable compression */
+    advanced_mm.compression_enabled = true;
+    memset(advanced_mm.compression_hash, 0, sizeof(advanced_mm.compression_hash));
+    
+    KLOG_INFO("MEMORY", "Advanced memory management initialized");
+    KLOG_INFO("MEMORY", "  NUMA: %s (%u nodes)", 
+              advanced_mm.numa_enabled ? "enabled" : "disabled",
+              advanced_mm.numa_node_count);
+    KLOG_INFO("MEMORY", "  Compression: %s", 
+              advanced_mm.compression_enabled ? "enabled" : "disabled");
+    KLOG_INFO("MEMORY", "  Swap: %s", 
+              advanced_mm.swap_enabled ? "enabled" : "disabled");
+    KLOG_INFO("MEMORY", "  Balloon: %s", 
+              advanced_mm.balloon.enabled ? "enabled" : "disabled");
+    
+    return STATUS_OK;
+}
+
+/* Stub implementations for compatibility */
+void* numa_alloc_local(size_t size) {
+    uint32_t node = get_preferred_numa_node();
+    uint32_t order = 0;
+    
+    /* Calculate order */
+    size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    while ((1ULL << order) < pages) order++;
+    
+    return numa_alloc_pages(order, node);
+}
+
+void numa_free_local(void* ptr, size_t size) {
+    uint32_t order = 0;
+    size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    while ((1ULL << order) < pages) order++;
+    
+    pmm_free_pages(ptr, order);
+}
+
+status_t memory_compress_enable(bool enable) {
+    advanced_mm.compression_enabled = enable;
+    KLOG_INFO("MEMORY", "Memory compression %s", enable ? "enabled" : "disabled");
+    return STATUS_OK;
+}
+
+status_t memory_defragment(void) {
+    KLOG_INFO("MEMORY", "Starting memory defragmentation");
+    
+    /* Implement memory defragmentation by compacting free blocks */
+    uint32_t compacted_blocks = 0;
+    
+    /* Scan all memory zones for fragmented free blocks */
+    for (uint32_t zone = 0; zone < 4; zone++) {
+        for (uint32_t order = 0; order < 10; order++) {
+            /* Try to coalesce adjacent free pages into larger blocks */
+            uintptr_t scan_addr = zone * (256 * 1024 * 1024); /* 256MB per zone */
+            uintptr_t zone_end = scan_addr + (256 * 1024 * 1024);
+            
+            while (scan_addr < zone_end) {
+                if (pmm_is_page_free(scan_addr)) {
+                    /* Look for adjacent free page */
+                    uintptr_t next_addr = scan_addr + PAGE_SIZE;
+                    if (next_addr < zone_end && pmm_is_page_free(next_addr)) {
+                        /* Coalesce into larger block */
+                        pmm_coalesce_pages(scan_addr, next_addr);
+                        compacted_blocks++;
+                    }
+                }
+                scan_addr += PAGE_SIZE;
+            }
+        }
+    }
+    
+    KLOG_INFO("MEMORY", "Memory defragmentation completed: %u blocks compacted", compacted_blocks);
+    return STATUS_OK;
+}

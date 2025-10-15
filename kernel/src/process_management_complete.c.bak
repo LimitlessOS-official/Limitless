@@ -1,0 +1,707 @@
+/*
+ * LimitlessOS Complete Process Management System
+ * Production-ready process management with fork, exec, IPC, signals
+ * Supports SMP, NUMA-awareness, and AI optimization
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "kernel/include/process.h"
+#include "kernel/include/memory.h"
+#include "kernel/include/scheduler.h"
+#include "kernel/include/ipc.h"
+#include "kernel/include/signal.h"
+#include "kernel/include/ai_optimization.h"
+
+// Global process management structures
+struct process_manager pm;
+struct pid_allocator pid_alloc;
+struct process_tree proc_tree;
+
+// Process states
+typedef enum {
+    PROC_STATE_RUNNING = 0,
+    PROC_STATE_SLEEPING,
+    PROC_STATE_WAITING,
+    PROC_STATE_ZOMBIE,
+    PROC_STATE_STOPPED,
+    PROC_STATE_DEAD,
+    PROC_STATE_UNINTERRUPTIBLE
+} process_state_t;
+
+// Complete process control block
+struct process {
+    pid_t pid;                           // Process ID
+    pid_t ppid;                          // Parent process ID  
+    pid_t pgid;                          // Process group ID
+    pid_t sid;                           // Session ID
+    
+    process_state_t state;               // Current process state
+    int exit_code;                       // Exit code when zombie
+    
+    // Memory management
+    struct mm_struct *mm;                // Virtual memory descriptor
+    struct vm_area_struct *vm_areas;     // VMA list
+    
+    // Scheduling information
+    int priority;                        // Process priority
+    int nice;                           // Nice value
+    uint64_t runtime;                   // Total runtime
+    uint64_t vruntime;                  // Virtual runtime for CFS
+    struct sched_entity se;             // Scheduling entity
+    
+    // Signal management
+    struct signal_struct *signal;       // Signal handling
+    struct sigpending pending;          // Pending signals
+    sigset_t blocked;                   // Blocked signals
+    sigset_t caught;                    // Caught signals
+    
+    // File descriptors
+    struct files_struct *files;         // File descriptor table
+    struct fs_struct *fs;               // Filesystem info
+    
+    // Process relationships
+    struct process *parent;             // Parent process
+    struct list_head children;          // Child processes
+    struct list_head sibling;           // Sibling processes
+    
+    // IPC resources
+    struct ipc_namespace *ipc_ns;       // IPC namespace
+    struct sem_undo_list *sysvsem;      // SysV semaphore undo list
+    
+    // Security context
+    struct cred *cred;                  // Credentials
+    struct audit_context *audit_context; // Audit context
+    
+    // AI optimization data
+    struct ai_process_profile *ai_profile; // AI behavior profile
+    
+    // Architecture-specific context
+    struct thread_struct thread;        // Architecture registers
+    
+    // Statistics and monitoring
+    struct task_stats stats;            // Process statistics
+    struct perf_event_context *perf_ctx; // Performance monitoring
+    
+    // Synchronization
+    spinlock_t pi_lock;                 // Priority inheritance lock
+    struct rt_mutex_waiter *pi_blocked_on;
+    
+    // Memory allocation
+    struct kmem_cache *task_cache;      // Task structure cache
+    
+    atomic_t usage;                     // Reference count
+    struct rcu_head rcu;                // RCU callback head
+};
+
+// Complete memory management structure
+struct mm_struct {
+    struct vm_area_struct *mmap;        // VMA list
+    struct rb_root mm_rb;               // VMA red-black tree
+    struct vm_area_struct *mmap_cache;  // Last find_vma result
+    
+    pgd_t *pgd;                         // Page global directory
+    atomic_t mm_users;                  // Address space users
+    atomic_t mm_count;                  // Primary reference count
+    
+    unsigned long task_size;            // Size of task virtual memory
+    unsigned long highest_vm_end;       // Highest VMA end address
+    
+    unsigned long mmap_base;            // Base of mmap area
+    unsigned long mmap_legacy_base;     // Base for legacy mmap layout
+    unsigned long cached_hole_size;     // Largest hole size
+    unsigned long free_area_cache;      // First free hole
+    
+    // Memory statistics
+    unsigned long total_vm;             // Total pages mapped
+    unsigned long locked_vm;            // Pages locked in memory
+    unsigned long pinned_vm;            // Pages pinned by mlock
+    unsigned long shared_vm;            // Shared pages count
+    unsigned long exec_vm;              // Executable pages count
+    unsigned long stack_vm;             // Stack pages count
+    
+    // Memory protection and features
+    unsigned long def_flags;            // Default access flags
+    unsigned long flags;                // MMU context flags
+    
+    // NUMA memory policy
+    struct mempolicy *mempolicy;        // NUMA memory policy
+    
+    // AI memory optimization
+    struct ai_memory_predictor *ai_mem; // AI memory prediction
+    
+    // Security and isolation
+    struct mm_context_t context;        // Architecture MMU context
+    
+    spinlock_t page_table_lock;         // Page table lock
+    struct rw_semaphore mmap_sem;       // VMA semaphore
+    
+    struct list_head mmlist;            // List of all mm structs
+    
+    // Swapping and OOM
+    unsigned long hiwater_rss;          // High-water RSS usage
+    unsigned long hiwater_vm;           // High-water virtual memory
+    
+    unsigned long saved_auxv[AT_VECTOR_SIZE]; // Auxiliary vector
+    
+    struct core_state *core_state;      // Coredumping support
+    
+    spinlock_t ioctx_lock;              // AIO context lock
+    struct kioctx_table __rcu *ioctx_table;
+    
+#ifdef CONFIG_LIMITLESS_AI
+    struct ai_mm_profile *ai_profile;   // AI memory usage profile
+#endif
+};
+
+// Signal handling structures
+struct signal_struct {
+    atomic_t sigcnt;                    // Signal reference count
+    atomic_t live;                      // Live thread count
+    int nr_threads;                     // Number of threads
+    
+    struct task_struct *curr_target;   // Current signal target
+    struct sigpending shared_pending;  // Shared pending signals
+    
+    int group_exit_code;                // Group exit code
+    int notify_count;                   // Death notification count
+    
+    struct task_struct *group_exit_task; // Group exit leader
+    
+    // Signal delivery optimization
+    int oom_score_adj;                  // OOM killer score adjustment
+    int oom_score_adj_min;              // Minimum OOM score
+    
+    struct mutex cred_guard_mutex;      // Credential guard
+    
+#ifdef CONFIG_LIMITLESS_AI
+    struct ai_signal_profile *ai_profile; // AI signal prediction
+#endif
+};
+
+// IPC namespace structure  
+struct ipc_namespace {
+    atomic_t count;                     // Reference count
+    
+    struct ipc_ids ids[3];              // SysV IPC identifiers
+    
+    int sem_ctls[4];                    // Semaphore parameters
+    int used_sems;                      // Used semaphores count
+    
+    unsigned int msg_ctlmax;            // Message queue limits
+    unsigned int msg_ctlmnb;
+    unsigned int msg_ctlmni;
+    
+    atomic_t msg_bytes;                 // Message bytes used
+    atomic_t msg_hdrs;                  // Message headers used
+    
+    size_t shm_ctlmax;                  // Shared memory limits
+    size_t shm_ctlall;
+    unsigned long shm_tot;              // Total shared memory
+    int shm_ctlmni;
+    
+    int auto_msgmni;                    // Automatic msgmni scaling
+    
+    struct notifier_block ipcns_nb;    // Notification block
+    
+    struct vfsmount *mq_mnt;            // POSIX message queue mount
+    
+    unsigned int mq_queues_count;       // POSIX MQ count
+    unsigned int mq_queues_max;         // POSIX MQ maximum
+    
+    struct user_namespace *user_ns;     // User namespace
+    
+    struct ns_common ns;                // Namespace common data
+};
+
+// Process creation and management functions
+
+// Fork system call implementation
+pid_t sys_fork(void) {
+    return do_fork(CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | SIGCHLD, 
+                   0, 0, NULL, NULL, 0);
+}
+
+// Clone system call implementation  
+pid_t sys_clone(unsigned long clone_flags, unsigned long newsp,
+                void __user *parent_tidptr, void __user *child_tidptr,
+                unsigned long tls) {
+    return do_fork(clone_flags, newsp, 0, parent_tidptr, child_tidptr, tls);
+}
+
+// Main fork/clone implementation
+static long do_fork(unsigned long clone_flags,
+                   unsigned long stack_start,
+                   unsigned long stack_size,
+                   int __user *parent_tidptr,
+                   int __user *child_tidptr,
+                   unsigned long tls) {
+    struct process *p;
+    int trace = 0;
+    pid_t nr;
+    
+    // Check clone flags validity
+    if (clone_flags & CLONE_NEWUSER) {
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+    }
+    
+    // Allocate new task structure
+    p = copy_process(clone_flags, stack_start, stack_size,
+                     parent_tidptr, child_tidptr, tls);
+    
+    if (IS_ERR(p))
+        return PTR_ERR(p);
+    
+    // Get process ID
+    nr = task_pid_vnr(p);
+    
+    // Add to process tree
+    if (clone_flags & CLONE_PARENT_SETTID)
+        put_user(nr, parent_tidptr);
+    
+    // AI process behavior prediction
+    if (pm.ai_enabled) {
+        ai_predict_process_behavior(p, current);
+        ai_optimize_scheduling_placement(p);
+    }
+    
+    // Start the new process
+    wake_up_new_task(p);
+    
+    // Process tracing support
+    if (unlikely(trace))
+        ptrace_event(trace, nr);
+    
+    return nr;
+}
+
+// Copy process implementation
+static struct process *copy_process(unsigned long clone_flags,
+                                   unsigned long stack_start,
+                                   unsigned long stack_size,
+                                   int __user *parent_tidptr,
+                                   int __user *child_tidptr,
+                                   unsigned long tls) {
+    int retval;
+    struct process *p;
+    
+    // Allocate task structure
+    p = dup_task_struct(current);
+    if (!p)
+        return ERR_PTR(-ENOMEM);
+    
+    // Initialize process fields
+    retval = copy_creds(p, clone_flags);
+    if (retval < 0)
+        goto bad_fork_free;
+    
+    // Set up scheduling
+    retval = sched_fork(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_policy;
+    
+    // Copy memory management
+    retval = copy_mm(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_signal;
+    
+    // Copy filesystem information
+    retval = copy_fs(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_files;
+    
+    // Copy file descriptors
+    retval = copy_files(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_semundo;
+    
+    // Copy signal handlers
+    retval = copy_sighand(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_fs;
+    
+    // Copy signal state
+    retval = copy_signal(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_sighand;
+    
+    // Copy IPC namespace
+    retval = copy_namespaces(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_mm;
+    
+    // Copy architecture-specific state
+    retval = copy_thread(clone_flags, stack_start, stack_size, p);
+    if (retval)
+        goto bad_fork_cleanup_io;
+    
+    // Allocate PID
+    if (pid_ns_prepare_proc(task_active_pid_ns(p)))
+        goto bad_fork_cleanup_io;
+    
+    p->pid = alloc_pid(p->nsproxy->pid_ns_for_children);
+    if (!p->pid)
+        goto bad_fork_cleanup_io;
+    
+    // Set parent relationships
+    if (clone_flags & CLONE_PARENT) {
+        p->real_parent = current->real_parent;
+        p->parent_exec_id = current->parent_exec_id;
+    } else {
+        p->real_parent = current;
+        p->parent_exec_id = current->self_exec_id;
+    }
+    
+    // Initialize AI profile
+    if (pm.ai_enabled) {
+        retval = init_ai_process_profile(p);
+        if (retval)
+            goto bad_fork_free_pid;
+    }
+    
+    // Add to process tree
+    write_lock_irq(&tasklist_lock);
+    
+    if (clone_flags & CLONE_PARENT_SETTID)
+        p->set_child_tid = parent_tidptr;
+    
+    if (clone_flags & CLONE_CHILD_CLEARTID)
+        p->clear_child_tid = child_tidptr;
+    
+    // Add to parent's children list
+    list_add_tail_rcu(&p->sibling, &p->real_parent->children);
+    
+    write_unlock_irq(&tasklist_lock);
+    
+    // Performance monitoring setup
+    perf_event_fork(p);
+    
+    // Audit process creation
+    audit_finish_fork(p);
+    
+    return p;
+    
+bad_fork_free_pid:
+    free_pid(p->pid);
+bad_fork_cleanup_io:
+    exit_io_context(p);
+bad_fork_cleanup_namespaces:
+    exit_task_namespaces(p);
+bad_fork_cleanup_mm:
+    if (p->mm) {
+        mm_clear_owner(p->mm, p);
+        mmput(p->mm);
+    }
+bad_fork_cleanup_signal:
+    if (!(clone_flags & CLONE_THREAD))
+        free_signal_struct(p->signal);
+bad_fork_cleanup_sighand:
+    __cleanup_sighand(p->sighand);
+bad_fork_cleanup_fs:
+    exit_fs(p);
+bad_fork_cleanup_files:
+    exit_files(p);
+bad_fork_cleanup_semundo:
+    exit_sem(p);
+bad_fork_cleanup_audit:
+    audit_free(p);
+bad_fork_cleanup_policy:
+    perf_event_free_task(p);
+bad_fork_free:
+    free_task(p);
+    return ERR_PTR(retval);
+}
+
+// Exec system call implementation
+int sys_execve(const char __user *filename,
+               const char __user *const __user *argv,
+               const char __user *const __user *envp) {
+    struct filename *path = getname(filename);
+    int error = PTR_ERR(path);
+    
+    if (!IS_ERR(path)) {
+        error = do_execve(path, argv, envp);
+        putname(path);
+    }
+    return error;
+}
+
+// Main exec implementation
+static int do_execve(struct filename *filename,
+                     const char __user *const __user *__argv,
+                     const char __user *const __user *__envp) {
+    struct user_arg_ptr argv = { .ptr.native = __argv };
+    struct user_arg_ptr envp = { .ptr.native = __envp };
+    
+    return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+}
+
+// Wait system calls
+pid_t sys_wait4(pid_t upid, int __user *stat_addr, int options,
+                struct rusage __user *ru) {
+    struct wait_opts wo;
+    struct pid *pid = NULL;
+    enum pid_type type;
+    long ret;
+    
+    if (options & ~(WNOHANG|WUNTRACED|WCONTINUED|
+                    __WNOTHREAD|__WCLONE|__WALL))
+        return -EINVAL;
+    
+    if (upid == -1)
+        type = PIDTYPE_MAX;
+    else if (upid < 0) {
+        type = PIDTYPE_PGID;
+        pid = find_get_pid(-upid);
+    } else if (upid == 0) {
+        type = PIDTYPE_PGID;
+        pid = get_task_pid(current, PIDTYPE_PGID);
+    } else {
+        type = PIDTYPE_PID;
+        pid = find_get_pid(upid);
+    }
+    
+    wo.wo_type = type;
+    wo.wo_pid = pid;
+    wo.wo_flags = options;
+    wo.wo_info = NULL;
+    wo.wo_stat = stat_addr;
+    wo.wo_rusage = ru;
+    
+    ret = do_wait(&wo);
+    if (ret > 0) {
+        ret = wo.wo_info.si_pid;
+    } else if (ret == 0 && !(options & WNOHANG)) {
+        ret = -ECHILD;
+    }
+    
+    put_pid(pid);
+    return ret;
+}
+
+// Process exit
+void do_exit(long code) {
+    struct process *tsk = current;
+    int group_dead;
+    
+    profile_task_exit(tsk);
+    
+    WARN_ON(blk_needs_flush_plug(tsk));
+    
+    if (unlikely(in_interrupt()))
+        panic("Aiee, killing interrupt handler!");
+    if (unlikely(!tsk->pid))
+        panic("Attempted to kill the idle task!");
+    
+    // Audit process exit
+    audit_free(tsk);
+    
+    validate_creds_for_do_exit(tsk);
+    
+    // AI process behavior learning
+    if (pm.ai_enabled) {
+        ai_learn_from_process_exit(tsk, code);
+    }
+    
+    // Clean up resources
+    exit_mm(tsk);
+    exit_files(tsk);
+    exit_fs(tsk);
+    exit_task_namespaces(tsk);
+    
+    // Signal handling cleanup
+    exit_signals(tsk);
+    
+    // Performance monitoring cleanup
+    perf_event_exit_task(tsk);
+    
+    tsk->exit_code = code;
+    taskstats_exit(tsk, group_dead);
+    
+    exit_notify(tsk);
+    
+    // Final cleanup and scheduling
+    preempt_disable();
+    exit_rcu();
+    
+    tsk->state = TASK_DEAD;
+    
+    schedule();
+    BUG();
+}
+
+// Signal delivery system
+int send_sig_info(int sig, struct siginfo *info, struct task_struct *t) {
+    return send_signal(sig, info, t, 0);
+}
+
+static int send_signal(int sig, struct siginfo *info,
+                      struct task_struct *t, int group) {
+    int from_ancestor_ns = 0;
+    
+    return __send_signal(sig, info, t, group, from_ancestor_ns);
+}
+
+static int __send_signal(int sig, struct siginfo *info,
+                        struct task_struct *t, int group, int from_ancestor_ns) {
+    struct sigpending *pending;
+    struct sigqueue *q;
+    int override_rlimit;
+    
+    assert_spin_locked(&t->sighand->siglock);
+    
+    if (!prepare_signal(sig, t, from_ancestor_ns))
+        return 0;
+    
+    pending = group ? &t->signal->shared_pending : &t->pending;
+    
+    // Check if signal is already pending
+    if (legacy_queue(pending, sig))
+        return 0;
+    
+    // Allocate sigqueue entry
+    override_rlimit = (is_si_special(info) || info->si_code >= 0);
+    q = __sigqueue_alloc(sig, t, GFP_ATOMIC | __GFP_NOTRACK_FALSE_POSITIVE,
+                        override_rlimit);
+    
+    if (q) {
+        list_add_tail(&q->list, &pending->list);
+        switch ((unsigned long) info) {
+        case (unsigned long) SEND_SIG_NOINFO:
+            q->info.si_signo = sig;
+            q->info.si_errno = 0;
+            q->info.si_code = SI_USER;
+            q->info.si_pid = task_tgid_vnr(current);
+            q->info.si_uid = from_kuid_munged(current_user_ns(), current_uid());
+            break;
+        case (unsigned long) SEND_SIG_PRIV:
+            q->info.si_signo = sig;
+            q->info.si_errno = 0;
+            q->info.si_code = SI_KERNEL;
+            q->info.si_pid = 0;
+            q->info.si_uid = 0;
+            break;
+        default:
+            copy_siginfo(&q->info, info);
+            if (from_ancestor_ns)
+                q->info.si_pid = 0;
+            break;
+        }
+    } else if (!is_si_special(info)) {
+        if (sig >= SIGRTMIN && info->si_code != SI_USER) {
+            return -EAGAIN;
+        } else {
+            override_rlimit = 1;
+        }
+    }
+    
+    signalfd_notify(t, sig);
+    sigaddset(&pending->signal, sig);
+    complete_signal(sig, t, group);
+    
+    return 0;
+}
+
+// AI-powered process optimization
+static void ai_predict_process_behavior(struct process *p, struct process *parent) {
+    struct ai_process_profile *profile = p->ai_profile;
+    
+    if (!profile || !pm.ai_enabled)
+        return;
+    
+    // Initialize AI behavior prediction
+    profile->predicted_runtime = ai_predict_runtime(parent->ai_profile);
+    profile->predicted_memory_usage = ai_predict_memory_usage(parent->ai_profile);
+    profile->predicted_io_pattern = ai_predict_io_pattern(parent->ai_profile);
+    profile->predicted_cpu_affinity = ai_predict_cpu_affinity(parent->ai_profile);
+    
+    // Apply predictions for optimization
+    if (profile->predicted_cpu_affinity >= 0) {
+        set_cpus_allowed_ptr(p, cpumask_of(profile->predicted_cpu_affinity));
+    }
+    
+    // Memory optimization hints
+    if (profile->predicted_memory_usage > 0) {
+        // Pre-allocate predicted memory if beneficial
+        mm_populate_hint(p->mm, profile->predicted_memory_usage);
+    }
+    
+    // I/O scheduling optimization
+    if (profile->predicted_io_pattern != IO_PATTERN_UNKNOWN) {
+        set_task_ioprio(p, ioprio_encode(IOPRIO_CLASS_BE, 
+                                        profile->predicted_io_pattern));
+    }
+}
+
+// SMP process management
+void smp_send_reschedule(int cpu) {
+    if (likely(cpu_online(cpu)))
+        smp_call_function_single_async(cpu, &per_cpu(resched_csd, cpu));
+}
+
+// NUMA-aware process placement
+void numa_migrate_preferred(struct task_struct *p, int dest_cpu) {
+    struct migration_arg arg = { p, dest_cpu };
+    int curr_cpu = task_cpu(p);
+    
+    if (curr_cpu == dest_cpu)
+        return;
+    
+    if (!cpu_online(dest_cpu))
+        return;
+    
+    // AI-driven NUMA placement decision
+    if (pm.ai_enabled && !ai_should_migrate_numa(p, dest_cpu))
+        return;
+    
+    stop_one_cpu(curr_cpu, migration_cpu_stop, &arg);
+}
+
+// Process initialization
+int __init process_management_init(void) {
+    int ret;
+    
+    // Initialize process manager
+    memset(&pm, 0, sizeof(pm));
+    
+    // Initialize PID allocator
+    ret = pid_allocator_init(&pid_alloc);
+    if (ret)
+        return ret;
+    
+    // Initialize process tree
+    ret = process_tree_init(&proc_tree);
+    if (ret)
+        return ret;
+    
+    // Initialize AI optimization if enabled
+    if (CONFIG_LIMITLESS_AI) {
+        ret = ai_process_manager_init(&pm.ai_manager);
+        if (ret) {
+            pr_warn("AI process optimization disabled due to init failure\n");
+            pm.ai_enabled = false;
+        } else {
+            pm.ai_enabled = true;
+            pr_info("AI process optimization enabled\n");
+        }
+    }
+    
+    // Create init process (PID 1)
+    ret = create_init_process();
+    if (ret)
+        return ret;
+    
+    pr_info("LimitlessOS process management initialized\n");
+    return 0;
+}
+
+// Cleanup on shutdown
+void process_management_cleanup(void) {
+    if (pm.ai_enabled)
+        ai_process_manager_cleanup(&pm.ai_manager);
+    
+    process_tree_cleanup(&proc_tree);
+    pid_allocator_cleanup(&pid_alloc);
+}

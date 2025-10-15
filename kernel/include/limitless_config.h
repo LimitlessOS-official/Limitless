@@ -1,0 +1,74 @@
+/**
+ * LimitlessOS Unified Configuration Header
+ * Central configuration for all system components
+ */
+
+#ifndef LIMITLESS_CONFIG_H
+#define LIMITLESS_CONFIG_H
+
+/* System Version */
+#define LIMITLESS_VERSION_MAJOR 2
+#define LIMITLESS_VERSION_MINOR 0
+#define LIMITLESS_VERSION_PATCH 0
+#define LIMITLESS_VERSION_STRING "2.0.0"
+
+/* Build Configuration */
+#ifdef ENTERPRISE_BUILD
+#define LIMITLESS_EDITION "Enterprise"
+#define SECURITY_ENHANCED 1
+#define AUDIT_ENABLED 1
+#define ENTERPRISE_FEATURES 1
+#else
+#define LIMITLESS_EDITION "Standard"
+#define SECURITY_ENHANCED 0
+#define AUDIT_ENABLED 0
+#define ENTERPRISE_FEATURES 0
+#endif
+
+/* Feature Toggles */
+#define ENABLE_GRAPHICS_ENTERPRISE 1
+#define ENABLE_AI_FRAMEWORK 1
+#define ENABLE_SANDBOX_SYSTEM 1
+#define ENABLE_INTELLIGENT_INSTALLER 1
+#define ENABLE_QUANTUM_SECURITY 1
+#define ENABLE_MULTIMEDIA_FRAMEWORK 1
+#define ENABLE_DEVELOPER_SDK 1
+#define ENABLE_STORAGE_ENTERPRISE 1
+
+/* Security Configuration */
+#define SECURITY_LEVEL_DEFAULT SECURITY_LEVEL_ENHANCED
+#define ENABLE_POST_QUANTUM_CRYPTO 1
+#define ENABLE_TPM_INTEGRATION 1
+#define ENABLE_HSM_SUPPORT 1
+
+/* AI Configuration */
+#define AI_PRIVACY_FIRST 1
+#define AI_LOCAL_PROCESSING 1
+#define AI_DISABLE_BY_DEFAULT 1
+
+/* System Limits */
+#define MAX_PROCESSES 4096
+#define MAX_THREADS_PER_PROCESS 256
+#define MAX_OPEN_FILES 1024
+#define MAX_MEMORY_GB 128
+#define MAX_SANDBOXES 512
+
+/* Hardware Support */
+#define SUPPORT_X86_64 1
+#define SUPPORT_AARCH64 1
+#define SUPPORT_GPU_ACCELERATION 1
+#define SUPPORT_QUANTUM_HARDWARE 1
+#define SUPPORT_AI_ACCELERATORS 1
+
+/* Debugging and Development */
+#ifdef DEBUG
+#define ENABLE_DEBUG_LOGGING 1
+#define ENABLE_ASSERTION_CHECKS 1
+#define ENABLE_MEMORY_DEBUGGING 1
+#else
+#define ENABLE_DEBUG_LOGGING 0
+#define ENABLE_ASSERTION_CHECKS 0
+#define ENABLE_MEMORY_DEBUGGING 0
+#endif
+
+#endif /* LIMITLESS_CONFIG_H */

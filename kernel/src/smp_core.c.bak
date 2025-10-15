@@ -1,0 +1,689 @@
+/*
+ * LimitlessOS Production Kernel - SMP and Per-CPU Data Structures
+ * Multi-processor support with spinlock audit and per-CPU optimization
+ */
+
+#include "kernel.h"
+#include "sched.h"
+#include "percpu.h"
+#include "acpi.h"
+#include "apic.h"
+#include <stdint.h>
+#include <string.h>
+
+/* ============================================================================
+ * SMP BRING-UP AND INITIALIZATION
+ * ============================================================================ */
+
+#define MAX_CPUS 256
+#define AP_BOOT_CODE_BASE 0x8000
+#define LAPIC_BASE 0xFEE00000
+
+typedef struct cpu_info {
+    uint32_t cpu_id;
+    uint32_t lapic_id;
+    uint32_t flags;
+    uint64_t boot_time;
+    uint64_t last_schedule;
+    
+    /* Per-CPU data */
+    process_t* current_process;
+    process_t* idle_process;
+    thread_t* current_thread;
+    
+    /* Scheduler data */
+    runqueue_t runqueue;
+    uint64_t load_avg[3];  /* 1min, 5min, 15min */
+    uint32_t nr_running;
+    uint32_t nr_switches;
+    
+    /* Memory management */
+    paddr_t page_pool;
+    uint32_t page_pool_count;
+    
+    /* Interrupt handling */
+    uint64_t irq_count[256];
+    uint64_t softirq_pending;
+    
+    /* Lock debugging */
+    spinlock_t* held_locks[16];
+    uint32_t lock_count;
+    uint64_t lock_time;
+    
+    /* Cache-aligned padding */
+} __attribute__((aligned(64))) cpu_info_t;
+
+#define CPU_FLAG_BSP        0x1
+#define CPU_FLAG_ONLINE     0x2
+#define CPU_FLAG_PRESENT    0x4
+#define CPU_FLAG_ENABLED    0x8
+
+static cpu_info_t cpu_info[MAX_CPUS];
+static volatile uint32_t cpu_count = 0;
+static volatile uint32_t online_cpus = 0;
+static uint32_t bsp_cpu_id = 0;
+
+/* Per-CPU data access */
+DEFINE_PER_CPU(cpu_info_t*, cpu_info_ptr);
+DEFINE_PER_CPU(uint32_t, cpu_id);
+DEFINE_PER_CPU(process_t*, current_process);
+DEFINE_PER_CPU(thread_t*, current_thread);
+
+/* SMP synchronization */
+static volatile uint32_t smp_barrier_count = 0;
+static volatile uint32_t smp_barrier_target = 0;
+static spinlock_t smp_barrier_lock = 0;
+
+/* AP boot code and stack */
+extern void ap_boot_entry(void);
+extern void ap_boot_end(void);
+static uint8_t ap_stacks[MAX_CPUS][8192] __attribute__((aligned(16)));
+
+/* Initialize BSP (Boot Strap Processor) */
+static void bsp_init(void) {
+    cpu_info_t* bsp = &cpu_info[0];
+    memset(bsp, 0, sizeof(*bsp));
+    
+    bsp->cpu_id = 0;
+    bsp->lapic_id = lapic_get_id();
+    bsp->flags = CPU_FLAG_BSP | CPU_FLAG_PRESENT | CPU_FLAG_ENABLED | CPU_FLAG_ONLINE;
+    bsp->boot_time = get_timestamp();
+    
+    /* Initialize per-CPU data for BSP */
+    set_percpu_ptr(cpu_info_ptr, bsp);
+    set_percpu(cpu_id, 0);
+    
+    /* Initialize runqueue */
+    runqueue_init(&bsp->runqueue);
+    
+    bsp_cpu_id = 0;
+    cpu_count = 1;
+    online_cpus = 1;
+    
+    kprintf("BSP initialized: CPU 0, LAPIC ID 0x%x\n", bsp->lapic_id);
+}
+
+/* AP (Application Processor) initialization */
+void ap_init(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS) {
+        kprintf("ERROR: CPU ID %u exceeds maximum\n", cpu_id);
+        while (1) halt();
+    }
+    
+    cpu_info_t* cpu = &cpu_info[cpu_id];
+    cpu->cpu_id = cpu_id;
+    cpu->lapic_id = lapic_get_id();
+    cpu->flags = CPU_FLAG_PRESENT | CPU_FLAG_ENABLED | CPU_FLAG_ONLINE;
+    cpu->boot_time = get_timestamp();
+    
+    /* Set up per-CPU data */
+    set_percpu_ptr(cpu_info_ptr, cpu);
+    set_percpu(cpu_id, cpu_id);
+    
+    /* Initialize local APIC */
+    lapic_init();
+    
+    /* Initialize runqueue */
+    runqueue_init(&cpu->runqueue);
+    
+    /* Enable interrupts */
+    enable_interrupts();
+    
+    atomic_inc(&online_cpus);
+    
+    kprintf("AP initialized: CPU %u, LAPIC ID 0x%x\n", cpu_id, cpu->lapic_id);
+    
+    /* Signal BSP that we're ready */
+    cpu->flags |= CPU_FLAG_ONLINE;
+    
+    /* Enter scheduler */
+    schedule();
+    
+    /* Should never reach here */
+    panic("AP fell through scheduler");
+}
+
+/* Start an Application Processor */
+static bool start_ap(uint32_t cpu_id, uint32_t lapic_id) {
+    /* Copy AP boot code to low memory */
+    size_t boot_code_size = (uintptr_t)ap_boot_end - (uintptr_t)ap_boot_entry;
+    memcpy((void*)AP_BOOT_CODE_BASE, ap_boot_entry, boot_code_size);
+    
+    /* Set up AP stack pointer */
+    uintptr_t stack_top = (uintptr_t)&ap_stacks[cpu_id][8192];
+    *(uint64_t*)(AP_BOOT_CODE_BASE + boot_code_size) = stack_top;
+    *(uint32_t*)(AP_BOOT_CODE_BASE + boot_code_size + 8) = cpu_id;
+    
+    /* Send INIT IPI */
+    lapic_send_ipi(lapic_id, 0, LAPIC_IPI_INIT);
+    udelay(10000);  /* 10ms delay */
+    
+    /* Send STARTUP IPI */
+    uint8_t vector = AP_BOOT_CODE_BASE >> 12;  /* Page boundary */
+    lapic_send_ipi(lapic_id, vector, LAPIC_IPI_STARTUP);
+    udelay(200);
+    
+    /* Send second STARTUP IPI (required by some processors) */
+    lapic_send_ipi(lapic_id, vector, LAPIC_IPI_STARTUP);
+    udelay(200);
+    
+    /* Wait for AP to come online */
+    uint64_t timeout = get_timestamp() + 1000000;  /* 1 second */
+    while (get_timestamp() < timeout) {
+        if (cpu_info[cpu_id].flags & CPU_FLAG_ONLINE) {
+            return true;
+        }
+        cpu_pause();
+    }
+    
+    kprintf("WARNING: AP %u (LAPIC 0x%x) failed to start\n", cpu_id, lapic_id);
+    return false;
+}
+
+/* Enumerate processors from ACPI MADT */
+static void enumerate_processors(void) {
+    madt_t* madt = acpi_find_table("APIC");
+    if (!madt) {
+        kprintf("No ACPI MADT found, assuming uniprocessor\n");
+        return;
+    }
+    
+    uint8_t* entry = (uint8_t*)madt + sizeof(madt_t);
+    uint8_t* end = (uint8_t*)madt + madt->header.length;
+    uint32_t next_cpu_id = 1;  /* BSP is CPU 0 */
+    
+    while (entry < end) {
+        madt_entry_t* madt_entry = (madt_entry_t*)entry;
+        
+        if (madt_entry->type == MADT_TYPE_LOCAL_APIC) {
+            madt_local_apic_t* lapic = (madt_local_apic_t*)entry;
+            
+            if (lapic->flags & MADT_LAPIC_ENABLED) {
+                if (lapic->lapic_id == bsp_cpu_id) {
+                    /* This is the BSP */
+                    cpu_info[0].lapic_id = lapic->lapic_id;
+                } else {
+                    /* This is an AP */
+                    if (next_cpu_id < MAX_CPUS) {
+                        cpu_info[next_cpu_id].cpu_id = next_cpu_id;
+                        cpu_info[next_cpu_id].lapic_id = lapic->lapic_id;
+                        cpu_info[next_cpu_id].flags = CPU_FLAG_PRESENT;
+                        
+                        kprintf("Found AP: CPU %u, LAPIC ID 0x%x\n", 
+                                next_cpu_id, lapic->lapic_id);
+                        next_cpu_id++;
+                    }
+                }
+            }
+        }
+        
+        entry += madt_entry->length;
+    }
+    
+    cpu_count = next_cpu_id;
+    kprintf("Total CPUs found: %u\n", cpu_count);
+}
+
+/* SMP barrier synchronization */
+void smp_barrier(void) {
+    uint32_t target = online_cpus;
+    uint32_t cpu_id = get_cpu_id();
+    
+    spin_lock(&smp_barrier_lock);
+    smp_barrier_count++;
+    if (smp_barrier_count == 1) {
+        smp_barrier_target = target;
+    }
+    
+    if (smp_barrier_count == smp_barrier_target) {
+        /* Last CPU - reset barrier and wake everyone */
+        smp_barrier_count = 0;
+        spin_unlock(&smp_barrier_lock);
+        /* Send IPI to all other CPUs */
+        for (uint32_t i = 0; i < cpu_count; i++) {
+            if (i != cpu_id && (cpu_info[i].flags & CPU_FLAG_ONLINE)) {
+                lapic_send_ipi(cpu_info[i].lapic_id, 0xF0, LAPIC_IPI_FIXED);
+            }
+        }
+        return;
+    }
+    
+    spin_unlock(&smp_barrier_lock);
+    
+    /* Wait for barrier completion */
+    while (smp_barrier_count > 0) {
+        cpu_pause();
+    }
+}
+
+/* ============================================================================
+ * SPINLOCK IMPLEMENTATION WITH DEBUGGING
+ * ============================================================================ */
+
+typedef struct spinlock_debug {
+    const char* name;
+    const char* file;
+    uint32_t line;
+    uint32_t cpu_id;
+    uint64_t acquire_time;
+    uint64_t hold_time;
+    uint64_t contention_count;
+    struct spinlock_debug* next;
+} spinlock_debug_t;
+
+static spinlock_debug_t* spinlock_debug_list = NULL;
+static spinlock_t spinlock_debug_lock = 0;
+
+#define SPINLOCK_DEBUG_MAGIC 0xDEADBEEF
+#define SPINLOCK_MAX_HOLD_TIME 10000000  /* 10ms in microseconds */
+
+/* Enhanced spinlock structure */
+typedef struct spinlock_enhanced {
+    volatile uint32_t lock;
+    uint32_t magic;
+    spinlock_debug_t* debug;
+    uint64_t acquire_count;
+    uint64_t contention_count;
+    uint64_t max_hold_time;
+} spinlock_enhanced_t;
+
+static spinlock_debug_t* spinlock_create_debug(const char* name, const char* file, uint32_t line) {
+    spinlock_debug_t* debug = kmalloc(sizeof(spinlock_debug_t));
+    if (!debug) return NULL;
+    
+    debug->name = name;
+    debug->file = file;
+    debug->line = line;
+    debug->cpu_id = 0xFFFFFFFF;
+    debug->acquire_time = 0;
+    debug->hold_time = 0;
+    debug->contention_count = 0;
+    
+    spin_lock(&spinlock_debug_lock);
+    debug->next = spinlock_debug_list;
+    spinlock_debug_list = debug;
+    spin_unlock(&spinlock_debug_lock);
+    
+    return debug;
+}
+
+void spin_lock_debug(spinlock_t* lock, const char* name, const char* file, uint32_t line) {
+    uint32_t cpu_id = get_cpu_id();
+    cpu_info_t* cpu = get_percpu_ptr(cpu_info_ptr);
+    uint64_t start_time = get_timestamp();
+    
+    /* Check if we already hold this lock (deadlock detection) */
+    for (uint32_t i = 0; i < cpu->lock_count; i++) {
+        if (cpu->held_locks[i] == lock) {
+            panic("DEADLOCK: CPU %u attempting to acquire lock %s twice", cpu_id, name);
+        }
+    }
+    
+    /* Attempt to acquire lock */
+    uint32_t contention = 0;
+    while (atomic_cmpxchg(lock, 0, 1) != 0) {
+        contention++;
+        if (contention > 1000000) {
+            kprintf("WARNING: High contention on lock %s at %s:%u (CPU %u)\n", 
+                    name, file, line, cpu_id);
+            contention = 0;
+        }
+        cpu_pause();
+    }
+    
+    uint64_t acquire_time = get_timestamp();
+    
+    /* Record lock acquisition */
+    if (cpu->lock_count < 16) {
+        cpu->held_locks[cpu->lock_count++] = lock;
+    } else {
+        panic("LOCK OVERFLOW: CPU %u holding too many locks", cpu_id);
+    }
+    
+    /* Update debug info if available */
+    spinlock_enhanced_t* elock = (spinlock_enhanced_t*)lock;
+    if (elock->magic == SPINLOCK_DEBUG_MAGIC && elock->debug) {
+        elock->debug->cpu_id = cpu_id;
+        elock->debug->acquire_time = acquire_time;
+        elock->acquire_count++;
+        if (contention > 0) {
+            elock->contention_count++;
+        }
+    }
+}
+
+void spin_unlock_debug(spinlock_t* lock, const char* name, const char* file, uint32_t line) {
+    uint32_t cpu_id = get_cpu_id();
+    cpu_info_t* cpu = get_percpu_ptr(cpu_info_ptr);
+    uint64_t release_time = get_timestamp();
+    
+    /* Find and remove lock from held list */
+    bool found = false;
+    for (uint32_t i = 0; i < cpu->lock_count; i++) {
+        if (cpu->held_locks[i] == lock) {
+            /* Shift remaining locks down */
+            for (uint32_t j = i; j < cpu->lock_count - 1; j++) {
+                cpu->held_locks[j] = cpu->held_locks[j + 1];
+            }
+            cpu->lock_count--;
+            found = true;
+            break;
+        }
+    }
+    
+    if (!found) {
+        panic("LOCK ERROR: CPU %u releasing unheld lock %s at %s:%u", 
+              cpu_id, name, file, line);
+    }
+    
+    /* Update debug info */
+    spinlock_enhanced_t* elock = (spinlock_enhanced_t*)lock;
+    if (elock->magic == SPINLOCK_DEBUG_MAGIC && elock->debug) {
+        uint64_t hold_time = release_time - elock->debug->acquire_time;
+        elock->debug->hold_time += hold_time;
+        
+        if (hold_time > elock->max_hold_time) {
+            elock->max_hold_time = hold_time;
+        }
+        
+        if (hold_time > SPINLOCK_MAX_HOLD_TIME) {
+            kprintf("WARNING: Lock %s held for %llu us at %s:%u (CPU %u)\n",
+                    name, hold_time, file, line, cpu_id);
+        }
+        
+        elock->debug->cpu_id = 0xFFFFFFFF;
+    }
+    
+    /* Release the lock */
+    atomic_store(lock, 0);
+}
+
+#define spin_lock(lock) spin_lock_debug(lock, #lock, __FILE__, __LINE__)
+#define spin_unlock(lock) spin_unlock_debug(lock, #lock, __FILE__, __LINE__)
+
+/* ============================================================================
+ * ROBUST SCHEDULER IMPLEMENTATION
+ * ============================================================================ */
+
+#define SCHED_NORMAL    0
+#define SCHED_FIFO      1
+#define SCHED_RR        2
+#define SCHED_IDLE      3
+
+#define MAX_PRIO        140
+#define DEFAULT_PRIO    120
+#define MAX_RT_PRIO     100
+
+typedef struct sched_entity {
+    uint64_t exec_time;
+    uint64_t vruntime;
+    uint64_t start_time;
+    uint32_t weight;
+    uint32_t inv_weight;
+    struct sched_entity* parent;
+} sched_entity_t;
+
+typedef struct cfs_runqueue {
+    struct rb_root tasks_timeline;
+    struct rb_node* leftmost;
+    uint64_t min_vruntime;
+    uint32_t nr_running;
+    uint64_t exec_clock;
+} cfs_rq_t;
+
+typedef struct rt_runqueue {
+    struct prio_array {
+        struct list_head queue[MAX_RT_PRIO];
+        unsigned long bitmap[MAX_RT_PRIO / BITS_PER_LONG + 1];
+    } active;
+    uint32_t nr_running;
+    uint32_t highest_prio;
+} rt_rq_t;
+
+typedef struct runqueue {
+    spinlock_t lock;
+    uint32_t nr_running;
+    uint32_t nr_switches;
+    uint64_t clock;
+    
+    cfs_rq_t cfs;
+    rt_rq_t rt;
+    
+    thread_t* curr;
+    thread_t* idle;
+    
+    /* Load balancing */
+    uint32_t cpu_load[3];
+    uint64_t last_load_update;
+    
+    /* Migration */
+    struct list_head migration_queue;
+    
+} runqueue_t;
+
+/* Per-CPU runqueues */
+DEFINE_PER_CPU(runqueue_t, runqueue);
+
+/* Scheduler tunables */
+static uint64_t sched_latency = 6000000;      /* 6ms */
+static uint64_t sched_min_granularity = 750000; /* 0.75ms */
+static uint32_t sched_wakeup_granularity = 1000000; /* 1ms */
+
+/* Nice to weight conversion */
+static const uint32_t prio_to_weight[40] = {
+    /* -20 */     88761,     71755,     56483,     46273,     36291,
+    /* -15 */     29154,     23254,     18705,     14949,     11916,
+    /* -10 */      9548,      7620,      6100,      4904,      3906,
+    /*  -5 */      3121,      2501,      1991,      1586,      1277,
+    /*   0 */      1024,       820,       655,       526,       423,
+    /*   5 */       335,       272,       215,       172,       137,
+    /*  10 */       110,        87,        70,        56,        45,
+    /*  15 */        36,        29,        23,        18,        15,
+};
+
+/* Initialize runqueue */
+void runqueue_init(runqueue_t* rq) {
+    memset(rq, 0, sizeof(*rq));
+    rq->cfs.tasks_timeline = RB_ROOT;
+    INIT_LIST_HEAD(&rq->migration_queue);
+    
+    /* Initialize RT priority arrays */
+    for (int i = 0; i < MAX_RT_PRIO; i++) {
+        INIT_LIST_HEAD(&rq->rt.active.queue[i]);
+    }
+}
+
+/* Calculate task weight based on nice value */
+static uint32_t calc_delta_fair(uint64_t delta, sched_entity_t* se) {
+    if (unlikely(se->weight != NICE_0_LOAD)) {
+        delta = calc_delta_mine(delta, NICE_0_LOAD, &se->load);
+    }
+    return delta;
+}
+
+/* Update virtual runtime */
+static void update_curr(cfs_rq_t* cfs_rq) {
+    thread_t* curr = get_percpu(current_thread);
+    if (!curr) return;
+    
+    uint64_t now = sched_clock();
+    uint64_t delta_exec = now - curr->se.start_time;
+    
+    curr->se.exec_time += delta_exec;
+    curr->se.vruntime += calc_delta_fair(delta_exec, &curr->se);
+    curr->se.start_time = now;
+    
+    if (cfs_rq->leftmost && curr->se.vruntime > cfs_rq->min_vruntime) {
+        cfs_rq->min_vruntime = curr->se.vruntime;
+    }
+}
+
+/* CFS task enqueue */
+static void enqueue_task_fair(runqueue_t* rq, thread_t* p, uint32_t flags) {
+    cfs_rq_t* cfs_rq = &rq->cfs;
+    sched_entity_t* se = &p->se;
+    
+    if (se->vruntime < cfs_rq->min_vruntime) {
+        se->vruntime = cfs_rq->min_vruntime;
+    }
+    
+    /* Insert into red-black tree */
+    struct rb_node** link = &cfs_rq->tasks_timeline.rb_node;
+    struct rb_node* parent = NULL;
+    thread_t* entry;
+    int leftmost = 1;
+    
+    while (*link) {
+        parent = *link;
+        entry = rb_entry(parent, thread_t, run_node);
+        
+        if (se->vruntime < entry->se.vruntime) {
+            link = &parent->rb_left;
+        } else {
+            link = &parent->rb_right;
+            leftmost = 0;
+        }
+    }
+    
+    if (leftmost) {
+        cfs_rq->leftmost = &p->run_node;
+    }
+    
+    rb_link_node(&p->run_node, parent, link);
+    rb_insert_color(&p->run_node, &cfs_rq->tasks_timeline);
+    
+    cfs_rq->nr_running++;
+    rq->nr_running++;
+}
+
+/* CFS task dequeue */
+static void dequeue_task_fair(runqueue_t* rq, thread_t* p, uint32_t flags) {
+    cfs_rq_t* cfs_rq = &rq->cfs;
+    
+    if (cfs_rq->leftmost == &p->run_node) {
+        cfs_rq->leftmost = rb_next(&p->run_node);
+    }
+    
+    rb_erase(&p->run_node, &cfs_rq->tasks_timeline);
+    
+    cfs_rq->nr_running--;
+    rq->nr_running--;
+}
+
+/* Pick next CFS task */
+static thread_t* pick_next_task_fair(runqueue_t* rq) {
+    cfs_rq_t* cfs_rq = &rq->cfs;
+    
+    if (!cfs_rq->leftmost) {
+        return NULL;
+    }
+    
+    thread_t* p = rb_entry(cfs_rq->leftmost, thread_t, run_node);
+    return p;
+}
+
+/* Main scheduler function */
+void schedule(void) {
+    uint32_t cpu_id = get_cpu_id();
+    runqueue_t* rq = &per_cpu(runqueue, cpu_id);
+    thread_t* prev, * next;
+    
+    local_irq_disable();
+    spin_lock(&rq->lock);
+    
+    prev = rq->curr;
+    
+    /* Update current task */
+    if (prev && prev->state == TASK_RUNNING) {
+        update_curr(&rq->cfs);
+    }
+    
+    /* Pick next task */
+    next = pick_next_task_fair(rq);
+    if (!next) {
+        next = rq->idle;
+    }
+    
+    if (next != prev) {
+        rq->nr_switches++;
+        rq->curr = next;
+        
+        /* Context switch */
+        context_switch(prev, next);
+    }
+    
+    spin_unlock(&rq->lock);
+    local_irq_enable();
+}
+
+/* Initialize SMP */
+status_t smp_init(void) {
+    kprintf("Initializing SMP...\n");
+    
+    /* Initialize BSP */
+    bsp_init();
+    
+    /* Enumerate processors */
+    enumerate_processors();
+    
+    if (cpu_count == 1) {
+        kprintf("Uniprocessor system detected\n");
+        return STATUS_OK;
+    }
+    
+    /* Start APs */
+    uint32_t started = 0;
+    for (uint32_t i = 1; i < cpu_count; i++) {
+        if (cpu_info[i].flags & CPU_FLAG_PRESENT) {
+            kprintf("Starting AP %u (LAPIC 0x%x)...\n", i, cpu_info[i].lapic_id);
+            
+            if (start_ap(i, cpu_info[i].lapic_id)) {
+                started++;
+            }
+        }
+    }
+    
+    kprintf("SMP initialization complete: %u CPUs online\n", online_cpus);
+    return STATUS_OK;
+}
+
+/* Per-CPU accessors */
+uint32_t get_cpu_id(void) {
+    return get_percpu(cpu_id);
+}
+
+cpu_info_t* get_cpu_info(void) {
+    return get_percpu_ptr(cpu_info_ptr);
+}
+
+process_t* process_current(void) {
+    return get_percpu(current_process);
+}
+
+/* SMP statistics */
+void smp_print_stats(void) {
+    kprintf("SMP STATISTICS\n");
+    kprintf("==============\n");
+    kprintf("Total CPUs: %u\n", cpu_count);
+    kprintf("Online CPUs: %u\n", online_cpus);
+    
+    for (uint32_t i = 0; i < cpu_count; i++) {
+        cpu_info_t* cpu = &cpu_info[i];
+        if (cpu->flags & CPU_FLAG_ONLINE) {
+            kprintf("CPU %u: LAPIC 0x%x, switches: %u, running: %u\n",
+                    i, cpu->lapic_id, cpu->nr_switches, cpu->nr_running);
+        }
+    }
+    
+    /* Lock statistics */
+    spin_lock(&spinlock_debug_lock);
+    spinlock_debug_t* debug = spinlock_debug_list;
+    kprintf("\nSPINLOCK STATISTICS\n");
+    kprintf("===================\n");
+    while (debug) {
+        kprintf("Lock %s: hold_time=%llu, contention=%llu\n",
+                debug->name, debug->hold_time, debug->contention_count);
+        debug = debug->next;
+    }
+    spin_unlock(&spinlock_debug_lock);
+}

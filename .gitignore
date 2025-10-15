@@ -1,0 +1,65 @@
+# Build outputs
+build/
+out/
+dist/
+target/
+obj/
+bin/
+Debug/
+Release/
+
+# Artifacts (binaries, images, maps)
+*.iso
+*.img
+*.elf
+*.map
+*.lst
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.pdb
+*.hex
+*.efi
+*.sym
+*.debug
+*.log
+*.tmp
+
+# Editor/OS junk
+.vscode/
+.vs/
+.idea/
+.cache/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Kernel/User artifacts (redundant due to build/ but explicit for clarity)
+kernel/limitless.elf
+build/bootloader/
+build/userspace/
+
+# Dependency directories
+vendor/
+third_party/
+
+# Test artifacts
+test/output/
+*.test
+
+# Temporary directories
+tmp/
+temp/
+
+# Config overrides
+config.local.mk
+.env.local
+
+# Idk
+test_results_*/
+test_results*/

@@ -1,0 +1,186 @@
+#include "kernel.h"
+#include "pci.h"
+#include "virtio_pci.h"
+#include "virtio_ring.h"
+#include "block_hw.h"
+#include "net/net.h"
+
+/*
+ * Virtio-net minimal driver (Phase 6)
+ * - Single RX/TX queues, polled
+ *
+ * TODO:
+ * - Interrupt (MSI-X)
+ * - Offloads and multiqueue
+ * - Bounce copy for non-contiguous user buffers
+ */
+
+#pragma pack(push, 1)
+typedef struct {
+    u8 mac[6];
+    u16 status;
+    u16 max_virtqueue_pairs;
+    u16 mtu;
+} virtio_net_config_t;
+#pragma pack(pop)
+
+typedef struct {
+    const pci_device_t* pci;
+    virtio_pci_common_cfg_t* common;
+    void* notify_base; u32 notify_mul;
+    virtio_net_config_t* devcfg;
+
+    /* RX queue */
+    u16 qsz_rx; dma_region_t desc_rx_dma, avail_rx_dma, used_rx_dma;
+    vring_desc* desc_rx; vring_avail* avail_rx; vring_used* used_rx;
+    u16 aidx_rx, uidx_rx;
+
+    /* TX queue */
+    u16 qsz_tx; dma_region_t desc_tx_dma, avail_tx_dma, used_tx_dma;
+    vring_desc* desc_tx; vring_avail* avail_tx; vring_used* used_tx;
+    u16 aidx_tx, uidx_tx;
+
+    /* RX buffers */
+    enum { RX_POOL = 64 };
+    dma_region_t rx_buf[RX_POOL];
+
+    net_if_t* nif;
+    u8 mac[6];
+} vnet_t;
+
+static inline void* vnet_notify_ptr(vnet_t* d) {
+    u16 off = d->common->queue_notify_off;
+    return (u8*)d->notify_base + (u32)off * d->notify_mul;
+}
+
+static int vnet_setup_queue(vnet_t* d, u16 qsel, u16* out_qsz,
+                            dma_region_t* descd, dma_region_t* availd, dma_region_t* usedd,
+                            vring_desc** desc, vring_avail** avail, vring_used** used) {
+    d->common->queue_select = qsel;
+    u16 qsz = d->common->queue_size; if (!qsz) return K_EIO; *out_qsz = qsz;
+    if (dma_alloc(vring_desc_size(qsz), 4096, descd)!=0) return K_ENOMEM;
+    if (dma_alloc(vring_avail_size(qsz), 4096, availd)!=0) return K_ENOMEM;
+    if (dma_alloc(vring_used_size(qsz), 4096, usedd)!=0) return K_ENOMEM;
+    *desc = (vring_desc*)descd->va; *avail = (vring_avail*)availd->va; *used = (vring_used*)usedd->va;
+    k_memset(*desc,0,descd->len); k_memset(*avail,0,availd->len); k_memset(*used,0,usedd->len);
+    d->common->queue_desc = descd->pa;
+    d->common->queue_avail = availd->pa;
+    d->common->queue_used = usedd->pa;
+    d->common->queue_enable = 1;
+    return 0;
+}
+
+static int vnet_init(vnet_t* d, const pci_device_t* dev) {
+    d->pci = dev;
+    if (virtio_find_caps(dev, &d->common, &d->notify_base, &d->notify_mul, (void**)&d->devcfg)!=0) return K_EIO;
+
+    d->common->device_status = 0;
+    d->common->device_status = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+
+    /* Accept default features for now */
+    d->common->device_feature_select = 0; (void)d->common->device_feature;
+    d->common->driver_feature_select = 0; d->common->driver_feature = 0;
+
+    d->common->device_status |= VIRTIO_STATUS_FEATURES_OK;
+
+    if (vnet_setup_queue(d, 0, &d->qsz_rx, &d->desc_rx_dma, &d->avail_rx_dma, &d->used_rx_dma, &d->desc_rx, &d->avail_rx, &d->used_rx)!=0) return K_EIO;
+    if (vnet_setup_queue(d, 1, &d->qsz_tx, &d->desc_tx_dma, &d->avail_tx_dma, &d->used_tx_dma, &d->desc_tx, &d->avail_tx, &d->used_tx)!=0) return K_EIO;
+
+    d->common->device_status |= VIRTIO_STATUS_DRIVER_OK;
+
+    /* MAC and net IF */
+    k_memcpy(d->mac, d->devcfg->mac, 6);
+    net_if_register("vnet0", d->mac, &d->nif);
+    d->nif->drv = d;
+
+    /* Pre-post RX buffers */
+    int rxN = (d->qsz_rx < RX_POOL) ? d->qsz_rx : RX_POOL;
+    for (int i=0;i<rxN;i++) {
+        dma_alloc(2048, 2048, &d->rx_buf[i]);
+        d->desc_rx[i].addr = d->rx_buf[i].pa;
+        d->desc_rx[i].len  = (u32)d->rx_buf[i].len;
+        d->desc_rx[i].flags= VRING_DESC_F_WRITE;
+        d->avail_rx->ring[d->aidx_rx % d->qsz_rx] = (u16)i;
+        d->aidx_rx++;
+    }
+    mmio_wmb();
+    d->avail_rx->idx = d->aidx_rx;
+
+    kprintf("virtio-net: mac %02x:%02x:%02x:%02x:%02x:%02x link up\n",
+        d->mac[0],d->mac[1],d->mac[2],d->mac[3],d->mac[4],d->mac[5]);
+    return 0;
+}
+
+static void vnet_rx_poll(vnet_t* d) {
+    while (d->uidx_rx != d->used_rx->idx) {
+        vring_used_elem* e = &d->used_rx->ring[d->uidx_rx % d->qsz_rx];
+        u32 id = e->id, len = e->len;
+        if (id < RX_POOL) {
+            dma_sync_for_cpu(&d->rx_buf[id]);
+            net_ingress(d->nif, d->rx_buf[id].va, len);
+            /* Re-post */
+            d->avail_rx->ring[d->aidx_rx % d->qsz_rx] = (u16)id;
+            d->aidx_rx++;
+        }
+        d->uidx_rx++;
+    }
+    mmio_wmb();
+    d->avail_rx->idx = d->aidx_rx;
+}
+
+static int vnet_tx(vnet_t* d, const void* pkt, u32 len) {
+    /* Single-desc TX; TODO: bounce copy for non-DMA-safe buffers */
+    d->desc_tx[0].addr = hal_virt_to_phys((void*)pkt);
+    d->desc_tx[0].len  = len;
+    d->desc_tx[0].flags= 0;
+    d->avail_tx->ring[d->aidx_tx % d->qsz_tx] = 0;
+    mmio_wmb();
+    d->avail_tx->idx = ++d->aidx_tx;
+    vmmio_write16(vnet_notify_ptr(d), 1);
+
+    /* Poll used */
+    const u64 SPIN_MAX = 1000000;
+    u64 spins=0;
+    while (d->uidx_tx == d->used_tx->idx && spins++ < SPIN_MAX) {
+        mmio_rmb();
+        cpu_relax();
+    }
+    if (d->uidx_tx == d->used_tx->idx) return K_ETIMEDOUT;
+    d->uidx_tx++;
+    return 0;
+}
+
+/* Net stack hooks */
+static int vnet_send(net_if_t* nif, const void* data, u32 len) {
+    vnet_t* d = (vnet_t*)nif->drv;
+    return vnet_tx(d, data, len);
+}
+
+/* Register periodic RX poll callback (timer or net thread calls this) */
+static void vnet_poll(void* arg) {
+    vnet_t* d = (vnet_t*)arg;
+    vnet_rx_poll(d);
+}
+
+extern void net_register_poll_cb(void (*cb)(void*), void* arg); /* Provided by net core */
+
+static void virtio_net_probe(const pci_device_t* dev, void* user) {
+    (void)user;
+    if (dev->vendor_id != VIRTIO_PCI_VENDOR) return;
+
+    static vnet_t g;
+    k_memset(&g, 0, sizeof(g));
+    if (vnet_init(&g, dev)!=0) {
+        kprintf("virtio-net: init failed\n"); return;
+    }
+    g.nif->send = vnet_send;
+
+    net_register_poll_cb(vnet_poll, &g);
+
+    /* Ensure default IP is set (QEMU user network); can be overridden later */
+    net_if_config_static(g.nif, net_htonl(0x0A00020F), net_htonl(0xFFFFFF00), net_htonl(0x0A000202));
+}
+
+void virtio_net_init(void) {
+    pci_enumerate(virtio_net_probe, NULL);
+}

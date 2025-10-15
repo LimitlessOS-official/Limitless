@@ -1,0 +1,41 @@
+#include "kernel.h"
+#include "pmm_test.h"
+#include "log.h"
+#include "microkernel.h"
+
+/* Basic PMM unit tests:
+ * 1. Allocate N pages, ensure unique addresses & page-aligned.
+ * 2. Refcount incref/decref leaves original allocated until last decref.
+ * 3. Free all pages; allocate again and verify reuse of at least one address (heuristic).
+ */
+
+#define TEST_PAGES 16
+
+int pmm_selftest(void) {
+    paddr_t pages[TEST_PAGES];
+    for (int i=0;i<TEST_PAGES;i++) {
+        pages[i] = pmm_alloc_page();
+        if (!pages[i] || (pages[i] & (PAGE_SIZE-1))) { KLOG_ERROR("pmm_test","alloc align fail i=%d", i); return -1; }
+        for (int j=0;j<i;j++) {
+            if (pages[j] == pages[i]) { KLOG_ERROR("pmm_test","duplicate page addr i=%d", i); return -2; }
+        }
+    }
+    /* Refcount check */
+    paddr_t target = pages[0];
+    pmm_incref(target); /* refcount 2 */
+    if (pmm_get_refcount(target) < 2) { KLOG_ERROR("pmm_test","refcount incref failed"); return -3; }
+    if (pmm_decref(target) == 0) { KLOG_ERROR("pmm_test","premature free on decref"); return -4; }
+    if (pmm_decref(target) != 0) { KLOG_ERROR("pmm_test","final decref not zero"); return -5; }
+    /* Free remaining pages */
+    for (int i=1;i<TEST_PAGES;i++) { pmm_free_page(pages[i]); }
+    /* Reallocate some pages and ensure at least one reused addr appears */
+    int reused = 0;
+    for (int i=0;i<4;i++) {
+        paddr_t p = pmm_alloc_page();
+        for (int j=0;j<TEST_PAGES;j++) if (p == pages[j]) reused = 1;
+        pmm_free_page(p);
+    }
+    if (!reused) { KLOG_WARN("pmm_test","did not observe reuse (may be OK if allocator strategy changed)" ); }
+    KLOG_INFO("pmm_test","PMM selftest complete");
+    return 0;
+}

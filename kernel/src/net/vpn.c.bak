@@ -1,0 +1,443 @@
+#include "net/vpn.h"
+#include "log.h"
+#include "kernel.h"
+#include "security.h" /* for crypto hash if needed */
+#include "vfs.h"
+
+/* Simple SHA256 + HMAC local implementation (leveraging update.c style) */
+typedef struct { uint32_t h[8]; uint8_t buf[64]; uint64_t len; uint32_t idx; } _sha256_ctx_t;
+static void _sha256_init(_sha256_ctx_t* c){ c->h[0]=0x6a09e667; c->h[1]=0xbb67ae85; c->h[2]=0x3c6ef372; c->h[3]=0xa54ff53a; c->h[4]=0x510e527f; c->h[5]=0x9b05688c; c->h[6]=0x1f83d9ab; c->h[7]=0x5be0cd19; c->len=0; c->idx=0; }
+#define ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static inline uint32_t Ch(uint32_t x,uint32_t y,uint32_t z){ return (x & y) ^ (~x & z); }
+static inline uint32_t Maj(uint32_t x,uint32_t y,uint32_t z){ return (x & y) ^ (x & z) ^ (y & z); }
+static inline uint32_t S0(uint32_t x){ return ROR(x,2)^ROR(x,13)^ROR(x,22); }
+static inline uint32_t S1(uint32_t x){ return ROR(x,6)^ROR(x,11)^ROR(x,25); }
+static inline uint32_t s0(uint32_t x){ return ROR(x,7)^ROR(x,18)^(x>>3); }
+static inline uint32_t s1(uint32_t x){ return ROR(x,17)^ROR(x,19)^(x>>10); }
+static const uint32_t Kt[64] = { 0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+static void _sha256_block(_sha256_ctx_t* c,const uint8_t b[64]){ uint32_t w[64]; for(int i=0;i<16;i++){ w[i]=(b[i*4]<<24)|(b[i*4+1]<<16)|(b[i*4+2]<<8)|b[i*4+3]; } for(int i=16;i<64;i++){ w[i]=s1(w[i-2])+w[i-7]+s0(w[i-15])+w[i-16]; } uint32_t a=c->h[0],b0=c->h[1],c1=c->h[2],d=c->h[3],e=c->h[4],f=c->h[5],g=c->h[6],h=c->h[7]; for(int i=0;i<64;i++){ uint32_t T1=h+S1(e)+Ch(e,f,g)+Kt[i]+w[i]; uint32_t T2=S0(a)+Maj(a,b0,c1); h=g; g=f; f=e; e=d+T1; d=c1; c1=b0; b0=a; a=T1+T2; } c->h[0]+=a; c->h[1]+=b0; c->h[2]+=c1; c->h[3]+=d; c->h[4]+=e; c->h[5]+=f; c->h[6]+=g; c->h[7]+=h; }
+static void _sha256_update(_sha256_ctx_t* c,const void* data,size_t len){ const uint8_t* p=(const uint8_t*)data; c->len += len; while(len--){ c->buf[c->idx++]=*p++; if(c->idx==64){ _sha256_block(c,c->buf); c->idx=0; } } }
+static void _sha256_final(_sha256_ctx_t* c,uint8_t out[32]){ uint64_t bits=c->len*8; c->buf[c->idx++]=0x80; if(c->idx>56){ while(c->idx<64) c->buf[c->idx++]=0; _sha256_block(c,c->buf); c->idx=0; } while(c->idx<56) c->buf[c->idx++]=0; for(int i=7;i>=0;i--) c->buf[c->idx++]=(uint8_t)((bits>>(i*8))&0xFF); _sha256_block(c,c->buf); for(int i=0;i<8;i++){ out[i*4]=(uint8_t)(c->h[i]>>24); out[i*4+1]=(uint8_t)(c->h[i]>>16); out[i*4+2]=(uint8_t)(c->h[i]>>8); out[i*4+3]=(uint8_t)(c->h[i]); } }
+static void _hmac_sha256(const uint8_t* key,size_t klen,const uint8_t* data,size_t dlen,uint8_t out[32]){ uint8_t k0[64]; k_memset(k0,0,sizeof(k0)); if(klen>64){ _sha256_ctx_t t; _sha256_init(&t); _sha256_update(&t,key,klen); _sha256_final(&t,k0); } else { k_memcpy(k0,key,klen); } uint8_t ipad[64],opad[64]; for(int i=0;i<64;i++){ ipad[i]=k0[i]^0x36; opad[i]=k0[i]^0x5c; } _sha256_ctx_t c; _sha256_init(&c); _sha256_update(&c,ipad,64); _sha256_update(&c,data,dlen); uint8_t ih[32]; _sha256_final(&c,ih); _sha256_init(&c); _sha256_update(&c,opad,64); _sha256_update(&c,ih,32); _sha256_final(&c,out); }
+
+/* Global state */
+static vpn_iface_t g_ifaces[VPN_MAX_IFACES];
+static spinlock_t g_if_lock;
+static vpn_metrics_t g_metrics;
+static uint64_t g_handshakes = 0;
+
+static vpn_iface_t* find_iface(uint32_t if_id){ for(int i=0;i<VPN_MAX_IFACES;i++){ if(g_ifaces[i].up && g_ifaces[i].if_id==if_id) return &g_ifaces[i]; } return NULL; }
+
+status_t vpn_init(void){ spinlock_init(&g_if_lock); k_memset(g_ifaces,0,sizeof(g_ifaces)); k_memset(&g_metrics,0,sizeof(g_metrics)); log_info("[VPN] Subsystem initialized"); return STATUS_OK; }
+
+status_t vpn_create_interface(const char* name, vpn_proto_t proto, uint32_t local_ip_be, uint16_t listen_port, uint32_t* out_if_id){
+    if(!name) return STATUS_INVALID;
+    spin_lock(&g_if_lock);
+    for(int i=0;i<VPN_MAX_IFACES;i++){
+        if(!g_ifaces[i].up){
+            vpn_iface_t* v=&g_ifaces[i]; k_memset(v,0,sizeof(*v));
+            k_strlcpy(v->name,name,sizeof(v->name));
+            v->if_id = (uint32_t)(i+1); v->proto=proto; v->local_ipv4_be=local_ip_be; v->listen_port=listen_port; v->up=true;
+            g_metrics.ifaces++;
+            if(out_if_id) *out_if_id = v->if_id;
+            spin_unlock(&g_if_lock);
+            return STATUS_OK;
+        }
+    }
+    spin_unlock(&g_if_lock);
+    return STATUS_NO_SPACE;
+}
+
+status_t vpn_add_peer(uint32_t if_id, const vpn_peer_t* peer_template, uint32_t* out_peer_id){
+    vpn_iface_t* v = find_iface(if_id); if(!v) return STATUS_INVALID;
+    if(v->peer_count>=VPN_MAX_PEERS) return STATUS_NO_SPACE;
+    vpn_peer_t* p = &v->peers[v->peer_count];
+    k_memcpy(p, peer_template, sizeof(vpn_peer_t));
+    p->id = v->peer_count+1; p->established=false; p->packets_in=0; p->packets_out=0; p->bytes_in=0; p->bytes_out=0;
+    v->peer_count++; g_metrics.peers++;
+    if(out_peer_id) *out_peer_id = p->id; return STATUS_OK;
+}
+
+status_t vpn_remove_peer(uint32_t if_id, uint32_t peer_id){
+    vpn_iface_t* v = find_iface(if_id); if(!v) return STATUS_INVALID;
+    if(peer_id==0 || peer_id>v->peer_count) return STATUS_INVALID;
+    uint32_t idx = peer_id-1;
+    if(idx != v->peer_count-1){ v->peers[idx] = v->peers[v->peer_count-1]; v->peers[idx].id = idx+1; }
+    v->peer_count--; g_metrics.peers = (g_metrics.peers>0)?g_metrics.peers-1:0;
+    return STATUS_OK;
+}
+
+status_t vpn_set_peer_keys(uint32_t if_id, uint32_t peer_id, const vpn_peer_keyset_t* keys){
+    vpn_iface_t* v = find_iface(if_id); if(!v||!keys) return STATUS_INVALID;
+    if(peer_id==0 || peer_id>v->peer_count) return STATUS_INVALID;
+    vpn_peer_t* p=&v->peers[peer_id-1];
+    p->keys = *keys; p->keys.key_epoch++;
+    g_metrics.key_rotations++;
+    return STATUS_OK;
+}
+
+/* Basic handshake: derive rx/tx keys using HMAC(static_priv || static_pub) for demo; in real design ephemeral curve keys would be used */
+status_t vpn_handshake(uint32_t if_id, uint32_t peer_id){
+    vpn_iface_t* v = find_iface(if_id); if(!v) return STATUS_INVALID;
+    if(peer_id==0 || peer_id>v->peer_count) return STATUS_INVALID;
+    vpn_peer_t* p=&v->peers[peer_id-1];
+    uint8_t material[64]; k_memcpy(material, p->keys.static_private,32); k_memcpy(material+32,p->keys.static_public,32);
+    uint8_t digest[32]; _hmac_sha256(p->keys.preshared_key,32,material,sizeof(material),digest);
+    /* Split digest */
+    k_memcpy(p->keys.tx_key,digest,VPN_KEY_SIZE);
+    k_memcpy(p->keys.rx_key,digest,VPN_KEY_SIZE);
+    p->established=true; p->last_handshake_ticks=timer_get_ticks();
+    g_handshakes++; g_metrics.handshakes = g_handshakes;
+    return STATUS_OK;
+}
+
+/* ChaCha20-Poly1305 AEAD implementation */
+#define CHACHA20_BLOCK_SIZE 64
+#define POLY1305_TAG_SIZE 16
+
+static void chacha20_quarterround(uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
+    *a += *b; *d ^= *a; *d = (*d << 16) | (*d >> 16);
+    *c += *d; *b ^= *c; *b = (*b << 12) | (*b >> 20);
+    *a += *b; *d ^= *a; *d = (*d << 8) | (*d >> 24);
+    *c += *d; *b ^= *c; *b = (*b << 7) | (*b >> 25);
+}
+
+static void chacha20_block(const uint32_t key[8], uint32_t counter, const uint32_t nonce[3], uint8_t block[64]) {
+    uint32_t state[16] = {
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,  /* "expand 32-byte k" */
+        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+        counter, nonce[0], nonce[1], nonce[2]
+    };
+    
+    uint32_t working_state[16];
+    for (int i = 0; i < 16; i++) working_state[i] = state[i];
+    
+    for (int i = 0; i < 10; i++) {
+        chacha20_quarterround(&working_state[0], &working_state[4], &working_state[8], &working_state[12]);
+        chacha20_quarterround(&working_state[1], &working_state[5], &working_state[9], &working_state[13]);
+        chacha20_quarterround(&working_state[2], &working_state[6], &working_state[10], &working_state[14]);
+        chacha20_quarterround(&working_state[3], &working_state[7], &working_state[11], &working_state[15]);
+        chacha20_quarterround(&working_state[0], &working_state[5], &working_state[10], &working_state[15]);
+        chacha20_quarterround(&working_state[1], &working_state[6], &working_state[11], &working_state[12]);
+        chacha20_quarterround(&working_state[2], &working_state[7], &working_state[8], &working_state[13]);
+        chacha20_quarterround(&working_state[3], &working_state[4], &working_state[9], &working_state[14]);
+    }
+    
+    for (int i = 0; i < 16; i++) {
+        uint32_t result = state[i] + working_state[i];
+        block[i*4] = result & 0xff;
+        block[i*4+1] = (result >> 8) & 0xff;
+        block[i*4+2] = (result >> 16) & 0xff;
+        block[i*4+3] = (result >> 24) & 0xff;
+    }
+}
+
+static void poly1305_clamp(uint8_t r[16]) {
+    r[3] &= 15;
+    r[7] &= 15;
+    r[11] &= 15;
+    r[15] &= 15;
+    r[4] &= 252;
+    r[8] &= 252;
+    r[12] &= 252;
+}
+
+static void poly1305_mac(const uint8_t* msg, size_t len, const uint8_t key[32], uint8_t tag[16]) {
+    uint8_t r[16], s[16];
+    k_memcpy(r, key, 16);
+    k_memcpy(s, key + 16, 16);
+    poly1305_clamp(r);
+    
+    uint32_t h[5] = {0, 0, 0, 0, 0};
+    uint32_t r32[4];
+    for (int i = 0; i < 4; i++) {
+        r32[i] = r[i*4] | (r[i*4+1] << 8) | (r[i*4+2] << 16) | (r[i*4+3] << 24);
+    }
+    
+    const uint8_t* p = msg;
+    size_t remaining = len;
+    
+    while (remaining > 0) {
+        uint8_t block[17] = {0};
+        size_t block_len = (remaining > 16) ? 16 : remaining;
+        k_memcpy(block, p, block_len);
+        block[block_len] = 1;  /* padding bit */
+        
+        uint64_t c = 0;
+        for (int i = 0; i < 5; i++) {
+            if (i < 4) {
+                c += h[i] + (block[i*4] | (block[i*4+1] << 8) | (block[i*4+2] << 16) | (block[i*4+3] << 24));
+            } else {
+                c += h[i] + block[16];
+            }
+            h[i] = c & 0x3ffffff;
+            c >>= 26;
+        }
+        
+        /* Multiply by r */
+        uint64_t d[5] = {0};
+        for (int i = 0; i < 5; i++) {
+            for (int j = 0; j < 4 && i + j < 5; j++) {
+                d[i + j] += (uint64_t)h[i] * r32[j];
+            }
+        }
+        
+        /* Reduce modulo 2^130 - 5 */
+        c = 0;
+        for (int i = 0; i < 5; i++) {
+            c += d[i];
+            h[i] = c & 0x3ffffff;
+            c >>= 26;
+        }
+        h[0] += c * 5;
+        
+        p += block_len;
+        remaining -= block_len;
+    }
+    
+    /* Add s */
+    uint64_t final_c = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t s32 = s[i*4] | (s[i*4+1] << 8) | (s[i*4+2] << 16) | (s[i*4+3] << 24);
+        final_c += h[i] + s32;
+        tag[i*4] = final_c & 0xff;
+        tag[i*4+1] = (final_c >> 8) & 0xff;
+        tag[i*4+2] = (final_c >> 16) & 0xff;
+        tag[i*4+3] = (final_c >> 24) & 0xff;
+        final_c >>= 32;
+    }
+}
+
+static status_t chacha20_poly1305_encrypt(const uint8_t key[32], const uint8_t nonce[12], 
+                                          const uint8_t* plaintext, size_t len,
+                                          const uint8_t* aad, size_t aad_len,
+                                          uint8_t* ciphertext, uint8_t tag[16]) {
+    uint32_t key32[8];
+    for (int i = 0; i < 8; i++) {
+        key32[i] = key[i*4] | (key[i*4+1] << 8) | (key[i*4+2] << 16) | (key[i*4+3] << 24);
+    }
+    
+    uint32_t nonce32[3];
+    for (int i = 0; i < 3; i++) {
+        nonce32[i] = nonce[i*4] | (nonce[i*4+1] << 8) | (nonce[i*4+2] << 16) | (nonce[i*4+3] << 24);
+    }
+    
+    /* Generate Poly1305 key */
+    uint8_t poly_key[32];
+    chacha20_block(key32, 0, nonce32, poly_key);
+    
+    /* Encrypt plaintext */
+    uint32_t counter = 1;
+    for (size_t i = 0; i < len; i += CHACHA20_BLOCK_SIZE) {
+        uint8_t keystream[CHACHA20_BLOCK_SIZE];
+        chacha20_block(key32, counter++, nonce32, keystream);
+        
+        size_t chunk_len = (i + CHACHA20_BLOCK_SIZE > len) ? len - i : CHACHA20_BLOCK_SIZE;
+        for (size_t j = 0; j < chunk_len; j++) {
+            ciphertext[i + j] = plaintext[i + j] ^ keystream[j];
+        }
+    }
+    
+    /* Compute authentication tag */
+    size_t mac_data_len = aad_len + len + 16;
+    uint8_t* mac_data = (uint8_t*)k_malloc(mac_data_len);
+    if (!mac_data) return STATUS_NO_MEMORY;
+    
+    k_memcpy(mac_data, aad, aad_len);
+    k_memcpy(mac_data + aad_len, ciphertext, len);
+    
+    /* Append lengths */
+    uint8_t* len_ptr = mac_data + aad_len + len;
+    for (int i = 0; i < 8; i++) {
+        len_ptr[i] = (aad_len >> (i * 8)) & 0xff;
+        len_ptr[8 + i] = (len >> (i * 8)) & 0xff;
+    }
+    
+    poly1305_mac(mac_data, mac_data_len, poly_key, tag);
+    k_free(mac_data);
+    
+    return STATUS_OK;
+}
+
+static status_t chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[12],
+                                          const uint8_t* ciphertext, size_t len,
+                                          const uint8_t* aad, size_t aad_len,
+                                          const uint8_t expected_tag[16],
+                                          uint8_t* plaintext) {
+    /* Verify authentication tag first */
+    uint32_t key32[8];
+    for (int i = 0; i < 8; i++) {
+        key32[i] = key[i*4] | (key[i*4+1] << 8) | (key[i*4+2] << 16) | (key[i*4+3] << 24);
+    }
+    
+    uint32_t nonce32[3];
+    for (int i = 0; i < 3; i++) {
+        nonce32[i] = nonce[i*4] | (nonce[i*4+1] << 8) | (nonce[i*4+2] << 16) | (nonce[i*4+3] << 24);
+    }
+    
+    uint8_t poly_key[32];
+    chacha20_block(key32, 0, nonce32, poly_key);
+    
+    size_t mac_data_len = aad_len + len + 16;
+    uint8_t* mac_data = (uint8_t*)kmalloc(mac_data_len);
+    if (!mac_data) return STATUS_NO_MEMORY;
+    
+    k_memcpy(mac_data, aad, aad_len);
+    k_memcpy(mac_data + aad_len, ciphertext, len);
+    
+    uint8_t* len_ptr = mac_data + aad_len + len;
+    for (int i = 0; i < 8; i++) {
+        len_ptr[i] = (aad_len >> (i * 8)) & 0xff;
+        len_ptr[8 + i] = (len >> (i * 8)) & 0xff;
+    }
+    
+    uint8_t computed_tag[16];
+    poly1305_mac(mac_data, mac_data_len, poly_key, computed_tag);
+    k_free(mac_data);
+    
+    /* Constant-time tag comparison */
+    uint8_t tag_diff = 0;
+    for (int i = 0; i < 16; i++) {
+        tag_diff |= expected_tag[i] ^ computed_tag[i];
+    }
+    if (tag_diff != 0) return STATUS_DENIED;
+    
+    /* Decrypt */
+    uint32_t counter = 1;
+    for (size_t i = 0; i < len; i += CHACHA20_BLOCK_SIZE) {
+        uint8_t keystream[CHACHA20_BLOCK_SIZE];
+        chacha20_block(key32, counter++, nonce32, keystream);
+        
+        size_t chunk_len = (i + CHACHA20_BLOCK_SIZE > len) ? len - i : CHACHA20_BLOCK_SIZE;
+        for (size_t j = 0; j < chunk_len; j++) {
+            plaintext[i + j] = ciphertext[i + j] ^ keystream[j];
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+/* Encapsulation format */
+typedef struct vpn_packet_header { uint32_t peer_id; uint32_t nonce; uint8_t flags; } vpn_packet_header_t;
+
+status_t vpn_process_outbound(uint32_t if_id, const uint8_t* payload, size_t len, uint32_t dst_peer_id){
+    vpn_iface_t* v=find_iface(if_id); if(!v||!payload||len==0) return STATUS_INVALID;
+    if(dst_peer_id==0||dst_peer_id>v->peer_count) return STATUS_INVALID;
+    vpn_peer_t* p=&v->peers[dst_peer_id-1]; if(!p->established) return STATUS_DENIED;
+    
+    /* Prepare nonce (12 bytes: 4-byte counter + 8-byte peer ID) */
+    uint8_t nonce[12];
+    uint32_t counter = (uint32_t)p->packets_out;
+    k_memcpy(nonce, &counter, 4);
+    k_memcpy(nonce + 4, &p->id, 4);
+    k_memset(nonce + 8, 0, 4);
+    
+    /* Prepare AAD (Additional Authenticated Data) */
+    vpn_packet_header_t header;
+    header.peer_id = p->id;
+    header.nonce = counter;
+    header.flags = 0x01; /* encrypted flag */
+    
+    /* Allocate buffer for encrypted packet + tag */
+    size_t total = sizeof(vpn_packet_header_t) + len + POLY1305_TAG_SIZE;
+    uint8_t* buf = (uint8_t*)k_malloc(total);
+    if (!buf) return STATUS_NO_MEMORY;
+    
+    /* Copy header */
+    k_memcpy(buf, &header, sizeof(header));
+    
+    /* Encrypt payload using ChaCha20-Poly1305 */
+    uint8_t* ciphertext = buf + sizeof(header);
+    uint8_t* tag = ciphertext + len;
+    
+    status_t status = chacha20_poly1305_encrypt(
+        p->keys.tx_key,           /* 32-byte key */
+        nonce,                    /* 12-byte nonce */
+        payload, len,             /* plaintext */
+        (uint8_t*)&header, sizeof(header),  /* AAD */
+        ciphertext, tag           /* output */
+    );
+    
+    if (status != STATUS_OK) {
+        kfree(buf);
+        return status;
+    }
+    
+    p->packets_out++; 
+    p->bytes_out += len; 
+    v->packets_encaps++; 
+    v->bytes_encaps += len;
+    
+    /* TODO: inject into lower network stack (UDP send with proper addressing) */
+    /* For now, would send to p->endpoint_ipv4_be:p->endpoint_port */
+    log_debug("[VPN] Encrypted packet for peer %u, len=%zu", dst_peer_id, total);
+    
+    k_free(buf);
+    return STATUS_OK;
+}
+
+status_t vpn_process_inbound(uint32_t if_id, const uint8_t* packet, size_t len){
+    vpn_iface_t* v=find_iface(if_id); if(!v||!packet) return STATUS_INVALID;
+    
+    size_t min_len = sizeof(vpn_packet_header_t) + POLY1305_TAG_SIZE;
+    if (len < min_len) return STATUS_INVALID;
+    
+    const vpn_packet_header_t* h = (const vpn_packet_header_t*)packet;
+    if(h->peer_id == 0 || h->peer_id > v->peer_count) return STATUS_INVALID;
+    
+    vpn_peer_t* p = &v->peers[h->peer_id - 1]; 
+    if(!p->established) return STATUS_DENIED;
+    
+    /* Check if packet is encrypted */
+    if (!(h->flags & 0x01)) {
+        log_warn("[VPN] Received unencrypted packet from peer %u", h->peer_id);
+        return STATUS_DENIED;
+    }
+    
+    /* Prepare nonce for decryption */
+    uint8_t nonce[12];
+    k_memcpy(nonce, &h->nonce, 4);
+    k_memcpy(nonce + 4, &h->peer_id, 4);
+    k_memset(nonce + 8, 0, 4);
+    
+    /* Extract ciphertext and tag */
+    const uint8_t* ciphertext = packet + sizeof(*h);
+    size_t ciphertext_len = len - sizeof(*h) - POLY1305_TAG_SIZE;
+    const uint8_t* expected_tag = ciphertext + ciphertext_len;
+    
+    /* Allocate buffer for decrypted payload */
+    uint8_t* plaintext = (uint8_t*)k_malloc(ciphertext_len);
+    if (!plaintext) return STATUS_NO_MEMORY;
+    
+    /* Decrypt using ChaCha20-Poly1305 */
+    status_t status = chacha20_poly1305_decrypt(
+        p->keys.rx_key,           /* 32-byte key */
+        nonce,                    /* 12-byte nonce */
+        ciphertext, ciphertext_len,    /* ciphertext */
+        (uint8_t*)h, sizeof(*h),  /* AAD (header) */
+        expected_tag,             /* expected tag */
+        plaintext                 /* output */
+    );
+    
+    if (status != STATUS_OK) {
+        k_free(plaintext);
+        log_warn("[VPN] Authentication failed for packet from peer %u", h->peer_id);
+        return STATUS_DENIED;
+    }
+    
+    p->packets_in++; 
+    p->bytes_in += ciphertext_len; 
+    v->packets_decaps++; 
+    v->bytes_decaps += ciphertext_len;
+    
+    /* TODO: deliver decrypted payload to network stack or TUN device */
+    /* This would typically involve injecting the plaintext into the IP stack */
+    log_debug("[VPN] Decrypted packet from peer %u, payload len=%zu", h->peer_id, ciphertext_len);
+    
+    k_free(plaintext);
+    return STATUS_OK;
+}
+
+status_t vpn_get_interface(uint32_t if_id, vpn_iface_t* out){ if(!out) return STATUS_INVALID; vpn_iface_t* v=find_iface(if_id); if(!v) return STATUS_INVALID; *out=*v; return STATUS_OK; }
+
+status_t vpn_get_metrics(vpn_metrics_t* out){ if(!out) return STATUS_INVALID; *out = g_metrics; return STATUS_OK; }

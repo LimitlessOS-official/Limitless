@@ -1,0 +1,16 @@
+#include "audio.h"
+#include "kernel.h"
+#include "pci.h"
+
+/* AC97 stub */
+
+static void ac97_probe(const pci_device_t* dev, void* user) {
+    (void)user;
+    if (dev->class_code == 0x04 && dev->subclass == 0x01) {
+        kprintf("AC97 controller at %02x:%02x.%x\n", dev->bus, dev->slot, dev->func);
+    }
+}
+
+void ac97_init(void) {
+    pci_enumerate(ac97_probe, NULL);
+}

@@ -1,0 +1,795 @@
+/*
+ * containers.c - LimitlessOS Container and Namespace Support
+ * 
+ * Linux-style namespace implementation providing process isolation
+ * including PID, network, filesystem, IPC, UTS, user, and cgroup namespaces.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "syscall.h"
+#include "vfs.h"
+#include "network.h"
+#include "vmm.h"
+#include "security.h"
+
+/* Namespace types */
+#define CLONE_NEWNS         0x00020000  /* Mount namespace */
+#define CLONE_NEWUTS        0x04000000  /* UTS namespace */
+#define CLONE_NEWIPC        0x08000000  /* IPC namespace */
+#define CLONE_NEWUSER       0x10000000  /* User namespace */
+#define CLONE_NEWPID        0x20000000  /* PID namespace */
+#define CLONE_NEWNET        0x40000000  /* Network namespace */
+#define CLONE_NEWCGROUP     0x02000000  /* Cgroup namespace */
+
+#define MAX_NAMESPACES      7
+#define MAX_NAMESPACE_DEPTH 32
+
+/* Namespace operations */
+struct ns_operations {
+    const char* name;
+    int type;
+    void* (*create)(void* parent);
+    void (*destroy)(void* ns);
+    int (*install)(void* ns);
+};
+
+/* Generic namespace structure */
+typedef struct namespace {
+    atomic_t count;                 /* Reference count */
+    uint32_t id;                    /* Namespace ID */
+    int type;                       /* Namespace type */
+    struct namespace* parent;       /* Parent namespace */
+    struct list_head children;      /* Child namespaces */
+    struct list_head sibling;       /* Sibling list */
+    
+    const struct ns_operations* ops; /* Namespace operations */
+    void* private_data;             /* Type-specific data */
+    
+    /* Statistics */
+    atomic64_t created_time;        /* Creation timestamp */
+    atomic32_t process_count;       /* Processes in this namespace */
+    
+} namespace_t;
+
+/* PID namespace */
+typedef struct pid_namespace {
+    namespace_t ns;                 /* Base namespace */
+    
+    struct pid_map* pid_map;        /* PID translation map */
+    uint32_t last_pid;              /* Last allocated PID */
+    uint32_t max_pid;               /* Maximum PID */
+    
+    /* Init process for this namespace */
+    process_t* child_reaper;        /* Process that reaps children */
+    
+    /* PID allocation bitmap */
+    unsigned long* pid_bitmap;
+    uint32_t bitmap_size;
+    
+    spinlock_t lock;
+    
+} pid_namespace_t;
+
+/* UTS namespace */
+typedef struct uts_namespace {
+    namespace_t ns;                 /* Base namespace */
+    
+    char nodename[65];              /* Node name */
+    char domainname[65];            /* Domain name */
+    char release[65];               /* OS release */
+    char version[65];               /* OS version */
+    char machine[65];               /* Machine type */
+    
+    spinlock_t lock;
+    
+} uts_namespace_t;
+
+/* IPC namespace */
+typedef struct ipc_namespace {
+    namespace_t ns;                 /* Base namespace */
+    
+    /* System V IPC */
+    struct ipc_ids shm_ids;         /* Shared memory */
+    struct ipc_ids sem_ids;         /* Semaphores */
+    struct ipc_ids msg_ids;         /* Message queues */
+    
+    /* POSIX message queues */
+    struct vfsmount* mq_mnt;        /* Mountpoint for mqueue */
+    unsigned int mq_queues_count;   /* Number of queues */
+    unsigned int mq_queues_max;     /* Maximum queues */
+    
+    /* Statistics */
+    atomic64_t shm_bytes;           /* Shared memory usage */
+    atomic32_t sem_count;           /* Semaphore count */
+    atomic32_t msg_count;           /* Message count */
+    
+    spinlock_t lock;
+    
+} ipc_namespace_t;
+
+/* Network namespace */
+typedef struct net_namespace {
+    namespace_t ns;                 /* Base namespace */
+    
+    /* Network interfaces */
+    struct list_head dev_list;      /* Network devices */
+    struct net_device* loopback;    /* Loopback device */
+    
+    /* Routing tables */
+    struct fib_table* fib_main;     /* Main routing table */
+    struct fib_table* fib_local;    /* Local routing table */
+    
+    /* Socket hash tables */
+    struct proto_hash tcp_hash;     /* TCP sockets */
+    struct proto_hash udp_hash;     /* UDP sockets */
+    
+    /* Network statistics */
+    atomic64_t packets_sent;        /* Packets sent */
+    atomic64_t packets_received;    /* Packets received */
+    atomic64_t bytes_sent;          /* Bytes sent */
+    atomic64_t bytes_received;      /* Bytes received */
+    
+    /* Netfilter */
+    struct netfilter_state netfilter; /* Netfilter rules */
+    
+    spinlock_t lock;
+    
+} net_namespace_t;
+
+/* Mount namespace */
+typedef struct mnt_namespace {
+    namespace_t ns;                 /* Base namespace */
+    
+    struct vfsmount* root;          /* Root mount */
+    struct list_head list;          /* Mount list */
+    struct vfsmount* umount_list;   /* Unmount list */
+    
+    /* Mount propagation */
+    int event;                      /* Last mount event */
+    struct list_head masters;       /* Master mounts */
+    struct list_head slaves;        /* Slave mounts */
+    
+    atomic32_t mount_count;         /* Number of mounts */
+    
+    spinlock_t lock;
+    
+} mnt_namespace_t;
+
+/* User namespace */
+typedef struct user_namespace {
+    namespace_t ns;                 /* Base namespace */
+    
+    /* UID/GID mappings */
+    struct uid_map uid_map[5];      /* UID mappings */
+    struct uid_map gid_map[5];      /* GID mappings */
+    
+    /* Capabilities */
+    capability_set_t cap_bset;      /* Capability bounding set */
+    
+    /* User namespace owner */
+    uid_t owner;                    /* Namespace owner UID */
+    gid_t group;                    /* Namespace owner GID */
+    
+    /* Statistics */
+    atomic32_t user_count;          /* Users in namespace */
+    atomic32_t group_count;         /* Groups in namespace */
+    
+    spinlock_t lock;
+    
+} user_namespace_t;
+
+/* Cgroup namespace */
+typedef struct cgroup_namespace {
+    namespace_t ns;                 /* Base namespace */
+    
+    struct cgroup* root_cgroup;     /* Root cgroup */
+    struct list_head cgroups;       /* Cgroup list */
+    
+    /* Resource limits */
+    uint64_t memory_limit;          /* Memory limit */
+    uint64_t cpu_quota;             /* CPU quota */
+    uint64_t blkio_weight;          /* Block I/O weight */
+    
+    /* Statistics */
+    atomic64_t memory_usage;        /* Current memory usage */
+    atomic64_t cpu_usage;           /* CPU usage */
+    atomic64_t blkio_usage;         /* Block I/O usage */
+    
+    spinlock_t lock;
+    
+} cgroup_namespace_t;
+
+/* Container structure */
+typedef struct container {
+    uint32_t id;                    /* Container ID */
+    char name[64];                  /* Container name */
+    
+    /* Namespaces */
+    namespace_t* namespaces[MAX_NAMESPACES];
+    
+    /* Root process */
+    process_t* init_process;        /* Container init */
+    
+    /* Container state */
+    int state;                      /* Container state */
+    atomic32_t process_count;       /* Processes in container */
+    
+    /* Resource limits */
+    uint64_t memory_limit;          /* Memory limit */
+    uint64_t cpu_shares;            /* CPU shares */
+    
+    /* Statistics */
+    uint64_t created_time;          /* Creation time */
+    uint64_t start_time;            /* Start time */
+    
+    struct list_head list;          /* Container list */
+    spinlock_t lock;
+    
+} container_t;
+
+/* Container states */
+#define CONTAINER_CREATED   1
+#define CONTAINER_RUNNING   2
+#define CONTAINER_PAUSED    3
+#define CONTAINER_STOPPED   4
+
+/* Global namespace and container state */
+static struct {
+    bool initialized;
+    
+    /* Root namespaces */
+    pid_namespace_t* root_pid_ns;
+    uts_namespace_t* root_uts_ns;
+    ipc_namespace_t* root_ipc_ns;
+    net_namespace_t* root_net_ns;
+    mnt_namespace_t* root_mnt_ns;
+    user_namespace_t* root_user_ns;
+    cgroup_namespace_t* root_cgroup_ns;
+    
+    /* Container management */
+    struct list_head containers;    /* All containers */
+    spinlock_t container_lock;
+    uint32_t next_container_id;
+    
+    /* Namespace counters */
+    atomic32_t namespace_count[MAX_NAMESPACES];
+    uint32_t next_namespace_id;
+    
+    /* Statistics */
+    atomic64_t namespace_creates;   /* Namespace creations */
+    atomic64_t namespace_destroys;  /* Namespace destructions */
+    atomic64_t container_creates;   /* Container creations */
+    atomic64_t container_destroys;  /* Container destructions */
+    
+} g_container_system = {0};
+
+/* Function prototypes */
+static namespace_t* namespace_create(int type, namespace_t* parent);
+static void namespace_destroy(namespace_t* ns);
+static int namespace_install(namespace_t* ns);
+static container_t* container_create(const char* name);
+static int container_start(container_t* container, const char* command);
+static int container_stop(container_t* container);
+
+/* PID namespace operations */
+static void* pidns_create(void* parent) {
+    pid_namespace_t* parent_pidns = (pid_namespace_t*)parent;
+    
+    pid_namespace_t* pidns = (pid_namespace_t*)vmm_kmalloc(sizeof(pid_namespace_t), 32);
+    if (!pidns) {
+        return NULL;
+    }
+    
+    memset(pidns, 0, sizeof(pid_namespace_t));
+    
+    /* Initialize namespace */
+    atomic_set(&pidns->ns.count, 1);
+    pidns->ns.type = CLONE_NEWPID;
+    pidns->ns.parent = parent_pidns ? &parent_pidns->ns : NULL;
+    INIT_LIST_HEAD(&pidns->ns.children);
+    
+    /* PID allocation */
+    pidns->max_pid = 32768;
+    pidns->last_pid = 1;
+    pidns->bitmap_size = (pidns->max_pid + BITS_PER_LONG - 1) / BITS_PER_LONG;
+    
+    pidns->pid_bitmap = (unsigned long*)vmm_kmalloc(pidns->bitmap_size * sizeof(unsigned long), 32);
+    if (!pidns->pid_bitmap) {
+        vmm_kfree(pidns, sizeof(pid_namespace_t));
+        return NULL;
+    }
+    
+    memset(pidns->pid_bitmap, 0, pidns->bitmap_size * sizeof(unsigned long));
+    spinlock_init(&pidns->lock);
+    
+    /* Reserve PID 1 for init */
+    set_bit(1, pidns->pid_bitmap);
+    
+    printf("containers: Created PID namespace %p (parent=%p)\n", pidns, parent_pidns);
+    
+    return pidns;
+}
+
+static void pidns_destroy(void* ns) {
+    pid_namespace_t* pidns = (pid_namespace_t*)ns;
+    
+    if (pidns->pid_bitmap) {
+        vmm_kfree(pidns->pid_bitmap, pidns->bitmap_size * sizeof(unsigned long));
+    }
+    
+    vmm_kfree(pidns, sizeof(pid_namespace_t));
+}
+
+/* UTS namespace operations */
+static void* utsns_create(void* parent) {
+    uts_namespace_t* parent_utsns = (uts_namespace_t*)parent;
+    
+    uts_namespace_t* utsns = (uts_namespace_t*)vmm_kmalloc(sizeof(uts_namespace_t), 32);
+    if (!utsns) {
+        return NULL;
+    }
+    
+    memset(utsns, 0, sizeof(uts_namespace_t));
+    
+    /* Initialize namespace */
+    atomic_set(&utsns->ns.count, 1);
+    utsns->ns.type = CLONE_NEWUTS;
+    utsns->ns.parent = parent_utsns ? &parent_utsns->ns : NULL;
+    INIT_LIST_HEAD(&utsns->ns.children);
+    
+    /* Copy UTS info from parent or set defaults */
+    if (parent_utsns) {
+        strcpy(utsns->nodename, parent_utsns->nodename);
+        strcpy(utsns->domainname, parent_utsns->domainname);
+        strcpy(utsns->release, parent_utsns->release);
+        strcpy(utsns->version, parent_utsns->version);
+        strcpy(utsns->machine, parent_utsns->machine);
+    } else {
+        strcpy(utsns->nodename, "limitless");
+        strcpy(utsns->domainname, "local");
+        strcpy(utsns->release, "1.0.0");
+        strcpy(utsns->version, "LimitlessOS 1.0.0");
+        strcpy(utsns->machine, "x86_64");
+    }
+    
+    spinlock_init(&utsns->lock);
+    
+    printf("containers: Created UTS namespace %p\n", utsns);
+    
+    return utsns;
+}
+
+static void utsns_destroy(void* ns) {
+    uts_namespace_t* utsns = (uts_namespace_t*)ns;
+    vmm_kfree(utsns, sizeof(uts_namespace_t));
+}
+
+/* Network namespace operations */
+static void* netns_create(void* parent) {
+    net_namespace_t* netns = (net_namespace_t*)vmm_kmalloc(sizeof(net_namespace_t), 32);
+    if (!netns) {
+        return NULL;
+    }
+    
+    memset(netns, 0, sizeof(net_namespace_t));
+    
+    /* Initialize namespace */
+    atomic_set(&netns->ns.count, 1);
+    netns->ns.type = CLONE_NEWNET;
+    INIT_LIST_HEAD(&netns->ns.children);
+    
+    /* Initialize network components */
+    INIT_LIST_HEAD(&netns->dev_list);
+    
+    /* Create loopback device */
+    /* netns->loopback = create_loopback_device(); */
+    
+    spinlock_init(&netns->lock);
+    
+    printf("containers: Created network namespace %p\n", netns);
+    
+    return netns;
+}
+
+static void netns_destroy(void* ns) {
+    net_namespace_t* netns = (net_namespace_t*)ns;
+    
+    /* Cleanup network devices */
+    /* cleanup_network_devices(&netns->dev_list); */
+    
+    vmm_kfree(netns, sizeof(net_namespace_t));
+}
+
+/* Namespace operations table */
+static const struct ns_operations namespace_ops[] = {
+    { "pid", CLONE_NEWPID, pidns_create, pidns_destroy, NULL },
+    { "uts", CLONE_NEWUTS, utsns_create, utsns_destroy, NULL },
+    { "ipc", CLONE_NEWIPC, NULL, NULL, NULL },
+    { "net", CLONE_NEWNET, netns_create, netns_destroy, NULL },
+    { "mnt", CLONE_NEWNS, NULL, NULL, NULL },
+    { "user", CLONE_NEWUSER, NULL, NULL, NULL },
+    { "cgroup", CLONE_NEWCGROUP, NULL, NULL, NULL },
+};
+
+/* Initialize container and namespace system */
+int container_system_init(void) {
+    if (g_container_system.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing container and namespace system\n");
+    
+    memset(&g_container_system, 0, sizeof(g_container_system));
+    
+    /* Initialize container management */
+    INIT_LIST_HEAD(&g_container_system.containers);
+    spinlock_init(&g_container_system.container_lock);
+    g_container_system.next_container_id = 1;
+    g_container_system.next_namespace_id = 1;
+    
+    /* Create root namespaces */
+    g_container_system.root_pid_ns = (pid_namespace_t*)pidns_create(NULL);
+    g_container_system.root_uts_ns = (uts_namespace_t*)utsns_create(NULL);
+    g_container_system.root_net_ns = (net_namespace_t*)netns_create(NULL);
+    
+    if (!g_container_system.root_pid_ns || 
+        !g_container_system.root_uts_ns ||
+        !g_container_system.root_net_ns) {
+        printf("containers: Failed to create root namespaces\n");
+        return -ENOMEM;
+    }
+    
+    g_container_system.initialized = true;
+    
+    printf("Container system initialized\n");
+    return 0;
+}
+
+/* Create new namespace */
+static namespace_t* namespace_create(int type, namespace_t* parent) {
+    const struct ns_operations* ops = NULL;
+    
+    /* Find namespace operations */
+    for (int i = 0; i < ARRAY_SIZE(namespace_ops); i++) {
+        if (namespace_ops[i].type == type) {
+            ops = &namespace_ops[i];
+            break;
+        }
+    }
+    
+    if (!ops || !ops->create) {
+        return NULL;
+    }
+    
+    namespace_t* ns = (namespace_t*)ops->create(parent);
+    if (!ns) {
+        return NULL;
+    }
+    
+    ns->id = g_container_system.next_namespace_id++;
+    ns->ops = ops;
+    
+    atomic64_inc(&g_container_system.namespace_creates);
+    
+    return ns;
+}
+
+/* Destroy namespace */
+static void namespace_destroy(namespace_t* ns) {
+    if (!ns || !atomic_dec_and_test(&ns->count)) {
+        return;
+    }
+    
+    if (ns->ops && ns->ops->destroy) {
+        ns->ops->destroy(ns);
+    }
+    
+    atomic64_inc(&g_container_system.namespace_destroys);
+}
+
+/* Get namespace reference */
+namespace_t* namespace_get(namespace_t* ns) {
+    if (ns) {
+        atomic_inc(&ns->count);
+    }
+    return ns;
+}
+
+/* Put namespace reference */
+void namespace_put(namespace_t* ns) {
+    if (ns) {
+        namespace_destroy(ns);
+    }
+}
+
+/* Allocate PID in namespace */
+pid_t pidns_alloc_pid(pid_namespace_t* pidns) {
+    if (!pidns) {
+        return -1;
+    }
+    
+    spin_lock(&pidns->lock);
+    
+    /* Find free PID */
+    for (uint32_t pid = pidns->last_pid + 1; pid < pidns->max_pid; pid++) {
+        if (!test_bit(pid, pidns->pid_bitmap)) {
+            set_bit(pid, pidns->pid_bitmap);
+            pidns->last_pid = pid;
+            
+            spin_unlock(&pidns->lock);
+            return pid;
+        }
+    }
+    
+    /* Wrap around */
+    for (uint32_t pid = 1; pid <= pidns->last_pid; pid++) {
+        if (!test_bit(pid, pidns->pid_bitmap)) {
+            set_bit(pid, pidns->pid_bitmap);
+            pidns->last_pid = pid;
+            
+            spin_unlock(&pidns->lock);
+            return pid;
+        }
+    }
+    
+    spin_unlock(&pidns->lock);
+    return -1; /* No free PID */
+}
+
+/* Free PID in namespace */
+void pidns_free_pid(pid_namespace_t* pidns, pid_t pid) {
+    if (!pidns || pid <= 0 || pid >= pidns->max_pid) {
+        return;
+    }
+    
+    spin_lock(&pidns->lock);
+    clear_bit(pid, pidns->pid_bitmap);
+    spin_unlock(&pidns->lock);
+}
+
+/* Create container */
+static container_t* container_create(const char* name) {
+    container_t* container = (container_t*)vmm_kmalloc(sizeof(container_t), 32);
+    if (!container) {
+        return NULL;
+    }
+    
+    memset(container, 0, sizeof(container_t));
+    
+    spin_lock(&g_container_system.container_lock);
+    
+    container->id = g_container_system.next_container_id++;
+    strncpy(container->name, name ? name : "unnamed", sizeof(container->name) - 1);
+    
+    container->state = CONTAINER_CREATED;
+    container->created_time = timer_get_ticks();
+    
+    /* Create namespaces */
+    container->namespaces[0] = namespace_create(CLONE_NEWPID, &g_container_system.root_pid_ns->ns);
+    container->namespaces[1] = namespace_create(CLONE_NEWUTS, &g_container_system.root_uts_ns->ns);
+    container->namespaces[2] = namespace_create(CLONE_NEWNET, &g_container_system.root_net_ns->ns);
+    
+    spinlock_init(&container->lock);
+    
+    list_add(&container->list, &g_container_system.containers);
+    
+    spin_unlock(&g_container_system.container_lock);
+    
+    atomic64_inc(&g_container_system.container_creates);
+    
+    printf("containers: Created container %u '%s'\n", container->id, container->name);
+    
+    return container;
+}
+
+/* Start container */
+static int container_start(container_t* container, const char* command) {
+    if (!container || container->state != CONTAINER_CREATED) {
+        return -EINVAL;
+    }
+    
+    /* TODO: Create init process in container namespaces */
+    /* This would involve:
+     * 1. Fork a new process
+     * 2. Switch to container namespaces
+     * 3. Execute the specified command
+     * 4. Set up proper signal handling
+     */
+    
+    container->state = CONTAINER_RUNNING;
+    container->start_time = timer_get_ticks();
+    
+    printf("containers: Started container %u\n", container->id);
+    
+    return 0;
+}
+
+/* Stop container */
+static int container_stop(container_t* container) {
+    if (!container || container->state != CONTAINER_RUNNING) {
+        return -EINVAL;
+    }
+    
+    /* TODO: Send SIGTERM to init process and wait */
+    
+    container->state = CONTAINER_STOPPED;
+    
+    printf("containers: Stopped container %u\n", container->id);
+    
+    return 0;
+}
+
+/* Destroy container */
+int container_destroy(container_t* container) {
+    if (!container) {
+        return -EINVAL;
+    }
+    
+    if (container->state == CONTAINER_RUNNING) {
+        container_stop(container);
+    }
+    
+    spin_lock(&g_container_system.container_lock);
+    list_del(&container->list);
+    spin_unlock(&g_container_system.container_lock);
+    
+    /* Release namespaces */
+    for (int i = 0; i < MAX_NAMESPACES; i++) {
+        if (container->namespaces[i]) {
+            namespace_put(container->namespaces[i]);
+        }
+    }
+    
+    vmm_kfree(container, sizeof(container_t));
+    
+    atomic64_inc(&g_container_system.container_destroys);
+    
+    return 0;
+}
+
+/* unshare system call */
+long sys_unshare(unsigned long unshare_flags) {
+    if (!current_process) {
+        return -EINVAL;
+    }
+    
+    /* Create new namespaces based on flags */
+    if (unshare_flags & CLONE_NEWPID) {
+        pid_namespace_t* new_pidns = (pid_namespace_t*)namespace_create(CLONE_NEWPID, 
+            (namespace_t*)current_process->pid_namespace);
+        if (!new_pidns) {
+            return -ENOMEM;
+        }
+        
+        /* Switch to new PID namespace on next fork */
+        current_process->pending_pid_namespace = new_pidns;
+    }
+    
+    if (unshare_flags & CLONE_NEWUTS) {
+        uts_namespace_t* new_utsns = (uts_namespace_t*)namespace_create(CLONE_NEWUTS,
+            (namespace_t*)current_process->uts_namespace);
+        if (!new_utsns) {
+            return -ENOMEM;
+        }
+        
+        current_process->uts_namespace = new_utsns;
+    }
+    
+    if (unshare_flags & CLONE_NEWNET) {
+        net_namespace_t* new_netns = (net_namespace_t*)namespace_create(CLONE_NEWNET,
+            (namespace_t*)current_process->net_namespace);
+        if (!new_netns) {
+            return -ENOMEM;
+        }
+        
+        current_process->net_namespace = new_netns;
+    }
+    
+    printf("containers: Process %d unshared namespaces (flags=0x%lx)\n", 
+           current_process->pid, unshare_flags);
+    
+    return 0;
+}
+
+/* setns system call */
+long sys_setns(int fd, int nstype) {
+    /* TODO: Implement joining existing namespace via file descriptor */
+    return -ENOSYS;
+}
+
+/* Container management system calls */
+long sys_container_create(const char* name) {
+    if (!name) {
+        return -EINVAL;
+    }
+    
+    /* TODO: Copy name from userspace */
+    container_t* container = container_create(name);
+    if (!container) {
+        return -ENOMEM;
+    }
+    
+    return container->id;
+}
+
+long sys_container_start(uint32_t container_id, const char* command) {
+    container_t* container = NULL;
+    
+    spin_lock(&g_container_system.container_lock);
+    
+    list_for_each_entry(container, &g_container_system.containers, list) {
+        if (container->id == container_id) {
+            break;
+        }
+    }
+    
+    spin_unlock(&g_container_system.container_lock);
+    
+    if (!container) {
+        return -ENOENT;
+    }
+    
+    return container_start(container, command);
+}
+
+long sys_container_stop(uint32_t container_id) {
+    container_t* container = NULL;
+    
+    spin_lock(&g_container_system.container_lock);
+    
+    list_for_each_entry(container, &g_container_system.containers, list) {
+        if (container->id == container_id) {
+            break;
+        }
+    }
+    
+    spin_unlock(&g_container_system.container_lock);
+    
+    if (!container) {
+        return -ENOENT;
+    }
+    
+    return container_stop(container);
+}
+
+/* Get container statistics */
+void container_get_stats(struct container_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct container_stats));
+    
+    stats->total_containers = 0;
+    stats->running_containers = 0;
+    
+    spin_lock(&g_container_system.container_lock);
+    
+    container_t* container;
+    list_for_each_entry(container, &g_container_system.containers, list) {
+        stats->total_containers++;
+        if (container->state == CONTAINER_RUNNING) {
+            stats->running_containers++;
+        }
+    }
+    
+    spin_unlock(&g_container_system.container_lock);
+    
+    stats->namespace_creates = atomic64_read(&g_container_system.namespace_creates);
+    stats->namespace_destroys = atomic64_read(&g_container_system.namespace_destroys);
+    stats->container_creates = atomic64_read(&g_container_system.container_creates);
+    stats->container_destroys = atomic64_read(&g_container_system.container_destroys);
+}
+
+/* Debug output */
+void container_dump_stats(void) {
+    struct container_stats stats;
+    container_get_stats(&stats);
+    
+    printf("Container Statistics:\n");
+    printf("  Total containers: %u\n", stats.total_containers);
+    printf("  Running containers: %u\n", stats.running_containers);
+    printf("  Namespace creates: %lu\n", stats.namespace_creates);
+    printf("  Namespace destroys: %lu\n", stats.namespace_destroys);
+    printf("  Container creates: %lu\n", stats.container_creates);
+    printf("  Container destroys: %lu\n", stats.container_destroys);
+}

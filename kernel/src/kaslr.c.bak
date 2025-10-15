@@ -1,0 +1,40 @@
+#include "kernel.h"
+
+/* Simple KASLR slide stub.
+ * For now we compute a pseudo-random offset once at early init using a weak entropy mix.
+ * Future: replace with real entropy (TSC jitter, RDRAND, firmware RNG, etc.).
+ */
+
+u64 g_kaslr_slide = 0;
+
+static u64 kaslr_prng_state = 0x853c49e6748fea9bull; /* arbitrary seed */
+static inline u64 kaslr_prng_next(void) {
+    /* xorshift64* */
+    u64 x = kaslr_prng_state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    kaslr_prng_state = x;
+    return x * 0x2545F4914F6CDD1Dull;
+}
+
+void kaslr_compute_slide(const boot_info_t* bi) {
+    if (!bi) return;
+    /* Derive some variability from physical kernel base and a timestamp read if available */
+    u64 mix = bi->kernel_phys_base ^ bi->kernel_phys_end;
+    /* Weak entropy fallback: rdtsc if supported */
+#ifdef __x86_64__
+    unsigned int lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    mix ^= ((u64)hi << 32) | lo;
+#endif
+    kaslr_prng_state ^= mix ? mix : 0xdeadbeefcafebabeull;
+    /* Choose slide in a bounded range: e.g., up to 256MB aligned to 2MB (huge page) */
+    const u64 SLIDE_RANGE = (u64)256 * 1024 * 1024; /* 256MB */
+    const u64 SLIDE_ALIGN = (u64)2 * 1024 * 1024;   /* 2MB */
+    u64 candidate = kaslr_prng_next() % SLIDE_RANGE;
+    candidate &= ~(SLIDE_ALIGN - 1);
+    g_kaslr_slide = candidate;
+}
+
+u64 kaslr_get_slide(void) { return g_kaslr_slide; }

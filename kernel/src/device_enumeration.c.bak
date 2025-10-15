@@ -1,0 +1,561 @@
+/**
+ * Device Enumeration and Hot-Plug Support for LimitlessOS
+ * Automatic device detection and dynamic driver loading
+ */
+
+#include "kernel.h"
+#include "driver_framework.h"
+#include "pci.h"
+#include "usb.h"
+#include "acpi.h"
+#include "timer.h"
+
+/* Device enumeration state */
+static struct {
+    bool enumeration_active;
+    uint32_t enumerated_devices;
+    uint64_t last_enumeration_time;
+    
+    /* Bus-specific enumeration callbacks */
+    struct {
+        bus_type_t bus_type;
+        status_t (*enumerate_func)(void);
+        bool enumeration_complete;
+    } bus_enumerators[8];
+    uint32_t enumerator_count;
+    
+    /* Hot-plug monitoring */
+    bool monitoring_enabled;
+    thread_t* monitor_thread;
+    
+    spinlock_t lock;
+} g_device_enum = {0};
+
+/* Device matching database */
+typedef struct {
+    device_id_t device_id;
+    char driver_name[MAX_DRIVER_NAME_LENGTH];
+    uint32_t match_score;
+} device_match_entry_t;
+
+static device_match_entry_t g_device_matches[] = {
+    /* PCI devices */
+    {{0x8086, 0x100E, 0, 0, 0x020000, 0, BUS_TYPE_PCI, "Intel", "82540EM Ethernet", ""}, "e1000", 100},
+    {{0x8086, 0x10D3, 0, 0, 0x020000, 0, BUS_TYPE_PCI, "Intel", "82574L Ethernet", ""}, "e1000", 90},
+    {{0x1234, 0x1111, 0, 0, 0x030000, 0, BUS_TYPE_PCI, "QEMU", "VGA Controller", ""}, "qemu_vga", 100},
+    {{0x1AF4, 0x1000, 0, 0, 0x020000, 0, BUS_TYPE_PCI, "Virtio", "Network Device", ""}, "virtio_net", 100},
+    {{0x1AF4, 0x1001, 0, 0, 0x018000, 0, BUS_TYPE_PCI, "Virtio", "Block Device", ""}, "virtio_blk", 100},
+    
+    /* USB devices */
+    {{0x046D, 0xC52F, 0, 0, 0x030101, 0, BUS_TYPE_USB, "Logitech", "USB Mouse", ""}, "usb_hid", 95},
+    {{0x046D, 0xC31C, 0, 0, 0x030101, 0, BUS_TYPE_USB, "Logitech", "USB Keyboard", ""}, "usb_hid", 95},
+    {{0x0781, 0x5567, 0, 0, 0x080650, 0, BUS_TYPE_USB, "SanDisk", "USB Storage", ""}, "usb_storage", 100},
+    
+    /* Platform devices */
+    {{0, 0, 0, 0, 0, 0, BUS_TYPE_PLATFORM, "Generic", "Serial Port", ""}, "serial", 50},
+    {{0, 0, 0, 0, 0, 0, BUS_TYPE_PLATFORM, "Generic", "Parallel Port", ""}, "parallel", 50},
+    {{0, 0, 0, 0, 0, 0, BUS_TYPE_PLATFORM, "Generic", "RTC", ""}, "rtc", 80},
+};
+
+#define DEVICE_MATCH_COUNT (sizeof(g_device_matches) / sizeof(g_device_matches[0]))
+
+/* Forward declarations */
+static status_t enumerate_pci_devices(void);
+static status_t enumerate_usb_devices(void);
+static status_t enumerate_acpi_devices(void);
+static status_t enumerate_platform_devices(void);
+static driver_t* find_best_driver_for_device(device_t* device);
+static uint32_t calculate_match_score(const device_id_t* device_id, const device_match_entry_t* match);
+static void* hotplug_monitor_thread(void* arg);
+
+/* Initialize device enumeration */
+status_t device_enumeration_init(void) {
+    k_memset(&g_device_enum, 0, sizeof(g_device_enum));
+    spinlock_init(&g_device_enum.lock);
+    
+    /* Register bus enumerators */
+    g_device_enum.bus_enumerators[0] = (typeof(g_device_enum.bus_enumerators[0])){
+        BUS_TYPE_PCI, enumerate_pci_devices, false
+    };
+    g_device_enum.bus_enumerators[1] = (typeof(g_device_enum.bus_enumerators[1])){
+        BUS_TYPE_USB, enumerate_usb_devices, false
+    };
+    g_device_enum.bus_enumerators[2] = (typeof(g_device_enum.bus_enumerators[2])){
+        BUS_TYPE_ACPI, enumerate_acpi_devices, false
+    };
+    g_device_enum.bus_enumerators[3] = (typeof(g_device_enum.bus_enumerators[3])){
+        BUS_TYPE_PLATFORM, enumerate_platform_devices, false
+    };
+    g_device_enum.enumerator_count = 4;
+    
+    console_printf("Device enumeration initialized\n");
+    
+    return STATUS_OK;
+}
+
+/* Enumerate devices on all buses */
+status_t device_enumerate_all(void) {
+    if (g_device_enum.enumeration_active) {
+        return STATUS_BUSY;
+    }
+    
+    spin_lock(&g_device_enum.lock);
+    g_device_enum.enumeration_active = true;
+    g_device_enum.enumerated_devices = 0;
+    g_device_enum.last_enumeration_time = timer_get_ticks();
+    spin_unlock(&g_device_enum.lock);
+    
+    console_printf("Starting device enumeration...\n");
+    
+    /* Enumerate each bus type */
+    for (uint32_t i = 0; i < g_device_enum.enumerator_count; i++) {
+        if (g_device_enum.bus_enumerators[i].enumerate_func) {
+            console_printf("Enumerating %s bus...\n", 
+                          (g_device_enum.bus_enumerators[i].bus_type == BUS_TYPE_PCI) ? "PCI" :
+                          (g_device_enum.bus_enumerators[i].bus_type == BUS_TYPE_USB) ? "USB" :
+                          (g_device_enum.bus_enumerators[i].bus_type == BUS_TYPE_ACPI) ? "ACPI" :
+                          "Platform");
+            
+            status_t status = g_device_enum.bus_enumerators[i].enumerate_func();
+            if (status == STATUS_OK) {
+                g_device_enum.bus_enumerators[i].enumeration_complete = true;
+            } else {
+                console_printf("Bus enumeration failed: %d\n", status);
+            }
+        }
+    }
+    
+    spin_lock(&g_device_enum.lock);
+    g_device_enum.enumeration_active = false;
+    spin_unlock(&g_device_enum.lock);
+    
+    console_printf("Device enumeration complete: %u devices found\n", 
+                  g_device_enum.enumerated_devices);
+    
+    /* Audit enumeration */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Device enumeration completed", "device_enum", 1);
+    
+    return STATUS_OK;
+}
+
+/* Enumerate PCI devices */
+static status_t enumerate_pci_devices(void) {
+    uint32_t devices_found = 0;
+    
+    /* Scan PCI configuration space */
+    for (uint32_t bus = 0; bus < 256; bus++) {
+        for (uint32_t device = 0; device < 32; device++) {
+            for (uint32_t function = 0; function < 8; function++) {
+                /* Read PCI configuration header */
+                uint32_t vendor_device = pci_config_read_dword(bus, device, function, 0x00);
+                if ((vendor_device & 0xFFFF) == 0xFFFF) {
+                    continue;  /* No device present */
+                }
+                
+                uint32_t vendor_id = vendor_device & 0xFFFF;
+                uint32_t device_id = (vendor_device >> 16) & 0xFFFF;
+                uint32_t class_rev = pci_config_read_dword(bus, device, function, 0x08);
+                uint32_t class_code = (class_rev >> 8) & 0xFFFFFF;
+                uint32_t revision = class_rev & 0xFF;
+                
+                /* Create device structure */
+                device_t* new_device;
+                char device_name[MAX_DEVICE_NAME_LENGTH];
+                snprintf(device_name, sizeof(device_name), "pci_%02x_%02x_%x", 
+                        bus, device, function);
+                
+                status_t status = device_register(device_name, DEVICE_TYPE_PCI_DEVICE, 
+                                                BUS_TYPE_PCI, &new_device);
+                if (status != STATUS_OK) {
+                    continue;
+                }
+                
+                /* Fill device identification */
+                new_device->id_info.vendor_id = vendor_id;
+                new_device->id_info.device_id = device_id;
+                new_device->id_info.class_code = class_code;
+                new_device->id_info.revision = revision;
+                new_device->id_info.bus_type = BUS_TYPE_PCI;
+                new_device->bus_number = bus;
+                new_device->slot_number = (device << 3) | function;
+                
+                /* Read subsystem information */
+                uint32_t subsystem = pci_config_read_dword(bus, device, function, 0x2C);
+                new_device->id_info.subsystem_vendor_id = subsystem & 0xFFFF;
+                new_device->id_info.subsystem_device_id = (subsystem >> 16) & 0xFFFF;
+                
+                /* Set manufacturer name based on vendor ID */
+                switch (vendor_id) {
+                    case 0x8086:
+                        strcpy(new_device->id_info.manufacturer, "Intel Corporation");
+                        break;
+                    case 0x1234:
+                        strcpy(new_device->id_info.manufacturer, "QEMU");
+                        break;
+                    case 0x1AF4:
+                        strcpy(new_device->id_info.manufacturer, "Red Hat, Inc.");
+                        break;
+                    default:
+                        snprintf(new_device->id_info.manufacturer, 
+                               sizeof(new_device->id_info.manufacturer), 
+                               "Vendor_%04X", vendor_id);
+                        break;
+                }
+                
+                /* Add PCI resources */
+                for (uint32_t bar = 0; bar < 6; bar++) {
+                    uint32_t bar_reg = 0x10 + (bar * 4);
+                    uint32_t bar_value = pci_config_read_dword(bus, device, function, bar_reg);
+                    
+                    if (bar_value != 0 && bar_value != 0xFFFFFFFF) {
+                        resource_type_t res_type = (bar_value & 1) ? 
+                                                 RESOURCE_TYPE_IO_PORT : RESOURCE_TYPE_MEMORY;
+                        
+                        uint64_t base_addr = bar_value & ((bar_value & 1) ? 0xFFFFFFFC : 0xFFFFFFF0);
+                        
+                        /* Determine size by writing all 1s and reading back */
+                        pci_config_write_dword(bus, device, function, bar_reg, 0xFFFFFFFF);
+                        uint32_t size_mask = pci_config_read_dword(bus, device, function, bar_reg);
+                        pci_config_write_dword(bus, device, function, bar_reg, bar_value);
+                        
+                        if (res_type == RESOURCE_TYPE_MEMORY) {
+                            size_mask &= 0xFFFFFFF0;
+                        } else {
+                            size_mask &= 0xFFFFFFFC;
+                        }
+                        
+                        uint64_t size = (~size_mask) + 1;
+                        
+                        if (size > 0) {
+                            device_add_resource(new_device, res_type, base_addr, size, 0);
+                        }
+                    }
+                }
+                
+                /* Try to find and bind appropriate driver */
+                driver_t* driver = find_best_driver_for_device(new_device);
+                if (driver) {
+                    status_t bind_status = device_bind_driver(new_device, driver);
+                    if (bind_status == STATUS_OK) {
+                        console_printf("PCI device %04X:%04X bound to driver '%s'\n",
+                                     vendor_id, device_id, driver->name);
+                    }
+                    driver_put(driver);  /* Release reference */
+                }
+                
+                devices_found++;
+                g_device_enum.enumerated_devices++;
+                
+                console_printf("PCI device: %04X:%04X (class %06X) at %02X:%02X.%X\n",
+                             vendor_id, device_id, class_code, bus, device, function);
+                
+                /* Check for multi-function device */
+                if (function == 0) {
+                    uint32_t header_type = pci_config_read_dword(bus, device, function, 0x0C);
+                    if (((header_type >> 16) & 0x80) == 0) {
+                        break;  /* Single function device */
+                    }
+                }
+            }
+        }
+    }
+    
+    console_printf("PCI enumeration complete: %u devices found\n", devices_found);
+    return STATUS_OK;
+}
+
+/* Enumerate USB devices */
+static status_t enumerate_usb_devices(void) {
+    uint32_t devices_found = 0;
+    
+    /* For demonstration, create some virtual USB devices */
+    const char* usb_devices[] = {
+        "usb_keyboard", "usb_mouse", "usb_storage", "usb_hub"
+    };
+    
+    for (uint32_t i = 0; i < sizeof(usb_devices) / sizeof(usb_devices[0]); i++) {
+        device_t* new_device;
+        status_t status = device_register(usb_devices[i], DEVICE_TYPE_USB_DEVICE, 
+                                        BUS_TYPE_USB, &new_device);
+        if (status != STATUS_OK) {
+            continue;
+        }
+        
+        /* Set USB-specific properties */
+        new_device->id_info.bus_type = BUS_TYPE_USB;
+        new_device->hot_pluggable = true;
+        new_device->surprise_removal_ok = true;
+        
+        /* Set device-specific vendor/device IDs */
+        switch (i) {
+            case 0: /* Keyboard */
+                new_device->id_info.vendor_id = 0x046D;
+                new_device->id_info.device_id = 0xC31C;
+                new_device->id_info.class_code = 0x030101;  /* HID Keyboard */
+                strcpy(new_device->id_info.manufacturer, "Logitech");
+                strcpy(new_device->id_info.product, "USB Keyboard");
+                break;
+            case 1: /* Mouse */
+                new_device->id_info.vendor_id = 0x046D;
+                new_device->id_info.device_id = 0xC52F;
+                new_device->id_info.class_code = 0x030102;  /* HID Mouse */
+                strcpy(new_device->id_info.manufacturer, "Logitech");
+                strcpy(new_device->id_info.product, "USB Mouse");
+                break;
+            case 2: /* Storage */
+                new_device->id_info.vendor_id = 0x0781;
+                new_device->id_info.device_id = 0x5567;
+                new_device->id_info.class_code = 0x080650;  /* Mass Storage */
+                strcpy(new_device->id_info.manufacturer, "SanDisk");
+                strcpy(new_device->id_info.product, "USB Storage");
+                break;
+            case 3: /* Hub */
+                new_device->id_info.vendor_id = 0x1D6B;
+                new_device->id_info.device_id = 0x0002;
+                new_device->id_info.class_code = 0x090000;  /* USB Hub */
+                strcpy(new_device->id_info.manufacturer, "Linux Foundation");
+                strcpy(new_device->id_info.product, "USB Hub");
+                break;
+        }
+        
+        /* Try to find and bind appropriate driver */
+        driver_t* driver = find_best_driver_for_device(new_device);
+        if (driver) {
+            device_bind_driver(new_device, driver);
+            driver_put(driver);
+        }
+        
+        devices_found++;
+        g_device_enum.enumerated_devices++;
+    }
+    
+    console_printf("USB enumeration complete: %u devices found\n", devices_found);
+    return STATUS_OK;
+}
+
+/* Enumerate ACPI devices */
+static status_t enumerate_acpi_devices(void) {
+    uint32_t devices_found = 0;
+    
+    /* For demonstration, create some virtual ACPI devices */
+    const char* acpi_devices[] = {
+        "acpi_power_button", "acpi_sleep_button", "acpi_thermal", "acpi_battery"
+    };
+    
+    for (uint32_t i = 0; i < sizeof(acpi_devices) / sizeof(acpi_devices[0]); i++) {
+        device_t* new_device;
+        status_t status = device_register(acpi_devices[i], DEVICE_TYPE_ACPI_DEVICE, 
+                                        BUS_TYPE_ACPI, &new_device);
+        if (status == STATUS_OK) {
+            new_device->id_info.bus_type = BUS_TYPE_ACPI;
+            strcpy(new_device->id_info.manufacturer, "ACPI");
+            strcpy(new_device->id_info.product, acpi_devices[i]);
+            
+            devices_found++;
+            g_device_enum.enumerated_devices++;
+        }
+    }
+    
+    console_printf("ACPI enumeration complete: %u devices found\n", devices_found);
+    return STATUS_OK;
+}
+
+/* Enumerate platform devices */
+static status_t enumerate_platform_devices(void) {
+    uint32_t devices_found = 0;
+    
+    /* For demonstration, create some virtual platform devices */
+    const char* platform_devices[] = {
+        "serial_port", "parallel_port", "rtc", "dma_controller", "pic"
+    };
+    
+    for (uint32_t i = 0; i < sizeof(platform_devices) / sizeof(platform_devices[0]); i++) {
+        device_t* new_device;
+        status_t status = device_register(platform_devices[i], DEVICE_TYPE_PLATFORM_DEVICE, 
+                                        BUS_TYPE_PLATFORM, &new_device);
+        if (status == STATUS_OK) {
+            new_device->id_info.bus_type = BUS_TYPE_PLATFORM;
+            strcpy(new_device->id_info.manufacturer, "Platform");
+            strcpy(new_device->id_info.product, platform_devices[i]);
+            
+            devices_found++;
+            g_device_enum.enumerated_devices++;
+        }
+    }
+    
+    console_printf("Platform enumeration complete: %u devices found\n", devices_found);
+    return STATUS_OK;
+}
+
+/* Find best matching driver for device */
+static driver_t* find_best_driver_for_device(device_t* device) {
+    if (!device) {
+        return NULL;
+    }
+    
+    uint32_t best_score = 0;
+    const char* best_driver_name = NULL;
+    
+    /* Search device match database */
+    for (uint32_t i = 0; i < DEVICE_MATCH_COUNT; i++) {
+        uint32_t score = calculate_match_score(&device->id_info, &g_device_matches[i]);
+        if (score > best_score) {
+            best_score = score;
+            best_driver_name = g_device_matches[i].driver_name;
+        }
+    }
+    
+    if (best_driver_name && best_score > 50) {  /* Minimum match threshold */
+        driver_t* driver = driver_find_by_name(best_driver_name);
+        if (driver) {
+            console_printf("Found driver '%s' for device '%s' (score: %u)\n",
+                          best_driver_name, device->name, best_score);
+            return driver;  /* Caller must call driver_put() */
+        }
+    }
+    
+    console_printf("No suitable driver found for device '%s'\n", device->name);
+    return NULL;
+}
+
+/* Calculate match score between device and driver entry */
+static uint32_t calculate_match_score(const device_id_t* device_id, const device_match_entry_t* match) {
+    uint32_t score = 0;
+    
+    /* Bus type must match */
+    if (device_id->bus_type != match->device_id.bus_type) {
+        return 0;
+    }
+    
+    /* Vendor ID match */
+    if (match->device_id.vendor_id != 0 && device_id->vendor_id == match->device_id.vendor_id) {
+        score += 40;
+    }
+    
+    /* Device ID match */
+    if (match->device_id.device_id != 0 && device_id->device_id == match->device_id.device_id) {
+        score += 40;
+    }
+    
+    /* Class code match */
+    if (match->device_id.class_code != 0 && device_id->class_code == match->device_id.class_code) {
+        score += 20;
+    }
+    
+    /* Subsystem vendor/device match */
+    if (match->device_id.subsystem_vendor_id != 0 && 
+        device_id->subsystem_vendor_id == match->device_id.subsystem_vendor_id) {
+        score += 10;
+    }
+    
+    if (match->device_id.subsystem_device_id != 0 && 
+        device_id->subsystem_device_id == match->device_id.subsystem_device_id) {
+        score += 10;
+    }
+    
+    /* Apply base match score */
+    if (score > 0) {
+        score = (score * match->match_score) / 100;
+    }
+    
+    return score;
+}
+
+/* Start hot-plug monitoring */
+status_t hotplug_start_monitoring(void) {
+    if (g_device_enum.monitoring_enabled) {
+        return STATUS_EXISTS;
+    }
+    
+    /* Create monitoring thread */
+    thread_create_info_t thread_info = {0};
+    strcpy(thread_info.name, "hotplug_monitor");
+    thread_info.entry_point = hotplug_monitor_thread;
+    thread_info.arg = NULL;
+    thread_info.priority = THREAD_PRIORITY_NORMAL;
+    thread_info.stack_size = 8192;
+    
+    status_t status = thread_create(&thread_info, &g_device_enum.monitor_thread);
+    if (status != STATUS_OK) {
+        return status;
+    }
+    
+    g_device_enum.monitoring_enabled = true;
+    
+    console_printf("Hot-plug monitoring started\n");
+    
+    return STATUS_OK;
+}
+
+/* Hot-plug monitoring thread */
+static void* hotplug_monitor_thread(void* arg) {
+    (void)arg;
+    
+    console_printf("Hot-plug monitor thread started\n");
+    
+    while (g_device_enum.monitoring_enabled) {
+        /* Simulate hot-plug events for demonstration */
+        /* In real implementation, would monitor hardware interrupts */
+        
+        /* Sleep for 5 seconds between checks */
+        thread_sleep(5000);
+        
+        /* Periodically re-scan for new devices */
+        static uint32_t scan_counter = 0;
+        if (++scan_counter >= 12) {  /* Every minute */
+            scan_counter = 0;
+            console_printf("Hot-plug: Performing periodic device scan\n");
+            
+            /* Re-enumerate USB bus (most likely for hot-plug events) */
+            enumerate_usb_devices();
+        }
+    }
+    
+    console_printf("Hot-plug monitor thread terminated\n");
+    return NULL;
+}
+
+/* Add device resource */
+status_t device_add_resource(device_t* device, resource_type_t type,
+                           uint64_t start, uint64_t size, uint32_t flags) {
+    if (!device || device->resource_count >= MAX_DEVICE_RESOURCES) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&device->lock);
+    
+    device_resource_t* resource = &device->resources[device->resource_count];
+    resource->type = type;
+    resource->start = start;
+    resource->size = size;
+    resource->flags = flags;
+    
+    /* Set resource name based on type */
+    switch (type) {
+        case RESOURCE_TYPE_MEMORY:
+            snprintf(resource->name, sizeof(resource->name), "mem_%u", device->resource_count);
+            break;
+        case RESOURCE_TYPE_IO_PORT:
+            snprintf(resource->name, sizeof(resource->name), "io_%u", device->resource_count);
+            break;
+        case RESOURCE_TYPE_IRQ:
+            snprintf(resource->name, sizeof(resource->name), "irq_%u", device->resource_count);
+            break;
+        case RESOURCE_TYPE_DMA:
+            snprintf(resource->name, sizeof(resource->name), "dma_%u", device->resource_count);
+            break;
+        default:
+            snprintf(resource->name, sizeof(resource->name), "res_%u", device->resource_count);
+            break;
+    }
+    
+    device->resource_count++;
+    
+    spin_unlock(&device->lock);
+    
+    console_printf("Added resource to device '%s': %s (0x%lX-0x%lX)\n",
+                  device->name, resource->name, start, start + size - 1);
+    
+    return STATUS_OK;
+}

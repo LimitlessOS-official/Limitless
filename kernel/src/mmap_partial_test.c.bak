@@ -1,0 +1,103 @@
+#include "syscall.h"
+#include "vmm.h"
+#include "page_cache.h"
+#include "vfs.h"
+#include "kernel.h"
+#include "process.h"
+#include "microkernel.h"
+
+#ifndef PROT_READ
+#define PROT_READ  0x1
+#endif
+#ifndef PROT_WRITE
+#define PROT_WRITE 0x2
+#endif
+#ifndef MAP_FILE
+#define MAP_FILE   0x01000
+#endif
+
+/* Weak export of a test entry so it can be invoked manually (e.g. from an init routine) */
+int mmap_partial_selftest(void);
+
+/* Provide a dummy vnode for sys_mmap test path if not already defined elsewhere. */
+#ifndef TEST_PARTIAL_UNMAP_VN_SIZE
+#define TEST_PARTIAL_UNMAP_VN_SIZE (6*4096)
+#endif
+
+typedef struct test_file_vn { vnode_t vn; char data[TEST_PARTIAL_UNMAP_VN_SIZE]; } test_file_vn_t;
+static long tf_read(struct vnode* vn, u64 off, void* buf, size_t len){ test_file_vn_t* f=(test_file_vn_t*)vn; if(off>=sizeof(f->data)) return 0; if(off+len>sizeof(f->data)) len=sizeof(f->data)-(size_t)off; k_memcpy(buf,f->data+off,len); return (long)len; }
+static long tf_write(struct vnode* vn, u64 off, const void* buf, size_t len){ test_file_vn_t* f=(test_file_vn_t*)vn; if(off+len>sizeof(f->data)) len=sizeof(f->data)-(size_t)off; k_memcpy(f->data+off,buf,len); if(off+len>f->vn.size) f->vn.size=off+len; return (long)len; }
+static vnode_ops_t tf_ops = { .read=tf_read, .write=tf_write, .readdir=NULL, .lookup=NULL, .release=NULL };
+static test_file_vn_t g_test_vn;
+
+vnode_t* test_mmap_default_vnode(void){
+    if(!g_test_vn.vn.ops){ k_memset(&g_test_vn,0,sizeof(g_test_vn)); g_test_vn.vn.type=VNODE_FILE; g_test_vn.vn.ops=&tf_ops; g_test_vn.vn.size=sizeof(g_test_vn.data); for(size_t i=0;i<sizeof(g_test_vn.data);i++) g_test_vn.data[i]=(char)(i&0xFF); }
+    return &g_test_vn.vn;
+}
+
+static int count_regions(vmm_aspace_t* as){ int c=0; for(vmm_region_t* r=as->regions;r;r=r->next) c++; return c; }
+
+static int validate_pattern(u8* base, u64 file_off, u64 length){
+    for(u64 i=0;i<length;i+= 997){ /* stride to hit various offsets incl crossing pages */
+        u8 expect = (u8)((file_off + i) & 0xFF);
+        if(base[i] != expect) return -100; /* pattern mismatch */
+    }
+    return 0;
+}
+
+static int force_fault_and_check(virt_addr_t start, u64 bytes, u64 file_off_base){
+    u8* p = (u8*)start;
+    int rc = validate_pattern(p, file_off_base, bytes);
+    if(rc!=0) return rc;
+    return 0;
+}
+
+int mmap_partial_selftest(void){
+    process_t* proc = process_current(); if(!proc) return -1; vmm_aspace_t* as=proc->as; if(!as) return -2;
+    page_cache_init(128);
+    /* Map 6 pages */
+    u64 length = 6*4096ULL; long base = sys_mmap(NULL,length, PROT_READ|PROT_WRITE, MAP_FILE, -1, 0); if(base<0) return -3;
+    vmm_region_t* r0 = vmm_region_find(as,(virt_addr_t)base); if(!r0 || r0->length!=length) return -4;
+    int regions_after_map = count_regions(as); if(regions_after_map < 1) return -5;
+    /* Touch all pages to fault them in and validate initial pattern */
+    if(force_fault_and_check((virt_addr_t)base, length, 0)!=0) return -26;
+    /* Trim prefix: unmap first 2 pages */
+    if(sys_munmap((void*)base, 2*4096ULL)!=0) return -6;
+    vmm_region_t* r_after_prefix = vmm_region_find(as,(virt_addr_t)(base+2*4096ULL)); if(!r_after_prefix) return -7;
+    if(r_after_prefix->start != (virt_addr_t)(base+2*4096ULL)) return -8;
+    if(r_after_prefix->length != 4*4096ULL) return -9;
+    if(r_after_prefix->file_map && r_after_prefix->file_map->file_off != 2*4096ULL) return -10;
+    if(force_fault_and_check(r_after_prefix->start, r_after_prefix->length, r_after_prefix->file_map?r_after_prefix->file_map->file_off:0)!=0) return -27;
+    /* Trim suffix: unmap last page */
+    if(sys_munmap((void*)(base+5*4096ULL), 4096ULL)!=0) return -11;
+    vmm_region_t* r_after_suffix = vmm_region_find(as,(virt_addr_t)(base+2*4096ULL)); if(!r_after_suffix) return -12;
+    if(r_after_suffix->length != 3*4096ULL) return -13;
+    if(r_after_suffix->file_map && r_after_suffix->file_map->length != 3*4096ULL) return -14;
+    if(force_fault_and_check(r_after_suffix->start, r_after_suffix->length, r_after_suffix->file_map?r_after_suffix->file_map->file_off:0)!=0) return -28;
+    /* Middle split: unmap one page in the middle (second of remaining 3 -> address base+3*4096) */
+    if(sys_munmap((void*)(base+3*4096ULL), 4096ULL)!=0) return -15;
+    vmm_region_t* left = vmm_region_find(as,(virt_addr_t)(base+2*4096ULL));
+    vmm_region_t* right = vmm_region_find(as,(virt_addr_t)(base+4*4096ULL));
+    if(!left || !right) return -16;
+    if(left==right) return -17;
+    if(left->length != 1*4096ULL) return -18;
+    if(right->length != 1*4096ULL) return -19;
+    if(left->file_map && left->file_map->length != 1*4096ULL) return -20;
+    if(right->file_map && right->file_map->length != 1*4096ULL) return -21;
+    /* Validate file offsets: left should start at original file_off 2*4096, right at 4*4096 */
+    if(left->file_map && left->file_map->file_off != 2*4096ULL) return -22;
+    if(right->file_map && right->file_map->file_off != 4*4096ULL) return -23;
+    if(force_fault_and_check(left->start, left->length, left->file_map?left->file_map->file_off:0)!=0) return -29;
+    if(force_fault_and_check(right->start, right->length, right->file_map?right->file_map->file_off:0)!=0) return -30;
+    /* Dirty marking test: write into left page and ensure data changes */
+    if(left->length >= 16 && left->file_map){
+        u8* lp = (u8*)left->start; u8 before = lp[8]; lp[8] = (u8)(before ^ 0x5A); if(lp[8] == before) return -31; /* changed */
+        /* Dirty lookup */
+        page_cache_page_info_t info; if(page_cache_debug_lookup(left->file_map->vnode, left->file_map->file_off, &info)!=0) return -32;
+        if(!info.present) return -33; if(!(info.flags & PAGE_CACHE_DIRTY)) return -34;
+    }
+    /* Cleanup: unmap remaining regions */
+    if(sys_munmap((void*)(left->start), left->length)!=0) return -24;
+    if(sys_munmap((void*)(right->start), right->length)!=0) return -25;
+    return 0;
+}

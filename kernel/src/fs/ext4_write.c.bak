@@ -1,0 +1,425 @@
+/*
+ * ext4_write.c - EXT4 write operations implementation
+ * 
+ * Provides complete write path including allocation, truncation, and metadata updates.
+ */
+
+#include <kernel/fs/ext4.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/pmm.h>
+#include <kernel/string.h>
+#include <kernel/klog.h>
+
+#define EXT4_BLOCK_SIZE(sb) (1024 << (sb)->s_log_block_size)
+#define EXT4_INODE_SIZE(sb) ((sb)->s_rev_level == 0 ? 128 : (sb)->s_inode_size)
+
+/* Block allocation bitmap operations */
+static status_t ext4_alloc_block(ext4_superblock_t* sb, uint64_t* block_num);
+static status_t ext4_free_block(ext4_superblock_t* sb, uint64_t block_num);
+static status_t ext4_mark_block_used(ext4_superblock_t* sb, uint64_t block_num);
+
+/* Extent tree operations */
+static status_t ext4_insert_extent(ext4_inode_t* inode, uint64_t logical_block, 
+                                  uint64_t physical_block, uint32_t length);
+static status_t ext4_split_extent(ext4_inode_t* inode, uint64_t logical_block);
+
+/* Write data to file */
+ssize_t ext4_write_file(vfs_node_t* node, off_t offset, const void* buffer, size_t count) {
+    if (!node || !buffer || count == 0) {
+        return -EINVAL;
+    }
+    
+    ext4_inode_t* inode = (ext4_inode_t*)node->fs_data;
+    if (!inode) {
+        return -EINVAL;
+    }
+    
+    /* Start journal transaction for write operation */
+    journal_transaction_t* transaction = ext4_journal_start_transaction();
+    if (!transaction) {
+        return -ENOSPC;
+    }
+    
+    KLOG_DEBUG("EXT4", "Writing %zu bytes at offset %lld to inode %u", 
+               count, (long long)offset, node->inode_num);
+    
+    ssize_t written = 0;
+    size_t remaining = count;
+    off_t current_offset = offset;
+    const uint8_t* data = (const uint8_t*)buffer;
+    
+    ext4_superblock_t* sb = (ext4_superblock_t*)node->fs->private_data;
+    uint32_t block_size = EXT4_BLOCK_SIZE(sb);
+    
+    while (remaining > 0) {
+        /* Calculate block number and offset within block */
+        uint64_t logical_block = current_offset / block_size;
+        uint32_t block_offset = current_offset % block_size;
+        size_t write_size = MIN(remaining, block_size - block_offset);
+        
+        /* Get or allocate physical block */
+        uint64_t physical_block;
+        status_t status = ext4_get_block_for_write(inode, logical_block, &physical_block);
+        if (status != STATUS_OK) {
+            KLOG_ERROR("EXT4", "Failed to get block for write: %d", status);
+            break;
+        }
+        
+        /* Read existing block if partial write */
+        void* block_buffer = pmm_alloc_page();
+        if (!block_buffer) {
+            status = STATUS_NO_MEMORY;
+            break;
+        }
+        
+        if (block_offset != 0 || write_size < block_size) {
+            /* Partial block write - read existing content */
+            status = node->fs->device->read_blocks(node->fs->device, physical_block, 1, block_buffer);
+            if (status != STATUS_OK && status != STATUS_NOT_FOUND) {
+                pmm_free_page(block_buffer);
+                break;
+            }
+        }
+        
+        /* Copy new data into block buffer */
+        memcpy((uint8_t*)block_buffer + block_offset, data, write_size);
+        
+        /* Add block to journal transaction */
+        status = ext4_journal_add_block(transaction, physical_block, block_buffer);
+        if (status != STATUS_OK) {
+            pmm_free_page(block_buffer);
+            break;
+        }
+        
+        /* Write block to disk */
+        status = node->fs->device->write_blocks(node->fs->device, physical_block, 1, block_buffer);
+        pmm_free_page(block_buffer);
+        
+        if (status != STATUS_OK) {
+            KLOG_ERROR("EXT4", "Failed to write block %llu: %d", physical_block, status);
+            break;
+        }
+        
+        /* Update progress */
+        written += write_size;
+        remaining -= write_size;
+        current_offset += write_size;
+        data += write_size;
+    }
+    
+    if (written > 0) {
+        /* Update inode metadata */
+        uint64_t new_size = MAX(inode->i_size, (uint64_t)(offset + written));
+        
+        if (new_size != inode->i_size) {
+            inode->i_size = new_size;
+            inode->i_size_high = (new_size >> 32);
+            
+            /* Update modification time */
+            uint64_t current_time = hal_timer_get_timestamp_ns() / 1000000000ULL; /* Convert to seconds */
+            inode->i_mtime = (uint32_t)current_time;
+            inode->i_mtime_extra = (uint32_t)(current_time >> 32);
+            
+            /* Mark inode dirty and add to journal */
+            ext4_journal_add_block(transaction, ext4_get_inode_block(node->inode_num), inode);
+            
+            /* Update node size */
+            node->size = new_size;
+        }
+        
+        /* Commit transaction */
+        ext4_journal_commit_transaction(transaction);
+        
+        KLOG_DEBUG("EXT4", "Successfully wrote %zd bytes to inode %u", written, node->inode_num);
+    } else {
+        /* No data written - abort transaction */
+        ext4_journal_free_transaction(transaction);
+    }
+    
+    return written;
+}
+
+/* Get or allocate block for writing */
+status_t ext4_get_block_for_write(ext4_inode_t* inode, uint64_t logical_block, uint64_t* physical_block) {
+    /* First try to find existing mapping */
+    status_t status = ext4_get_block_mapping(inode, logical_block, physical_block);
+    if (status == STATUS_OK) {
+        return STATUS_OK; /* Block already allocated */
+    }
+    
+    /* Need to allocate new block */
+    ext4_superblock_t* sb = ext4_get_superblock(); /* Get from global context */
+    
+    status = ext4_alloc_block(sb, physical_block);
+    if (status != STATUS_OK) {
+        return status;
+    }
+    
+    /* Insert extent mapping */
+    status = ext4_insert_extent(inode, logical_block, *physical_block, 1);
+    if (status != STATUS_OK) {
+        /* Allocation failed - free the block */
+        ext4_free_block(sb, *physical_block);
+        return status;
+    }
+    
+    KLOG_DEBUG("EXT4", "Allocated block %llu for logical block %llu", *physical_block, logical_block);
+    return STATUS_OK;
+}
+
+/* Allocate a new block */
+static status_t ext4_alloc_block(ext4_superblock_t* sb, uint64_t* block_num) {
+    /* Simple first-fit allocation from block bitmap */
+    uint32_t blocks_per_group = sb->s_blocks_per_group;
+    uint32_t block_groups = (sb->s_blocks_count + blocks_per_group - 1) / blocks_per_group;
+    
+    for (uint32_t group = 0; group < block_groups; group++) {
+        /* Check if group has free blocks */
+        ext4_group_desc_t* group_desc = ext4_get_group_descriptor(group);
+        if (group_desc->bg_free_blocks_count == 0) {
+            continue;
+        }
+        
+        /* Scan block bitmap for free block */
+        void* bitmap = ext4_read_block_bitmap(group);
+        if (!bitmap) {
+            continue;
+        }
+        
+        uint32_t blocks_in_group = MIN(blocks_per_group, sb->s_blocks_count - group * blocks_per_group);
+        
+        for (uint32_t bit = 0; bit < blocks_in_group; bit++) {
+            if (!test_bit(bit, bitmap)) {
+                /* Found free block */
+                *block_num = group * blocks_per_group + bit;
+                
+                /* Mark block as used */
+                set_bit(bit, bitmap);
+                
+                /* Update counters */
+                group_desc->bg_free_blocks_count--;
+                sb->s_free_blocks_count--;
+                
+                /* Write updated bitmap and group descriptor */
+                ext4_write_block_bitmap(group, bitmap);
+                ext4_write_group_descriptor(group, group_desc);
+                ext4_write_superblock(sb);
+                
+                kfree(bitmap);
+                
+                KLOG_DEBUG("EXT4", "Allocated block %llu from group %u", *block_num, group);
+                return STATUS_OK;
+            }
+        }
+        
+        kfree(bitmap);
+    }
+    
+    KLOG_ERROR("EXT4", "No free blocks available");
+    return STATUS_NO_SPACE;
+}
+
+/* Free a block */
+static status_t ext4_free_block(ext4_superblock_t* sb, uint64_t block_num) {
+    uint32_t blocks_per_group = sb->s_blocks_per_group;
+    uint32_t group = block_num / blocks_per_group;
+    uint32_t bit = block_num % blocks_per_group;
+    
+    ext4_group_desc_t* group_desc = ext4_get_group_descriptor(group);
+    void* bitmap = ext4_read_block_bitmap(group);
+    
+    if (!bitmap) {
+        return STATUS_IO_ERROR;
+    }
+    
+    /* Clear bit in bitmap */
+    clear_bit(bit, bitmap);
+    
+    /* Update counters */
+    group_desc->bg_free_blocks_count++;
+    sb->s_free_blocks_count++;
+    
+    /* Write updated bitmap and group descriptor */
+    ext4_write_block_bitmap(group, bitmap);
+    ext4_write_group_descriptor(group, group_desc);
+    ext4_write_superblock(sb);
+    
+    kfree(bitmap);
+    
+    KLOG_DEBUG("EXT4", "Freed block %llu in group %u", block_num, group);
+    return STATUS_OK;
+}
+
+/* Truncate file to specified size */
+status_t ext4_truncate_file(vfs_node_t* node, off_t new_size) {
+    if (!node) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    ext4_inode_t* inode = (ext4_inode_t*)node->fs_data;
+    if (!inode) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    uint64_t old_size = inode->i_size | ((uint64_t)inode->i_size_high << 32);
+    
+    KLOG_DEBUG("EXT4", "Truncating inode %u from %llu to %lld bytes", 
+               node->inode_num, old_size, (long long)new_size);
+    
+    if (new_size < 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Start journal transaction */
+    journal_transaction_t* transaction = ext4_journal_start_transaction();
+    if (!transaction) {
+        return STATUS_NO_MEMORY;
+    }
+    
+    status_t status = STATUS_OK;
+    
+    if ((uint64_t)new_size < old_size) {
+        /* Shrinking file - free blocks beyond new size */
+        ext4_superblock_t* sb = (ext4_superblock_t*)node->fs->private_data;
+        uint32_t block_size = EXT4_BLOCK_SIZE(sb);
+        
+        uint64_t first_block_to_free = (new_size + block_size - 1) / block_size;
+        uint64_t last_block = (old_size + block_size - 1) / block_size;
+        
+        /* Free blocks in reverse order to maintain extent tree consistency */
+        for (uint64_t logical_block = last_block - 1; logical_block >= first_block_to_free; logical_block--) {
+            uint64_t physical_block;
+            if (ext4_get_block_mapping(inode, logical_block, &physical_block) == STATUS_OK) {
+                /* Free the physical block */
+                ext4_free_block(sb, physical_block);
+                
+                /* Remove from extent tree */
+                ext4_remove_extent(inode, logical_block);
+            }
+            
+            if (logical_block == 0) break; /* Prevent underflow */
+        }
+    }
+    
+    /* Update inode size */
+    inode->i_size = (uint32_t)new_size;
+    inode->i_size_high = (uint32_t)((uint64_t)new_size >> 32);
+    
+    /* Update modification time */
+    uint64_t current_time = hal_timer_get_timestamp_ns() / 1000000000ULL;
+    inode->i_mtime = (uint32_t)current_time;
+    inode->i_mtime_extra = (uint32_t)(current_time >> 32);
+    
+    /* Add updated inode to journal */
+    ext4_journal_add_block(transaction, ext4_get_inode_block(node->inode_num), inode);
+    
+    /* Commit transaction */
+    status = ext4_journal_commit_transaction(transaction);
+    
+    if (status == STATUS_OK) {
+        /* Update VFS node size */
+        node->size = new_size;
+        KLOG_DEBUG("EXT4", "Successfully truncated inode %u to %lld bytes", 
+                   node->inode_num, (long long)new_size);
+    } else {
+        ext4_journal_free_transaction(transaction);
+        KLOG_ERROR("EXT4", "Failed to truncate inode %u: %d", node->inode_num, status);
+    }
+    
+    return status;
+}
+
+/* Insert extent into inode */
+static status_t ext4_insert_extent(ext4_inode_t* inode, uint64_t logical_block, 
+                                  uint64_t physical_block, uint32_t length) {
+    /* Simple implementation - in production would use proper extent tree */
+    
+    /* Check if we can extend an existing extent */
+    for (int i = 0; i < 4; i++) { /* EXT4_N_BLOCKS = 15, but using first 4 for extents */
+        ext4_extent_t* extent = (ext4_extent_t*)&inode->i_block[i * 3];
+        
+        if (extent->ee_len == 0) {
+            /* Empty slot - insert new extent */
+            extent->ee_block = logical_block;
+            extent->ee_start_lo = (uint32_t)physical_block;
+            extent->ee_start_hi = (uint16_t)(physical_block >> 32);
+            extent->ee_len = length;
+            
+            KLOG_DEBUG("EXT4", "Inserted extent: logical %llu -> physical %llu, length %u", 
+                       logical_block, physical_block, length);
+            return STATUS_OK;
+        }
+        
+        /* Check if we can extend this extent */
+        uint64_t extent_start = extent->ee_start_lo | ((uint64_t)extent->ee_start_hi << 32);
+        uint64_t extent_end_logical = extent->ee_block + extent->ee_len;
+        uint64_t extent_end_physical = extent_start + extent->ee_len;
+        
+        if (logical_block == extent_end_logical && physical_block == extent_end_physical) {
+            /* Extend existing extent */
+            extent->ee_len += length;
+            
+            KLOG_DEBUG("EXT4", "Extended extent: logical %llu, new length %u", 
+                       extent->ee_block, extent->ee_len);
+            return STATUS_OK;
+        }
+    }
+    
+    KLOG_ERROR("EXT4", "No free extent slots available");
+    return STATUS_NO_SPACE;
+}
+
+/* Remove extent mapping */
+status_t ext4_remove_extent(ext4_inode_t* inode, uint64_t logical_block) {
+    for (int i = 0; i < 4; i++) {
+        ext4_extent_t* extent = (ext4_extent_t*)&inode->i_block[i * 3];
+        
+        if (extent->ee_len > 0 && 
+            logical_block >= extent->ee_block && 
+            logical_block < extent->ee_block + extent->ee_len) {
+            
+            if (extent->ee_len == 1) {
+                /* Remove entire extent */
+                extent->ee_block = 0;
+                extent->ee_start_lo = 0;
+                extent->ee_start_hi = 0;
+                extent->ee_len = 0;
+            } else if (logical_block == extent->ee_block) {
+                /* Remove from beginning */
+                extent->ee_block++;
+                extent->ee_start_lo++;
+                extent->ee_len--;
+            } else if (logical_block == extent->ee_block + extent->ee_len - 1) {
+                /* Remove from end */
+                extent->ee_len--;
+            } else {
+                /* Split extent - simplified implementation */
+                extent->ee_len = logical_block - extent->ee_block;
+            }
+            
+            KLOG_DEBUG("EXT4", "Removed extent mapping for logical block %llu", logical_block);
+            return STATUS_OK;
+        }
+    }
+    
+    return STATUS_NOT_FOUND;
+}
+
+/* Sync all pending writes */
+status_t ext4_sync_filesystem(vfs_filesystem_t* fs) {
+    KLOG_INFO("EXT4", "Syncing filesystem");
+    
+    /* Force journal sync */
+    status_t status = ext4_journal_sync();
+    if (status != STATUS_OK) {
+        return status;
+    }
+    
+    /* Sync device buffers */
+    if (fs->device->sync) {
+        status = fs->device->sync(fs->device);
+    }
+    
+    KLOG_INFO("EXT4", "Filesystem sync completed");
+    return status;
+}

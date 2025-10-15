@@ -1,0 +1,798 @@
+/*
+ * service_manager.c - LimitlessOS systemd-style Service Manager
+ * 
+ * Comprehensive service management system with dependency resolution,
+ * service lifecycle management, and systemd-compatible unit system.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "vfs.h"
+#include "syscall.h"
+#include "timer.h"
+#include "vmm.h"
+
+#define MAX_SERVICES            1024
+#define MAX_SERVICE_NAME        256
+#define MAX_COMMAND_LINE        1024
+#define MAX_DEPENDENCIES        32
+#define MAX_TARGETS             64
+
+/* Service states */
+#define SERVICE_STATE_INACTIVE      0
+#define SERVICE_STATE_ACTIVATING    1
+#define SERVICE_STATE_ACTIVE        2
+#define SERVICE_STATE_DEACTIVATING  3
+#define SERVICE_STATE_FAILED        4
+#define SERVICE_STATE_MAINTENANCE   5
+
+/* Service types */
+#define SERVICE_TYPE_SIMPLE         0
+#define SERVICE_TYPE_FORKING        1
+#define SERVICE_TYPE_ONESHOT        2
+#define SERVICE_TYPE_DBUS          3
+#define SERVICE_TYPE_NOTIFY        4
+#define SERVICE_TYPE_IDLE          5
+
+/* Restart policies */
+#define SERVICE_RESTART_NO          0
+#define SERVICE_RESTART_ON_SUCCESS  1
+#define SERVICE_RESTART_ON_FAILURE  2
+#define SERVICE_RESTART_ON_ABNORMAL 3
+#define SERVICE_RESTART_ON_ABORT    4
+#define SERVICE_RESTART_ALWAYS      5
+
+/* Unit types */
+#define UNIT_TYPE_SERVICE           0
+#define UNIT_TYPE_TARGET           1
+#define UNIT_TYPE_SOCKET           2
+#define UNIT_TYPE_DEVICE           3
+#define UNIT_TYPE_MOUNT            4
+#define UNIT_TYPE_TIMER            5
+
+/* Dependency types */
+#define DEPENDENCY_REQUIRES         0
+#define DEPENDENCY_WANTS           1
+#define DEPENDENCY_REQUISITE       2
+#define DEPENDENCY_BINDS_TO        3
+#define DEPENDENCY_PART_OF         4
+#define DEPENDENCY_CONFLICTS       5
+#define DEPENDENCY_BEFORE          6
+#define DEPENDENCY_AFTER           7
+
+/* Service unit structure */
+typedef struct service_unit {
+    char name[MAX_SERVICE_NAME];    /* Service name */
+    char description[256];          /* Service description */
+    
+    /* Service configuration */
+    int type;                       /* Service type */
+    char exec_start[MAX_COMMAND_LINE]; /* Start command */
+    char exec_stop[MAX_COMMAND_LINE];  /* Stop command */
+    char exec_reload[MAX_COMMAND_LINE]; /* Reload command */
+    char working_directory[256];    /* Working directory */
+    char user[64];                  /* Run as user */
+    char group[64];                 /* Run as group */
+    
+    /* Runtime state */
+    int state;                      /* Current state */
+    pid_t main_pid;                 /* Main process PID */
+    int exit_code;                  /* Last exit code */
+    uint64_t start_time;            /* Start timestamp */
+    uint64_t stop_time;             /* Stop timestamp */
+    
+    /* Restart configuration */
+    int restart_policy;             /* Restart policy */
+    uint32_t restart_delay;         /* Restart delay (ms) */
+    uint32_t restart_count;         /* Current restart count */
+    uint32_t restart_limit;         /* Restart limit */
+    
+    /* Dependencies */
+    struct dependency {
+        int type;                   /* Dependency type */
+        char target[MAX_SERVICE_NAME]; /* Target service */
+    } dependencies[MAX_DEPENDENCIES];
+    uint32_t dependency_count;
+    
+    /* Reverse dependencies (who depends on us) */
+    struct list_head dependents;    /* Services depending on us */
+    
+    /* Timers */
+    uint64_t timeout_start;         /* Start timeout */
+    uint64_t timeout_stop;          /* Stop timeout */
+    
+    /* Resource limits */
+    uint64_t memory_limit;          /* Memory limit */
+    uint32_t cpu_quota;             /* CPU quota (%) */
+    
+    /* Statistics */
+    atomic64_t start_count;         /* Start count */
+    atomic64_t failure_count;       /* Failure count */
+    atomic64_t total_runtime;       /* Total runtime */
+    
+    /* Service capabilities */
+    uint32_t capabilities;          /* Required capabilities */
+    
+    struct list_head unit_list;     /* Global unit list */
+    struct list_head dep_list;      /* Dependency tracking */
+    
+    spinlock_t lock;
+    
+} service_unit_t;
+
+/* Target unit (for grouping services) */
+typedef struct target_unit {
+    char name[MAX_SERVICE_NAME];    /* Target name */
+    char description[256];          /* Target description */
+    
+    /* Target state */
+    int state;                      /* Current state */
+    
+    /* Services in this target */
+    struct list_head services;      /* Services list */
+    atomic32_t service_count;       /* Number of services */
+    
+    /* Statistics */
+    atomic64_t activation_count;    /* Activation count */
+    uint64_t last_activation;       /* Last activation time */
+    
+    struct list_head target_list;   /* Global target list */
+    
+} target_unit_t;
+
+/* Service manager state */
+typedef struct service_manager {
+    bool initialized;
+    bool running;
+    
+    /* Units */
+    struct list_head services;      /* All services */
+    struct list_head targets;       /* All targets */
+    spinlock_t unit_lock;
+    
+    /* Service tracking */
+    atomic32_t service_count;       /* Number of services */
+    atomic32_t active_services;     /* Active services */
+    atomic32_t failed_services;     /* Failed services */
+    
+    /* Default target */
+    target_unit_t* default_target;  /* Default system target */
+    
+    /* Dependency resolver */
+    struct list_head activation_queue; /* Services to activate */
+    spinlock_t queue_lock;
+    
+    /* Manager process */
+    process_t* manager_process;     /* Service manager process */
+    
+    /* Configuration */
+    char config_path[256];          /* Configuration directory */
+    
+    /* Statistics */
+    atomic64_t total_starts;        /* Total service starts */
+    atomic64_t total_stops;         /* Total service stops */
+    atomic64_t total_failures;      /* Total failures */
+    atomic64_t dependency_cycles;   /* Dependency cycles detected */
+    
+} service_manager_t;
+
+/* Global service manager */
+static service_manager_t g_service_manager = {0};
+
+/* Function prototypes */
+static int service_load_unit_file(const char* filename);
+static int service_resolve_dependencies(service_unit_t* service);
+static int service_start_unit(service_unit_t* service);
+static int service_stop_unit(service_unit_t* service);
+static service_unit_t* service_find_unit(const char* name);
+static int service_check_cycles(service_unit_t* service, struct list_head* visited);
+
+/* Initialize service manager */
+int service_manager_init(void) {
+    if (g_service_manager.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing systemd-style service manager\n");
+    
+    memset(&g_service_manager, 0, sizeof(g_service_manager));
+    
+    INIT_LIST_HEAD(&g_service_manager.services);
+    INIT_LIST_HEAD(&g_service_manager.targets);
+    INIT_LIST_HEAD(&g_service_manager.activation_queue);
+    
+    spinlock_init(&g_service_manager.unit_lock);
+    spinlock_init(&g_service_manager.queue_lock);
+    
+    strcpy(g_service_manager.config_path, "/etc/systemd/system");
+    
+    /* Create default target */
+    target_unit_t* default_target = (target_unit_t*)vmm_kmalloc(sizeof(target_unit_t), 32);
+    if (!default_target) {
+        return -ENOMEM;
+    }
+    
+    memset(default_target, 0, sizeof(target_unit_t));
+    strcpy(default_target->name, "default.target");
+    strcpy(default_target->description, "Default System Target");
+    default_target->state = SERVICE_STATE_INACTIVE;
+    INIT_LIST_HEAD(&default_target->services);
+    INIT_LIST_HEAD(&default_target->target_list);
+    
+    g_service_manager.default_target = default_target;
+    
+    spin_lock(&g_service_manager.unit_lock);
+    list_add(&default_target->target_list, &g_service_manager.targets);
+    spin_unlock(&g_service_manager.unit_lock);
+    
+    g_service_manager.initialized = true;
+    g_service_manager.running = true;
+    
+    printf("Service manager initialized\n");
+    return 0;
+}
+
+/* Create service unit */
+service_unit_t* service_create_unit(const char* name, const char* description) {
+    if (!name || strlen(name) >= MAX_SERVICE_NAME) {
+        return NULL;
+    }
+    
+    service_unit_t* service = (service_unit_t*)vmm_kmalloc(sizeof(service_unit_t), 32);
+    if (!service) {
+        return NULL;
+    }
+    
+    memset(service, 0, sizeof(service_unit_t));
+    
+    strcpy(service->name, name);
+    if (description) {
+        strncpy(service->description, description, sizeof(service->description) - 1);
+    }
+    
+    /* Default configuration */
+    service->type = SERVICE_TYPE_SIMPLE;
+    service->state = SERVICE_STATE_INACTIVE;
+    service->restart_policy = SERVICE_RESTART_NO;
+    service->restart_delay = 100;       /* 100ms */
+    service->restart_limit = 5;
+    service->timeout_start = 90000;     /* 90 seconds */
+    service->timeout_stop = 90000;      /* 90 seconds */
+    service->memory_limit = 0;          /* No limit */
+    service->cpu_quota = 0;             /* No limit */
+    
+    INIT_LIST_HEAD(&service->dependents);
+    INIT_LIST_HEAD(&service->unit_list);
+    INIT_LIST_HEAD(&service->dep_list);
+    spinlock_init(&service->lock);
+    
+    /* Add to global service list */
+    spin_lock(&g_service_manager.unit_lock);
+    list_add(&service->unit_list, &g_service_manager.services);
+    atomic32_inc(&g_service_manager.service_count);
+    spin_unlock(&g_service_manager.unit_lock);
+    
+    printf("service: Created unit '%s'\n", name);
+    
+    return service;
+}
+
+/* Add dependency */
+int service_add_dependency(service_unit_t* service, int dep_type, const char* target) {
+    if (!service || !target || service->dependency_count >= MAX_DEPENDENCIES) {
+        return -EINVAL;
+    }
+    
+    struct dependency* dep = &service->dependencies[service->dependency_count];
+    dep->type = dep_type;
+    strncpy(dep->target, target, MAX_SERVICE_NAME - 1);
+    
+    service->dependency_count++;
+    
+    printf("service: Added dependency '%s' %s '%s'\n", 
+           service->name, 
+           (dep_type == DEPENDENCY_REQUIRES) ? "requires" : 
+           (dep_type == DEPENDENCY_WANTS) ? "wants" :
+           (dep_type == DEPENDENCY_AFTER) ? "after" :
+           (dep_type == DEPENDENCY_BEFORE) ? "before" : "unknown",
+           target);
+    
+    return 0;
+}
+
+/* Find service by name */
+static service_unit_t* service_find_unit(const char* name) {
+    if (!name) {
+        return NULL;
+    }
+    
+    spin_lock(&g_service_manager.unit_lock);
+    
+    service_unit_t* service;
+    list_for_each_entry(service, &g_service_manager.services, unit_list) {
+        if (strcmp(service->name, name) == 0) {
+            spin_unlock(&g_service_manager.unit_lock);
+            return service;
+        }
+    }
+    
+    spin_unlock(&g_service_manager.unit_lock);
+    return NULL;
+}
+
+/* Check for dependency cycles */
+static int service_check_cycles(service_unit_t* service, struct list_head* visited) {
+    struct visited_node {
+        service_unit_t* service;
+        struct list_head list;
+    } node;
+    
+    /* Check if already visited */
+    struct visited_node* vnode;
+    list_for_each_entry(vnode, visited, list) {
+        if (vnode->service == service) {
+            /* Cycle detected */
+            atomic64_inc(&g_service_manager.dependency_cycles);
+            return -ELOOP;
+        }
+    }
+    
+    /* Add to visited list */
+    node.service = service;
+    list_add(&node.list, visited);
+    
+    /* Check dependencies */
+    for (uint32_t i = 0; i < service->dependency_count; i++) {
+        struct dependency* dep = &service->dependencies[i];
+        
+        if (dep->type == DEPENDENCY_REQUIRES || dep->type == DEPENDENCY_WANTS) {
+            service_unit_t* target = service_find_unit(dep->target);
+            if (target) {
+                int result = service_check_cycles(target, visited);
+                if (result != 0) {
+                    list_del(&node.list);
+                    return result;
+                }
+            }
+        }
+    }
+    
+    /* Remove from visited list */
+    list_del(&node.list);
+    
+    return 0;
+}
+
+/* Resolve dependencies */
+static int service_resolve_dependencies(service_unit_t* service) {
+    if (!service) {
+        return -EINVAL;
+    }
+    
+    /* Check for dependency cycles */
+    LIST_HEAD(visited);
+    int cycle_check = service_check_cycles(service, &visited);
+    if (cycle_check != 0) {
+        printf("service: Dependency cycle detected for '%s'\n", service->name);
+        return cycle_check;
+    }
+    
+    /* Start required dependencies */
+    for (uint32_t i = 0; i < service->dependency_count; i++) {
+        struct dependency* dep = &service->dependencies[i];
+        
+        if (dep->type == DEPENDENCY_REQUIRES || dep->type == DEPENDENCY_WANTS) {
+            service_unit_t* target = service_find_unit(dep->target);
+            if (!target) {
+                if (dep->type == DEPENDENCY_REQUIRES) {
+                    printf("service: Required dependency '%s' not found for '%s'\n",
+                           dep->target, service->name);
+                    return -ENOENT;
+                }
+                continue;
+            }
+            
+            if (target->state == SERVICE_STATE_INACTIVE) {
+                printf("service: Starting dependency '%s' for '%s'\n", 
+                       dep->target, service->name);
+                
+                int result = service_start_unit(target);
+                if (result != 0 && dep->type == DEPENDENCY_REQUIRES) {
+                    return result;
+                }
+            }
+        }
+    }
+    
+    return 0;
+}
+
+/* Start service */
+static int service_start_unit(service_unit_t* service) {
+    if (!service) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&service->lock);
+    
+    if (service->state == SERVICE_STATE_ACTIVE || 
+        service->state == SERVICE_STATE_ACTIVATING) {
+        spin_unlock(&service->lock);
+        return 0;
+    }
+    
+    printf("service: Starting '%s'\n", service->name);
+    
+    service->state = SERVICE_STATE_ACTIVATING;
+    service->start_time = timer_get_ticks();
+    
+    spin_unlock(&service->lock);
+    
+    /* Resolve dependencies first */
+    int dep_result = service_resolve_dependencies(service);
+    if (dep_result != 0) {
+        service->state = SERVICE_STATE_FAILED;
+        atomic32_inc(&g_service_manager.failed_services);
+        return dep_result;
+    }
+    
+    /* Execute start command */
+    if (strlen(service->exec_start) > 0) {
+        /* Create process for service */
+        process_t* proc = process_create_user_process(service->exec_start);
+        if (!proc) {
+            service->state = SERVICE_STATE_FAILED;
+            service->exit_code = -1;
+            atomic32_inc(&g_service_manager.failed_services);
+            atomic64_inc(&service->failure_count);
+            return -EFAULT;
+        }
+        
+        service->main_pid = proc->pid;
+        
+        /* Set working directory */
+        if (strlen(service->working_directory) > 0) {
+            /* TODO: Set process working directory */
+        }
+        
+        /* Set user/group */
+        if (strlen(service->user) > 0) {
+            /* TODO: Set process user */
+        }
+        
+        /* Apply resource limits */
+        if (service->memory_limit > 0) {
+            /* TODO: Set memory limit */
+        }
+        
+        if (service->cpu_quota > 0) {
+            /* TODO: Set CPU quota */
+        }
+    }
+    
+    service->state = SERVICE_STATE_ACTIVE;
+    atomic32_inc(&g_service_manager.active_services);
+    atomic64_inc(&service->start_count);
+    atomic64_inc(&g_service_manager.total_starts);
+    
+    printf("service: Started '%s' (PID=%d)\n", service->name, service->main_pid);
+    
+    return 0;
+}
+
+/* Stop service */
+static int service_stop_unit(service_unit_t* service) {
+    if (!service) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&service->lock);
+    
+    if (service->state != SERVICE_STATE_ACTIVE) {
+        spin_unlock(&service->lock);
+        return 0;
+    }
+    
+    printf("service: Stopping '%s'\n", service->name);
+    
+    service->state = SERVICE_STATE_DEACTIVATING;
+    service->stop_time = timer_get_ticks();
+    
+    spin_unlock(&service->lock);
+    
+    /* Execute stop command or terminate process */
+    if (strlen(service->exec_stop) > 0) {
+        /* Execute custom stop command */
+        /* TODO: Execute stop command */
+    } else if (service->main_pid > 0) {
+        /* Send SIGTERM to main process */
+        process_t* proc = process_find_by_pid(service->main_pid);
+        if (proc) {
+            process_send_signal(proc, SIGTERM);
+            
+            /* Wait for process to exit */
+            /* TODO: Implement timeout */
+        }
+    }
+    
+    service->state = SERVICE_STATE_INACTIVE;
+    service->main_pid = 0;
+    atomic32_dec(&g_service_manager.active_services);
+    atomic64_inc(&g_service_manager.total_stops);
+    
+    /* Update runtime statistics */
+    if (service->start_time > 0) {
+        uint64_t runtime = service->stop_time - service->start_time;
+        atomic64_add(&service->total_runtime, runtime);
+    }
+    
+    printf("service: Stopped '%s'\n", service->name);
+    
+    return 0;
+}
+
+/* Restart service */
+int service_restart_unit(service_unit_t* service) {
+    if (!service) {
+        return -EINVAL;
+    }
+    
+    int stop_result = service_stop_unit(service);
+    if (stop_result != 0) {
+        return stop_result;
+    }
+    
+    /* Apply restart delay */
+    if (service->restart_delay > 0) {
+        /* TODO: Sleep for restart_delay milliseconds */
+    }
+    
+    return service_start_unit(service);
+}
+
+/* Handle service failure */
+void service_handle_failure(service_unit_t* service, int exit_code) {
+    if (!service) {
+        return;
+    }
+    
+    printf("service: '%s' failed with exit code %d\n", service->name, exit_code);
+    
+    service->state = SERVICE_STATE_FAILED;
+    service->exit_code = exit_code;
+    service->main_pid = 0;
+    
+    atomic32_dec(&g_service_manager.active_services);
+    atomic32_inc(&g_service_manager.failed_services);
+    atomic64_inc(&service->failure_count);
+    atomic64_inc(&g_service_manager.total_failures);
+    
+    /* Check restart policy */
+    bool should_restart = false;
+    
+    switch (service->restart_policy) {
+        case SERVICE_RESTART_ALWAYS:
+            should_restart = true;
+            break;
+            
+        case SERVICE_RESTART_ON_FAILURE:
+            should_restart = (exit_code != 0);
+            break;
+            
+        case SERVICE_RESTART_ON_SUCCESS:
+            should_restart = (exit_code == 0);
+            break;
+            
+        case SERVICE_RESTART_ON_ABNORMAL:
+            should_restart = (exit_code < 0);
+            break;
+            
+        case SERVICE_RESTART_ON_ABORT:
+            /* TODO: Check if process was aborted */
+            break;
+            
+        default:
+            break;
+    }
+    
+    /* Check restart limit */
+    if (should_restart && service->restart_count < service->restart_limit) {
+        service->restart_count++;
+        
+        printf("service: Restarting '%s' (attempt %u/%u)\n",
+               service->name, service->restart_count, service->restart_limit);
+        
+        /* Schedule restart */
+        /* TODO: Schedule delayed restart */
+        service_start_unit(service);
+    }
+}
+
+/* Load service unit file */
+static int service_load_unit_file(const char* filename) {
+    if (!filename) {
+        return -EINVAL;
+    }
+    
+    /* TODO: Parse systemd unit file format */
+    /* This would parse .service files with sections like:
+     * [Unit]
+     * Description=...
+     * Requires=...
+     * After=...
+     * 
+     * [Service]
+     * Type=...
+     * ExecStart=...
+     * ExecStop=...
+     * User=...
+     * Group=...
+     * 
+     * [Install]
+     * WantedBy=...
+     */
+    
+    return 0;
+}
+
+/* Load all service units from configuration directory */
+int service_load_all_units(void) {
+    printf("service: Loading service units from %s\n", g_service_manager.config_path);
+    
+    /* TODO: Scan configuration directory for .service files */
+    
+    /* Create some default services for demonstration */
+    service_unit_t* kernel_service = service_create_unit("kernel.service", 
+                                                        "Kernel Core Service");
+    if (kernel_service) {
+        strcpy(kernel_service->exec_start, "/bin/kernel_daemon");
+        kernel_service->type = SERVICE_TYPE_SIMPLE;
+        kernel_service->restart_policy = SERVICE_RESTART_ALWAYS;
+    }
+    
+    service_unit_t* network_service = service_create_unit("network.service",
+                                                         "Network Service");
+    if (network_service) {
+        strcpy(network_service->exec_start, "/bin/networkd");
+        service_add_dependency(network_service, DEPENDENCY_AFTER, "kernel.service");
+        network_service->type = SERVICE_TYPE_SIMPLE;
+        network_service->restart_policy = SERVICE_RESTART_ON_FAILURE;
+    }
+    
+    service_unit_t* display_service = service_create_unit("display.service",
+                                                         "Display Manager");
+    if (display_service) {
+        strcpy(display_service->exec_start, "/bin/displayd");
+        service_add_dependency(display_service, DEPENDENCY_AFTER, "network.service");
+        display_service->type = SERVICE_TYPE_FORKING;
+        display_service->restart_policy = SERVICE_RESTART_ON_FAILURE;
+    }
+    
+    printf("service: Loaded %u service units\n", 
+           atomic32_read(&g_service_manager.service_count));
+    
+    return 0;
+}
+
+/* Start default target */
+int service_start_default_target(void) {
+    printf("service: Starting default target\n");
+    
+    /* Start all services in default target */
+    service_unit_t* service;
+    
+    spin_lock(&g_service_manager.unit_lock);
+    
+    list_for_each_entry(service, &g_service_manager.services, unit_list) {
+        if (service->state == SERVICE_STATE_INACTIVE) {
+            printf("service: Auto-starting '%s'\n", service->name);
+            service_start_unit(service);
+        }
+    }
+    
+    spin_unlock(&g_service_manager.unit_lock);
+    
+    return 0;
+}
+
+/* Public API functions */
+int systemctl_start(const char* service_name) {
+    service_unit_t* service = service_find_unit(service_name);
+    if (!service) {
+        return -ENOENT;
+    }
+    
+    return service_start_unit(service);
+}
+
+int systemctl_stop(const char* service_name) {
+    service_unit_t* service = service_find_unit(service_name);
+    if (!service) {
+        return -ENOENT;
+    }
+    
+    return service_stop_unit(service);
+}
+
+int systemctl_restart(const char* service_name) {
+    service_unit_t* service = service_find_unit(service_name);
+    if (!service) {
+        return -ENOENT;
+    }
+    
+    return service_restart_unit(service);
+}
+
+int systemctl_status(const char* service_name) {
+    service_unit_t* service = service_find_unit(service_name);
+    if (!service) {
+        return -ENOENT;
+    }
+    
+    printf("● %s - %s\n", service->name, service->description);
+    printf("   Loaded: loaded\n");
+    printf("   Active: %s", 
+           (service->state == SERVICE_STATE_ACTIVE) ? "active (running)" :
+           (service->state == SERVICE_STATE_INACTIVE) ? "inactive (dead)" :
+           (service->state == SERVICE_STATE_FAILED) ? "failed" : "unknown");
+    
+    if (service->main_pid > 0) {
+        printf(" (PID %d)", service->main_pid);
+    }
+    printf("\n");
+    
+    printf("  Process: %d %s\n", service->main_pid, service->exec_start);
+    printf(" Main PID: %d\n", service->main_pid);
+    printf("   Starts: %lu\n", atomic64_read(&service->start_count));
+    printf(" Failures: %lu\n", atomic64_read(&service->failure_count));
+    
+    return 0;
+}
+
+/* Get service manager statistics */
+void service_manager_get_stats(struct service_manager_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct service_manager_stats));
+    
+    stats->total_services = atomic32_read(&g_service_manager.service_count);
+    stats->active_services = atomic32_read(&g_service_manager.active_services);
+    stats->failed_services = atomic32_read(&g_service_manager.failed_services);
+    stats->total_starts = atomic64_read(&g_service_manager.total_starts);
+    stats->total_stops = atomic64_read(&g_service_manager.total_stops);
+    stats->total_failures = atomic64_read(&g_service_manager.total_failures);
+    stats->dependency_cycles = atomic64_read(&g_service_manager.dependency_cycles);
+}
+
+/* Debug service manager */
+void service_manager_dump_stats(void) {
+    struct service_manager_stats stats;
+    service_manager_get_stats(&stats);
+    
+    printf("Service Manager Statistics:\n");
+    printf("  Total services: %u\n", stats.total_services);
+    printf("  Active services: %u\n", stats.active_services);
+    printf("  Failed services: %u\n", stats.failed_services);
+    printf("  Total starts: %lu\n", stats.total_starts);
+    printf("  Total stops: %lu\n", stats.total_stops);
+    printf("  Total failures: %lu\n", stats.total_failures);
+    printf("  Dependency cycles: %lu\n", stats.dependency_cycles);
+    
+    printf("\nService List:\n");
+    
+    spin_lock(&g_service_manager.unit_lock);
+    
+    service_unit_t* service;
+    list_for_each_entry(service, &g_service_manager.services, unit_list) {
+        printf("  %-20s %s (PID %d, starts=%lu, failures=%lu)\n",
+               service->name,
+               (service->state == SERVICE_STATE_ACTIVE) ? "ACTIVE " :
+               (service->state == SERVICE_STATE_FAILED) ? "FAILED " :
+               (service->state == SERVICE_STATE_INACTIVE) ? "INACTIVE" : "UNKNOWN",
+               service->main_pid,
+               atomic64_read(&service->start_count),
+               atomic64_read(&service->failure_count));
+    }
+    
+    spin_unlock(&g_service_manager.unit_lock);
+}

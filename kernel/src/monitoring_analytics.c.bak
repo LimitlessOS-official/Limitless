@@ -1,0 +1,561 @@
+/**
+ * Advanced Monitoring Analytics for LimitlessOS
+ * Machine learning-based anomaly detection and predictive monitoring
+ */
+
+#include "system_monitoring.h"
+#include "kernel.h"
+
+/* Machine learning structures for monitoring */
+typedef struct {
+    double weights[32];           /* Neural network weights */
+    double biases[8];            /* Neural network biases */
+    double learning_rate;        /* Learning rate for training */
+    uint32_t training_samples;   /* Number of training samples */
+    bool trained;                /* Whether model is trained */
+} ml_anomaly_detector_t;
+
+typedef struct {
+    double historical_values[1440]; /* 24 hours of minute samples */
+    uint32_t sample_count;
+    uint32_t current_index;
+    double mean;
+    double std_deviation;
+    double trend_coefficient;
+    double seasonal_factors[24];    /* Hourly seasonal factors */
+} metric_predictor_t;
+
+typedef struct {
+    uint32_t metric_id;
+    ml_anomaly_detector_t detector;
+    metric_predictor_t predictor;
+    
+    /* Anomaly detection state */
+    double anomaly_threshold;
+    uint32_t consecutive_anomalies;
+    uint64_t last_anomaly_ns;
+    
+    /* Prediction state */
+    double predicted_value;
+    double prediction_confidence;
+    uint64_t next_prediction_ns;
+    
+    struct advanced_monitor* next;
+    spinlock_t lock;
+} advanced_monitor_t;
+
+/* Correlation analysis */
+typedef struct {
+    uint32_t metric_id_a;
+    uint32_t metric_id_b;
+    double correlation_coefficient;
+    double p_value;
+    bool significant;
+    uint64_t last_calculation_ns;
+} metric_correlation_t;
+
+/* Capacity planning */
+typedef struct {
+    monitor_subsystem_t subsystem;
+    double current_utilization;
+    double growth_rate_per_day;
+    uint32_t days_to_capacity;
+    double recommended_scaling_factor;
+    uint64_t calculation_timestamp_ns;
+} capacity_forecast_t;
+
+/* Advanced monitoring analytics state */
+typedef struct {
+    bool analytics_enabled;
+    advanced_monitor_t* monitor_list;
+    uint32_t monitor_count;
+    
+    /* Correlation analysis */
+    metric_correlation_t correlations[256];
+    uint32_t correlation_count;
+    uint64_t last_correlation_analysis_ns;
+    
+    /* Capacity planning */
+    capacity_forecast_t forecasts[MONITOR_SUBSYS_COUNT];
+    uint64_t last_capacity_analysis_ns;
+    
+    /* Anomaly detection statistics */
+    uint64_t anomalies_detected;
+    uint64_t false_positives;
+    uint64_t true_positives;
+    double detection_accuracy;
+    
+    /* Machine learning parameters */
+    double global_anomaly_threshold;
+    uint32_t min_training_samples;
+    double prediction_horizon_hours;
+    
+    spinlock_t analytics_lock;
+} monitoring_analytics_t;
+
+static monitoring_analytics_t g_analytics = {0};
+
+/* Advanced monitoring function prototypes */
+status_t monitoring_analytics_init(void);
+status_t monitoring_enable_ml_anomaly_detection(uint32_t metric_id, double threshold);
+status_t monitoring_detect_anomalies(void);
+status_t monitoring_train_anomaly_detector(uint32_t metric_id);
+status_t monitoring_predict_metric_values(void);
+status_t monitoring_analyze_correlations(void);
+status_t monitoring_perform_capacity_planning(void);
+
+/* Mathematical utility functions */
+static double calculate_correlation_coefficient(const double* x, const double* y, uint32_t n);
+static double calculate_mean(const double* values, uint32_t n);
+static double calculate_std_deviation(const double* values, uint32_t n, double mean);
+static double sigmoid_activation(double x);
+static double neural_network_forward(ml_anomaly_detector_t* detector, const double* input);
+
+/**
+ * Initialize advanced monitoring analytics
+ */
+status_t monitoring_analytics_init(void)
+{
+    kprintf("Advanced Monitoring: Initializing ML-based analytics...\n");
+    
+    memset(&g_analytics, 0, sizeof(monitoring_analytics_t));
+    spinlock_init(&g_analytics.analytics_lock);
+    
+    /* Set default parameters */
+    g_analytics.global_anomaly_threshold = 0.85;  /* 85% confidence for anomaly */
+    g_analytics.min_training_samples = 100;       /* Minimum samples for training */
+    g_analytics.prediction_horizon_hours = 24.0;  /* 24-hour prediction horizon */
+    
+    /* Initialize capacity forecasts */
+    for (int i = 0; i < MONITOR_SUBSYS_COUNT; i++) {
+        g_analytics.forecasts[i].subsystem = i;
+        g_analytics.forecasts[i].recommended_scaling_factor = 1.0;
+    }
+    
+    g_analytics.analytics_enabled = true;
+    
+    kprintf("Advanced Monitoring: Analytics initialized with ML anomaly detection\n");
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Enable ML-based anomaly detection for a metric
+ */
+status_t monitoring_enable_ml_anomaly_detection(uint32_t metric_id, double threshold)
+{
+    if (!g_analytics.analytics_enabled || threshold < 0.5 || threshold > 1.0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_acquire(&g_analytics.analytics_lock);
+    
+    /* Check if already exists */
+    advanced_monitor_t* monitor = g_analytics.monitor_list;
+    while (monitor) {
+        if (monitor->metric_id == metric_id) {
+            monitor->anomaly_threshold = threshold;
+            spinlock_release(&g_analytics.analytics_lock);
+            return STATUS_SUCCESS;
+        }
+        monitor = monitor->next;
+    }
+    
+    /* Create new advanced monitor */
+    monitor = kmalloc(sizeof(advanced_monitor_t));
+    if (!monitor) {
+        spinlock_release(&g_analytics.analytics_lock);
+        return STATUS_OUT_OF_MEMORY;
+    }
+    
+    memset(monitor, 0, sizeof(advanced_monitor_t));
+    monitor->metric_id = metric_id;
+    monitor->anomaly_threshold = threshold;
+    
+    /* Initialize ML detector with random weights */
+    for (int i = 0; i < 32; i++) {
+        monitor->detector.weights[i] = ((double)rand() / RAND_MAX) * 0.1 - 0.05;
+    }
+    for (int i = 0; i < 8; i++) {
+        monitor->detector.biases[i] = ((double)rand() / RAND_MAX) * 0.1 - 0.05;
+    }
+    monitor->detector.learning_rate = 0.001;
+    
+    /* Initialize predictor */
+    for (int i = 0; i < 24; i++) {
+        monitor->predictor.seasonal_factors[i] = 1.0; /* No seasonal bias initially */
+    }
+    
+    spinlock_init(&monitor->lock);
+    
+    /* Add to list */
+    monitor->next = g_analytics.monitor_list;
+    g_analytics.monitor_list = monitor;
+    g_analytics.monitor_count++;
+    
+    spinlock_release(&g_analytics.analytics_lock);
+    
+    kprintf("Advanced Monitoring: Enabled ML anomaly detection for metric %u (threshold: %.2f)\n",
+            metric_id, threshold);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Detect anomalies using machine learning
+ */
+status_t monitoring_detect_anomalies(void)
+{
+    if (!g_analytics.analytics_enabled) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_acquire(&g_analytics.analytics_lock);
+    
+    advanced_monitor_t* monitor = g_analytics.monitor_list;
+    while (monitor) {
+        spinlock_acquire(&monitor->lock);
+        
+        if (monitor->detector.trained && monitor->detector.training_samples >= g_analytics.min_training_samples) {
+            /* Get current metric value */
+            system_metric_t* metric = NULL;
+            // Find the metric (this would integrate with the main monitoring system)
+            
+            if (metric) {
+                /* Prepare input features for neural network */
+                double input_features[8];
+                input_features[0] = metric->value.percentage / 100.0;  /* Normalized current value */
+                input_features[1] = monitor->predictor.mean / 100.0;   /* Normalized historical mean */
+                input_features[2] = monitor->predictor.std_deviation / 100.0; /* Normalized std dev */
+                input_features[3] = monitor->predictor.trend_coefficient;
+                
+                /* Add time-based features */
+                uint64_t current_ns = timer_get_ns();
+                uint32_t hour_of_day = ((current_ns / 1000000000ULL) / 3600) % 24;
+                input_features[4] = monitor->predictor.seasonal_factors[hour_of_day];
+                input_features[5] = (double)(current_ns - metric->last_update_ns) / 1000000000.0; /* Time since last update */
+                input_features[6] = (double)metric->update_count / 1000.0; /* Update frequency indicator */
+                input_features[7] = 0.0; /* Reserved for future use */
+                
+                /* Run anomaly detection */
+                double anomaly_score = neural_network_forward(&monitor->detector, input_features);
+                
+                if (anomaly_score > monitor->anomaly_threshold) {
+                    monitor->consecutive_anomalies++;
+                    monitor->last_anomaly_ns = current_ns;
+                    g_analytics.anomalies_detected++;
+                    
+                    /* Create anomaly alert */
+                    if (monitor->consecutive_anomalies >= 3) { /* Require 3 consecutive anomalies */
+                        char alert_message[512];
+                        snprintf(alert_message, sizeof(alert_message),
+                                "ML Anomaly detected for metric %s: score %.3f > threshold %.3f (%u consecutive)",
+                                metric->name, anomaly_score, monitor->anomaly_threshold,
+                                monitor->consecutive_anomalies);
+                        
+                        uint32_t alert_id;
+                        monitoring_create_alert(ALERT_SEVERITY_WARNING, metric->subsystem,
+                                              "ML Anomaly Detected", alert_message,
+                                              "ML Anomaly Detector", &alert_id);
+                    }
+                } else {
+                    monitor->consecutive_anomalies = 0;
+                }
+            }
+        }
+        
+        spinlock_release(&monitor->lock);
+        monitor = monitor->next;
+    }
+    
+    spinlock_release(&g_analytics.analytics_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Predict future metric values
+ */
+status_t monitoring_predict_metric_values(void)
+{
+    if (!g_analytics.analytics_enabled) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_acquire(&g_analytics.analytics_lock);
+    
+    advanced_monitor_t* monitor = g_analytics.monitor_list;
+    while (monitor) {
+        spinlock_acquire(&monitor->lock);
+        
+        if (monitor->predictor.sample_count >= 60) { /* Need at least 1 hour of data */
+            /* Simple linear trend prediction with seasonal adjustment */
+            double trend_prediction = monitor->predictor.mean + 
+                                    (monitor->predictor.trend_coefficient * g_analytics.prediction_horizon_hours);
+            
+            /* Apply seasonal factor */
+            uint64_t future_ns = timer_get_ns() + (uint64_t)(g_analytics.prediction_horizon_hours * 3600 * 1000000000ULL);
+            uint32_t future_hour = ((future_ns / 1000000000ULL) / 3600) % 24;
+            double seasonal_adjustment = monitor->predictor.seasonal_factors[future_hour];
+            
+            monitor->predicted_value = trend_prediction * seasonal_adjustment;
+            
+            /* Calculate prediction confidence based on historical variance */
+            double variance_factor = 1.0 - (monitor->predictor.std_deviation / monitor->predictor.mean);
+            monitor->prediction_confidence = MAX(0.0, MIN(1.0, variance_factor));
+            
+            monitor->next_prediction_ns = future_ns;
+            
+            /* Generate predictive alert if needed */
+            if (monitor->predicted_value > 90.0 && monitor->prediction_confidence > 0.7) {
+                char alert_message[512];
+                snprintf(alert_message, sizeof(alert_message),
+                        "Predictive alert: Metric predicted to reach %.1f%% in %.1f hours (confidence: %.1f%%)",
+                        monitor->predicted_value, g_analytics.prediction_horizon_hours,
+                        monitor->prediction_confidence * 100.0);
+                
+                uint32_t alert_id;
+                // Create predictive alert (would integrate with main system)
+            }
+        }
+        
+        spinlock_release(&monitor->lock);
+        monitor = monitor->next;
+    }
+    
+    spinlock_release(&g_analytics.analytics_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Analyze correlations between metrics
+ */
+status_t monitoring_analyze_correlations(void)
+{
+    if (!g_analytics.analytics_enabled) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    uint64_t current_ns = timer_get_ns();
+    
+    /* Only run correlation analysis every 5 minutes */
+    if (current_ns - g_analytics.last_correlation_analysis_ns < MONITOR_INTERVAL_5M) {
+        return STATUS_SUCCESS;
+    }
+    
+    spinlock_acquire(&g_analytics.analytics_lock);
+    
+    /* Find metrics to correlate */
+    advanced_monitor_t* monitor_a = g_analytics.monitor_list;
+    while (monitor_a) {
+        advanced_monitor_t* monitor_b = monitor_a->next;
+        while (monitor_b) {
+            /* Check if we have enough data points */
+            if (monitor_a->predictor.sample_count >= 30 && monitor_b->predictor.sample_count >= 30) {
+                /* Calculate correlation coefficient */
+                uint32_t min_samples = MIN(monitor_a->predictor.sample_count, monitor_b->predictor.sample_count);
+                double correlation = calculate_correlation_coefficient(
+                    monitor_a->predictor.historical_values,
+                    monitor_b->predictor.historical_values,
+                    min_samples);
+                
+                /* Store correlation if significant */
+                if (fabs(correlation) > 0.7 && g_analytics.correlation_count < 256) {
+                    metric_correlation_t* corr = &g_analytics.correlations[g_analytics.correlation_count];
+                    corr->metric_id_a = monitor_a->metric_id;
+                    corr->metric_id_b = monitor_b->metric_id;
+                    corr->correlation_coefficient = correlation;
+                    corr->significant = true;
+                    corr->last_calculation_ns = current_ns;
+                    g_analytics.correlation_count++;
+                    
+                    kprintf("Advanced Monitoring: Strong correlation detected between metrics %u and %u: %.3f\n",
+                            monitor_a->metric_id, monitor_b->metric_id, correlation);
+                }
+            }
+            
+            monitor_b = monitor_b->next;
+        }
+        monitor_a = monitor_a->next;
+    }
+    
+    g_analytics.last_correlation_analysis_ns = current_ns;
+    
+    spinlock_release(&g_analytics.analytics_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Perform capacity planning analysis
+ */
+status_t monitoring_perform_capacity_planning(void)
+{
+    if (!g_analytics.analytics_enabled) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    uint64_t current_ns = timer_get_ns();
+    
+    /* Only run capacity analysis every 15 minutes */
+    if (current_ns - g_analytics.last_capacity_analysis_ns < MONITOR_INTERVAL_15M) {
+        return STATUS_SUCCESS;
+    }
+    
+    spinlock_acquire(&g_analytics.analytics_lock);
+    
+    /* Analyze capacity for each subsystem */
+    for (int subsys = 0; subsys < MONITOR_SUBSYS_COUNT; subsys++) {
+        capacity_forecast_t* forecast = &g_analytics.forecasts[subsys];
+        
+        /* Find utilization metrics for this subsystem */
+        advanced_monitor_t* monitor = g_analytics.monitor_list;
+        while (monitor) {
+            system_metric_t* metric = NULL; /* Would get from main system */
+            
+            if (metric && metric->subsystem == subsys && metric->type == METRIC_TYPE_PERCENTAGE) {
+                forecast->current_utilization = metric->value.percentage;
+                
+                /* Calculate growth rate based on historical data */
+                if (monitor->predictor.sample_count >= 1440) { /* Need at least 24 hours of data */
+                    double first_day_avg = 0.0;
+                    double last_day_avg = 0.0;
+                    
+                    /* Calculate average for first and last day */
+                    for (int i = 0; i < 1440; i++) {
+                        if (i < 720) {
+                            first_day_avg += monitor->predictor.historical_values[i];
+                        } else {
+                            last_day_avg += monitor->predictor.historical_values[i];
+                        }
+                    }
+                    first_day_avg /= 720.0;
+                    last_day_avg /= 720.0;
+                    
+                    forecast->growth_rate_per_day = last_day_avg - first_day_avg;
+                    
+                    /* Calculate days to capacity (assuming 95% is capacity) */
+                    if (forecast->growth_rate_per_day > 0.0) {
+                        double remaining_capacity = 95.0 - forecast->current_utilization;
+                        forecast->days_to_capacity = (uint32_t)(remaining_capacity / forecast->growth_rate_per_day);
+                        
+                        /* Calculate recommended scaling factor */
+                        if (forecast->days_to_capacity < 30) {
+                            forecast->recommended_scaling_factor = 1.5; /* 50% increase */
+                        } else if (forecast->days_to_capacity < 90) {
+                            forecast->recommended_scaling_factor = 1.25; /* 25% increase */
+                        } else {
+                            forecast->recommended_scaling_factor = 1.0; /* No scaling needed */
+                        }
+                        
+                        /* Generate capacity alert if needed */
+                        if (forecast->days_to_capacity < 14) {
+                            char alert_message[512];
+                            snprintf(alert_message, sizeof(alert_message),
+                                    "Capacity alert for %s: %.1f%% utilization, %u days to capacity at %.2f%%/day growth",
+                                    monitoring_subsystem_name(subsys), forecast->current_utilization,
+                                    forecast->days_to_capacity, forecast->growth_rate_per_day);
+                            
+                            uint32_t alert_id;
+                            monitoring_create_alert(ALERT_SEVERITY_WARNING, subsys,
+                                                  "Capacity Planning Alert", alert_message,
+                                                  "Capacity Planner", &alert_id);
+                        }
+                    }
+                }
+                
+                forecast->calculation_timestamp_ns = current_ns;
+                break;
+            }
+            
+            monitor = monitor->next;
+        }
+    }
+    
+    g_analytics.last_capacity_analysis_ns = current_ns;
+    
+    spinlock_release(&g_analytics.analytics_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Mathematical utility functions
+ */
+
+static double calculate_correlation_coefficient(const double* x, const double* y, uint32_t n)
+{
+    if (n < 2) return 0.0;
+    
+    double sum_x = 0.0, sum_y = 0.0, sum_xy = 0.0;
+    double sum_x2 = 0.0, sum_y2 = 0.0;
+    
+    for (uint32_t i = 0; i < n; i++) {
+        sum_x += x[i];
+        sum_y += y[i];
+        sum_xy += x[i] * y[i];
+        sum_x2 += x[i] * x[i];
+        sum_y2 += y[i] * y[i];
+    }
+    
+    double numerator = n * sum_xy - sum_x * sum_y;
+    double denominator = sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y));
+    
+    if (denominator == 0.0) return 0.0;
+    
+    return numerator / denominator;
+}
+
+static double calculate_mean(const double* values, uint32_t n)
+{
+    if (n == 0) return 0.0;
+    
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n; i++) {
+        sum += values[i];
+    }
+    
+    return sum / n;
+}
+
+static double calculate_std_deviation(const double* values, uint32_t n, double mean)
+{
+    if (n < 2) return 0.0;
+    
+    double variance = 0.0;
+    for (uint32_t i = 0; i < n; i++) {
+        double diff = values[i] - mean;
+        variance += diff * diff;
+    }
+    variance /= (n - 1);
+    
+    return sqrt(variance);
+}
+
+static double sigmoid_activation(double x)
+{
+    return 1.0 / (1.0 + exp(-x));
+}
+
+static double neural_network_forward(ml_anomaly_detector_t* detector, const double* input)
+{
+    /* Simple feedforward neural network for anomaly detection */
+    double hidden[8];
+    
+    /* Hidden layer */
+    for (int i = 0; i < 8; i++) {
+        double activation = detector->biases[i];
+        for (int j = 0; j < 8; j++) {
+            activation += input[j] * detector->weights[i * 8 + j];
+        }
+        hidden[i] = sigmoid_activation(activation);
+    }
+    
+    /* Output layer (single neuron) */
+    double output = 0.0;
+    for (int i = 0; i < 8; i++) {
+        output += hidden[i] * detector->weights[24 + i]; /* Use remaining weights for output layer */
+    }
+    
+    return sigmoid_activation(output);
+}

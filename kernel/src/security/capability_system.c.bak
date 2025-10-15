@@ -1,0 +1,671 @@
+/*
+ * capability_system.c - LimitlessOS Capability-Based Security
+ * 
+ * POSIX.1e capabilities implementation for fine-grained privilege control,
+ * allowing processes to operate with minimal required permissions.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "security.h"
+#include "syscall.h"
+#include "vmm.h"
+
+/* POSIX.1e capabilities */
+#define CAP_CHOWN               0   /* Change file ownership */
+#define CAP_DAC_OVERRIDE        1   /* Override DAC permissions */
+#define CAP_DAC_READ_SEARCH     2   /* Override DAC read/search */
+#define CAP_FOWNER              3   /* File owner operations */
+#define CAP_FSETID              4   /* Set file capabilities */
+#define CAP_KILL                5   /* Send signals to any process */
+#define CAP_SETGID              6   /* Set group ID */
+#define CAP_SETUID              7   /* Set user ID */
+#define CAP_SETPCAP             8   /* Transfer capabilities */
+#define CAP_LINUX_IMMUTABLE     9   /* Set immutable attributes */
+#define CAP_NET_BIND_SERVICE    10  /* Bind to privileged ports */
+#define CAP_NET_BROADCAST       11  /* Network broadcast */
+#define CAP_NET_ADMIN           12  /* Network administration */
+#define CAP_NET_RAW             13  /* Raw sockets */
+#define CAP_IPC_LOCK            14  /* Lock memory */
+#define CAP_IPC_OWNER           15  /* IPC ownership operations */
+#define CAP_SYS_MODULE          16  /* Load/unload modules */
+#define CAP_SYS_RAWIO           17  /* Raw I/O access */
+#define CAP_SYS_CHROOT          18  /* chroot() */
+#define CAP_SYS_PTRACE          19  /* ptrace() */
+#define CAP_SYS_PACCT           20  /* Process accounting */
+#define CAP_SYS_ADMIN           21  /* System administration */
+#define CAP_SYS_BOOT            22  /* System reboot */
+#define CAP_SYS_NICE            23  /* Process priority */
+#define CAP_SYS_RESOURCE        24  /* Resource limits */
+#define CAP_SYS_TIME            25  /* System time */
+#define CAP_SYS_TTY_CONFIG      26  /* TTY configuration */
+#define CAP_MKNOD               27  /* Create special files */
+#define CAP_LEASE               28  /* File leases */
+#define CAP_AUDIT_WRITE         29  /* Audit log write */
+#define CAP_AUDIT_CONTROL       30  /* Audit configuration */
+#define CAP_SETFCAP             31  /* Set file capabilities */
+#define CAP_MAC_OVERRIDE        32  /* Override MAC */
+#define CAP_MAC_ADMIN           33  /* MAC administration */
+#define CAP_SYSLOG              34  /* Kernel log access */
+#define CAP_WAKE_ALARM          35  /* Wake alarms */
+#define CAP_BLOCK_SUSPEND       36  /* Block system suspend */
+#define CAP_AUDIT_READ          37  /* Read audit log */
+
+#define CAP_LAST_CAP            CAP_AUDIT_READ
+#define CAP_NUM_CAPS            (CAP_LAST_CAP + 1)
+
+/* Capability sets */
+#define CAPABILITY_SET_SIZE     ((CAP_NUM_CAPS + 63) / 64)
+
+typedef struct capability_set {
+    uint64_t caps[CAPABILITY_SET_SIZE];
+} capability_set_t;
+
+/* Process capability state */
+typedef struct process_capabilities {
+    capability_set_t effective;     /* Currently effective capabilities */
+    capability_set_t permitted;     /* Maximum capabilities allowed */
+    capability_set_t inheritable;   /* Capabilities inherited by children */
+    
+    /* Bounding set - global limit */
+    capability_set_t bounding;
+    
+    /* Ambient capabilities (since Linux 4.3) */
+    capability_set_t ambient;
+    
+    /* Secure bits */
+    uint32_t securebits;
+    
+    /* Statistics */
+    atomic64_t cap_checks;          /* Capability checks performed */
+    atomic64_t cap_grants;          /* Capabilities granted */
+    atomic64_t cap_denials;         /* Capabilities denied */
+    
+    spinlock_t lock;
+    
+} process_capabilities_t;
+
+/* Secure bits */
+#define SECBIT_NOROOT           0   /* Disable setuid-root programs */
+#define SECBIT_NOROOT_LOCKED    1   /* Lock NOROOT bit */
+#define SECBIT_NO_SETUID_FIXUP  2   /* Disable setuid fixup */
+#define SECBIT_NO_SETUID_FIXUP_LOCKED 3 /* Lock NO_SETUID_FIXUP */
+#define SECBIT_KEEP_CAPS        4   /* Keep caps across setuid */
+#define SECBIT_KEEP_CAPS_LOCKED 5   /* Lock KEEP_CAPS */
+#define SECBIT_NO_CAP_AMBIENT_RAISE 6 /* Disable ambient raise */
+#define SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED 7 /* Lock NO_CAP_AMBIENT_RAISE */
+
+/* Global capability system state */
+static struct {
+    bool initialized;
+    
+    /* Default capability sets */
+    capability_set_t default_permitted;
+    capability_set_t default_effective;
+    capability_set_t default_inheritable;
+    capability_set_t default_bounding;
+    capability_set_t default_ambient;
+    
+    /* System-wide statistics */
+    atomic64_t total_cap_checks;
+    atomic64_t total_cap_grants;
+    atomic64_t total_cap_denials;
+    
+    /* Capability names for debugging */
+    const char* cap_names[CAP_NUM_CAPS];
+    
+} g_capability_system = {0};
+
+/* Function prototypes */
+static bool capability_set_has(const capability_set_t* set, int cap);
+static void capability_set_add(capability_set_t* set, int cap);
+static void capability_set_remove(capability_set_t* set, int cap);
+static void capability_set_clear(capability_set_t* set);
+static void capability_set_fill(capability_set_t* set);
+static void capability_set_copy(capability_set_t* dst, const capability_set_t* src);
+static bool capability_set_is_subset(const capability_set_t* subset, const capability_set_t* superset);
+static int capability_check(process_t* proc, int cap);
+
+/* Initialize capability system */
+int capability_system_init(void) {
+    if (g_capability_system.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing capability-based security system\n");
+    
+    memset(&g_capability_system, 0, sizeof(g_capability_system));
+    
+    /* Initialize capability names */
+    g_capability_system.cap_names[CAP_CHOWN] = "CAP_CHOWN";
+    g_capability_system.cap_names[CAP_DAC_OVERRIDE] = "CAP_DAC_OVERRIDE";
+    g_capability_system.cap_names[CAP_DAC_READ_SEARCH] = "CAP_DAC_READ_SEARCH";
+    g_capability_system.cap_names[CAP_FOWNER] = "CAP_FOWNER";
+    g_capability_system.cap_names[CAP_FSETID] = "CAP_FSETID";
+    g_capability_system.cap_names[CAP_KILL] = "CAP_KILL";
+    g_capability_system.cap_names[CAP_SETGID] = "CAP_SETGID";
+    g_capability_system.cap_names[CAP_SETUID] = "CAP_SETUID";
+    g_capability_system.cap_names[CAP_SETPCAP] = "CAP_SETPCAP";
+    g_capability_system.cap_names[CAP_LINUX_IMMUTABLE] = "CAP_LINUX_IMMUTABLE";
+    g_capability_system.cap_names[CAP_NET_BIND_SERVICE] = "CAP_NET_BIND_SERVICE";
+    g_capability_system.cap_names[CAP_NET_BROADCAST] = "CAP_NET_BROADCAST";
+    g_capability_system.cap_names[CAP_NET_ADMIN] = "CAP_NET_ADMIN";
+    g_capability_system.cap_names[CAP_NET_RAW] = "CAP_NET_RAW";
+    g_capability_system.cap_names[CAP_IPC_LOCK] = "CAP_IPC_LOCK";
+    g_capability_system.cap_names[CAP_IPC_OWNER] = "CAP_IPC_OWNER";
+    g_capability_system.cap_names[CAP_SYS_MODULE] = "CAP_SYS_MODULE";
+    g_capability_system.cap_names[CAP_SYS_RAWIO] = "CAP_SYS_RAWIO";
+    g_capability_system.cap_names[CAP_SYS_CHROOT] = "CAP_SYS_CHROOT";
+    g_capability_system.cap_names[CAP_SYS_PTRACE] = "CAP_SYS_PTRACE";
+    g_capability_system.cap_names[CAP_SYS_PACCT] = "CAP_SYS_PACCT";
+    g_capability_system.cap_names[CAP_SYS_ADMIN] = "CAP_SYS_ADMIN";
+    g_capability_system.cap_names[CAP_SYS_BOOT] = "CAP_SYS_BOOT";
+    g_capability_system.cap_names[CAP_SYS_NICE] = "CAP_SYS_NICE";
+    g_capability_system.cap_names[CAP_SYS_RESOURCE] = "CAP_SYS_RESOURCE";
+    g_capability_system.cap_names[CAP_SYS_TIME] = "CAP_SYS_TIME";
+    g_capability_system.cap_names[CAP_SYS_TTY_CONFIG] = "CAP_SYS_TTY_CONFIG";
+    g_capability_system.cap_names[CAP_MKNOD] = "CAP_MKNOD";
+    g_capability_system.cap_names[CAP_LEASE] = "CAP_LEASE";
+    g_capability_system.cap_names[CAP_AUDIT_WRITE] = "CAP_AUDIT_WRITE";
+    g_capability_system.cap_names[CAP_AUDIT_CONTROL] = "CAP_AUDIT_CONTROL";
+    g_capability_system.cap_names[CAP_SETFCAP] = "CAP_SETFCAP";
+    g_capability_system.cap_names[CAP_MAC_OVERRIDE] = "CAP_MAC_OVERRIDE";
+    g_capability_system.cap_names[CAP_MAC_ADMIN] = "CAP_MAC_ADMIN";
+    g_capability_system.cap_names[CAP_SYSLOG] = "CAP_SYSLOG";
+    g_capability_system.cap_names[CAP_WAKE_ALARM] = "CAP_WAKE_ALARM";
+    g_capability_system.cap_names[CAP_BLOCK_SUSPEND] = "CAP_BLOCK_SUSPEND";
+    g_capability_system.cap_names[CAP_AUDIT_READ] = "CAP_AUDIT_READ";
+    
+    /* Set default capability sets - root gets all, others get minimal */
+    capability_set_fill(&g_capability_system.default_bounding);
+    capability_set_fill(&g_capability_system.default_permitted);
+    capability_set_fill(&g_capability_system.default_effective);
+    capability_set_clear(&g_capability_system.default_inheritable);
+    capability_set_clear(&g_capability_system.default_ambient);
+    
+    g_capability_system.initialized = true;
+    
+    printf("Capability system initialized with %d capabilities\n", CAP_NUM_CAPS);
+    return 0;
+}
+
+/* Initialize process capabilities */
+int capability_init_process(process_t* proc, bool is_privileged) {
+    if (!proc) {
+        return -EINVAL;
+    }
+    
+    process_capabilities_t* caps = (process_capabilities_t*)vmm_kmalloc(sizeof(process_capabilities_t), 32);
+    if (!caps) {
+        return -ENOMEM;
+    }
+    
+    memset(caps, 0, sizeof(process_capabilities_t));
+    
+    spinlock_init(&caps->lock);
+    
+    if (is_privileged) {
+        /* Privileged process gets full capabilities */
+        capability_set_copy(&caps->permitted, &g_capability_system.default_permitted);
+        capability_set_copy(&caps->effective, &g_capability_system.default_effective);
+        capability_set_copy(&caps->bounding, &g_capability_system.default_bounding);
+    } else {
+        /* Unprivileged process gets minimal capabilities */
+        capability_set_clear(&caps->permitted);
+        capability_set_clear(&caps->effective);
+        capability_set_copy(&caps->bounding, &g_capability_system.default_bounding);
+    }
+    
+    capability_set_clear(&caps->inheritable);
+    capability_set_clear(&caps->ambient);
+    caps->securebits = 0;
+    
+    proc->capabilities = caps;
+    
+    return 0;
+}
+
+/* Capability set operations */
+static bool capability_set_has(const capability_set_t* set, int cap) {
+    if (cap < 0 || cap >= CAP_NUM_CAPS) {
+        return false;
+    }
+    
+    int word = cap / 64;
+    int bit = cap % 64;
+    
+    return !!(set->caps[word] & (1ULL << bit));
+}
+
+static void capability_set_add(capability_set_t* set, int cap) {
+    if (cap < 0 || cap >= CAP_NUM_CAPS) {
+        return;
+    }
+    
+    int word = cap / 64;
+    int bit = cap % 64;
+    
+    set->caps[word] |= (1ULL << bit);
+}
+
+static void capability_set_remove(capability_set_t* set, int cap) {
+    if (cap < 0 || cap >= CAP_NUM_CAPS) {
+        return;
+    }
+    
+    int word = cap / 64;
+    int bit = cap % 64;
+    
+    set->caps[word] &= ~(1ULL << bit);
+}
+
+static void capability_set_clear(capability_set_t* set) {
+    memset(set, 0, sizeof(capability_set_t));
+}
+
+static void capability_set_fill(capability_set_t* set) {
+    memset(set, 0xff, sizeof(capability_set_t));
+    
+    /* Clear bits beyond last capability */
+    int last_word = CAP_NUM_CAPS / 64;
+    int last_bit = CAP_NUM_CAPS % 64;
+    
+    if (last_bit > 0) {
+        set->caps[last_word] &= (1ULL << last_bit) - 1;
+    }
+    
+    /* Clear any remaining words */
+    for (int i = last_word + 1; i < CAPABILITY_SET_SIZE; i++) {
+        set->caps[i] = 0;
+    }
+}
+
+static void capability_set_copy(capability_set_t* dst, const capability_set_t* src) {
+    memcpy(dst, src, sizeof(capability_set_t));
+}
+
+static bool capability_set_is_subset(const capability_set_t* subset, const capability_set_t* superset) {
+    for (int i = 0; i < CAPABILITY_SET_SIZE; i++) {
+        if ((subset->caps[i] & superset->caps[i]) != subset->caps[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Check if process has capability */
+static int capability_check(process_t* proc, int cap) {
+    if (!proc || !proc->capabilities) {
+        return -EPERM;
+    }
+    
+    if (cap < 0 || cap >= CAP_NUM_CAPS) {
+        return -EINVAL;
+    }
+    
+    process_capabilities_t* caps = proc->capabilities;
+    
+    spin_lock(&caps->lock);
+    
+    atomic64_inc(&caps->cap_checks);
+    atomic64_inc(&g_capability_system.total_cap_checks);
+    
+    bool has_capability = capability_set_has(&caps->effective, cap);
+    
+    if (has_capability) {
+        atomic64_inc(&caps->cap_grants);
+        atomic64_inc(&g_capability_system.total_cap_grants);
+    } else {
+        atomic64_inc(&caps->cap_denials);
+        atomic64_inc(&g_capability_system.total_cap_denials);
+    }
+    
+    spin_unlock(&caps->lock);
+    
+    return has_capability ? 0 : -EPERM;
+}
+
+/* Public capability check interface */
+bool capable(int cap) {
+    return capability_check(current_process, cap) == 0;
+}
+
+/* Check capability with audit */
+bool capable_audit(int cap, const char* operation) {
+    bool result = capable(cap);
+    
+    if (!result) {
+        const char* cap_name = (cap >= 0 && cap < CAP_NUM_CAPS) ? 
+                              g_capability_system.cap_names[cap] : "UNKNOWN";
+        
+        printf("capability: Process %d lacks %s for %s\n", 
+               current_process ? current_process->pid : 0,
+               cap_name, operation ? operation : "operation");
+    }
+    
+    return result;
+}
+
+/* Set process capabilities */
+int capability_set_process_caps(process_t* proc, int which, const capability_set_t* new_caps) {
+    if (!proc || !proc->capabilities || !new_caps) {
+        return -EINVAL;
+    }
+    
+    process_capabilities_t* caps = proc->capabilities;
+    
+    spin_lock(&caps->lock);
+    
+    switch (which) {
+        case 0: /* Effective */
+            /* Must be subset of permitted */
+            if (!capability_set_is_subset(new_caps, &caps->permitted)) {
+                spin_unlock(&caps->lock);
+                return -EPERM;
+            }
+            capability_set_copy(&caps->effective, new_caps);
+            break;
+            
+        case 1: /* Permitted */
+            /* Can only remove capabilities */
+            if (!capability_set_is_subset(new_caps, &caps->permitted)) {
+                spin_unlock(&caps->lock);
+                return -EPERM;
+            }
+            capability_set_copy(&caps->permitted, new_caps);
+            
+            /* Update effective to be subset */
+            for (int i = 0; i < CAPABILITY_SET_SIZE; i++) {
+                caps->effective.caps[i] &= caps->permitted.caps[i];
+            }
+            break;
+            
+        case 2: /* Inheritable */
+            capability_set_copy(&caps->inheritable, new_caps);
+            break;
+            
+        case 3: /* Bounding */
+            /* Can only remove capabilities */
+            if (!capability_set_is_subset(new_caps, &caps->bounding)) {
+                spin_unlock(&caps->lock);
+                return -EPERM;
+            }
+            capability_set_copy(&caps->bounding, new_caps);
+            break;
+            
+        case 4: /* Ambient */
+            /* Must be subset of both permitted and inheritable */
+            if (!capability_set_is_subset(new_caps, &caps->permitted) ||
+                !capability_set_is_subset(new_caps, &caps->inheritable)) {
+                spin_unlock(&caps->lock);
+                return -EPERM;
+            }
+            capability_set_copy(&caps->ambient, new_caps);
+            break;
+            
+        default:
+            spin_unlock(&caps->lock);
+            return -EINVAL;
+    }
+    
+    spin_unlock(&caps->lock);
+    return 0;
+}
+
+/* Get process capabilities */
+int capability_get_process_caps(process_t* proc, int which, capability_set_t* caps_out) {
+    if (!proc || !proc->capabilities || !caps_out) {
+        return -EINVAL;
+    }
+    
+    process_capabilities_t* caps = proc->capabilities;
+    
+    spin_lock(&caps->lock);
+    
+    switch (which) {
+        case 0: /* Effective */
+            capability_set_copy(caps_out, &caps->effective);
+            break;
+        case 1: /* Permitted */
+            capability_set_copy(caps_out, &caps->permitted);
+            break;
+        case 2: /* Inheritable */
+            capability_set_copy(caps_out, &caps->inheritable);
+            break;
+        case 3: /* Bounding */
+            capability_set_copy(caps_out, &caps->bounding);
+            break;
+        case 4: /* Ambient */
+            capability_set_copy(caps_out, &caps->ambient);
+            break;
+        default:
+            spin_unlock(&caps->lock);
+            return -EINVAL;
+    }
+    
+    spin_unlock(&caps->lock);
+    return 0;
+}
+
+/* Handle execve() capability transition */
+int capability_exec_transition(process_t* proc, bool is_setuid, uid_t new_uid, gid_t new_gid) {
+    if (!proc || !proc->capabilities) {
+        return -EINVAL;
+    }
+    
+    process_capabilities_t* caps = proc->capabilities;
+    
+    spin_lock(&caps->lock);
+    
+    capability_set_t new_permitted, new_effective, new_inheritable;
+    
+    if (is_setuid && new_uid == 0) {
+        /* Setuid-root program gets full capabilities */
+        capability_set_copy(&new_permitted, &caps->bounding);
+        capability_set_copy(&new_effective, &caps->bounding);
+    } else {
+        /* Regular transition */
+        capability_set_copy(&new_permitted, &caps->inheritable);
+        
+        /* Effective = (inheritable & bounding) | ambient */
+        capability_set_copy(&new_effective, &caps->inheritable);
+        for (int i = 0; i < CAPABILITY_SET_SIZE; i++) {
+            new_effective.caps[i] &= caps->bounding.caps[i];
+            new_effective.caps[i] |= caps->ambient.caps[i];
+        }
+    }
+    
+    /* Inheritable capabilities are preserved */
+    capability_set_copy(&new_inheritable, &caps->inheritable);
+    
+    /* Apply new capability sets */
+    capability_set_copy(&caps->permitted, &new_permitted);
+    capability_set_copy(&caps->effective, &new_effective);
+    capability_set_copy(&caps->inheritable, &new_inheritable);
+    
+    spin_unlock(&caps->lock);
+    
+    printf("capability: Exec transition for process %d (setuid=%d, uid=%u)\n", 
+           proc->pid, is_setuid, new_uid);
+    
+    return 0;
+}
+
+/* Handle fork() capability inheritance */
+int capability_fork_inherit(process_t* parent, process_t* child) {
+    if (!parent || !child || !parent->capabilities) {
+        return -EINVAL;
+    }
+    
+    int result = capability_init_process(child, false);
+    if (result != 0) {
+        return result;
+    }
+    
+    process_capabilities_t* parent_caps = parent->capabilities;
+    process_capabilities_t* child_caps = child->capabilities;
+    
+    spin_lock(&parent_caps->lock);
+    
+    /* Child inherits parent's capability sets */
+    capability_set_copy(&child_caps->permitted, &parent_caps->permitted);
+    capability_set_copy(&child_caps->effective, &parent_caps->effective);
+    capability_set_copy(&child_caps->inheritable, &parent_caps->inheritable);
+    capability_set_copy(&child_caps->bounding, &parent_caps->bounding);
+    capability_set_copy(&child_caps->ambient, &parent_caps->ambient);
+    child_caps->securebits = parent_caps->securebits;
+    
+    spin_unlock(&parent_caps->lock);
+    
+    return 0;
+}
+
+/* capget/capset system calls */
+long sys_capget(struct user_cap_header* header, struct user_cap_data* data) {
+    if (!header) {
+        return -EINVAL;
+    }
+    
+    /* TODO: Implement proper capget with userspace structures */
+    return -ENOSYS;
+}
+
+long sys_capset(struct user_cap_header* header, const struct user_cap_data* data) {
+    if (!header || !data) {
+        return -EINVAL;
+    }
+    
+    /* TODO: Implement proper capset with userspace structures */
+    return -ENOSYS;
+}
+
+/* prctl capability operations */
+long capability_prctl(int option, unsigned long arg2, unsigned long arg3, 
+                     unsigned long arg4, unsigned long arg5) {
+    
+    if (!current_process || !current_process->capabilities) {
+        return -EINVAL;
+    }
+    
+    process_capabilities_t* caps = current_process->capabilities;
+    
+    switch (option) {
+        case 8: /* PR_SET_KEEPCAPS */
+            if (arg2) {
+                caps->securebits |= (1 << SECBIT_KEEP_CAPS);
+            } else {
+                caps->securebits &= ~(1 << SECBIT_KEEP_CAPS);
+            }
+            return 0;
+            
+        case 9: /* PR_GET_KEEPCAPS */
+            return !!(caps->securebits & (1 << SECBIT_KEEP_CAPS));
+            
+        case 22: /* PR_SET_SECUREBITS */
+            if (!capable(CAP_SETPCAP)) {
+                return -EPERM;
+            }
+            caps->securebits = arg2;
+            return 0;
+            
+        case 23: /* PR_GET_SECUREBITS */
+            return caps->securebits;
+            
+        case 46: /* PR_CAP_AMBIENT */
+            {
+                int ambient_op = arg2;
+                int cap = arg3;
+                
+                if (cap < 0 || cap >= CAP_NUM_CAPS) {
+                    return -EINVAL;
+                }
+                
+                switch (ambient_op) {
+                    case 1: /* PR_CAP_AMBIENT_RAISE */
+                        if (!capability_set_has(&caps->permitted, cap) ||
+                            !capability_set_has(&caps->inheritable, cap)) {
+                            return -EPERM;
+                        }
+                        capability_set_add(&caps->ambient, cap);
+                        return 0;
+                        
+                    case 2: /* PR_CAP_AMBIENT_LOWER */
+                        capability_set_remove(&caps->ambient, cap);
+                        return 0;
+                        
+                    case 3: /* PR_CAP_AMBIENT_IS_SET */
+                        return capability_set_has(&caps->ambient, cap) ? 1 : 0;
+                        
+                    case 4: /* PR_CAP_AMBIENT_CLEAR_ALL */
+                        capability_set_clear(&caps->ambient);
+                        return 0;
+                        
+                    default:
+                        return -EINVAL;
+                }
+            }
+            
+        default:
+            return -EINVAL;
+    }
+}
+
+/* Get capability statistics */
+void capability_get_stats(struct capability_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct capability_stats));
+    
+    stats->total_checks = atomic64_read(&g_capability_system.total_cap_checks);
+    stats->total_grants = atomic64_read(&g_capability_system.total_cap_grants);
+    stats->total_denials = atomic64_read(&g_capability_system.total_cap_denials);
+}
+
+/* Debug capability information */
+void capability_dump_process(process_t* proc) {
+    if (!proc || !proc->capabilities) {
+        printf("Process %d has no capabilities\n", proc ? proc->pid : -1);
+        return;
+    }
+    
+    process_capabilities_t* caps = proc->capabilities;
+    
+    printf("Process %d capabilities:\n", proc->pid);
+    printf("  Effective:   ");
+    for (int i = 0; i < CAP_NUM_CAPS; i++) {
+        if (capability_set_has(&caps->effective, i)) {
+            printf("%d ", i);
+        }
+    }
+    printf("\n");
+    
+    printf("  Permitted:   ");
+    for (int i = 0; i < CAP_NUM_CAPS; i++) {
+        if (capability_set_has(&caps->permitted, i)) {
+            printf("%d ", i);
+        }
+    }
+    printf("\n");
+    
+    printf("  Inheritable: ");
+    for (int i = 0; i < CAP_NUM_CAPS; i++) {
+        if (capability_set_has(&caps->inheritable, i)) {
+            printf("%d ", i);
+        }
+    }
+    printf("\n");
+    
+    printf("  Ambient:     ");
+    for (int i = 0; i < CAP_NUM_CAPS; i++) {
+        if (capability_set_has(&caps->ambient, i)) {
+            printf("%d ", i);
+        }
+    }
+    printf("\n");
+    
+    printf("  Securebits:  0x%x\n", caps->securebits);
+    printf("  Statistics:  checks=%lu grants=%lu denials=%lu\n",
+           atomic64_read(&caps->cap_checks),
+           atomic64_read(&caps->cap_grants),
+           atomic64_read(&caps->cap_denials));
+}

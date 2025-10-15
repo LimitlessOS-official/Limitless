@@ -1,0 +1,586 @@
+/*
+ * namespaces.c - LimitlessOS Namespace Implementation
+ * 
+ * Provides complete namespace isolation including PID, mount, network,
+ * UTS, and user namespaces for container support.
+ */
+
+#include <kernel/namespace.h>
+#include <kernel/process.h>
+#include <kernel/pmm.h>
+#include <kernel/vmm.h>
+#include <kernel/vfs.h>
+#include <kernel/net.h>
+#include <kernel/klog.h>
+#include <kernel/string.h>
+
+#define MAX_NAMESPACES 1024
+#define MAX_MOUNTS_PER_NS 256
+#define MAX_PIDS_PER_NS 32768
+
+/* Namespace types */
+typedef enum {
+    NAMESPACE_PID = 1,
+    NAMESPACE_MOUNT = 2,
+    NAMESPACE_NET = 4,
+    NAMESPACE_UTS = 8,
+    NAMESPACE_IPC = 16,
+    NAMESPACE_USER = 32,
+    NAMESPACE_CGROUP = 64
+} namespace_type_t;
+
+/* PID namespace */
+typedef struct pid_namespace {
+    uint32_t ns_id;
+    uint32_t level;                    /* Nesting level */
+    struct pid_namespace* parent;      /* Parent PID namespace */
+    pid_t next_pid;                   /* Next PID to assign */
+    process_t* init_process;          /* Init process for this namespace */
+    uint32_t nr_processes;            /* Number of processes */
+    struct rb_root pid_tree;          /* PID allocation tree */
+    spinlock_t lock;
+} pid_namespace_t;
+
+/* Mount namespace */
+typedef struct mount_namespace {
+    uint32_t ns_id;
+    vfs_mount_t* root_mount;          /* Root mount point */
+    vfs_mount_t mounts[MAX_MOUNTS_PER_NS];
+    uint32_t mount_count;
+    spinlock_t lock;
+} mount_namespace_t;
+
+/* Network namespace */
+typedef struct net_namespace {
+    uint32_t ns_id;
+    network_interface_t* interfaces;   /* Network interfaces */
+    route_table_t* route_table;       /* Routing table */
+    uint16_t next_port;               /* Next available port */
+    socket_t* sockets;                /* Socket list */
+    spinlock_t lock;
+} net_namespace_t;
+
+/* UTS namespace */
+typedef struct uts_namespace {
+    uint32_t ns_id;
+    char hostname[256];
+    char domainname[256];
+    spinlock_t lock;
+} uts_namespace_t;
+
+/* User namespace */
+typedef struct user_namespace {
+    uint32_t ns_id;
+    struct user_namespace* parent;
+    uid_t uid_map[256];               /* UID mapping */
+    gid_t gid_map[256];               /* GID mapping */
+    uint32_t uid_map_count;
+    uint32_t gid_map_count;
+    spinlock_t lock;
+} user_namespace_t;
+
+/* Generic namespace structure */
+typedef struct namespace {
+    uint32_t ns_id;
+    namespace_type_t type;
+    uint32_t ref_count;
+    union {
+        pid_namespace_t pid_ns;
+        mount_namespace_t mount_ns;
+        net_namespace_t net_ns;
+        uts_namespace_t uts_ns;
+        user_namespace_t user_ns;
+    } data;
+    spinlock_t lock;
+} namespace_t;
+
+/* Global namespace manager */
+static struct {
+    namespace_t namespaces[MAX_NAMESPACES];
+    uint32_t namespace_count;
+    uint32_t next_ns_id;
+    namespace_t* init_pid_ns;
+    namespace_t* init_mount_ns;
+    namespace_t* init_net_ns;
+    namespace_t* init_uts_ns;
+    namespace_t* init_user_ns;
+    spinlock_t global_lock;
+} ns_manager;
+
+/* Function prototypes */
+static namespace_t* create_namespace(namespace_type_t type);
+static status_t clone_namespace(namespace_t* src, namespace_t** dst, namespace_type_t type);
+static void destroy_namespace(namespace_t* ns);
+static pid_t allocate_pid_in_namespace(pid_namespace_t* pid_ns);
+static void free_pid_in_namespace(pid_namespace_t* pid_ns, pid_t pid);
+
+/* Initialize namespace subsystem */
+status_t namespace_init(void) {
+    KLOG_INFO("NAMESPACE", "Initializing namespace subsystem");
+    
+    spin_lock_init(&ns_manager.global_lock);
+    ns_manager.namespace_count = 0;
+    ns_manager.next_ns_id = 1;
+    
+    /* Create initial namespaces */
+    ns_manager.init_pid_ns = create_namespace(NAMESPACE_PID);
+    ns_manager.init_mount_ns = create_namespace(NAMESPACE_MOUNT);
+    ns_manager.init_net_ns = create_namespace(NAMESPACE_NET);
+    ns_manager.init_uts_ns = create_namespace(NAMESPACE_UTS);
+    ns_manager.init_user_ns = create_namespace(NAMESPACE_USER);
+    
+    if (!ns_manager.init_pid_ns || !ns_manager.init_mount_ns || 
+        !ns_manager.init_net_ns || !ns_manager.init_uts_ns || !ns_manager.init_user_ns) {
+        KLOG_ERROR("NAMESPACE", "Failed to create initial namespaces");
+        return STATUS_NO_MEMORY;
+    }
+    
+    /* Initialize default values */
+    strcpy(ns_manager.init_uts_ns->data.uts_ns.hostname, "limitlessos");
+    strcpy(ns_manager.init_uts_ns->data.uts_ns.domainname, "local");
+    
+    ns_manager.init_pid_ns->data.pid_ns.next_pid = 1;
+    ns_manager.init_pid_ns->data.pid_ns.level = 0;
+    
+    KLOG_INFO("NAMESPACE", "Namespace subsystem initialized");
+    return STATUS_OK;
+}
+
+/* Create new namespace */
+static namespace_t* create_namespace(namespace_type_t type) {
+    spin_lock(&ns_manager.global_lock);
+    
+    if (ns_manager.namespace_count >= MAX_NAMESPACES) {
+        spin_unlock(&ns_manager.global_lock);
+        return NULL;
+    }
+    
+    namespace_t* ns = &ns_manager.namespaces[ns_manager.namespace_count++];
+    memset(ns, 0, sizeof(namespace_t));
+    
+    ns->ns_id = ns_manager.next_ns_id++;
+    ns->type = type;
+    ns->ref_count = 1;
+    spin_lock_init(&ns->lock);
+    
+    /* Initialize type-specific data */
+    switch (type) {
+        case NAMESPACE_PID:
+            ns->data.pid_ns.ns_id = ns->ns_id;
+            ns->data.pid_ns.next_pid = 1;
+            ns->data.pid_ns.nr_processes = 0;
+            spin_lock_init(&ns->data.pid_ns.lock);
+            break;
+            
+        case NAMESPACE_MOUNT:
+            ns->data.mount_ns.ns_id = ns->ns_id;
+            ns->data.mount_ns.mount_count = 0;
+            spin_lock_init(&ns->data.mount_ns.lock);
+            break;
+            
+        case NAMESPACE_NET:
+            ns->data.net_ns.ns_id = ns->ns_id;
+            ns->data.net_ns.next_port = 1024;
+            spin_lock_init(&ns->data.net_ns.lock);
+            break;
+            
+        case NAMESPACE_UTS:
+            ns->data.uts_ns.ns_id = ns->ns_id;
+            strcpy(ns->data.uts_ns.hostname, "container");
+            strcpy(ns->data.uts_ns.domainname, "local");
+            spin_lock_init(&ns->data.uts_ns.lock);
+            break;
+            
+        case NAMESPACE_USER:
+            ns->data.user_ns.ns_id = ns->ns_id;
+            ns->data.user_ns.uid_map_count = 0;
+            ns->data.user_ns.gid_map_count = 0;
+            spin_lock_init(&ns->data.user_ns.lock);
+            break;
+            
+        default:
+            break;
+    }
+    
+    spin_unlock(&ns_manager.global_lock);
+    
+    KLOG_DEBUG("NAMESPACE", "Created namespace %u type %d", ns->ns_id, type);
+    return ns;
+}
+
+/* Clone namespace from existing one */
+static status_t clone_namespace(namespace_t* src, namespace_t** dst, namespace_type_t type) {
+    if (!src || !dst || src->type != type) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    *dst = create_namespace(type);
+    if (!*dst) {
+        return STATUS_NO_MEMORY;
+    }
+    
+    /* Copy type-specific data */
+    switch (type) {
+        case NAMESPACE_MOUNT:
+            /* Copy mount table */
+            spin_lock(&src->data.mount_ns.lock);
+            memcpy((*dst)->data.mount_ns.mounts, src->data.mount_ns.mounts, 
+                   sizeof(vfs_mount_t) * src->data.mount_ns.mount_count);
+            (*dst)->data.mount_ns.mount_count = src->data.mount_ns.mount_count;
+            (*dst)->data.mount_ns.root_mount = src->data.mount_ns.root_mount;
+            spin_unlock(&src->data.mount_ns.lock);
+            break;
+            
+        case NAMESPACE_UTS:
+            /* Copy hostname and domain */
+            spin_lock(&src->data.uts_ns.lock);
+            strcpy((*dst)->data.uts_ns.hostname, src->data.uts_ns.hostname);
+            strcpy((*dst)->data.uts_ns.domainname, src->data.uts_ns.domainname);
+            spin_unlock(&src->data.uts_ns.lock);
+            break;
+            
+        case NAMESPACE_PID:
+            /* PID namespace inherits from parent */
+            (*dst)->data.pid_ns.parent = &src->data.pid_ns;
+            (*dst)->data.pid_ns.level = src->data.pid_ns.level + 1;
+            break;
+            
+        case NAMESPACE_NET:
+            /* Network namespace starts empty */
+            break;
+            
+        case NAMESPACE_USER:
+            /* User namespace inherits parent */
+            (*dst)->data.user_ns.parent = &src->data.user_ns;
+            break;
+            
+        default:
+            break;
+    }
+    
+    KLOG_DEBUG("NAMESPACE", "Cloned namespace %u -> %u", src->ns_id, (*dst)->ns_id);
+    return STATUS_OK;
+}
+
+/* Create new namespaces for process */
+status_t process_create_namespaces(process_t* process, uint32_t clone_flags) {
+    if (!process) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Clone PID namespace if requested */
+    if (clone_flags & CLONE_NEWPID) {
+        status_t status = clone_namespace(process->namespaces.pid_ns, 
+                                        &process->namespaces.pid_ns, NAMESPACE_PID);
+        if (status != STATUS_OK) {
+            return status;
+        }
+        
+        /* Allocate PID 1 in new namespace */
+        process->pid_in_ns = 1;
+        process->namespaces.pid_ns->data.pid_ns.init_process = process;
+    }
+    
+    /* Clone mount namespace if requested */
+    if (clone_flags & CLONE_NEWNS) {
+        status_t status = clone_namespace(process->namespaces.mount_ns,
+                                        &process->namespaces.mount_ns, NAMESPACE_MOUNT);
+        if (status != STATUS_OK) {
+            return status;
+        }
+    }
+    
+    /* Clone network namespace if requested */
+    if (clone_flags & CLONE_NEWNET) {
+        status_t status = clone_namespace(process->namespaces.net_ns,
+                                        &process->namespaces.net_ns, NAMESPACE_NET);
+        if (status != STATUS_OK) {
+            return status;
+        }
+    }
+    
+    /* Clone UTS namespace if requested */
+    if (clone_flags & CLONE_NEWUTS) {
+        status_t status = clone_namespace(process->namespaces.uts_ns,
+                                        &process->namespaces.uts_ns, NAMESPACE_UTS);
+        if (status != STATUS_OK) {
+            return status;
+        }
+    }
+    
+    /* Clone user namespace if requested */
+    if (clone_flags & CLONE_NEWUSER) {
+        status_t status = clone_namespace(process->namespaces.user_ns,
+                                        &process->namespaces.user_ns, NAMESPACE_USER);
+        if (status != STATUS_OK) {
+            return status;
+        }
+    }
+    
+    KLOG_DEBUG("NAMESPACE", "Created namespaces for process %u (flags: 0x%x)", 
+               process->pid, clone_flags);
+    
+    return STATUS_OK;
+}
+
+/* Allocate PID in namespace */
+static pid_t allocate_pid_in_namespace(pid_namespace_t* pid_ns) {
+    spin_lock(&pid_ns->lock);
+    
+    pid_t pid = pid_ns->next_pid++;
+    pid_ns->nr_processes++;
+    
+    /* Simple linear allocation - in production would use bitmap */
+    if (pid_ns->next_pid >= MAX_PIDS_PER_NS) {
+        pid_ns->next_pid = 1; /* Wrap around */
+    }
+    
+    spin_unlock(&pid_ns->lock);
+    
+    KLOG_DEBUG("NAMESPACE", "Allocated PID %d in namespace %u", pid, pid_ns->ns_id);
+    return pid;
+}
+
+/* Free PID in namespace */
+static void free_pid_in_namespace(pid_namespace_t* pid_ns, pid_t pid) {
+    spin_lock(&pid_ns->lock);
+    
+    pid_ns->nr_processes--;
+    
+    /* In production, would mark PID as free in bitmap */
+    
+    spin_unlock(&pid_ns->lock);
+    
+    KLOG_DEBUG("NAMESPACE", "Freed PID %d in namespace %u", pid, pid_ns->ns_id);
+}
+
+/* Get PID as seen from specific namespace */
+pid_t get_pid_in_namespace(process_t* process, pid_namespace_t* ns) {
+    if (!process || !ns) {
+        return 0;
+    }
+    
+    /* Walk up the namespace hierarchy */
+    pid_namespace_t* current_ns = process->namespaces.pid_ns->data.pid_ns.parent;
+    
+    while (current_ns) {
+        if (current_ns == ns) {
+            return process->pid_in_ns;
+        }
+        current_ns = current_ns->parent;
+    }
+    
+    /* Not visible in this namespace */
+    return 0;
+}
+
+/* Set hostname in UTS namespace */
+status_t set_hostname_in_namespace(uts_namespace_t* uts_ns, const char* hostname) {
+    if (!uts_ns || !hostname) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&uts_ns->lock);
+    strncpy(uts_ns->hostname, hostname, sizeof(uts_ns->hostname) - 1);
+    uts_ns->hostname[sizeof(uts_ns->hostname) - 1] = '\0';
+    spin_unlock(&uts_ns->lock);
+    
+    KLOG_DEBUG("NAMESPACE", "Set hostname to '%s' in namespace %u", hostname, uts_ns->ns_id);
+    return STATUS_OK;
+}
+
+/* Get hostname from UTS namespace */
+status_t get_hostname_from_namespace(uts_namespace_t* uts_ns, char* hostname, size_t size) {
+    if (!uts_ns || !hostname || size == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&uts_ns->lock);
+    strncpy(hostname, uts_ns->hostname, size - 1);
+    hostname[size - 1] = '\0';
+    spin_unlock(&uts_ns->lock);
+    
+    return STATUS_OK;
+}
+
+/* Mount filesystem in mount namespace */
+status_t mount_in_namespace(mount_namespace_t* mount_ns, const char* device,
+                           const char* mountpoint, const char* fstype, uint32_t flags) {
+    if (!mount_ns || !mountpoint) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&mount_ns->lock);
+    
+    if (mount_ns->mount_count >= MAX_MOUNTS_PER_NS) {
+        spin_unlock(&mount_ns->lock);
+        return STATUS_LIMIT_EXCEEDED;
+    }
+    
+    vfs_mount_t* mount = &mount_ns->mounts[mount_ns->mount_count++];
+    memset(mount, 0, sizeof(vfs_mount_t));
+    
+    strncpy(mount->device, device ? device : "none", sizeof(mount->device) - 1);
+    strncpy(mount->mountpoint, mountpoint, sizeof(mount->mountpoint) - 1);
+    strncpy(mount->fstype, fstype ? fstype : "tmpfs", sizeof(mount->fstype) - 1);
+    mount->flags = flags;
+    
+    /* Perform actual mount operation */
+    status_t status = vfs_mount(device, mountpoint, fstype, flags, NULL);
+    
+    if (status != STATUS_OK) {
+        mount_ns->mount_count--; /* Rollback */
+    }
+    
+    spin_unlock(&mount_ns->lock);
+    
+    KLOG_DEBUG("NAMESPACE", "Mounted %s at %s in namespace %u", 
+               device ? device : "none", mountpoint, mount_ns->ns_id);
+    
+    return status;
+}
+
+/* Add network interface to network namespace */
+status_t add_netif_to_namespace(net_namespace_t* net_ns, network_interface_t* netif) {
+    if (!net_ns || !netif) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spin_lock(&net_ns->lock);
+    
+    /* Add to interface list */
+    netif->next = net_ns->interfaces;
+    net_ns->interfaces = netif;
+    netif->net_ns = net_ns;
+    
+    spin_unlock(&net_ns->lock);
+    
+    KLOG_DEBUG("NAMESPACE", "Added interface %s to namespace %u", netif->name, net_ns->ns_id);
+    return STATUS_OK;
+}
+
+/* Create virtual ethernet pair */
+status_t create_veth_pair(const char* name1, const char* name2,
+                         net_namespace_t* ns1, net_namespace_t* ns2) {
+    /* Create virtual ethernet interfaces */
+    network_interface_t* veth1 = kmalloc(sizeof(network_interface_t));
+    network_interface_t* veth2 = kmalloc(sizeof(network_interface_t));
+    
+    if (!veth1 || !veth2) {
+        if (veth1) kfree(veth1);
+        if (veth2) kfree(veth2);
+        return STATUS_NO_MEMORY;
+    }
+    
+    memset(veth1, 0, sizeof(network_interface_t));
+    memset(veth2, 0, sizeof(network_interface_t));
+    
+    /* Configure veth1 */
+    strncpy(veth1->name, name1, sizeof(veth1->name) - 1);
+    veth1->type = NETIF_TYPE_VETH;
+    veth1->peer = veth2;
+    veth1->mtu = 1500;
+    veth1->flags = NETIF_FLAG_UP | NETIF_FLAG_RUNNING;
+    
+    /* Configure veth2 */
+    strncpy(veth2->name, name2, sizeof(veth2->name) - 1);
+    veth2->type = NETIF_TYPE_VETH;
+    veth2->peer = veth1;
+    veth2->mtu = 1500;
+    veth2->flags = NETIF_FLAG_UP | NETIF_FLAG_RUNNING;
+    
+    /* Add to respective namespaces */
+    status_t status = add_netif_to_namespace(ns1, veth1);
+    if (status != STATUS_OK) {
+        kfree(veth1);
+        kfree(veth2);
+        return status;
+    }
+    
+    status = add_netif_to_namespace(ns2, veth2);
+    if (status != STATUS_OK) {
+        /* Remove veth1 and cleanup */
+        kfree(veth1);
+        kfree(veth2);
+        return status;
+    }
+    
+    KLOG_INFO("NAMESPACE", "Created veth pair: %s (ns %u) <-> %s (ns %u)", 
+              name1, ns1->ns_id, name2, ns2->ns_id);
+    
+    return STATUS_OK;
+}
+
+/* Reference counting */
+void namespace_get(namespace_t* ns) {
+    if (ns) {
+        __sync_fetch_and_add(&ns->ref_count, 1);
+    }
+}
+
+void namespace_put(namespace_t* ns) {
+    if (ns && __sync_sub_and_fetch(&ns->ref_count, 1) == 0) {
+        destroy_namespace(ns);
+    }
+}
+
+/* Destroy namespace */
+static void destroy_namespace(namespace_t* ns) {
+    if (!ns) {
+        return;
+    }
+    
+    KLOG_DEBUG("NAMESPACE", "Destroying namespace %u type %d", ns->ns_id, ns->type);
+    
+    /* Type-specific cleanup */
+    switch (ns->type) {
+        case NAMESPACE_NET:
+            /* Cleanup network interfaces */
+            network_interface_t* netif = ns->data.net_ns.interfaces;
+            while (netif) {
+                network_interface_t* next = netif->next;
+                kfree(netif);
+                netif = next;
+            }
+            break;
+            
+        case NAMESPACE_MOUNT:
+            /* Unmount all mounts */
+            for (uint32_t i = 0; i < ns->data.mount_ns.mount_count; i++) {
+                vfs_unmount(ns->data.mount_ns.mounts[i].mountpoint);
+            }
+            break;
+            
+        default:
+            break;
+    }
+    
+    /* Clear the namespace entry */
+    memset(ns, 0, sizeof(namespace_t));
+}
+
+/* System call implementations */
+long sys_unshare(unsigned long flags) {
+    process_t* current = get_current_process();
+    
+    /* Create new namespaces as requested */
+    return process_create_namespaces(current, flags);
+}
+
+long sys_setns(int fd, int nstype) {
+    /* Join existing namespace - simplified implementation */
+    return -ENOSYS; /* Not implemented */
+}
+
+/* Container runtime support */
+status_t container_create_namespaces(container_t* container) {
+    if (!container) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Create all namespaces for container isolation */
+    uint32_t clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | 
+                          CLONE_NEWUTS | CLONE_NEWUSER;
+    
+    return process_create_namespaces(container->init_process, clone_flags);
+}

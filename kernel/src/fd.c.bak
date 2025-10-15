@@ -1,0 +1,68 @@
+#include "fd.h"
+#include "kernel.h"
+
+void fd_table_init(fd_table_t* table) {
+    k_memset(table, 0, sizeof(fd_table_t));
+    spinlock_init(&table->lock);
+}
+
+int fd_alloc(fd_table_t* table, void* obj, u32 type, u32 flags) {
+    spin_lock(&table->lock);
+    for (int i = 0; i < MAX_FD; ++i) {
+        if (table->entries[i].refcnt == 0) {
+            table->entries[i].obj = obj;
+            table->entries[i].type = type;
+            table->entries[i].flags = flags;
+            table->entries[i].refcnt = 1;
+            spin_unlock(&table->lock);
+            return i;
+        }
+    }
+    spin_unlock(&table->lock);
+    return -1;
+}
+
+int fd_dup(fd_table_t* table, int oldfd) {
+    spin_lock(&table->lock);
+    if (oldfd < 0 || oldfd >= MAX_FD || table->entries[oldfd].refcnt == 0) {
+        spin_unlock(&table->lock);
+        return -1;
+    }
+    for (int i = 0; i < MAX_FD; ++i) {
+        if (table->entries[i].refcnt == 0) {
+            table->entries[i] = table->entries[oldfd];
+            table->entries[i].refcnt++;
+            spin_unlock(&table->lock);
+            return i;
+        }
+    }
+    spin_unlock(&table->lock);
+    return -1;
+}
+
+int fd_close(fd_table_t* table, int fd) {
+    spin_lock(&table->lock);
+    if (fd < 0 || fd >= MAX_FD || table->entries[fd].refcnt == 0) {
+        spin_unlock(&table->lock);
+        return -1;
+    }
+    if (--table->entries[fd].refcnt == 0) {
+        table->entries[fd].obj = NULL;
+        table->entries[fd].type = 0;
+        table->entries[fd].flags = 0;
+    }
+    spin_unlock(&table->lock);
+    return 0;
+}
+
+void* fd_get_obj(fd_table_t* table, int fd, u32* type_out) {
+    spin_lock(&table->lock);
+    if (fd < 0 || fd >= MAX_FD || table->entries[fd].refcnt == 0) {
+        spin_unlock(&table->lock);
+        return NULL;
+    }
+    if (type_out) *type_out = table->entries[fd].type;
+    void* obj = table->entries[fd].obj;
+    spin_unlock(&table->lock);
+    return obj;
+}

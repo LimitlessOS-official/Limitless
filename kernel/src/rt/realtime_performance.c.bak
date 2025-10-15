@@ -1,0 +1,612 @@
+/*
+ * LimitlessOS Real-time & Performance Implementation
+ * Real-time scheduling, performance profiling, and system optimization
+ */
+
+#include "realtime_performance.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <time.h>
+#include <fcntl.h>
+
+/* Global real-time system */
+realtime_system_t rt_system = {0};
+
+/* Threading support */
+static pthread_mutex_t rt_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t profiler_thread;
+static pthread_t optimizer_thread;
+static bool rt_running = false;
+
+/* Performance monitoring thread */
+static void *performance_monitor_thread(void *arg) {
+    while (rt_running && rt_system.profiler.enabled) {
+        pthread_mutex_lock(&rt_system.profiler.sample_mutex);
+        
+        /* Collect performance samples */
+        for (uint32_t cpu = 0; cpu < sysconf(_SC_NPROCESSORS_ONLN); cpu++) {
+            if (!rt_system.profiler.counters[PERF_COUNTER_CPU_CYCLES]) continue;
+            
+            perf_sample_t sample = {0};
+            sample.timestamp = rt_get_time_ns();
+            sample.type = PERF_COUNTER_CPU_CYCLES;
+            sample.cpu_id = cpu;
+            sample.value = rt_get_cpu_cycles();
+            
+            /* Add sample to buffer */
+            if (rt_system.profiler.sample_count < rt_system.profiler.buffer_size) {
+                rt_system.profiler.samples[rt_system.profiler.sample_index] = sample;
+                rt_system.profiler.sample_index = 
+                    (rt_system.profiler.sample_index + 1) % rt_system.profiler.buffer_size;
+                rt_system.profiler.sample_count++;
+            }
+        }
+        
+        /* Update CPU usage analysis */
+        FILE *stat_fp = fopen("/proc/stat", "r");
+        if (stat_fp) {
+            char line[256];
+            uint32_t cpu_id = 0;
+            
+            while (fgets(line, sizeof(line), stat_fp) && cpu_id < 64) {
+                if (strncmp(line, "cpu", 3) == 0 && line[3] >= '0' && line[3] <= '9') {
+                    unsigned long user, nice, system, idle, iowait, irq, softirq;
+                    sscanf(line, "cpu%u %lu %lu %lu %lu %lu %lu %lu", 
+                           &cpu_id, &user, &nice, &system, &idle, &iowait, &irq, &softirq);
+                    
+                    unsigned long total = user + nice + system + idle + iowait + irq + softirq;
+                    unsigned long active = total - idle;
+                    
+                    rt_system.profiler.analysis.cpu_usage[cpu_id] = 
+                        total > 0 ? (double)active / total * 100.0 : 0.0;
+                    cpu_id++;
+                }
+            }
+            fclose(stat_fp);
+        }
+        
+        /* Update memory usage */
+        FILE *meminfo_fp = fopen("/proc/meminfo", "r");
+        if (meminfo_fp) {
+            char line[256];
+            unsigned long mem_total = 0, mem_available = 0;
+            
+            while (fgets(line, sizeof(line), meminfo_fp)) {
+                if (strncmp(line, "MemTotal:", 9) == 0) {
+                    sscanf(line, "MemTotal: %lu kB", &mem_total);
+                } else if (strncmp(line, "MemAvailable:", 13) == 0) {
+                    sscanf(line, "MemAvailable: %lu kB", &mem_available);
+                }
+            }
+            fclose(meminfo_fp);
+            
+            if (mem_total > 0) {
+                rt_system.profiler.analysis.memory_usage = 
+                    (double)(mem_total - mem_available) / mem_total * 100.0;
+            }
+        }
+        
+        pthread_mutex_unlock(&rt_system.profiler.sample_mutex);
+        
+        /* Sleep based on sample rate */
+        usleep(1000000 / rt_system.profiler.sample_rate);
+    }
+    
+    return NULL;
+}
+
+/* System optimization thread */
+static void *system_optimization_thread(void *arg) {
+    while (rt_running && rt_system.optimizer.enabled && rt_system.optimizer.auto_optimization) {
+        /* Run optimization analysis */
+        system_optimizer_run_analysis();
+        
+        /* Apply optimizations based on analysis */
+        system_optimizer_apply_optimizations();
+        
+        /* Sleep for 60 seconds between optimization cycles */
+        sleep(60);
+    }
+    
+    return NULL;
+}
+
+/* Initialize real-time system */
+int rt_system_init(void) {
+    memset(&rt_system, 0, sizeof(rt_system));
+    
+    printf("Initializing Real-time & Performance System...\n");
+    
+    /* Initialize task mutex */
+    pthread_mutex_init(&rt_system.task_mutex, NULL);
+    
+    /* Configure system defaults */
+    rt_system.config.preempt_rt = false;  /* Detect if running PREEMPT_RT kernel */
+    rt_system.config.tick_rate = 1000;    /* 1000 Hz default */
+    rt_system.config.high_res_timers = true;
+    rt_system.config.dynamic_ticks = true;
+    rt_system.config.max_latency_us = 100; /* 100 microseconds max latency */
+    
+    /* Check for PREEMPT_RT kernel */
+    FILE *version_fp = fopen("/proc/version", "r");
+    if (version_fp) {
+        char version_str[512];
+        if (fgets(version_str, sizeof(version_str), version_fp)) {
+            if (strstr(version_str, "PREEMPT_RT") || strstr(version_str, "rt")) {
+                rt_system.config.preempt_rt = true;
+            }
+        }
+        fclose(version_fp);
+    }
+    
+    /* Initialize performance profiler */
+    perf_profiler_init();
+    
+    /* Initialize system optimizer */
+    system_optimizer_init();
+    
+    /* Initialize low-latency I/O */
+    lowlat_io_init();
+    
+    /* Initialize CPU isolation */
+    cpu_isolation_init();
+    
+    /* Start monitoring threads */
+    rt_running = true;
+    pthread_create(&profiler_thread, NULL, performance_monitor_thread, NULL);
+    pthread_create(&optimizer_thread, NULL, system_optimization_thread, NULL);
+    
+    rt_system.initialized = true;
+    
+    printf("Real-time system initialized (PREEMPT_RT: %s)\n", 
+           rt_system.config.preempt_rt ? "Yes" : "No");
+    
+    return 0;
+}
+
+/* Cleanup real-time system */
+void rt_system_exit(void) {
+    rt_running = false;
+    
+    /* Wait for threads to finish */
+    pthread_join(profiler_thread, NULL);
+    pthread_join(optimizer_thread, NULL);
+    
+    /* Cleanup profiler */
+    if (rt_system.profiler.samples) {
+        free(rt_system.profiler.samples);
+    }
+    pthread_mutex_destroy(&rt_system.profiler.sample_mutex);
+    
+    pthread_mutex_destroy(&rt_system.task_mutex);
+    
+    rt_system.initialized = false;
+    memset(&rt_system, 0, sizeof(rt_system));
+}
+
+/* Create real-time task */
+int rt_task_create(const rt_task_t *task) {
+    if (!task || !rt_system.initialized) return -EINVAL;
+    
+    pthread_mutex_lock(&rt_system.task_mutex);
+    
+    if (rt_system.task_count >= 1024) {
+        pthread_mutex_unlock(&rt_system.task_mutex);
+        return -ENOMEM;
+    }
+    
+    /* Find available task slot */
+    uint32_t task_index = rt_system.task_count;
+    for (uint32_t i = 0; i < rt_system.task_count; i++) {
+        if (rt_system.tasks[i].task_id == 0) {
+            task_index = i;
+            break;
+        }
+    }
+    
+    /* Copy task configuration */
+    rt_system.tasks[task_index] = *task;
+    rt_system.tasks[task_index].task_id = task_index + 1;
+    
+    if (task_index == rt_system.task_count) {
+        rt_system.task_count++;
+    }
+    
+    rt_system.stats.total_rt_tasks++;
+    
+    pthread_mutex_unlock(&rt_system.task_mutex);
+    
+    printf("Created real-time task: %s (ID: %u, Policy: %s, Priority: %u)\n",
+           task->name, task_index + 1, rt_policy_name(task->policy), task->priority);
+    
+    return task_index + 1;
+}
+
+/* Set task scheduling policy */
+int rt_task_set_policy(uint32_t task_id, rt_policy_t policy, uint32_t priority) {
+    if (task_id == 0 || task_id > rt_system.task_count) return -EINVAL;
+    
+    pthread_mutex_lock(&rt_system.task_mutex);
+    
+    rt_task_t *task = &rt_system.tasks[task_id - 1];
+    if (task->task_id == 0) {
+        pthread_mutex_unlock(&rt_system.task_mutex);
+        return -ENOENT;
+    }
+    
+    task->policy = policy;
+    task->priority = priority;
+    
+    pthread_mutex_unlock(&rt_system.task_mutex);
+    
+    return 0;
+}
+
+/* Initialize performance profiler */
+int perf_profiler_init(void) {
+    memset(&rt_system.profiler, 0, sizeof(performance_profiler_t));
+    
+    rt_system.profiler.enabled = false;
+    rt_system.profiler.system_wide = true;
+    rt_system.profiler.sample_rate = 1000; /* 1000 samples per second */
+    rt_system.profiler.buffer_size = 1000000; /* 1M samples */
+    rt_system.profiler.stack_profiling = false;
+    rt_system.profiler.stack_depth = 16;
+    
+    /* Allocate sample buffer */
+    rt_system.profiler.samples = calloc(rt_system.profiler.buffer_size, sizeof(perf_sample_t));
+    if (!rt_system.profiler.samples) {
+        return -ENOMEM;
+    }
+    
+    /* Initialize sample mutex */
+    pthread_mutex_init(&rt_system.profiler.sample_mutex, NULL);
+    
+    /* Enable basic counters by default */
+    rt_system.profiler.counters[PERF_COUNTER_CPU_CYCLES] = true;
+    rt_system.profiler.counters[PERF_COUNTER_INSTRUCTIONS] = true;
+    rt_system.profiler.counters[PERF_COUNTER_CONTEXT_SWITCHES] = true;
+    rt_system.profiler.counter_count = 3;
+    
+    strcpy(rt_system.profiler.output_file, "/tmp/limitlessos_perf.data");
+    
+    return 0;
+}
+
+/* Start performance profiling */
+int perf_profiler_start(void) {
+    if (!rt_system.initialized) return -EINVAL;
+    
+    rt_system.profiler.enabled = true;
+    rt_system.profiler.sample_count = 0;
+    rt_system.profiler.sample_index = 0;
+    
+    printf("Performance profiler started (rate: %u samples/sec)\n", 
+           rt_system.profiler.sample_rate);
+    
+    return 0;
+}
+
+/* Stop performance profiling */
+int perf_profiler_stop(void) {
+    rt_system.profiler.enabled = false;
+    
+    printf("Performance profiler stopped (%lu samples collected)\n", 
+           rt_system.profiler.sample_count);
+    
+    return 0;
+}
+
+/* Initialize system optimizer */
+int system_optimizer_init(void) {
+    memset(&rt_system.optimizer, 0, sizeof(system_optimizer_t));
+    
+    rt_system.optimizer.enabled = false;
+    rt_system.optimizer.auto_optimization = false;
+    rt_system.optimizer.target = OPTIMIZE_BALANCED;
+    
+    /* CPU optimization defaults */
+    rt_system.optimizer.cpu.frequency_scaling = true;
+    rt_system.optimizer.cpu.governor_switching = true;
+    rt_system.optimizer.cpu.core_parking = false;
+    rt_system.optimizer.cpu.hyperthreading = true;
+    rt_system.optimizer.cpu.cache_optimization = true;
+    rt_system.optimizer.cpu.idle_threshold = 10;
+    
+    /* Memory optimization defaults */
+    rt_system.optimizer.memory.compaction = true;
+    rt_system.optimizer.memory.transparent_hugepages = true;
+    rt_system.optimizer.memory.numa_balancing = true;
+    rt_system.optimizer.memory.swap_optimization = true;
+    rt_system.optimizer.memory.prefetching = true;
+    rt_system.optimizer.memory.swappiness = 10;
+    
+    /* I/O optimization defaults */
+    rt_system.optimizer.io.io_scheduling = true;
+    rt_system.optimizer.io.read_ahead = true;
+    rt_system.optimizer.io.write_back = true;
+    rt_system.optimizer.io.queue_depth = true;
+    strcpy(rt_system.optimizer.io.scheduler, "mq-deadline");
+    
+    /* Network optimization defaults */
+    rt_system.optimizer.network.tcp_window_scaling = true;
+    rt_system.optimizer.network.interrupt_coalescing = true;
+    rt_system.optimizer.network.rss_scaling = true;
+    rt_system.optimizer.network.gro_gso = true;
+    rt_system.optimizer.network.buffer_sizes = true;
+    
+    return 0;
+}
+
+/* Run optimization analysis */
+int system_optimizer_run_analysis(void) {
+    if (!rt_system.optimizer.enabled) return -EINVAL;
+    
+    /* Analyze CPU usage patterns */
+    double total_cpu_usage = 0.0;
+    for (uint32_t i = 0; i < sysconf(_SC_NPROCESSORS_ONLN); i++) {
+        total_cpu_usage += rt_system.profiler.analysis.cpu_usage[i];
+    }
+    total_cpu_usage /= sysconf(_SC_NPROCESSORS_ONLN);
+    
+    /* Analyze memory pressure */
+    double memory_pressure = rt_system.profiler.analysis.memory_usage;
+    
+    /* Make optimization decisions based on analysis */
+    if (rt_system.optimizer.target == OPTIMIZE_LATENCY) {
+        /* Low latency optimizations */
+        if (total_cpu_usage < 50.0) {
+            rt_system.optimizer.cpu.frequency_scaling = false; /* Lock to max frequency */
+            rt_system.optimizer.cpu.core_parking = false;
+        }
+        
+        if (memory_pressure > 80.0) {
+            rt_system.optimizer.memory.swappiness = 1; /* Minimize swapping */
+        }
+    } else if (rt_system.optimizer.target == OPTIMIZE_POWER) {
+        /* Power efficiency optimizations */
+        if (total_cpu_usage < 30.0) {
+            rt_system.optimizer.cpu.frequency_scaling = true;
+            rt_system.optimizer.cpu.core_parking = true;
+        }
+        
+        rt_system.optimizer.memory.swappiness = 60; /* Allow more swapping */
+    }
+    
+    return 0;
+}
+
+/* Apply system optimizations */
+int system_optimizer_apply_optimizations(void) {
+    if (!rt_system.optimizer.enabled) return -EINVAL;
+    
+    uint64_t optimizations = 0;
+    
+    /* CPU governor optimization */
+    if (rt_system.optimizer.cpu.governor_switching) {
+        const char *governor = NULL;
+        
+        switch (rt_system.optimizer.target) {
+            case OPTIMIZE_LATENCY:
+            case OPTIMIZE_GAMING:
+                governor = "performance";
+                break;
+            case OPTIMIZE_POWER:
+                governor = "powersave";
+                break;
+            case OPTIMIZE_BALANCED:
+            default:
+                governor = "ondemand";
+                break;
+        }
+        
+        if (governor) {
+            rt_set_cpu_governor(governor);
+            optimizations++;
+        }
+    }
+    
+    /* Memory swappiness optimization */
+    if (rt_system.optimizer.memory.swap_optimization) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "sysctl vm.swappiness=%u", 
+                rt_system.optimizer.memory.swappiness);
+        system(cmd);
+        optimizations++;
+    }
+    
+    /* I/O scheduler optimization */
+    if (rt_system.optimizer.io.io_scheduling) {
+        char cmd[256];
+        
+        /* Set I/O scheduler for block devices */
+        FILE *devices_fp = fopen("/proc/partitions", "r");
+        if (devices_fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), devices_fp)) {
+                char device[32];
+                if (sscanf(line, "%*u %*u %*u %s", device) == 1) {
+                    if (strncmp(device, "sd", 2) == 0 || strncmp(device, "nvme", 4) == 0) {
+                        snprintf(cmd, sizeof(cmd), 
+                                "echo %s > /sys/block/%s/queue/scheduler 2>/dev/null",
+                                rt_system.optimizer.io.scheduler, device);
+                        system(cmd);
+                    }
+                }
+            }
+            fclose(devices_fp);
+            optimizations++;
+        }
+    }
+    
+    /* Network buffer optimization */
+    if (rt_system.optimizer.network.buffer_sizes) {
+        system("sysctl net.core.rmem_max=134217728");
+        system("sysctl net.core.wmem_max=134217728");
+        system("sysctl net.ipv4.tcp_rmem='4096 87380 134217728'");
+        system("sysctl net.ipv4.tcp_wmem='4096 65536 134217728'");
+        optimizations++;
+    }
+    
+    rt_system.optimizer.stats.optimizations_applied += optimizations;
+    
+    if (optimizations > 0) {
+        printf("Applied %lu system optimizations (target: %s)\n", 
+               optimizations, 
+               rt_system.optimizer.target == OPTIMIZE_LATENCY ? "Latency" :
+               rt_system.optimizer.target == OPTIMIZE_POWER ? "Power" : "Balanced");
+    }
+    
+    return 0;
+}
+
+/* Initialize low-latency I/O */
+int lowlat_io_init(void) {
+    memset(&rt_system.lowlat_io, 0, sizeof(lowlatency_io_t));
+    
+    rt_system.lowlat_io.enabled = false;
+    rt_system.lowlat_io.kernel_bypass = false;
+    rt_system.lowlat_io.zero_copy = false;
+    rt_system.lowlat_io.polling_mode = false;
+    rt_system.lowlat_io.interrupt_mitigation = true;
+    
+    /* DPDK defaults */
+    rt_system.lowlat_io.dpdk.enabled = false;
+    strcpy(rt_system.lowlat_io.dpdk.eal_args, "-l 0-3 -n 4");
+    rt_system.lowlat_io.dpdk.hugepage_size = 1024; /* 1GB */
+    rt_system.lowlat_io.dpdk.memory_channels = 4;
+    rt_system.lowlat_io.dpdk.lcores = 4;
+    
+    /* User-space networking defaults */
+    rt_system.lowlat_io.userspace_net.enabled = false;
+    strcpy(rt_system.lowlat_io.userspace_net.driver, "uio_pci_generic");
+    rt_system.lowlat_io.userspace_net.ring_size = 1024;
+    rt_system.lowlat_io.userspace_net.batch_size = 32;
+    rt_system.lowlat_io.userspace_net.busy_polling = true;
+    
+    return 0;
+}
+
+/* Initialize CPU isolation */
+int cpu_isolation_init(void) {
+    memset(&rt_system.cpu_isolation, 0, sizeof(cpu_isolation_t));
+    
+    rt_system.cpu_isolation.enabled = false;
+    rt_system.cpu_isolation.interrupt_isolation = false;
+    rt_system.cpu_isolation.nohz_full = false;
+    rt_system.cpu_isolation.rcu_nocbs = false;
+    rt_system.cpu_isolation.workqueue_isolation = false;
+    
+    /* Default CPU allocation (for 8-core system) */
+    uint32_t total_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    rt_system.cpu_isolation.cpu_sets.system_cpus = (1 << (total_cpus / 4)) - 1; /* First 25% */
+    rt_system.cpu_isolation.cpu_sets.realtime_cpus = ((1 << (total_cpus / 2)) - 1) & ~rt_system.cpu_isolation.cpu_sets.system_cpus;
+    rt_system.cpu_isolation.cpu_sets.application_cpus = ~(rt_system.cpu_isolation.cpu_sets.system_cpus | rt_system.cpu_isolation.cpu_sets.realtime_cpus);
+    rt_system.cpu_isolation.cpu_sets.isolated_cpus = 0;
+    
+    return 0;
+}
+
+/* Measure system latency */
+int rt_measure_latency(uint32_t iterations, double *avg_latency, double *min_latency, double *max_latency) {
+    if (!avg_latency || !min_latency || !max_latency) return -EINVAL;
+    
+    struct timespec start, end;
+    double total_latency = 0.0;
+    *min_latency = 1000000.0; /* Large initial value */
+    *max_latency = 0.0;
+    
+    for (uint32_t i = 0; i < iterations; i++) {
+        clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+        
+        /* Simulate workload (context switch) */
+        sched_yield();
+        
+        clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+        
+        double latency_us = (end.tv_sec - start.tv_sec) * 1000000.0 +
+                           (end.tv_nsec - start.tv_nsec) / 1000.0;
+        
+        total_latency += latency_us;
+        
+        if (latency_us < *min_latency) *min_latency = latency_us;
+        if (latency_us > *max_latency) *max_latency = latency_us;
+    }
+    
+    *avg_latency = total_latency / iterations;
+    
+    /* Update system statistics */
+    rt_system.stats.avg_latency_us = *avg_latency;
+    rt_system.stats.max_latency_us = *max_latency;
+    
+    return 0;
+}
+
+/* Set CPU governor */
+int rt_set_cpu_governor(const char *governor) {
+    if (!governor) return -EINVAL;
+    
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), 
+            "for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do "
+            "[ -w \"$cpu\" ] && echo %s > \"$cpu\"; done", governor);
+    
+    int result = system(cmd);
+    
+    if (WIFEXITED(result) && WEXITSTATUS(result) == 0) {
+        printf("Set CPU governor to: %s\n", governor);
+        return 0;
+    }
+    
+    return -1;
+}
+
+/* Get high-resolution timestamp */
+uint64_t rt_get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* Get CPU cycles */
+uint64_t rt_get_cpu_cycles(void) {
+    uint32_t low, high;
+    __asm__ __volatile__ ("rdtsc" : "=a"(low), "=d"(high));
+    return ((uint64_t)high << 32) | low;
+}
+
+/* Utility functions */
+const char *rt_policy_name(rt_policy_t policy) {
+    static const char *names[] = {
+        "Normal", "FIFO", "Round Robin", "Deadline", "Sporadic", 
+        "Batch", "Idle", "Interactive", "Game Mode", "Low Latency"
+    };
+    
+    if (policy >= 0 && policy < sizeof(names) / sizeof(names[0])) {
+        return names[policy];
+    }
+    return "Unknown";
+}
+
+const char *perf_counter_name(perf_counter_type_t counter) {
+    static const char *names[] = {
+        "CPU Cycles", "Instructions", "L1 Cache Misses", "L2 Cache Misses",
+        "L3 Cache Misses", "Branch Misses", "TLB Misses", "Memory Loads",
+        "Memory Stores", "Context Switches", "Page Faults", "Syscalls",
+        "Interrupts", "Network Packets", "Disk I/O", "GPU Utilization",
+        "Power Usage", "Thermal Events"
+    };
+    
+    if (counter >= 0 && counter < PERF_COUNTER_MAX) {
+        return names[counter];
+    }
+    return "Unknown";
+}

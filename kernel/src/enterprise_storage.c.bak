@@ -1,0 +1,1145 @@
+/*
+ * LimitlessOS Enterprise Storage Stack
+ * Advanced storage management system with RAID, LVM, device mapper,
+ * comprehensive file system support, encryption, virtualization,
+ * and enterprise storage connectivity (SAN/NAS).
+ * 
+ * Features:
+ * - Software RAID 0/1/4/5/6/10 with hot-spare and rebuild
+ * - Logical Volume Management (LVM) with snapshots and thin provisioning
+ * - Device mapper framework for virtual block devices
+ * - File system drivers: ext4, NTFS, APFS, ZFS, Btrfs, XFS
+ * - Block-level encryption (dm-crypt) with multiple cipher support
+ * - Storage virtualization and thin provisioning
+ * - SAN protocols: iSCSI, Fibre Channel, FCoE
+ * - NAS protocols: NFS v3/v4, SMB/CIFS, AFP
+ * - High-availability and multi-path I/O
+ * - Performance optimization and caching
+ * - Storage monitoring and health management
+ * - Backup and disaster recovery integration
+ */
+
+#include "kernel.h"
+#include "storage.h"
+#include "vmm.h"
+#include "crypto.h"
+#include "net.h"
+
+#define MAX_BLOCK_DEVICES       1024
+#define MAX_RAID_ARRAYS         64
+#define MAX_LVM_VOLUMES         512
+#define MAX_FILESYSTEMS         32
+#define MAX_SAN_TARGETS         256
+#define MAX_NAS_EXPORTS         128
+#define BLOCK_SIZE              4096
+#define MAX_IO_SIZE             (1024 * 1024)  /* 1MB max I/O */
+#define RAID_STRIPE_SIZE        65536          /* 64KB default stripe */
+#define LVM_PE_SIZE             4194304        /* 4MB physical extent */
+
+/* Block device types */
+typedef enum {
+    BLOCK_DEVICE_DISK = 0,         /* Physical disk */
+    BLOCK_DEVICE_PARTITION,         /* Disk partition */
+    BLOCK_DEVICE_RAID,              /* RAID array */
+    BLOCK_DEVICE_LVM_PV,            /* LVM physical volume */
+    BLOCK_DEVICE_LVM_LV,            /* LVM logical volume */
+    BLOCK_DEVICE_DM,                /* Device mapper virtual device */
+    BLOCK_DEVICE_LOOP,              /* Loop device */
+    BLOCK_DEVICE_RAM,               /* RAM disk */
+    BLOCK_DEVICE_NETWORK,           /* Network block device */
+    BLOCK_DEVICE_OPTICAL,           /* CD/DVD/Blu-ray */
+    BLOCK_DEVICE_TAPE,              /* Tape device */
+    BLOCK_DEVICE_UNKNOWN
+} block_device_type_t;
+
+/* RAID levels */
+typedef enum {
+    RAID_LEVEL_0 = 0,               /* Striping */
+    RAID_LEVEL_1,                   /* Mirroring */
+    RAID_LEVEL_4,                   /* Dedicated parity */
+    RAID_LEVEL_5,                   /* Distributed parity */
+    RAID_LEVEL_6,                   /* Double distributed parity */
+    RAID_LEVEL_10,                  /* Striped mirrors */
+    RAID_LEVEL_JBOD,                /* Just a bunch of disks */
+    RAID_LEVEL_LINEAR               /* Linear concatenation */
+} raid_level_t;
+
+/* RAID states */
+typedef enum {
+    RAID_STATE_OPTIMAL = 0,         /* All devices functional */
+    RAID_STATE_DEGRADED,            /* Some devices failed */
+    RAID_STATE_FAILED,              /* Array failed */
+    RAID_STATE_REBUILDING,          /* Rebuild in progress */
+    RAID_STATE_RESYNCING,           /* Resync in progress */
+    RAID_STATE_CHECKING,            /* Consistency check */
+    RAID_STATE_OFFLINE              /* Array offline */
+} raid_state_t;
+
+/* File system types */
+typedef enum {
+    FS_TYPE_EXT4 = 0,
+    FS_TYPE_NTFS,
+    FS_TYPE_APFS,
+    FS_TYPE_ZFS,
+    FS_TYPE_BTRFS,
+    FS_TYPE_XFS,
+    FS_TYPE_F2FS,
+    FS_TYPE_EXFAT,
+    FS_TYPE_FAT32,
+    FS_TYPE_HFS_PLUS,
+    FS_TYPE_UFS,
+    FS_TYPE_JFS,
+    FS_TYPE_REISERFS,
+    FS_TYPE_NILFS2,
+    FS_TYPE_TMPFS,
+    FS_TYPE_PROCFS,
+    FS_TYPE_SYSFS,
+    FS_TYPE_DEVFS,
+    FS_TYPE_UNKNOWN
+} filesystem_type_t;
+
+/* Storage encryption */
+typedef struct storage_encryption {
+    uint32_t cipher_id;             /* Encryption cipher */
+    uint32_t key_size;              /* Key size in bits */
+    uint8_t key[64];                /* Encryption key */
+    uint8_t iv[32];                 /* Initialization vector */
+    uint64_t sector_size;           /* Encrypted sector size */
+    bool enabled;                   /* Encryption active */
+    
+    /* Key derivation */
+    uint32_t kdf_algorithm;         /* Key derivation function */
+    uint32_t iterations;            /* PBKDF2 iterations */
+    uint8_t salt[32];               /* Salt for key derivation */
+    
+    /* Performance counters */
+    uint64_t encrypt_operations;    /* Encryption operations */
+    uint64_t decrypt_operations;    /* Decryption operations */
+    uint64_t encrypt_bytes;         /* Bytes encrypted */
+    uint64_t decrypt_bytes;         /* Bytes decrypted */
+} storage_encryption_t;
+
+/* Block I/O request */
+typedef struct block_io_request {
+    struct list_head list;          /* Request queue linkage */
+    
+    uint32_t device_id;             /* Target device ID */
+    uint64_t sector;                /* Starting sector */
+    uint32_t num_sectors;           /* Number of sectors */
+    uint32_t flags;                 /* Request flags */
+    
+    /* Data buffer */
+    void* buffer;                   /* Data buffer */
+    size_t buffer_size;             /* Buffer size */
+    bool is_write;                  /* Write operation */
+    bool is_flush;                  /* Flush/sync operation */
+    bool is_discard;                /* Discard/TRIM operation */
+    
+    /* Completion */
+    void (*completion_fn)(struct block_io_request* req, int result);
+    void* completion_data;          /* Completion callback data */
+    struct completion completion;   /* Synchronous completion */
+    
+    /* Error handling */
+    int error_code;                 /* Error code */
+    uint32_t retry_count;           /* Retry attempts */
+    uint32_t max_retries;           /* Maximum retries */
+    
+    /* Timing */
+    uint64_t submit_time;           /* Request submission time */
+    uint64_t complete_time;         /* Request completion time */
+    
+    /* Priority and QoS */
+    uint32_t priority;              /* I/O priority */
+    uint32_t qos_class;             /* QoS class */
+} block_io_request_t;
+
+/* Block device structure */
+typedef struct block_device {
+    struct list_head list;          /* Global device list */
+    
+    uint32_t device_id;             /* Device identifier */
+    char name[64];                  /* Device name */
+    block_device_type_t type;       /* Device type */
+    
+    /* Geometry */
+    uint64_t num_sectors;           /* Total sectors */
+    uint32_t sector_size;           /* Sector size in bytes */
+    uint64_t capacity_bytes;        /* Total capacity */
+    
+    /* Physical properties */
+    bool removable;                 /* Removable media */
+    bool readonly;                  /* Read-only device */
+    bool supports_flush;            /* Flush/FUA support */
+    bool supports_discard;          /* DISCARD/TRIM support */
+    bool supports_secure_erase;     /* Secure erase support */
+    uint32_t queue_depth;           /* Maximum queue depth */
+    
+    /* I/O operations */
+    int (*read_sectors)(struct block_device* dev, uint64_t sector, 
+                       uint32_t count, void* buffer);
+    int (*write_sectors)(struct block_device* dev, uint64_t sector, 
+                        uint32_t count, const void* buffer);
+    int (*flush)(struct block_device* dev);
+    int (*discard)(struct block_device* dev, uint64_t sector, uint32_t count);
+    
+    /* Request queue */
+    struct list_head request_queue; /* Pending I/O requests */
+    spinlock_t queue_lock;          /* Queue lock */
+    struct work_struct io_work;     /* I/O processing work */
+    
+    /* Statistics */
+    uint64_t read_requests;         /* Read requests */
+    uint64_t write_requests;        /* Write requests */
+    uint64_t read_bytes;            /* Bytes read */
+    uint64_t write_bytes;           /* Bytes written */
+    uint64_t io_errors;             /* I/O errors */
+    uint64_t total_io_time;         /* Total I/O time */
+    
+    /* Encryption */
+    storage_encryption_t encryption; /* Encryption context */
+    
+    /* Health monitoring */
+    uint32_t temperature;           /* Device temperature */
+    uint32_t power_on_hours;        /* Power-on hours */
+    uint32_t reallocated_sectors;   /* Reallocated sectors */
+    uint32_t wear_level;            /* Wear leveling (SSD) */
+    bool smart_enabled;             /* SMART monitoring */
+    
+    /* Private data */
+    void* private_data;             /* Device-specific data */
+} block_device_t;
+
+/* RAID array structure */
+typedef struct raid_array {
+    struct list_head list;          /* Global RAID list */
+    
+    uint32_t array_id;              /* Array identifier */
+    char name[64];                  /* Array name */
+    raid_level_t level;             /* RAID level */
+    raid_state_t state;             /* Array state */
+    
+    /* Configuration */
+    uint32_t num_devices;           /* Number of devices */
+    uint32_t num_active;            /* Active devices */
+    uint32_t num_spare;             /* Hot spare devices */
+    uint32_t chunk_size;            /* Chunk/stripe size */
+    
+    /* Device list */
+    block_device_t* devices[16];    /* Member devices */
+    bool device_failed[16];         /* Device failure status */
+    
+    /* Virtual block device */
+    block_device_t block_device;    /* RAID as block device */
+    
+    /* Rebuild/resync */
+    bool rebuild_active;            /* Rebuild in progress */
+    uint32_t rebuild_device;        /* Device being rebuilt */
+    uint64_t rebuild_progress;      /* Rebuild progress (sectors) */
+    uint64_t rebuild_rate;          /* Rebuild rate (KB/s) */
+    
+    /* Performance */
+    uint32_t read_ahead_kb;         /* Read-ahead size */
+    uint32_t stripe_cache_size;     /* Stripe cache size */
+    bool write_mostly;              /* Write-mostly optimization */
+    
+    /* Monitoring */
+    uint64_t degraded_time;         /* Time spent degraded */
+    uint32_t media_errors;          /* Media error count */
+    uint32_t corrected_errors;      /* Corrected error count */
+} raid_array_t;
+
+/* LVM Physical Volume */
+typedef struct lvm_pv {
+    struct list_head list;          /* PV list linkage */
+    
+    char uuid[64];                  /* PV UUID */
+    char name[64];                  /* PV name */
+    block_device_t* device;         /* Underlying device */
+    
+    /* Size information */
+    uint64_t size;                  /* Total PV size */
+    uint64_t pe_size;               /* Physical extent size */
+    uint64_t pe_count;              /* Total physical extents */
+    uint64_t pe_free;               /* Free physical extents */
+    
+    /* Allocation bitmap */
+    uint8_t* allocation_map;        /* PE allocation bitmap */
+    
+    /* Volume group membership */
+    struct lvm_vg* volume_group;    /* Parent volume group */
+    
+    /* Statistics */
+    uint64_t read_operations;       /* Read operations */
+    uint64_t write_operations;      /* Write operations */
+} lvm_pv_t;
+
+/* LVM Volume Group */
+typedef struct lvm_vg {
+    struct list_head list;          /* VG list linkage */
+    
+    char uuid[64];                  /* VG UUID */
+    char name[64];                  /* VG name */
+    
+    /* Physical volumes */
+    struct list_head pv_list;       /* Physical volumes */
+    uint32_t pv_count;              /* Number of PVs */
+    
+    /* Logical volumes */
+    struct list_head lv_list;       /* Logical volumes */
+    uint32_t lv_count;              /* Number of LVs */
+    
+    /* Size information */
+    uint64_t size;                  /* Total VG size */
+    uint64_t pe_size;               /* Physical extent size */
+    uint64_t pe_count;              /* Total physical extents */
+    uint64_t pe_free;               /* Free physical extents */
+    
+    /* Configuration */
+    uint32_t max_lv;                /* Maximum logical volumes */
+    uint32_t max_pv;                /* Maximum physical volumes */
+    bool clustered;                 /* Clustered VG */
+} lvm_vg_t;
+
+/* LVM Logical Volume */
+typedef struct lvm_lv {
+    struct list_head list;          /* LV list linkage */
+    
+    char uuid[64];                  /* LV UUID */
+    char name[64];                  /* LV name */
+    struct lvm_vg* volume_group;    /* Parent volume group */
+    
+    /* Size and layout */
+    uint64_t size;                  /* LV size in bytes */
+    uint64_t le_count;              /* Logical extent count */
+    uint32_t stripes;               /* Number of stripes */
+    uint64_t stripe_size;           /* Stripe size */
+    
+    /* Type and attributes */
+    uint32_t type;                  /* LV type (linear, striped, etc.) */
+    bool active;                    /* LV is active */
+    bool readonly;                  /* Read-only LV */
+    bool snapshot;                  /* Snapshot LV */
+    bool thin_pool;                 /* Thin pool LV */
+    bool thin_volume;               /* Thin volume LV */
+    
+    /* Snapshot information */
+    struct lvm_lv* origin;          /* Origin LV for snapshots */
+    struct list_head snapshots;     /* Snapshot list */
+    uint64_t snapshot_size;         /* Snapshot size */
+    
+    /* Thin provisioning */
+    struct lvm_lv* thin_pool_lv;    /* Thin pool parent */
+    uint64_t thin_pool_size;        /* Thin pool size */
+    uint64_t thin_pool_used;        /* Thin pool used space */
+    
+    /* Virtual block device */
+    block_device_t block_device;    /* LV as block device */
+    
+    /* Extent mapping */
+    struct {
+        lvm_pv_t* pv;               /* Physical volume */
+        uint64_t pe_start;          /* Starting PE */
+        uint64_t pe_count;          /* PE count */
+    } *extent_map;                  /* Extent mapping table */
+    uint32_t extent_count;          /* Number of extents */
+} lvm_lv_t;
+
+/* File system driver */
+typedef struct filesystem_driver {
+    struct list_head list;          /* Driver list linkage */
+    
+    char name[32];                  /* File system name */
+    filesystem_type_t type;         /* File system type */
+    
+    /* Operations */
+    int (*mount)(block_device_t* device, const char* mount_point, 
+                 uint32_t flags, void* options);
+    int (*unmount)(const char* mount_point, uint32_t flags);
+    int (*format)(block_device_t* device, void* options);
+    int (*check)(block_device_t* device, uint32_t flags);
+    int (*resize)(block_device_t* device, uint64_t new_size);
+    
+    /* Capability flags */
+    bool supports_journaling;       /* Journaling support */
+    bool supports_compression;      /* Compression support */
+    bool supports_encryption;       /* Encryption support */
+    bool supports_snapshots;        /* Snapshot support */
+    bool supports_quota;            /* Quota support */
+    bool supports_acl;              /* ACL support */
+    bool supports_xattr;            /* Extended attributes */
+    
+    /* Size limits */
+    uint64_t max_file_size;         /* Maximum file size */
+    uint64_t max_filesystem_size;   /* Maximum file system size */
+    uint32_t max_filename_length;   /* Maximum filename length */
+} filesystem_driver_t;
+
+/* Storage subsystem state */
+static struct {
+    bool initialized;               /* Storage subsystem initialized */
+    
+    /* Block devices */
+    struct list_head block_devices; /* All block devices */
+    uint32_t next_device_id;        /* Next device ID */
+    spinlock_t devices_lock;        /* Devices list lock */
+    
+    /* RAID arrays */
+    struct list_head raid_arrays;   /* RAID arrays */
+    uint32_t next_array_id;         /* Next array ID */
+    spinlock_t arrays_lock;         /* Arrays list lock */
+    
+    /* LVM */
+    struct list_head volume_groups; /* Volume groups */
+    struct list_head physical_volumes; /* Physical volumes */
+    spinlock_t lvm_lock;            /* LVM lock */
+    
+    /* File systems */
+    struct list_head filesystem_drivers; /* File system drivers */
+    spinlock_t fs_drivers_lock;     /* FS drivers lock */
+    
+    /* Device mapper */
+    struct list_head dm_targets;    /* Device mapper targets */
+    spinlock_t dm_lock;             /* Device mapper lock */
+    
+    /* I/O scheduler */
+    struct work_queue io_workqueue; /* I/O work queue */
+    
+    /* Statistics */
+    uint64_t total_read_requests;   /* Total read requests */
+    uint64_t total_write_requests;  /* Total write requests */
+    uint64_t total_read_bytes;      /* Total bytes read */
+    uint64_t total_write_bytes;     /* Total bytes written */
+    uint64_t total_io_errors;       /* Total I/O errors */
+    
+    /* Configuration */
+    uint32_t default_queue_depth;   /* Default queue depth */
+    uint32_t max_io_size;           /* Maximum I/O size */
+    bool enable_write_cache;        /* Write cache enabled */
+    bool enable_read_ahead;         /* Read-ahead enabled */
+} storage_system = {0};
+
+/* Function prototypes */
+static int storage_detect_devices(void);
+static int storage_register_filesystems(void);
+static int storage_setup_device_mapper(void);
+static void storage_io_work(struct work_struct* work);
+static int storage_create_raid_array(const char* name, raid_level_t level,
+                                     uint32_t num_devices, uint32_t* device_ids);
+
+/* File system implementations */
+extern const filesystem_driver_t ext4_driver;
+extern const filesystem_driver_t ntfs_driver;
+extern const filesystem_driver_t apfs_driver;
+extern const filesystem_driver_t zfs_driver;
+extern const filesystem_driver_t btrfs_driver;
+extern const filesystem_driver_t xfs_driver;
+
+/* Initialize storage subsystem */
+int storage_init(void) {
+    console_printf("Storage: Initializing enterprise storage stack\n");
+    
+    /* Initialize data structures */
+    INIT_LIST_HEAD(&storage_system.block_devices);
+    INIT_LIST_HEAD(&storage_system.raid_arrays);
+    INIT_LIST_HEAD(&storage_system.volume_groups);
+    INIT_LIST_HEAD(&storage_system.physical_volumes);
+    INIT_LIST_HEAD(&storage_system.filesystem_drivers);
+    INIT_LIST_HEAD(&storage_system.dm_targets);
+    
+    spin_lock_init(&storage_system.devices_lock);
+    spin_lock_init(&storage_system.arrays_lock);
+    spin_lock_init(&storage_system.lvm_lock);
+    spin_lock_init(&storage_system.fs_drivers_lock);
+    spin_lock_init(&storage_system.dm_lock);
+    
+    /* Initialize I/O work queue */
+    work_queue_init(&storage_system.io_workqueue, "storage_io", 8);
+    
+    /* Set default configuration */
+    storage_system.default_queue_depth = 32;
+    storage_system.max_io_size = MAX_IO_SIZE;
+    storage_system.enable_write_cache = true;
+    storage_system.enable_read_ahead = true;
+    
+    /* Register file system drivers */
+    int result = storage_register_filesystems();
+    if (result != 0) {
+        console_printf("Storage: Failed to register file systems: %d\n", result);
+        return result;
+    }
+    
+    /* Set up device mapper */
+    result = storage_setup_device_mapper();
+    if (result != 0) {
+        console_printf("Storage: Failed to setup device mapper: %d\n", result);
+        return result;
+    }
+    
+    /* Detect storage devices */
+    result = storage_detect_devices();
+    if (result != 0) {
+        console_printf("Storage: Failed to detect storage devices: %d\n", result);
+        return result;
+    }
+    
+    storage_system.initialized = true;
+    
+    console_printf("Storage: Initialized with %d block devices\n", 
+                   storage_get_device_count());
+    
+    return 0;
+}
+
+/* Detect storage devices */
+static int storage_detect_devices(void) {
+    /* Detect SATA/AHCI devices */
+    int sata_devices = storage_detect_sata_devices();
+    console_printf("Storage: Found %d SATA devices\n", sata_devices);
+    
+    /* Detect NVMe devices */
+    int nvme_devices = storage_detect_nvme_devices();
+    console_printf("Storage: Found %d NVMe devices\n", nvme_devices);
+    
+    /* Detect SCSI devices */
+    int scsi_devices = storage_detect_scsi_devices();
+    console_printf("Storage: Found %d SCSI devices\n", scsi_devices);
+    
+    /* Detect USB storage devices */
+    int usb_devices = storage_detect_usb_storage();
+    console_printf("Storage: Found %d USB storage devices\n", usb_devices);
+    
+    /* Detect optical drives */
+    int optical_devices = storage_detect_optical_drives();
+    console_printf("Storage: Found %d optical drives\n", optical_devices);
+    
+    /* Create RAM disk */
+    int result = storage_create_ramdisk(64 * 1024 * 1024); /* 64MB RAM disk */
+    if (result == 0) {
+        console_printf("Storage: Created 64MB RAM disk\n");
+    }
+    
+    return 0;
+}
+
+/* Register file system drivers */
+static int storage_register_filesystems(void) {
+    /* Register built-in file system drivers */
+    static const filesystem_driver_t* drivers[] = {
+        &ext4_driver,
+        &ntfs_driver,
+        &apfs_driver,
+        &zfs_driver,
+        &btrfs_driver,
+        &xfs_driver,
+        NULL
+    };
+    
+    for (int i = 0; drivers[i]; i++) {
+        int result = storage_register_filesystem_driver(drivers[i]);
+        if (result != 0) {
+            console_printf("Storage: Failed to register %s driver: %d\n",
+                          drivers[i]->name, result);
+        } else {
+            console_printf("Storage: Registered %s file system driver\n",
+                          drivers[i]->name);
+        }
+    }
+    
+    return 0;
+}
+
+/* Set up device mapper */
+static int storage_setup_device_mapper(void) {
+    /* Initialize device mapper targets */
+    
+    /* Linear target */
+    storage_register_dm_target("linear", dm_linear_create, dm_linear_destroy);
+    
+    /* Striped target */
+    storage_register_dm_target("striped", dm_striped_create, dm_striped_destroy);
+    
+    /* Mirror target */
+    storage_register_dm_target("mirror", dm_mirror_create, dm_mirror_destroy);
+    
+    /* Snapshot target */
+    storage_register_dm_target("snapshot", dm_snapshot_create, dm_snapshot_destroy);
+    
+    /* Crypt target */
+    storage_register_dm_target("crypt", dm_crypt_create, dm_crypt_destroy);
+    
+    /* Thin provisioning target */
+    storage_register_dm_target("thin", dm_thin_create, dm_thin_destroy);
+    
+    console_printf("Storage: Device mapper initialized with 6 targets\n");
+    return 0;
+}
+
+/* Register block device */
+int storage_register_block_device(block_device_t* device) {
+    if (!device) {
+        return -1;
+    }
+    
+    spin_lock(&storage_system.devices_lock);
+    
+    /* Assign device ID */
+    device->device_id = storage_system.next_device_id++;
+    
+    /* Initialize device structures */
+    INIT_LIST_HEAD(&device->request_queue);
+    spin_lock_init(&device->queue_lock);
+    INIT_WORK(&device->io_work, storage_io_work);
+    
+    /* Add to global list */
+    list_add_tail(&device->list, &storage_system.block_devices);
+    
+    spin_unlock(&storage_system.devices_lock);
+    
+    console_printf("Storage: Registered block device %s (ID %d, %llu sectors)\n",
+                   device->name, device->device_id, device->num_sectors);
+    
+    return 0;
+}
+
+/* Submit I/O request */
+int storage_submit_io(block_io_request_t* request) {
+    if (!request || !storage_system.initialized) {
+        return -1;
+    }
+    
+    /* Find target device */
+    block_device_t* device = storage_find_device(request->device_id);
+    if (!device) {
+        return -1;
+    }
+    
+    /* Validate request */
+    if (request->sector + request->num_sectors > device->num_sectors) {
+        return -1; /* Request beyond device bounds */
+    }
+    
+    if (request->buffer_size < request->num_sectors * device->sector_size) {
+        return -1; /* Buffer too small */
+    }
+    
+    /* Set timing information */
+    request->submit_time = timer_get_ticks();
+    request->error_code = 0;
+    request->retry_count = 0;
+    request->max_retries = 3;
+    
+    /* Queue the request */
+    spin_lock(&device->queue_lock);
+    list_add_tail(&request->list, &device->request_queue);
+    spin_unlock(&device->queue_lock);
+    
+    /* Schedule I/O processing */
+    work_queue_queue_work(&storage_system.io_workqueue, &device->io_work);
+    
+    return 0;
+}
+
+/* I/O work processing */
+static void storage_io_work(struct work_struct* work) {
+    block_device_t* device = container_of(work, block_device_t, io_work);
+    
+    /* Process all pending requests */
+    while (true) {
+        block_io_request_t* request;
+        
+        /* Get next request */
+        spin_lock(&device->queue_lock);
+        if (list_empty(&device->request_queue)) {
+            spin_unlock(&device->queue_lock);
+            break;
+        }
+        
+        request = list_first_entry(&device->request_queue, block_io_request_t, list);
+        list_del(&request->list);
+        spin_unlock(&device->queue_lock);
+        
+        /* Process the request */
+        int result = -1;
+        
+        if (request->is_write) {
+            /* Write operation */
+            if (device->write_sectors) {
+                result = device->write_sectors(device, request->sector,
+                                              request->num_sectors, request->buffer);
+            }
+            
+            if (result == 0) {
+                device->write_requests++;
+                device->write_bytes += request->buffer_size;
+                storage_system.total_write_requests++;
+                storage_system.total_write_bytes += request->buffer_size;
+            }
+        } else {
+            /* Read operation */
+            if (device->read_sectors) {
+                result = device->read_sectors(device, request->sector,
+                                             request->num_sectors, request->buffer);
+            }
+            
+            if (result == 0) {
+                device->read_requests++;
+                device->read_bytes += request->buffer_size;
+                storage_system.total_read_requests++;
+                storage_system.total_read_bytes += request->buffer_size;
+            }
+        }
+        
+        /* Handle flush requests */
+        if (request->is_flush && device->flush) {
+            result = device->flush(device);
+        }
+        
+        /* Handle discard requests */
+        if (request->is_discard && device->discard) {
+            result = device->discard(device, request->sector, request->num_sectors);
+        }
+        
+        /* Update statistics */
+        request->complete_time = timer_get_ticks();
+        device->total_io_time += (request->complete_time - request->submit_time);
+        
+        if (result != 0) {
+            device->io_errors++;
+            storage_system.total_io_errors++;
+            request->error_code = result;
+            
+            /* Retry logic */
+            if (request->retry_count < request->max_retries) {
+                request->retry_count++;
+                
+                /* Requeue for retry */
+                spin_lock(&device->queue_lock);
+                list_add(&request->list, &device->request_queue);
+                spin_unlock(&device->queue_lock);
+                continue;
+            }
+        }
+        
+        /* Complete the request */
+        if (request->completion_fn) {
+            request->completion_fn(request, result);
+        } else {
+            complete(&request->completion);
+        }
+    }
+}
+
+/* Create RAID array */
+int storage_create_raid_array(const char* name, raid_level_t level,
+                             uint32_t num_devices, uint32_t* device_ids) {
+    if (!name || num_devices == 0 || !device_ids) {
+        return -1;
+    }
+    
+    /* Validate RAID level and device count */
+    switch (level) {
+        case RAID_LEVEL_0:  /* Stripe - minimum 2 devices */
+            if (num_devices < 2) return -1;
+            break;
+        case RAID_LEVEL_1:  /* Mirror - exactly 2 devices */
+            if (num_devices != 2) return -1;
+            break;
+        case RAID_LEVEL_5:  /* RAID 5 - minimum 3 devices */
+            if (num_devices < 3) return -1;
+            break;
+        case RAID_LEVEL_6:  /* RAID 6 - minimum 4 devices */
+            if (num_devices < 4) return -1;
+            break;
+        case RAID_LEVEL_10: /* RAID 10 - minimum 4 devices, must be even */
+            if (num_devices < 4 || (num_devices % 2) != 0) return -1;
+            break;
+        default:
+            return -1;
+    }
+    
+    /* Allocate RAID array structure */
+    raid_array_t* array = vmm_alloc(sizeof(raid_array_t));
+    if (!array) {
+        return -1;
+    }
+    
+    memset(array, 0, sizeof(raid_array_t));
+    
+    /* Initialize array */
+    spin_lock(&storage_system.arrays_lock);
+    array->array_id = storage_system.next_array_id++;
+    spin_unlock(&storage_system.arrays_lock);
+    
+    strcpy(array->name, name);
+    array->level = level;
+    array->state = RAID_STATE_OPTIMAL;
+    array->num_devices = num_devices;
+    array->num_active = num_devices;
+    array->chunk_size = RAID_STRIPE_SIZE;
+    
+    /* Find and validate member devices */
+    uint64_t min_size = UINT64_MAX;
+    for (uint32_t i = 0; i < num_devices; i++) {
+        block_device_t* device = storage_find_device(device_ids[i]);
+        if (!device) {
+            vmm_free(array);
+            return -1;
+        }
+        
+        array->devices[i] = device;
+        array->device_failed[i] = false;
+        
+        if (device->capacity_bytes < min_size) {
+            min_size = device->capacity_bytes;
+        }
+    }
+    
+    /* Calculate array capacity based on RAID level */
+    uint64_t array_capacity = 0;
+    switch (level) {
+        case RAID_LEVEL_0:   /* Stripe */
+            array_capacity = min_size * num_devices;
+            break;
+        case RAID_LEVEL_1:   /* Mirror */
+            array_capacity = min_size;
+            break;
+        case RAID_LEVEL_5:   /* RAID 5 */
+            array_capacity = min_size * (num_devices - 1);
+            break;
+        case RAID_LEVEL_6:   /* RAID 6 */
+            array_capacity = min_size * (num_devices - 2);
+            break;
+        case RAID_LEVEL_10:  /* RAID 10 */
+            array_capacity = min_size * (num_devices / 2);
+            break;
+        default:
+            array_capacity = min_size;
+            break;
+    }
+    
+    /* Initialize virtual block device for the array */
+    block_device_t* block_dev = &array->block_device;
+    block_dev->type = BLOCK_DEVICE_RAID;
+    strcpy(block_dev->name, name);
+    block_dev->capacity_bytes = array_capacity;
+    block_dev->num_sectors = array_capacity / 512;
+    block_dev->sector_size = 512;
+    block_dev->supports_flush = true;
+    block_dev->supports_discard = true;
+    block_dev->queue_depth = storage_system.default_queue_depth;
+    
+    /* Set RAID I/O operations */
+    block_dev->read_sectors = raid_read_sectors;
+    block_dev->write_sectors = raid_write_sectors;
+    block_dev->flush = raid_flush;
+    block_dev->discard = raid_discard;
+    block_dev->private_data = array;
+    
+    /* Register the RAID array as a block device */
+    int result = storage_register_block_device(block_dev);
+    if (result != 0) {
+        vmm_free(array);
+        return result;
+    }
+    
+    /* Add to RAID array list */
+    spin_lock(&storage_system.arrays_lock);
+    list_add_tail(&array->list, &storage_system.raid_arrays);
+    spin_unlock(&storage_system.arrays_lock);
+    
+    console_printf("Storage: Created RAID %d array '%s' with %d devices (ID %d)\n",
+                   level, name, num_devices, array->array_id);
+    
+    return array->array_id;
+}
+
+/* Create LVM volume group */
+int storage_create_volume_group(const char* name, uint32_t num_pvs, uint32_t* pv_device_ids) {
+    if (!name || num_pvs == 0 || !pv_device_ids) {
+        return -1;
+    }
+    
+    /* Allocate volume group structure */
+    lvm_vg_t* vg = vmm_alloc(sizeof(lvm_vg_t));
+    if (!vg) {
+        return -1;
+    }
+    
+    memset(vg, 0, sizeof(lvm_vg_t));
+    
+    /* Initialize volume group */
+    strcpy(vg->name, name);
+    snprintf(vg->uuid, sizeof(vg->uuid), "VG_%s_%016lx", name, timer_get_ticks());
+    INIT_LIST_HEAD(&vg->pv_list);
+    INIT_LIST_HEAD(&vg->lv_list);
+    vg->pe_size = LVM_PE_SIZE;
+    vg->max_lv = 256;
+    vg->max_pv = 256;
+    
+    /* Add physical volumes */
+    uint64_t total_size = 0;
+    for (uint32_t i = 0; i < num_pvs; i++) {
+        block_device_t* device = storage_find_device(pv_device_ids[i]);
+        if (!device) {
+            /* Clean up and return error */
+            vmm_free(vg);
+            return -1;
+        }
+        
+        /* Create physical volume */
+        lvm_pv_t* pv = vmm_alloc(sizeof(lvm_pv_t));
+        if (!pv) {
+            vmm_free(vg);
+            return -1;
+        }
+        
+        memset(pv, 0, sizeof(lvm_pv_t));
+        strcpy(pv->name, device->name);
+        snprintf(pv->uuid, sizeof(pv->uuid), "PV_%s_%016lx", device->name, timer_get_ticks());
+        pv->device = device;
+        pv->size = device->capacity_bytes;
+        pv->pe_size = LVM_PE_SIZE;
+        pv->pe_count = pv->size / pv->pe_size;
+        pv->pe_free = pv->pe_count;
+        pv->volume_group = vg;
+        
+        /* Allocate allocation bitmap */
+        size_t bitmap_size = (pv->pe_count + 7) / 8;
+        pv->allocation_map = vmm_alloc(bitmap_size);
+        if (!pv->allocation_map) {
+            vmm_free(pv);
+            vmm_free(vg);
+            return -1;
+        }
+        memset(pv->allocation_map, 0, bitmap_size);
+        
+        /* Add to VG */
+        list_add_tail(&pv->list, &vg->pv_list);
+        vg->pv_count++;
+        total_size += pv->size;
+    }
+    
+    /* Update VG size information */
+    vg->size = total_size;
+    vg->pe_count = total_size / vg->pe_size;
+    vg->pe_free = vg->pe_count;
+    
+    /* Add to global lists */
+    spin_lock(&storage_system.lvm_lock);
+    list_add_tail(&vg->list, &storage_system.volume_groups);
+    spin_unlock(&storage_system.lvm_lock);
+    
+    console_printf("Storage: Created volume group '%s' with %d PVs (%llu GB)\n",
+                   name, num_pvs, total_size / (1024 * 1024 * 1024));
+    
+    return 0;
+}
+
+/* Create LVM logical volume */
+int storage_create_logical_volume(const char* vg_name, const char* lv_name,
+                                 uint64_t size_bytes) {
+    if (!vg_name || !lv_name || size_bytes == 0) {
+        return -1;
+    }
+    
+    /* Find volume group */
+    lvm_vg_t* vg = storage_find_volume_group(vg_name);
+    if (!vg) {
+        return -1;
+    }
+    
+    /* Check available space */
+    uint64_t available_bytes = vg->pe_free * vg->pe_size;
+    if (size_bytes > available_bytes) {
+        return -1; /* Not enough space */
+    }
+    
+    /* Allocate logical volume structure */
+    lvm_lv_t* lv = vmm_alloc(sizeof(lvm_lv_t));
+    if (!lv) {
+        return -1;
+    }
+    
+    memset(lv, 0, sizeof(lvm_lv_t));
+    
+    /* Initialize logical volume */
+    strcpy(lv->name, lv_name);
+    snprintf(lv->uuid, sizeof(lv->uuid), "LV_%s_%016lx", lv_name, timer_get_ticks());
+    lv->volume_group = vg;
+    lv->size = size_bytes;
+    lv->le_count = (size_bytes + vg->pe_size - 1) / vg->pe_size;
+    lv->stripes = 1; /* Linear by default */
+    lv->active = true;
+    INIT_LIST_HEAD(&lv->snapshots);
+    
+    /* Allocate extents from physical volumes */
+    lv->extent_count = lv->le_count;
+    lv->extent_map = vmm_alloc(sizeof(*lv->extent_map) * lv->extent_count);
+    if (!lv->extent_map) {
+        vmm_free(lv);
+        return -1;
+    }
+    
+    /* Simple linear allocation from first available PV */
+    uint64_t extents_allocated = 0;
+    lvm_pv_t* pv;
+    list_for_each_entry(pv, &vg->pv_list, list) {
+        if (extents_allocated >= lv->le_count) {
+            break;
+        }
+        
+        uint64_t extents_needed = lv->le_count - extents_allocated;
+        uint64_t extents_available = pv->pe_free;
+        uint64_t extents_to_allocate = (extents_needed < extents_available) ? 
+                                      extents_needed : extents_available;
+        
+        if (extents_to_allocate > 0) {
+            /* Find free extents in PV */
+            uint64_t pe_start = 0;
+            for (uint64_t pe = 0; pe < pv->pe_count; pe++) {
+                uint32_t byte_index = pe / 8;
+                uint32_t bit_index = pe % 8;
+                
+                if (!(pv->allocation_map[byte_index] & (1 << bit_index))) {
+                    /* Found free extent */
+                    if (pe_start == 0) {
+                        pe_start = pe;
+                    }
+                    
+                    if (pe - pe_start + 1 >= extents_to_allocate) {
+                        /* Found contiguous block */
+                        lv->extent_map[extents_allocated].pv = pv;
+                        lv->extent_map[extents_allocated].pe_start = pe_start;
+                        lv->extent_map[extents_allocated].pe_count = extents_to_allocate;
+                        
+                        /* Mark extents as allocated */
+                        for (uint64_t alloc_pe = pe_start; alloc_pe < pe_start + extents_to_allocate; alloc_pe++) {
+                            uint32_t alloc_byte = alloc_pe / 8;
+                            uint32_t alloc_bit = alloc_pe % 8;
+                            pv->allocation_map[alloc_byte] |= (1 << alloc_bit);
+                        }
+                        
+                        pv->pe_free -= extents_to_allocate;
+                        vg->pe_free -= extents_to_allocate;
+                        extents_allocated += extents_to_allocate;
+                        break;
+                    }
+                } else {
+                    pe_start = 0; /* Reset search */
+                }
+            }
+        }
+    }
+    
+    if (extents_allocated < lv->le_count) {
+        /* Failed to allocate all extents */
+        vmm_free(lv->extent_map);
+        vmm_free(lv);
+        return -1;
+    }
+    
+    /* Initialize virtual block device for the logical volume */
+    block_device_t* block_dev = &lv->block_device;
+    block_dev->type = BLOCK_DEVICE_LVM_LV;
+    snprintf(block_dev->name, sizeof(block_dev->name), "%s-%s", vg_name, lv_name);
+    block_dev->capacity_bytes = size_bytes;
+    block_dev->num_sectors = size_bytes / 512;
+    block_dev->sector_size = 512;
+    block_dev->supports_flush = true;
+    block_dev->supports_discard = true;
+    block_dev->queue_depth = storage_system.default_queue_depth;
+    
+    /* Set LVM I/O operations */
+    block_dev->read_sectors = lvm_read_sectors;
+    block_dev->write_sectors = lvm_write_sectors;
+    block_dev->flush = lvm_flush;
+    block_dev->discard = lvm_discard;
+    block_dev->private_data = lv;
+    
+    /* Register the logical volume as a block device */
+    int result = storage_register_block_device(block_dev);
+    if (result != 0) {
+        vmm_free(lv->extent_map);
+        vmm_free(lv);
+        return result;
+    }
+    
+    /* Add to VG */
+    list_add_tail(&lv->list, &vg->lv_list);
+    vg->lv_count++;
+    
+    console_printf("Storage: Created logical volume '%s' in VG '%s' (%llu MB)\n",
+                   lv_name, vg_name, size_bytes / (1024 * 1024));
+    
+    return 0;
+}
+
+/* Enable storage encryption */
+int storage_enable_encryption(uint32_t device_id, uint32_t cipher,
+                             const uint8_t* key, uint32_t key_size) {
+    block_device_t* device = storage_find_device(device_id);
+    if (!device || !key) {
+        return -1;
+    }
+    
+    storage_encryption_t* enc = &device->encryption;
+    
+    /* Set encryption parameters */
+    enc->cipher_id = cipher;
+    enc->key_size = key_size * 8; /* Convert bytes to bits */
+    memcpy(enc->key, key, (key_size < sizeof(enc->key)) ? key_size : sizeof(enc->key));
+    enc->sector_size = device->sector_size;
+    enc->enabled = true;
+    
+    /* Generate random IV */
+    crypto_random_bytes(enc->iv, sizeof(enc->iv));
+    
+    /* Set up key derivation parameters */
+    enc->kdf_algorithm = CRYPTO_KDF_PBKDF2;
+    enc->iterations = 100000; /* PBKDF2 iterations */
+    crypto_random_bytes(enc->salt, sizeof(enc->salt));
+    
+    console_printf("Storage: Enabled encryption on device %s (cipher %d, %d-bit key)\n",
+                   device->name, cipher, key_size * 8);
+    
+    return 0;
+}
+
+/* Get storage statistics */
+void storage_get_stats(struct storage_stats* stats) {
+    if (!stats) {
+        return;
+    }
+    
+    memset(stats, 0, sizeof(struct storage_stats));
+    
+    /* Global statistics */
+    stats->total_devices = storage_get_device_count();
+    stats->total_read_requests = storage_system.total_read_requests;
+    stats->total_write_requests = storage_system.total_write_requests;
+    stats->total_read_bytes = storage_system.total_read_bytes;
+    stats->total_write_bytes = storage_system.total_write_bytes;
+    stats->total_io_errors = storage_system.total_io_errors;
+    
+    /* Count arrays and volumes */
+    spin_lock(&storage_system.arrays_lock);
+    raid_array_t* array;
+    list_for_each_entry(array, &storage_system.raid_arrays, list) {
+        stats->raid_arrays++;
+    }
+    spin_unlock(&storage_system.arrays_lock);
+    
+    spin_lock(&storage_system.lvm_lock);
+    lvm_vg_t* vg;
+    list_for_each_entry(vg, &storage_system.volume_groups, list) {
+        stats->volume_groups++;
+        stats->logical_volumes += vg->lv_count;
+    }
+    spin_unlock(&storage_system.lvm_lock);
+}
+
+/* Check if storage subsystem is initialized */
+bool storage_is_initialized(void) {
+    return storage_system.initialized;
+}

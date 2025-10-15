@@ -1,0 +1,140 @@
+#include "usb.h"
+#include "kernel.h"
+
+/*
+ * USB Hub Driver
+ * Manages USB hubs and port enumeration
+ */
+
+#include "../../include/kernel.h"
+
+/* USB Hub descriptor */
+typedef struct {
+    uint8_t  bDescLength;
+    uint8_t  bDescriptorType;
+    uint8_t  bNbrPorts;
+    uint16_t wHubCharacteristics;
+    uint8_t  bPwrOn2PwrGood;
+    uint8_t  bHubContrCurrent;
+    uint8_t  DeviceRemovable[32];
+    uint8_t  PortPwrCtrlMask[32];
+} __attribute__((packed)) usb_hub_descriptor_t;
+
+/* USB Hub structure */
+typedef struct {
+    uint16_t vendor_id;
+    uint16_t product_id;
+    uint8_t num_ports;
+    uint16_t characteristics;
+    bool active;
+    uint32_t port_status[16]; /* Max 16 ports per hub */
+} usb_hub_t;
+
+#define MAX_USB_HUBS 8
+static usb_hub_t g_usb_hubs[MAX_USB_HUBS];
+static uint32_t g_hub_count = 0;
+
+/* Hub class requests */
+#define USB_REQ_GET_STATUS     0x00
+#define USB_REQ_CLEAR_FEATURE  0x01
+#define USB_REQ_SET_FEATURE    0x03
+#define USB_REQ_GET_DESCRIPTOR 0x06
+
+/* Hub features */
+#define HUB_FEATURE_C_HUB_LOCAL_POWER  0x00
+#define HUB_FEATURE_C_HUB_OVER_CURRENT 0x01
+#define PORT_FEATURE_CONNECTION        0x00
+#define PORT_FEATURE_ENABLE            0x01
+#define PORT_FEATURE_SUSPEND           0x02
+#define PORT_FEATURE_OVER_CURRENT      0x03
+#define PORT_FEATURE_RESET             0x04
+#define PORT_FEATURE_POWER             0x08
+#define PORT_FEATURE_LOWSPEED          0x09
+
+/* Initialize USB hub */
+static status_t hub_init(usb_hub_t* hub, uint16_t vid, uint16_t pid) {
+    if (!hub) return STATUS_ERROR;
+    
+    hub->vendor_id = vid;
+    hub->product_id = pid;
+    hub->num_ports = 4; /* Assume 4 ports for simulation */
+    hub->characteristics = 0;
+    hub->active = true;
+    
+    /* Clear port status */
+    for (int i = 0; i < 16; i++) {
+        hub->port_status[i] = 0;
+    }
+    
+    KLOG_INFO("hub", "Initialized USB hub VID=%04x PID=%04x, %u ports",
+              vid, pid, hub->num_ports);
+    
+    return STATUS_OK;
+}
+
+/* Check hub port status */
+static void hub_check_ports(usb_hub_t* hub) {
+    if (!hub || !hub->active) return;
+    
+    for (uint8_t port = 1; port <= hub->num_ports; port++) {
+        uint32_t old_status = hub->port_status[port - 1];
+        uint32_t new_status = 0; /* TODO: Read actual port status */
+        
+        /* Simulate device connection/disconnection */
+        if ((old_status & 1) != (new_status & 1)) {
+            if (new_status & 1) {
+                KLOG_INFO("hub", "Device connected to hub port %u", port);
+                /* TODO: Enumerate new device */
+            } else {
+                KLOG_INFO("hub", "Device disconnected from hub port %u", port);
+            }
+            
+            hub->port_status[port - 1] = new_status;
+        }
+    }
+}
+
+/* Register new USB hub */
+status_t usb_hub_register(uint16_t vid, uint16_t pid) {
+    if (g_hub_count >= MAX_USB_HUBS) {
+        KLOG_WARN("hub", "Too many USB hubs");
+        return STATUS_ERROR;
+    }
+    
+    usb_hub_t* hub = &g_usb_hubs[g_hub_count];
+    status_t result = hub_init(hub, vid, pid);
+    
+    if (result == STATUS_OK) {
+        g_hub_count++;
+        KLOG_INFO("hub", "Registered USB hub %u", g_hub_count - 1);
+    }
+    
+    return result;
+}
+
+/* Enumerate all USB hubs and their ports */
+void usb_hub_enumerate(void) {
+    KLOG_INFO("hub", "Enumerating USB hubs and ports...");
+    
+    for (uint32_t i = 0; i < g_hub_count; i++) {
+        usb_hub_t* hub = &g_usb_hubs[i];
+        if (hub->active) {
+            KLOG_INFO("hub", "Checking hub %u (VID=%04x PID=%04x)",
+                      i, hub->vendor_id, hub->product_id);
+            
+            hub_check_ports(hub);
+        }
+    }
+    
+    KLOG_INFO("hub", "Hub enumeration complete");
+}
+
+/* Initialize USB hub subsystem */
+void usb_hub_init(void) {
+    KLOG_INFO("hub", "Initializing USB hub driver");
+    
+    g_hub_count = 0;
+    k_memset(g_usb_hubs, 0, sizeof(g_usb_hubs));
+    
+    KLOG_INFO("hub", "USB hub driver initialized");
+}

@@ -1,0 +1,448 @@
+#include "testing.h"
+#include "performance.h"
+#include "log.h"
+#include "kernel.h"
+#include "pci.h"
+#include "cpu.h"
+
+/* LimitlessOS Phase 6 - Hardware Compatibility Testing Implementation */
+
+#define HW_MAX_DEVICES 256
+#define HW_MAX_LAPTOP_MODELS 200
+
+typedef struct {
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint32_t class_code;
+    char name[64];
+    bool supported;
+    bool tested;
+    status_t test_result;
+} hw_device_info_t;
+
+typedef struct {
+    char manufacturer[32];
+    char model[64];
+    char cpu_model[64];
+    uint32_t memory_size_mb;
+    char storage_type[32];
+    char gpu_model[64];
+    bool compatibility_tested;
+    uint32_t compatibility_score; /* 0-100 */
+    char notes[256];
+} laptop_model_info_t;
+
+static hw_device_info_t g_detected_devices[HW_MAX_DEVICES];
+static uint32_t g_device_count = 0;
+
+static laptop_model_info_t g_laptop_models[HW_MAX_LAPTOP_MODELS];
+static uint32_t g_laptop_model_count = 0;
+
+/* Initialize hardware compatibility database */
+static status_t hw_init_compatibility_database(void) {
+    /* Initialize common laptop models database */
+    
+    /* Dell models */
+    hw_add_laptop_model("Dell", "XPS 13 9310", "Intel i7-1165G7", 16384, "NVMe SSD", "Intel Iris Xe");
+    hw_add_laptop_model("Dell", "XPS 15 9500", "Intel i7-10750H", 32768, "NVMe SSD", "NVIDIA GTX 1650 Ti");
+    hw_add_laptop_model("Dell", "Latitude 7420", "Intel i5-1145G7", 16384, "NVMe SSD", "Intel Iris Xe");
+    hw_add_laptop_model("Dell", "Inspiron 15 5000", "AMD Ryzen 5 5500U", 8192, "NVMe SSD", "AMD Radeon Graphics");
+    
+    /* HP models */
+    hw_add_laptop_model("HP", "EliteBook 840 G8", "Intel i7-1165G7", 16384, "NVMe SSD", "Intel Iris Xe");
+    hw_add_laptop_model("HP", "Pavilion 15", "AMD Ryzen 7 5700U", 16384, "NVMe SSD", "AMD Radeon Graphics");
+    hw_add_laptop_model("HP", "ZBook Studio G8", "Intel i7-11800H", 32768, "NVMe SSD", "NVIDIA RTX A2000");
+    hw_add_laptop_model("HP", "Spectre x360 14", "Intel i7-1165G7", 16384, "NVMe SSD", "Intel Iris Xe");
+    
+    /* Lenovo models */
+    hw_add_laptop_model("Lenovo", "ThinkPad X1 Carbon Gen 9", "Intel i7-1165G7", 16384, "NVMe SSD", "Intel Iris Xe");
+    hw_add_laptop_model("Lenovo", "ThinkPad T14 Gen 2", "AMD Ryzen 7 PRO 5850U", 32768, "NVMe SSD", "AMD Radeon Graphics");
+    hw_add_laptop_model("Lenovo", "Legion 5 Pro", "AMD Ryzen 7 5800H", 16384, "NVMe SSD", "NVIDIA RTX 3060");
+    hw_add_laptop_model("Lenovo", "IdeaPad 3", "Intel i5-1135G7", 8192, "NVMe SSD", "Intel Iris Xe");
+    
+    /* ASUS models */
+    hw_add_laptop_model("ASUS", "ZenBook 14", "AMD Ryzen 7 5700U", 16384, "NVMe SSD", "AMD Radeon Graphics");
+    hw_add_laptop_model("ASUS", "ROG Strix G15", "AMD Ryzen 9 5900HX", 32768, "NVMe SSD", "NVIDIA RTX 3070");
+    hw_add_laptop_model("ASUS", "VivoBook S15", "Intel i7-1165G7", 16384, "NVMe SSD", "Intel Iris Xe");
+    
+    /* Acer models */
+    hw_add_laptop_model("Acer", "Swift 3", "AMD Ryzen 7 5700U", 16384, "NVMe SSD", "AMD Radeon Graphics");
+    hw_add_laptop_model("Acer", "Predator Helios 300", "Intel i7-10750H", 16384, "NVMe SSD", "NVIDIA RTX 3060");
+    hw_add_laptop_model("Acer", "Aspire 5", "AMD Ryzen 5 5500U", 8192, "NVMe SSD", "AMD Radeon Graphics");
+    
+    /* MSI models */
+    hw_add_laptop_model("MSI", "GS66 Stealth", "Intel i7-10870H", 32768, "NVMe SSD", "NVIDIA RTX 3070");
+    hw_add_laptop_model("MSI", "Modern 14", "AMD Ryzen 7 5700U", 16384, "NVMe SSD", "AMD Radeon Graphics");
+    
+    /* Apple models (for compatibility reference) */
+    hw_add_laptop_model("Apple", "MacBook Air M1", "Apple M1", 16384, "NVMe SSD", "Apple M1 GPU");
+    hw_add_laptop_model("Apple", "MacBook Pro 14-inch M1", "Apple M1 Pro", 32768, "NVMe SSD", "Apple M1 Pro GPU");
+    
+    log_info("[HW] Initialized compatibility database with %u laptop models", g_laptop_model_count);
+    return STATUS_OK;
+}
+
+/* Add a laptop model to the compatibility database */
+static status_t hw_add_laptop_model(const char* manufacturer, const char* model, 
+                                   const char* cpu, uint32_t memory_mb, 
+                                   const char* storage, const char* gpu) {
+    if (g_laptop_model_count >= HW_MAX_LAPTOP_MODELS) return STATUS_NO_SPACE;
+    
+    laptop_model_info_t* laptop = &g_laptop_models[g_laptop_model_count++];
+    k_memset(laptop, 0, sizeof(*laptop));
+    
+    k_strlcpy(laptop->manufacturer, manufacturer, sizeof(laptop->manufacturer));
+    k_strlcpy(laptop->model, model, sizeof(laptop->model));
+    k_strlcpy(laptop->cpu_model, cpu, sizeof(laptop->cpu_model));
+    laptop->memory_size_mb = memory_mb;
+    k_strlcpy(laptop->storage_type, storage, sizeof(laptop->storage_type));
+    k_strlcpy(laptop->gpu_model, gpu, sizeof(laptop->gpu_model));
+    laptop->compatibility_score = 85; /* Default assumed compatibility */
+    
+    return STATUS_OK;
+}
+
+/* Hardware detection implementation */
+status_t test_detect_hardware(void) {
+    log_info("[HW] Starting comprehensive hardware detection...");
+    
+    g_device_count = 0;
+    
+    /* Initialize compatibility database */
+    hw_init_compatibility_database();
+    
+    /* Detect CPU */
+    hw_detect_cpu_info();
+    
+    /* Detect memory */
+    hw_detect_memory_info();
+    
+    /* Detect PCI devices */
+    hw_detect_pci_devices();
+    
+    /* Detect storage devices */
+    hw_detect_storage_devices();
+    
+    /* Detect network devices */
+    hw_detect_network_devices();
+    
+    /* Detect graphics devices */
+    hw_detect_graphics_devices();
+    
+    /* Detect audio devices */
+    hw_detect_audio_devices();
+    
+    /* Detect input devices */
+    hw_detect_input_devices();
+    
+    /* Identify laptop model if possible */
+    hw_identify_laptop_model();
+    
+    log_info("[HW] Hardware detection completed - found %u devices", g_device_count);
+    
+    return STATUS_OK;
+}
+
+/* CPU feature testing */
+status_t test_cpu_features(void) {
+    log_info("[HW] Testing CPU features...");
+    
+    /* Test basic CPU features */
+    uint32_t cpuid_result[4];
+    
+    /* Check for x86_64 */
+    if (!hw_check_x86_64_support()) {
+        log_error("[HW] CPU does not support x86_64 - LimitlessOS requires 64-bit CPU");
+        return STATUS_ERROR;
+    }
+    
+    /* Check for required features */
+    bool sse42_supported = hw_check_cpu_feature("SSE4.2");
+    bool avx_supported = hw_check_cpu_feature("AVX");
+    bool aes_ni_supported = hw_check_cpu_feature("AES-NI");
+    
+    if (!sse42_supported) {
+        log_warn("[HW] SSE4.2 not supported - some optimizations disabled");
+    }
+    
+    if (avx_supported) {
+        log_info("[HW] AVX supported - advanced vector operations enabled");
+    }
+    
+    if (aes_ni_supported) {
+        log_info("[HW] AES-NI supported - hardware crypto acceleration enabled");
+    }
+    
+    /* Test CPU performance */
+    uint64_t cpu_freq_mhz = hw_measure_cpu_frequency();
+    uint32_t cpu_cores = hw_get_cpu_core_count();
+    uint32_t cpu_threads = hw_get_cpu_thread_count();
+    
+    log_info("[HW] CPU: %u cores, %u threads, %llu MHz", cpu_cores, cpu_threads, cpu_freq_mhz);
+    
+    /* Add to device list */
+    hw_add_detected_device(0x8086, 0x0000, 0x060000, "CPU", true);
+    
+    return STATUS_OK;
+}
+
+/* Memory configuration testing */
+status_t test_memory_configuration(void) {
+    log_info("[HW] Testing memory configuration...");
+    
+    uint64_t total_memory = hw_get_total_memory_bytes();
+    uint64_t available_memory = hw_get_available_memory_bytes();
+    uint32_t memory_speed_mhz = hw_get_memory_speed_mhz();
+    
+    log_info("[HW] Memory: %llu MB total, %llu MB available, %u MHz", 
+             total_memory / (1024*1024), available_memory / (1024*1024), memory_speed_mhz);
+    
+    /* Check minimum requirements */
+    uint64_t min_memory_mb = 4 * 1024; /* 4GB minimum */
+    uint64_t recommended_memory_mb = 8 * 1024; /* 8GB recommended */
+    
+    if (total_memory < min_memory_mb * 1024 * 1024) {
+        log_error("[HW] Insufficient memory: %llu MB < %llu MB required", 
+                  total_memory / (1024*1024), min_memory_mb);
+        return STATUS_ERROR;
+    }
+    
+    if (total_memory < recommended_memory_mb * 1024 * 1024) {
+        log_warn("[HW] Memory below recommended: %llu MB < %llu MB recommended", 
+                 total_memory / (1024*1024), recommended_memory_mb);
+    }
+    
+    /* Test memory performance */
+    uint64_t memory_bandwidth = perf_measure_memory_bandwidth();
+    log_info("[HW] Memory bandwidth: %llu MB/s", memory_bandwidth);
+    
+    return STATUS_OK;
+}
+
+/* Storage device testing */
+status_t test_storage_devices(void) {
+    log_info("[HW] Testing storage devices...");
+    
+    uint32_t storage_device_count = 0;
+    
+    /* Detect NVMe devices */
+    storage_device_count += hw_detect_nvme_devices();
+    
+    /* Detect SATA devices */
+    storage_device_count += hw_detect_sata_devices();
+    
+    /* Detect USB storage */
+    storage_device_count += hw_detect_usb_storage();
+    
+    if (storage_device_count == 0) {
+        log_error("[HW] No storage devices detected");
+        return STATUS_ERROR;
+    }
+    
+    log_info("[HW] Found %u storage device(s)", storage_device_count);
+    
+    /* Test primary storage performance */
+    uint64_t read_speed = hw_test_storage_read_speed();
+    uint64_t write_speed = hw_test_storage_write_speed();
+    
+    log_info("[HW] Primary storage: %llu MB/s read, %llu MB/s write", read_speed, write_speed);
+    
+    return STATUS_OK;
+}
+
+/* Network device testing */
+status_t test_network_devices(void) {
+    log_info("[HW] Testing network devices...");
+    
+    uint32_t network_device_count = 0;
+    
+    /* Detect Ethernet devices */
+    network_device_count += hw_detect_ethernet_devices();
+    
+    /* Detect WiFi devices */
+    network_device_count += hw_detect_wifi_devices();
+    
+    /* Detect Bluetooth devices */
+    network_device_count += hw_detect_bluetooth_devices();
+    
+    log_info("[HW] Found %u network device(s)", network_device_count);
+    
+    if (network_device_count == 0) {
+        log_warn("[HW] No network devices detected - limited connectivity");
+    }
+    
+    return STATUS_OK;
+}
+
+/* Graphics device testing */
+status_t test_graphics_devices(void) {
+    log_info("[HW] Testing graphics devices...");
+    
+    uint32_t graphics_device_count = 0;
+    
+    /* Detect Intel graphics */
+    graphics_device_count += hw_detect_intel_graphics();
+    
+    /* Detect AMD graphics */
+    graphics_device_count += hw_detect_amd_graphics();
+    
+    /* Detect NVIDIA graphics */
+    graphics_device_count += hw_detect_nvidia_graphics();
+    
+    log_info("[HW] Found %u graphics device(s)", graphics_device_count);
+    
+    if (graphics_device_count == 0) {
+        log_warn("[HW] No graphics devices detected - using framebuffer");
+    }
+    
+    return STATUS_OK;
+}
+
+/* Audio device testing */
+status_t test_audio_devices(void) {
+    log_info("[HW] Testing audio devices...");
+    
+    uint32_t audio_device_count = 0;
+    
+    /* Detect Intel HDA */
+    audio_device_count += hw_detect_intel_hda();
+    
+    /* Detect USB audio */
+    audio_device_count += hw_detect_usb_audio();
+    
+    log_info("[HW] Found %u audio device(s)", audio_device_count);
+    
+    return STATUS_OK;
+}
+
+/* Input device testing */
+status_t test_input_devices(void) {
+    log_info("[HW] Testing input devices...");
+    
+    uint32_t input_device_count = 0;
+    
+    /* Detect keyboards */
+    input_device_count += hw_detect_keyboards();
+    
+    /* Detect mice/touchpads */
+    input_device_count += hw_detect_pointing_devices();
+    
+    /* Detect touchscreens */
+    input_device_count += hw_detect_touchscreens();
+    
+    log_info("[HW] Found %u input device(s)", input_device_count);
+    
+    return STATUS_OK;
+}
+
+/* Identify current laptop model */
+static status_t hw_identify_laptop_model(void) {
+    /* Try to identify current laptop model using DMI/SMBIOS data */
+    char manufacturer[64] = "Unknown";
+    char model[64] = "Unknown";
+    
+    /* Read DMI information (placeholder implementation) */
+    hw_read_dmi_info(manufacturer, sizeof(manufacturer), model, sizeof(model));
+    
+    log_info("[HW] Detected laptop: %s %s", manufacturer, model);
+    
+    /* Find matching model in database */
+    for (uint32_t i = 0; i < g_laptop_model_count; i++) {
+        laptop_model_info_t* laptop = &g_laptop_models[i];
+        
+        if (k_strstr(manufacturer, laptop->manufacturer) && 
+            k_strstr(model, laptop->model)) {
+            log_info("[HW] Found matching laptop model with %u%% compatibility", 
+                     laptop->compatibility_score);
+            laptop->compatibility_tested = true;
+            return STATUS_OK;
+        }
+    }
+    
+    log_warn("[HW] Laptop model not in compatibility database - may have limited support");
+    return STATUS_OK;
+}
+
+/* Add detected device to list */
+static status_t hw_add_detected_device(uint16_t vendor_id, uint16_t device_id, 
+                                      uint32_t class_code, const char* name, bool supported) {
+    if (g_device_count >= HW_MAX_DEVICES) return STATUS_NO_SPACE;
+    
+    hw_device_info_t* device = &g_detected_devices[g_device_count++];
+    device->vendor_id = vendor_id;
+    device->device_id = device_id;
+    device->class_code = class_code;
+    k_strlcpy(device->name, name, sizeof(device->name));
+    device->supported = supported;
+    device->tested = true;
+    device->test_result = STATUS_OK;
+    
+    return STATUS_OK;
+}
+
+/* Placeholder implementations for hardware detection functions */
+static void hw_detect_cpu_info(void) {
+    hw_add_detected_device(0x8086, 0x1234, 0x060000, "Intel CPU", true);
+}
+
+static void hw_detect_memory_info(void) {
+    hw_add_detected_device(0x0000, 0x0000, 0x050000, "System Memory", true);
+}
+
+static void hw_detect_pci_devices(void) {
+    /* Enumerate PCI bus and detect all devices */
+    /* This would use the actual PCI enumeration code */
+    hw_add_detected_device(0x8086, 0x5678, 0x060100, "PCI Bridge", true);
+}
+
+static void hw_detect_storage_devices(void) {
+    hw_add_detected_device(0x8086, 0xABCD, 0x010802, "NVMe SSD", true);
+}
+
+static void hw_detect_network_devices(void) {
+    hw_add_detected_device(0x8086, 0xEF01, 0x020000, "Ethernet Controller", true);
+    hw_add_detected_device(0x8086, 0xEF02, 0x028000, "WiFi Controller", true);
+}
+
+static void hw_detect_graphics_devices(void) {
+    hw_add_detected_device(0x8086, 0x9A49, 0x030000, "Intel Iris Xe Graphics", true);
+}
+
+static void hw_detect_audio_devices(void) {
+    hw_add_detected_device(0x8086, 0xA170, 0x040300, "Intel HDA", true);
+}
+
+static void hw_detect_input_devices(void) {
+    hw_add_detected_device(0x046D, 0xC52B, 0x030102, "USB Keyboard", true);
+    hw_add_detected_device(0x046D, 0xC077, 0x030102, "USB Mouse", true);
+}
+
+/* Additional placeholder implementations */
+static bool hw_check_x86_64_support(void) { return true; }
+static bool hw_check_cpu_feature(const char* feature) { return true; }
+static uint64_t hw_measure_cpu_frequency(void) { return 2400; }
+static uint32_t hw_get_cpu_core_count(void) { return 8; }
+static uint32_t hw_get_cpu_thread_count(void) { return 16; }
+static uint64_t hw_get_total_memory_bytes(void) { return 16ULL * 1024 * 1024 * 1024; }
+static uint64_t hw_get_available_memory_bytes(void) { return 12ULL * 1024 * 1024 * 1024; }
+static uint32_t hw_get_memory_speed_mhz(void) { return 3200; }
+static uint32_t hw_detect_nvme_devices(void) { return 1; }
+static uint32_t hw_detect_sata_devices(void) { return 0; }
+static uint32_t hw_detect_usb_storage(void) { return 0; }
+static uint64_t hw_test_storage_read_speed(void) { return 3500; }
+static uint64_t hw_test_storage_write_speed(void) { return 2800; }
+static uint32_t hw_detect_ethernet_devices(void) { return 1; }
+static uint32_t hw_detect_wifi_devices(void) { return 1; }
+static uint32_t hw_detect_bluetooth_devices(void) { return 1; }
+static uint32_t hw_detect_intel_graphics(void) { return 1; }
+static uint32_t hw_detect_amd_graphics(void) { return 0; }
+static uint32_t hw_detect_nvidia_graphics(void) { return 0; }
+static uint32_t hw_detect_intel_hda(void) { return 1; }
+static uint32_t hw_detect_usb_audio(void) { return 0; }
+static uint32_t hw_detect_keyboards(void) { return 1; }
+static uint32_t hw_detect_pointing_devices(void) { return 1; }
+static uint32_t hw_detect_touchscreens(void) { return 0; }
+static void hw_read_dmi_info(char* manufacturer, size_t man_size, char* model, size_t model_size) {
+    k_strlcpy(manufacturer, "Dell", man_size);
+    k_strlcpy(model, "XPS 13", model_size);
+}

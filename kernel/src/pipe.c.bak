@@ -1,0 +1,61 @@
+#include "pipe.h"
+#include "vmm.h"
+#include "kernel.h"
+
+int pipe_create(pipe_t** out_read, pipe_t** out_write) {
+    if (!out_read || !out_write) return -1;
+    pipe_t* p = (pipe_t*)vmm_kmalloc(sizeof(pipe_t), 32);
+    if (!p) return -1;
+    k_memset(p, 0, sizeof(pipe_t));
+    spinlock_init(&p->lock);
+    p->refcnt = 2; // one for read, one for write
+    *out_read = p;
+    *out_write = p;
+    return 0;
+}
+
+int pipe_read(pipe_t* p, void* buf, u32 len) {
+    if (!p || !buf || len == 0) return -1;
+    spin_lock(&p->lock);
+    u32 n = 0;
+    while (n < len && p->data_size > 0) {
+        ((u8*)buf)[n] = p->buf[p->read_pos];
+        p->read_pos = (p->read_pos + 1) % PIPE_BUF_SIZE;
+        p->data_size--;
+        n++;
+    }
+    spin_unlock(&p->lock);
+    return n;
+}
+
+int pipe_write(pipe_t* p, const void* buf, u32 len) {
+    if (!p || !buf || len == 0) return -1;
+    spin_lock(&p->lock);
+    u32 n = 0;
+    while (n < len && p->data_size < PIPE_BUF_SIZE) {
+        p->buf[p->write_pos] = ((const u8*)buf)[n];
+        p->write_pos = (p->write_pos + 1) % PIPE_BUF_SIZE;
+        p->data_size++;
+        n++;
+    }
+    spin_unlock(&p->lock);
+    return n;
+}
+
+int pipe_close_read(pipe_t* p) {
+    if (!p) return -1;
+    spin_lock(&p->lock);
+    p->closed_read = 1;
+    if (--p->refcnt == 0) vmm_kfree(p, sizeof(pipe_t));
+    spin_unlock(&p->lock);
+    return 0;
+}
+
+int pipe_close_write(pipe_t* p) {
+    if (!p) return -1;
+    spin_lock(&p->lock);
+    p->closed_write = 1;
+    if (--p->refcnt == 0) vmm_kfree(p, sizeof(pipe_t));
+    spin_unlock(&p->lock);
+    return 0;
+}

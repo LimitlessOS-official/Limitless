@@ -1,0 +1,643 @@
+/**
+ * Memory Compression Engine for LimitlessOS
+ * Advanced memory compression with multiple algorithms
+ */
+
+#include "kernel.h"
+#include "advanced_vmm.h"
+#include "security.h"
+#include "timer.h"
+
+/* Compression algorithm implementations */
+
+/* LZ4 Compression - Fast compression with good ratio */
+static size_t lz4_compress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    /* Simplified LZ4 implementation - in production use real LZ4 library */
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    size_t compressed_size = 0;
+    size_t pos = 0;
+    
+    if (dst_capacity < src_size / 2) {
+        return 0;  /* Not enough space */
+    }
+    
+    /* Simple run-length encoding as LZ4 placeholder */
+    while (pos < src_size && compressed_size < dst_capacity - 2) {
+        uint8_t current = src_ptr[pos];
+        uint8_t count = 1;
+        
+        /* Count consecutive bytes */
+        while (pos + count < src_size && src_ptr[pos + count] == current && count < 255) {
+            count++;
+        }
+        
+        if (count > 3 || current == 0) {
+            /* Store as run-length */
+            dst_ptr[compressed_size++] = 0xFF;  /* Escape byte */
+            dst_ptr[compressed_size++] = count;
+            dst_ptr[compressed_size++] = current;
+        } else {
+            /* Store literal bytes */
+            for (uint8_t i = 0; i < count; i++) {
+                dst_ptr[compressed_size++] = current;
+            }
+        }
+        
+        pos += count;
+    }
+    
+    return compressed_size;
+}
+
+static size_t lz4_decompress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    size_t decompressed_size = 0;
+    size_t pos = 0;
+    
+    while (pos < src_size && decompressed_size < dst_capacity) {
+        if (src_ptr[pos] == 0xFF && pos + 2 < src_size) {
+            /* Run-length encoded */
+            uint8_t count = src_ptr[pos + 1];
+            uint8_t value = src_ptr[pos + 2];
+            
+            for (uint8_t i = 0; i < count && decompressed_size < dst_capacity; i++) {
+                dst_ptr[decompressed_size++] = value;
+            }
+            
+            pos += 3;
+        } else {
+            /* Literal byte */
+            dst_ptr[decompressed_size++] = src_ptr[pos];
+            pos++;
+        }
+    }
+    
+    return decompressed_size;
+}
+
+/* ZSTD Compression - High compression ratio */
+static size_t zstd_compress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    /* Simplified ZSTD implementation - better compression than LZ4 */
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    
+    if (dst_capacity < src_size / 3) {
+        return 0;  /* Not enough space */
+    }
+    
+    /* Simple dictionary-based compression */
+    uint8_t dict[256] = {0};
+    size_t compressed_size = 0;
+    size_t pos = 0;
+    
+    /* Build frequency table */
+    for (size_t i = 0; i < src_size; i++) {
+        dict[src_ptr[i]]++;
+    }
+    
+    /* Simple Huffman-like encoding */
+    while (pos < src_size && compressed_size < dst_capacity - 1) {
+        uint8_t current = src_ptr[pos];
+        
+        if (dict[current] > 4) {
+            /* High frequency byte - encode with single bit */
+            dst_ptr[compressed_size++] = current | 0x80;
+        } else {
+            /* Low frequency - store as is */
+            dst_ptr[compressed_size++] = current;
+        }
+        
+        pos++;
+    }
+    
+    return compressed_size > src_size ? 0 : compressed_size;
+}
+
+static size_t zstd_decompress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    size_t decompressed_size = 0;
+    size_t pos = 0;
+    
+    while (pos < src_size && decompressed_size < dst_capacity) {
+        uint8_t current = src_ptr[pos];
+        
+        if (current & 0x80) {
+            /* Encoded byte */
+            dst_ptr[decompressed_size++] = current & 0x7F;
+        } else {
+            /* Literal byte */
+            dst_ptr[decompressed_size++] = current;
+        }
+        
+        pos++;
+    }
+    
+    return decompressed_size;
+}
+
+/* LZO Compression - Very fast compression */
+static size_t lzo_compress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    /* Simplified LZO - fastest compression */
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    
+    if (dst_capacity < src_size) {
+        return 0;
+    }
+    
+    /* Simple pattern matching */
+    size_t compressed_size = 0;
+    size_t pos = 0;
+    
+    while (pos < src_size && compressed_size < dst_capacity - 4) {
+        /* Look for 4-byte patterns */
+        uint32_t pattern = *(uint32_t*)&src_ptr[pos];
+        bool found_match = false;
+        
+        /* Search backward for matches */
+        for (size_t back = 1; back <= 64 && back <= pos; back++) {
+            if (*(uint32_t*)&src_ptr[pos - back] == pattern) {
+                /* Encode match: distance (1 byte) + length (1 byte) */
+                dst_ptr[compressed_size++] = 0xFF;  /* Match marker */
+                dst_ptr[compressed_size++] = (uint8_t)back;
+                dst_ptr[compressed_size++] = 4;  /* Length */
+                pos += 4;
+                found_match = true;
+                break;
+            }
+        }
+        
+        if (!found_match) {
+            /* Literal byte */
+            dst_ptr[compressed_size++] = src_ptr[pos];
+            pos++;
+        }
+    }
+    
+    return compressed_size;
+}
+
+static size_t lzo_decompress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    size_t decompressed_size = 0;
+    size_t pos = 0;
+    
+    while (pos < src_size && decompressed_size < dst_capacity) {
+        if (src_ptr[pos] == 0xFF && pos + 2 < src_size) {
+            /* Match encoding */
+            uint8_t distance = src_ptr[pos + 1];
+            uint8_t length = src_ptr[pos + 2];
+            
+            /* Copy from backward reference */
+            for (uint8_t i = 0; i < length && decompressed_size < dst_capacity; i++) {
+                if (decompressed_size >= distance) {
+                    dst_ptr[decompressed_size] = dst_ptr[decompressed_size - distance];
+                    decompressed_size++;
+                }
+            }
+            
+            pos += 3;
+        } else {
+            /* Literal byte */
+            dst_ptr[decompressed_size++] = src_ptr[pos];
+            pos++;
+        }
+    }
+    
+    return decompressed_size;
+}
+
+/* Deflate Compression - Balanced compression */
+static size_t deflate_compress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    /* Simplified deflate implementation */
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    
+    if (dst_capacity < src_size / 2) {
+        return 0;
+    }
+    
+    /* Huffman-like encoding with sliding window */
+    size_t compressed_size = 0;
+    size_t pos = 0;
+    uint8_t window[256] = {0};
+    uint8_t window_pos = 0;
+    
+    while (pos < src_size && compressed_size < dst_capacity - 3) {
+        uint8_t current = src_ptr[pos];
+        
+        /* Check if byte is in recent window */
+        bool in_window = false;
+        for (uint8_t i = 0; i < 32; i++) {
+            if (window[i] == current) {
+                in_window = true;
+                break;
+            }
+        }
+        
+        if (in_window) {
+            /* Encode as reference */
+            dst_ptr[compressed_size++] = 0xFE;
+            dst_ptr[compressed_size++] = current;
+        } else {
+            /* Literal encoding */
+            dst_ptr[compressed_size++] = current;
+            window[window_pos++ % 32] = current;
+        }
+        
+        pos++;
+    }
+    
+    return compressed_size;
+}
+
+static size_t deflate_decompress(const void* src, void* dst, size_t src_size, size_t dst_capacity) {
+    const uint8_t* src_ptr = (const uint8_t*)src;
+    uint8_t* dst_ptr = (uint8_t*)dst;
+    size_t decompressed_size = 0;
+    size_t pos = 0;
+    
+    while (pos < src_size && decompressed_size < dst_capacity) {
+        if (src_ptr[pos] == 0xFE && pos + 1 < src_size) {
+            /* Reference encoding */
+            dst_ptr[decompressed_size++] = src_ptr[pos + 1];
+            pos += 2;
+        } else {
+            /* Literal byte */
+            dst_ptr[decompressed_size++] = src_ptr[pos];
+            pos++;
+        }
+    }
+    
+    return decompressed_size;
+}
+
+/* Compression algorithm function tables */
+typedef struct {
+    size_t (*compress)(const void*, void*, size_t, size_t);
+    size_t (*decompress)(const void*, void*, size_t, size_t);
+    const char* name;
+    uint32_t speed_rating;      /* 1-10, higher = faster */
+    uint32_t compression_rating; /* 1-10, higher = better compression */
+} compression_algorithm_t;
+
+static const compression_algorithm_t compression_algorithms[COMPRESSION_ALGORITHM_COUNT] = {
+    { lz4_compress,     lz4_decompress,     "LZ4",     9, 6 },
+    { zstd_compress,    zstd_decompress,    "ZSTD",    6, 8 },
+    { lzo_compress,     lzo_decompress,     "LZO",    10, 4 },
+    { deflate_compress, deflate_decompress, "Deflate", 7, 7 }
+};
+
+/* Initialize compression system */
+status_t memory_compression_init(void) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    memory_compression_t* comp = &g_advanced_vmm.compression;
+    
+    k_memset(comp, 0, sizeof(memory_compression_t));
+    spinlock_init(&comp->lock);
+    
+    /* Set default configuration */
+    comp->enabled = true;
+    comp->algorithm = COMPRESSION_LZ4;  /* Default to LZ4 for speed */
+    comp->compression_threshold = PAGE_SIZE;  /* Compress pages >= 4KB */
+    comp->target_ratio_percent = 400;   /* Target 4:1 compression */
+    
+    /* Initialize statistics */
+    comp->pages_compressed = 0;
+    comp->pages_decompressed = 0;
+    comp->compression_failures = 0;
+    comp->total_original_size = 0;
+    comp->total_compressed_size = 0;
+    comp->compression_time_ns = 0;
+    comp->decompression_time_ns = 0;
+    
+    console_printf("Memory compression initialized (algorithm: %s)\n", 
+                  compression_algorithms[comp->algorithm].name);
+    
+    return STATUS_OK;
+}
+
+/* Configure compression settings */
+status_t memory_compression_configure(compression_algorithm_e algorithm, 
+                                    uint32_t threshold, 
+                                    uint32_t target_ratio_percent) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!g_advanced_vmm.initialized || algorithm >= COMPRESSION_ALGORITHM_COUNT) {
+        return STATUS_ERROR;
+    }
+    
+    memory_compression_t* comp = &g_advanced_vmm.compression;
+    
+    spin_lock(&comp->lock);
+    
+    comp->algorithm = algorithm;
+    comp->compression_threshold = threshold;
+    comp->target_ratio_percent = target_ratio_percent;
+    
+    spin_unlock(&comp->lock);
+    
+    console_printf("Compression configured: %s, threshold: %u, target: %u%%\n",
+                  compression_algorithms[algorithm].name, threshold, target_ratio_percent);
+    
+    return STATUS_OK;
+}
+
+/* Compress memory page */
+status_t memory_compress_page(void* page_addr, void** compressed_data, size_t* compressed_size) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!page_addr || !compressed_data || !compressed_size) {
+        return STATUS_ERROR;
+    }
+    
+    memory_compression_t* comp = &g_advanced_vmm.compression;
+    
+    if (!comp->enabled) {
+        return STATUS_ERROR;
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    /* Allocate compression buffer */
+    void* comp_buffer = k_malloc(PAGE_SIZE);
+    if (!comp_buffer) {
+        spin_lock(&comp->lock);
+        comp->compression_failures++;
+        spin_unlock(&comp->lock);
+        return STATUS_ERROR;
+    }
+    
+    /* Perform compression */
+    const compression_algorithm_t* alg = &compression_algorithms[comp->algorithm];
+    size_t result_size = alg->compress(page_addr, comp_buffer, PAGE_SIZE, PAGE_SIZE);
+    
+    if (result_size == 0 || result_size >= PAGE_SIZE) {
+        /* Compression failed or not beneficial */
+        k_free(comp_buffer);
+        
+        spin_lock(&comp->lock);
+        comp->compression_failures++;
+        spin_unlock(&comp->lock);
+        
+        return STATUS_ERROR;
+    }
+    
+    /* Compression successful */
+    uint64_t compression_time = timer_get_ticks() - start_time;
+    
+    *compressed_data = comp_buffer;
+    *compressed_size = result_size;
+    
+    /* Update statistics */
+    spin_lock(&comp->lock);
+    
+    comp->pages_compressed++;
+    comp->total_original_size += PAGE_SIZE;
+    comp->total_compressed_size += result_size;
+    comp->compression_time_ns += (compression_time * 1000000) / TIMER_HZ;
+    
+    /* Update ratio statistics */
+    uint32_t ratio = (PAGE_SIZE * 100) / result_size;
+    if (ratio > comp->best_ratio_percent) {
+        comp->best_ratio_percent = ratio;
+    }
+    if (comp->worst_ratio_percent == 0 || ratio < comp->worst_ratio_percent) {
+        comp->worst_ratio_percent = ratio;
+    }
+    
+    spin_unlock(&comp->lock);
+    
+    return STATUS_OK;
+}
+
+/* Decompress memory page */
+status_t memory_decompress_page(const void* compressed_data, size_t compressed_size, void* page_addr) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!compressed_data || !page_addr || compressed_size == 0) {
+        return STATUS_ERROR;
+    }
+    
+    memory_compression_t* comp = &g_advanced_vmm.compression;
+    
+    if (!comp->enabled) {
+        return STATUS_ERROR;
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    /* Perform decompression */
+    const compression_algorithm_t* alg = &compression_algorithms[comp->algorithm];
+    size_t result_size = alg->decompress(compressed_data, page_addr, compressed_size, PAGE_SIZE);
+    
+    if (result_size != PAGE_SIZE) {
+        /* Decompression failed */
+        return STATUS_ERROR;
+    }
+    
+    /* Decompression successful */
+    uint64_t decompression_time = timer_get_ticks() - start_time;
+    
+    /* Update statistics */
+    spin_lock(&comp->lock);
+    
+    comp->pages_decompressed++;
+    comp->decompression_time_ns += (decompression_time * 1000000) / TIMER_HZ;
+    
+    spin_unlock(&comp->lock);
+    
+    return STATUS_OK;
+}
+
+/* Get compression statistics */
+status_t memory_get_compression_stats(compression_stats_t* stats) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!stats) {
+        return STATUS_ERROR;
+    }
+    
+    memory_compression_t* comp = &g_advanced_vmm.compression;
+    
+    spin_lock(&comp->lock);
+    
+    k_memset(stats, 0, sizeof(compression_stats_t));
+    
+    stats->enabled = comp->enabled;
+    stats->algorithm = comp->algorithm;
+    stats->compression_threshold = comp->compression_threshold;
+    stats->target_ratio_percent = comp->target_ratio_percent;
+    
+    stats->pages_compressed = comp->pages_compressed;
+    stats->pages_decompressed = comp->pages_decompressed;
+    stats->compression_failures = comp->compression_failures;
+    
+    stats->total_original_size = comp->total_original_size;
+    stats->total_compressed_size = comp->total_compressed_size;
+    
+    if (comp->total_original_size > 0) {
+        stats->average_ratio_percent = (comp->total_original_size * 100) / comp->total_compressed_size;
+        stats->space_saved_bytes = comp->total_original_size - comp->total_compressed_size;
+    }
+    
+    stats->best_ratio_percent = comp->best_ratio_percent;
+    stats->worst_ratio_percent = comp->worst_ratio_percent;
+    
+    if (comp->pages_compressed > 0) {
+        stats->average_compression_time_ns = comp->compression_time_ns / comp->pages_compressed;
+    }
+    
+    if (comp->pages_decompressed > 0) {
+        stats->average_decompression_time_ns = comp->decompression_time_ns / comp->pages_decompressed;
+    }
+    
+    /* Calculate success rate */
+    uint64_t total_attempts = comp->pages_compressed + comp->compression_failures;
+    if (total_attempts > 0) {
+        stats->success_rate_percent = (comp->pages_compressed * 100) / total_attempts;
+    }
+    
+    spin_unlock(&comp->lock);
+    
+    return STATUS_OK;
+}
+
+/* Auto-tune compression algorithm based on workload */
+status_t memory_compression_auto_tune(void) {
+    extern advanced_vmm_t g_advanced_vmm;
+    memory_compression_t* comp = &g_advanced_vmm.compression;
+    
+    if (!comp->enabled) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Auto-tuning memory compression...\n");
+    
+    compression_stats_t stats;
+    if (memory_get_compression_stats(&stats) != STATUS_OK) {
+        return STATUS_ERROR;
+    }
+    
+    /* Determine optimal algorithm based on performance */
+    compression_algorithm_e best_algorithm = comp->algorithm;
+    uint32_t best_score = 0;
+    
+    for (uint32_t i = 0; i < COMPRESSION_ALGORITHM_COUNT; i++) {
+        const compression_algorithm_t* alg = &compression_algorithms[i];
+        
+        /* Score based on speed and compression ratio */
+        uint32_t speed_weight = 60;  /* 60% weight on speed */
+        uint32_t ratio_weight = 40;  /* 40% weight on compression */
+        
+        uint32_t score = (alg->speed_rating * speed_weight + 
+                         alg->compression_rating * ratio_weight) / 100;
+        
+        if (score > best_score) {
+            best_score = score;
+            best_algorithm = (compression_algorithm_e)i;
+        }
+        
+        console_printf("  %s: speed=%u, ratio=%u, score=%u\n",
+                      alg->name, alg->speed_rating, alg->compression_rating, score);
+    }
+    
+    /* Switch to best algorithm if different */
+    if (best_algorithm != comp->algorithm) {
+        console_printf("Switching compression algorithm: %s -> %s\n",
+                      compression_algorithms[comp->algorithm].name,
+                      compression_algorithms[best_algorithm].name);
+        
+        spin_lock(&comp->lock);
+        comp->algorithm = best_algorithm;
+        spin_unlock(&comp->lock);
+    } else {
+        console_printf("Current algorithm %s is optimal\n",
+                      compression_algorithms[comp->algorithm].name);
+    }
+    
+    /* Adjust threshold based on success rate */
+    if (stats.success_rate_percent < 50) {
+        /* Low success rate - increase threshold */
+        uint32_t new_threshold = comp->compression_threshold * 2;
+        if (new_threshold <= PAGE_SIZE * 4) {
+            console_printf("Increasing compression threshold: %u -> %u\n",
+                          comp->compression_threshold, new_threshold);
+            
+            spin_lock(&comp->lock);
+            comp->compression_threshold = new_threshold;
+            spin_unlock(&comp->lock);
+        }
+    } else if (stats.success_rate_percent > 90 && comp->compression_threshold > PAGE_SIZE) {
+        /* High success rate - decrease threshold */
+        uint32_t new_threshold = comp->compression_threshold / 2;
+        console_printf("Decreasing compression threshold: %u -> %u\n",
+                      comp->compression_threshold, new_threshold);
+        
+        spin_lock(&comp->lock);
+        comp->compression_threshold = new_threshold;
+        spin_unlock(&comp->lock);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Dump compression statistics */
+status_t memory_dump_compression_stats(void) {
+    compression_stats_t stats;
+    
+    if (memory_get_compression_stats(&stats) != STATUS_OK) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("=== Memory Compression Statistics ===\n");
+    console_printf("Enabled: %s\n", stats.enabled ? "Yes" : "No");
+    console_printf("Algorithm: %s\n", compression_algorithms[stats.algorithm].name);
+    console_printf("Threshold: %u bytes\n", stats.compression_threshold);
+    console_printf("Target Ratio: %u%%\n", stats.target_ratio_percent);
+    
+    console_printf("\nActivity:\n");
+    console_printf("  Pages Compressed: %llu\n", stats.pages_compressed);
+    console_printf("  Pages Decompressed: %llu\n", stats.pages_decompressed);
+    console_printf("  Compression Failures: %llu\n", stats.compression_failures);
+    console_printf("  Success Rate: %u%%\n", stats.success_rate_percent);
+    
+    console_printf("\nCompression Ratios:\n");
+    console_printf("  Average: %u:1 (%u%%)\n", 
+                  stats.average_ratio_percent / 100, stats.average_ratio_percent);
+    console_printf("  Best: %u:1 (%u%%)\n", 
+                  stats.best_ratio_percent / 100, stats.best_ratio_percent);
+    console_printf("  Worst: %u:1 (%u%%)\n", 
+                  stats.worst_ratio_percent / 100, stats.worst_ratio_percent);
+    
+    console_printf("\nSpace Savings:\n");
+    console_printf("  Original Size: %llu MB\n", stats.total_original_size / (1024 * 1024));
+    console_printf("  Compressed Size: %llu MB\n", stats.total_compressed_size / (1024 * 1024));
+    console_printf("  Space Saved: %llu MB\n", stats.space_saved_bytes / (1024 * 1024));
+    
+    console_printf("\nPerformance:\n");
+    console_printf("  Average Compression Time: %llu ns\n", stats.average_compression_time_ns);
+    console_printf("  Average Decompression Time: %llu ns\n", stats.average_decompression_time_ns);
+    
+    /* Algorithm comparison */
+    console_printf("\nAlgorithm Comparison:\n");
+    for (uint32_t i = 0; i < COMPRESSION_ALGORITHM_COUNT; i++) {
+        const compression_algorithm_t* alg = &compression_algorithms[i];
+        console_printf("  %s: Speed=%u/10, Compression=%u/10%s\n",
+                      alg->name, alg->speed_rating, alg->compression_rating,
+                      (i == stats.algorithm) ? " (CURRENT)" : "");
+    }
+    
+    console_printf("=== End Compression Statistics ===\n");
+    
+    return STATUS_OK;
+}

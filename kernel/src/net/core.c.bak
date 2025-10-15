@@ -1,0 +1,244 @@
+
+#if 0 /* disabled: legacy net/core.c conflicts with net_core.c */
+
+#endif
+#include "net/net.h"
+#include "net/ipv4.h"
+#include "net/arp.h"
+#include "net/icmp.h"
+#include "net/udp.h"
+#include "net/tcp.h"
+#include "kernel.h"
+#include <vmm.h>
+
+#define MAX_IFS 8
+#define MAX_SOCK 256
+
+static net_if_t* g_ifs[MAX_IFS];
+static u32 g_if_count = 0;
+
+/* Socket table */
+typedef enum { ST_NONE=0, ST_DGRAM=1, ST_STREAM=2, ST_RAW=3 } socktype_t;
+typedef struct {
+    int in_use;
+    int domain;
+    int type;
+    int proto;
+    int nonblock;
+    /* UDP/TCP state */
+    in_addr_t laddr;
+    in_port_t lport;
+} socket_ent_t;
+
+static socket_ent_t g_socks[MAX_SOCK];
+
+static spinlock_t g_sock_lock;
+
+static u32 g_if_next_index = 1;
+
+static net_if_t g_lo; /* loopback */
+
+static void loopback_setup(void);
+
+void net_init(void) {
+    for (u32 i=0;i<MAX_IFS;i++) g_ifs[i]=NULL;
+    spinlock_init(&g_sock_lock);
+    for (u32 i=0;i<MAX_SOCK;i++) g_socks[i].in_use=0;
+
+    ipv4_init();
+    arp_init();
+    icmp_init();
+    udp_init();
+    tcp_init();
+
+    loopback_setup();
+}
+
+net_if_t* net_if_first(void) {
+    for (u32 i=0;i<g_if_count;i++) {
+        if (g_ifs[i]) return g_ifs[i];
+    }
+    return NULL;
+}
+
+int net_if_register(net_if_t* nif) {
+    if (g_if_count >= MAX_IFS) return K_EBUSY;
+    nif->ifindex = g_if_next_index++;
+    g_ifs[g_if_count++] = nif;
+    return 0;
+}
+
+net_if_t* net_if_get_loopback(void) { return &g_lo; }
+
+net_if_t* net_if_by_index(u32 ifindex) {
+    for (u32 i=0;i<g_if_count;i++) if (g_ifs[i]->ifindex == ifindex) return g_ifs[i];
+    return NULL;
+}
+
+net_buf_t* net_buf_alloc(u32 size, u32 headroom) {
+    u32 cap = size + headroom + 64;
+    u8* mem = (u8*)vmm_kmalloc(cap, 64);
+    if (!mem) return NULL;
+    net_buf_t* b = (net_buf_t*)vmm_kmalloc(sizeof(net_buf_t), 64);
+    if (!b) { vmm_kfree(mem, cap); return NULL; }
+    b->data = mem + headroom;
+    b->len = 0;
+    b->cap = cap - headroom;
+    b->headroom = headroom;
+    b->tailroom = cap - headroom;
+    return b;
+}
+void net_buf_free(net_buf_t* b) {
+    if (!b) return;
+    u8* base = b->data - b->headroom;
+    u32 cap = b->cap + b->headroom;
+    vmm_kfree(base, cap);
+    vmm_kfree(b, sizeof(*b));
+}
+int net_buf_reserve_head(net_buf_t* b, u32 bytes) {
+    if (b->headroom < bytes) return K_EINVAL;
+    b->data -= bytes;
+    b->len += bytes;
+    b->headroom -= bytes;
+    return 0;
+}
+int net_buf_push(net_buf_t* b, const void* data, u32 len) {
+    if (b->tailroom < len) return K_EINVAL;
+    k_memcpy(b->data + b->len, data, len);
+    b->len += len;
+    b->tailroom -= len;
+    return 0;
+}
+u8* net_buf_push_uninit(net_buf_t* b, u32 len) {
+    if (b->tailroom < len) return NULL;
+    u8* p = b->data + b->len;
+    b->len += len;
+    b->tailroom -= len;
+    return p;
+}
+int net_buf_trim_head(net_buf_t* b, u32 len) {
+    if (b->len < len) return K_EINVAL;
+    b->data += len;
+    b->len -= len;
+    b->headroom += len;
+    return 0;
+}
+
+/* Ethernet dispatch (drivers pass raw L2 where applicable).
+ * For loopback, we skip L2 and directly pass to IPv4. */
+void net_ingress(net_if_t* nif, net_buf_t* buf) {
+    /* For loopback: expect payload as IPv4 packet already */
+    ipv4_input(nif, buf);
+}
+
+/* Socket helpers */
+static int sock_alloc_locked(void) {
+    for (int i=0;i<MAX_SOCK;i++) {
+        if (!g_socks[i].in_use) {
+            g_socks[i].in_use = 1;
+            g_socks[i].domain = AF_UNSPEC;
+            g_socks[i].type = 0;
+            g_socks[i].proto = 0;
+            g_socks[i].nonblock = 0;
+            g_socks[i].laddr.s_addr = 0;
+            g_socks[i].lport = 0;
+            return i;
+        }
+    }
+    return -1;
+}
+static socket_ent_t* sock_get(sock_t s) {
+    if (s >= MAX_SOCK) return NULL;
+    if (!g_socks[s].in_use) return NULL;
+    return &g_socks[s];
+}
+
+int sock_create(int domain, int type, int proto, sock_t* out) {
+    if (!out) return K_EINVAL;
+    spin_lock(&g_sock_lock);
+    int idx = sock_alloc_locked();
+    spin_unlock(&g_sock_lock);
+    if (idx < 0) return K_EBUSY;
+    g_socks[idx].domain = domain;
+    g_socks[idx].type = type;
+    g_socks[idx].proto = proto;
+    *out = (sock_t)idx;
+    return 0;
+}
+
+int sock_close(sock_t s) {
+    spin_lock(&g_sock_lock);
+    if (s >= MAX_SOCK || !g_socks[s].in_use) { spin_unlock(&g_sock_lock); return K_EINVAL; }
+    g_socks[s].in_use = 0;
+    spin_unlock(&g_sock_lock);
+    return 0;
+}
+
+int sock_bind(sock_t s, const void* addr, u32 addrlen) {
+    socket_ent_t* se = sock_get(s);
+    if (!se) return K_EINVAL;
+    if (se->domain == AF_INET) {
+        if (!addr || addrlen < sizeof(sockaddr_in_t)) return K_EINVAL;
+        const sockaddr_in_t* in = (const sockaddr_in_t*)addr;
+        se->laddr = in->sin_addr;
+        se->lport = in->sin_port;
+        if (se->type == SOCK_DGRAM) return udp_bind(s, in);
+        if (se->type == SOCK_STREAM) return tcp_bind(s, addr, addrlen);
+        return 0;
+    }
+    return K_ENOTSUP;
+}
+
+int sock_sendto(sock_t s, const void* buf, u32 len, u32 flags, const void* dest_addr, u32 addrlen) {
+    (void)flags;
+    socket_ent_t* se = sock_get(s);
+    if (!se) return K_EINVAL;
+    if (se->domain == AF_INET && se->type == SOCK_DGRAM) {
+        return udp_send(s, buf, len, (const sockaddr_in_t*)dest_addr);
+    }
+    if (se->domain == AF_INET && se->type == SOCK_STREAM) {
+        return tcp_send(s, buf, len);
+    }
+    return K_ENOTSUP;
+}
+
+int sock_recvfrom(sock_t s, void* buf, u32 len, u32 flags, void* src_addr, u32* addrlen) {
+    (void)flags; (void)src_addr; (void)addrlen;
+    socket_ent_t* se = sock_get(s);
+    if (!se) return K_EINVAL;
+    if (se->domain == AF_INET && se->type == SOCK_DGRAM) {
+        extern int udp_recvfrom(sock_t s, void* buf, u32 len, u32* src_ip_be, u16* src_port_be);
+        return udp_recvfrom(s, buf, len, (u32*)src_addr, (u16*)addrlen);
+    }
+    if (se->domain == AF_INET && se->type == SOCK_STREAM) {
+        return tcp_recv(s, buf, len);
+    }
+    return K_ENOTSUP;
+}
+
+int sock_set_nonblock(sock_t s, int nonblock) {
+    socket_ent_t* se = sock_get(s);
+    if (!se) return K_EINVAL;
+    se->nonblock = (nonblock != 0);
+    return 0;
+}
+
+/* Loopback device implementation */
+static int lo_xmit(net_if_t* nif, net_buf_t* buf, u16 ethertype, const u8 dst_mac[6]) {
+    (void)nif; (void)ethertype; (void)dst_mac;
+    /* For loopback, assume buf contains IPv4 payload; send directly to ingress */
+    net_ingress(&g_lo, buf);
+    return 0;
+}
+static void loopback_setup(void) {
+    k_memset(&g_lo, 0, sizeof(g_lo));
+    g_lo.name[0]='l'; g_lo.name[1]='o'; g_lo.name[2]=0;
+    g_lo.mtu = 65535;
+    g_lo.flags = NETIF_UP | NETIF_LOOPBACK;
+    g_lo.ops.xmit = lo_xmit;
+    g_lo.ops.poll = NULL;
+    g_lo.ipv4_addr.s_addr = (in_addr_t){ .s_addr = 0x0100007F };
+    g_lo.ipv4_netmask.s_addr = (in_addr_t){ .s_addr = 0x000000FF };
+    g_lo.ipv4_gateway.s_addr = (in_addr_t){ .s_addr = 0 };
+    net_if_register(&g_lo);
+}

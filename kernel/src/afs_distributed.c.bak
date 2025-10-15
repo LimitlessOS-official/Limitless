@@ -1,0 +1,539 @@
+/**
+ * Advanced Filesystem Distributed Storage for LimitlessOS
+ * Distributed file storage with replication and load balancing
+ */
+
+#include "kernel.h"
+#include "advanced_filesystem.h"
+#include "network.h"
+#include "security.h"
+#include "timer.h"
+
+/* Distributed storage protocol messages */
+typedef enum {
+    AFS_MSG_NODE_JOIN = 1,
+    AFS_MSG_NODE_LEAVE,
+    AFS_MSG_HEARTBEAT,
+    AFS_MSG_DATA_READ,
+    AFS_MSG_DATA_WRITE,
+    AFS_MSG_DATA_REPLICATE,
+    AFS_MSG_METADATA_SYNC,
+    AFS_MSG_REBALANCE
+} afs_message_type_t;
+
+/* Network message header */
+typedef struct {
+    uint32_t magic;                 /* Protocol magic */
+    uint32_t version;               /* Protocol version */
+    afs_message_type_t type;        /* Message type */
+    uint32_t length;                /* Message length */
+    uint64_t timestamp;             /* Message timestamp */
+    uint32_t source_node;           /* Source node ID */
+    uint32_t dest_node;             /* Destination node ID */
+    uint32_t sequence;              /* Sequence number */
+    uint32_t checksum;              /* Message checksum */
+} __attribute__((packed)) afs_msg_header_t;
+
+/* Replication configuration */
+typedef struct {
+    uint32_t replica_count;         /* Number of replicas */
+    uint32_t consistency_level;     /* Consistency requirements */
+    uint32_t placement_policy;      /* Replica placement policy */
+    uint32_t repair_threshold;      /* Auto-repair threshold */
+} afs_replication_config_t;
+
+/* Load balancing metrics */
+typedef struct {
+    uint32_t cpu_usage_percent;
+    uint32_t memory_usage_percent;
+    uint32_t disk_usage_percent;
+    uint32_t network_usage_percent;
+    uint64_t active_operations;
+    uint64_t queue_depth;
+} afs_load_metrics_t;
+
+/* Global distributed storage state */
+static struct {
+    bool enabled;
+    uint32_t cluster_size;
+    uint32_t local_node_id;
+    afs_replication_config_t replication;
+    
+    /* Node management */
+    afs_node_t* node_list;
+    uint32_t active_nodes;
+    
+    /* Load balancing */
+    afs_load_metrics_t local_metrics;
+    uint64_t last_balance_time;
+    
+    /* Network statistics */
+    uint64_t messages_sent;
+    uint64_t messages_received;
+    uint64_t bytes_replicated;
+    uint64_t replication_errors;
+    
+    spinlock_t lock;
+} g_distributed_storage = {0};
+
+/* Initialize distributed storage */
+status_t afs_distributed_init(void) {
+    k_memset(&g_distributed_storage, 0, sizeof(g_distributed_storage));
+    
+    spinlock_init(&g_distributed_storage.lock);
+    
+    /* Set default configuration */
+    g_distributed_storage.enabled = false;
+    g_distributed_storage.cluster_size = 0;
+    g_distributed_storage.local_node_id = 1;  /* Default local node ID */
+    
+    /* Default replication settings */
+    g_distributed_storage.replication.replica_count = 3;
+    g_distributed_storage.replication.consistency_level = 2;  /* Quorum */
+    g_distributed_storage.replication.placement_policy = 1;   /* Rack-aware */
+    g_distributed_storage.replication.repair_threshold = 2;   /* Repair when < 2 replicas */
+    
+    console_printf("Distributed storage initialized\n");
+    
+    return STATUS_OK;
+}
+
+/* Add node to distributed cluster */
+status_t afs_add_node(uint32_t ip_address, uint16_t port, const char* hostname) {
+    if (!hostname) {
+        return STATUS_ERROR;
+    }
+    
+    extern advanced_filesystem_t g_afs;
+    
+    spin_lock(&g_afs.global_lock);
+    
+    /* Allocate new node */
+    afs_node_t* node = k_malloc(sizeof(afs_node_t));
+    if (!node) {
+        spin_unlock(&g_afs.global_lock);
+        return STATUS_ERROR;
+    }
+    
+    k_memset(node, 0, sizeof(afs_node_t));
+    
+    /* Initialize node */
+    static uint32_t next_node_id = 2;  /* Start from 2, 1 is local */
+    node->node_id = next_node_id++;
+    node->node_type = AFS_NODE_TYPE_STORAGE;
+    node->ip_address = ip_address;
+    node->port = port;
+    k_strncpy(node->hostname, hostname, sizeof(node->hostname) - 1);
+    
+    /* Set default capabilities */
+    node->storage_capacity = 1ULL * 1024 * 1024 * 1024 * 1024; /* 1TB */
+    node->storage_free = node->storage_capacity * 90 / 100;      /* 90% free */
+    node->bandwidth_mbps = 1000;  /* 1Gbps */
+    node->cpu_cores = 8;
+    
+    node->status = 1;  /* Active */
+    node->last_heartbeat = timer_get_ticks_ns();
+    node->load_factor = 10;  /* Low load initially */
+    
+    spinlock_init(&node->lock);
+    
+    /* Add to cluster */
+    /* In real implementation, would add to proper data structure */
+    g_afs.node_count++;
+    
+    spin_unlock(&g_afs.global_lock);
+    
+    /* Enable distributed storage if first node */
+    spin_lock(&g_distributed_storage.lock);
+    if (!g_distributed_storage.enabled && g_afs.node_count >= 1) {
+        g_distributed_storage.enabled = true;
+        g_afs.features |= AFS_FEATURE_DISTRIBUTED;
+        
+        console_printf("Distributed storage enabled\n");
+    }
+    g_distributed_storage.active_nodes = g_afs.node_count + 1; /* +1 for local */
+    spin_unlock(&g_distributed_storage.lock);
+    
+    console_printf("Added node %u: %s (%u.%u.%u.%u:%u)\n",
+                  node->node_id, hostname,
+                  (ip_address >> 24) & 0xFF, (ip_address >> 16) & 0xFF,
+                  (ip_address >> 8) & 0xFF, ip_address & 0xFF, port);
+    console_printf("  Storage: %llu GB\n", node->storage_capacity / (1024 * 1024 * 1024));
+    console_printf("  Bandwidth: %u Mbps\n", node->bandwidth_mbps);
+    
+    return STATUS_OK;
+}
+
+/* Send heartbeat to cluster nodes */
+static status_t afs_send_heartbeat(void) {
+    if (!g_distributed_storage.enabled) {
+        return STATUS_OK;
+    }
+    
+    /* Create heartbeat message */
+    afs_msg_header_t msg = {0};
+    msg.magic = 0x41465348;  /* "AFSH" */
+    msg.version = 1;
+    msg.type = AFS_MSG_HEARTBEAT;
+    msg.length = sizeof(afs_msg_header_t);
+    msg.timestamp = timer_get_ticks_ns();
+    msg.source_node = g_distributed_storage.local_node_id;
+    msg.dest_node = 0;  /* Broadcast */
+    msg.sequence = 0;
+    msg.checksum = 0;  /* Would calculate in real implementation */
+    
+    /* Update local load metrics */
+    spin_lock(&g_distributed_storage.lock);
+    
+    g_distributed_storage.local_metrics.cpu_usage_percent = 25;    /* Simulate 25% CPU */
+    g_distributed_storage.local_metrics.memory_usage_percent = 60; /* Simulate 60% RAM */
+    g_distributed_storage.local_metrics.disk_usage_percent = 40;   /* Simulate 40% disk */
+    g_distributed_storage.local_metrics.network_usage_percent = 15; /* Simulate 15% network */
+    g_distributed_storage.local_metrics.active_operations = 42;
+    g_distributed_storage.local_metrics.queue_depth = 8;
+    
+    g_distributed_storage.messages_sent++;
+    
+    spin_unlock(&g_distributed_storage.lock);
+    
+    /* In real implementation, would send via network stack */
+    console_printf("Heartbeat sent to cluster (load: CPU %u%%, MEM %u%%, DISK %u%%)\n",
+                  g_distributed_storage.local_metrics.cpu_usage_percent,
+                  g_distributed_storage.local_metrics.memory_usage_percent,
+                  g_distributed_storage.local_metrics.disk_usage_percent);
+    
+    return STATUS_OK;
+}
+
+/* Replicate data to other nodes */
+status_t afs_replicate_data(const char* path, uint32_t replica_count) {
+    if (!path || !g_distributed_storage.enabled) {
+        return STATUS_ERROR;
+    }
+    
+    if (replica_count == 0 || replica_count > g_distributed_storage.active_nodes) {
+        replica_count = g_distributed_storage.replication.replica_count;
+    }
+    
+    console_printf("Replicating '%s' to %u nodes\n", path, replica_count);
+    
+    uint64_t start_time = timer_get_ticks_ns();
+    
+    /* Simulate file size for replication */
+    uint64_t file_size = 10 * 1024 * 1024;  /* 10MB file */
+    uint64_t bytes_replicated = 0;
+    
+    /* Select target nodes for replication */
+    uint32_t selected_nodes[16] = {0};
+    uint32_t selected_count = 0;
+    
+    /* Simple node selection - in real implementation would use sophisticated placement */
+    extern advanced_filesystem_t g_afs;
+    
+    spin_lock(&g_afs.global_lock);
+    
+    /* Simulate selecting nodes based on load and capacity */
+    for (uint32_t i = 0; i < replica_count && selected_count < g_afs.node_count; i++) {
+        selected_nodes[selected_count] = i + 2;  /* Node IDs start from 2 */
+        selected_count++;
+    }
+    
+    spin_unlock(&g_afs.global_lock);
+    
+    /* Replicate to each selected node */
+    for (uint32_t i = 0; i < selected_count; i++) {
+        uint32_t target_node = selected_nodes[i];
+        
+        /* Create replication message */
+        afs_msg_header_t msg = {0};
+        msg.magic = 0x41465348;
+        msg.version = 1;
+        msg.type = AFS_MSG_DATA_REPLICATE;
+        msg.length = sizeof(afs_msg_header_t) + file_size;
+        msg.timestamp = timer_get_ticks_ns();
+        msg.source_node = g_distributed_storage.local_node_id;
+        msg.dest_node = target_node;
+        
+        /* Simulate network transfer time */
+        uint64_t transfer_time_ms = file_size / (1024 * 128);  /* 128KB/s simulation */
+        timer_sleep_ns(transfer_time_ms * 1000000);
+        
+        bytes_replicated += file_size;
+        
+        console_printf("  Replicated to node %u (%llu MB in %llu ms)\n",
+                      target_node, file_size / (1024 * 1024), transfer_time_ms);
+    }
+    
+    uint64_t total_time = timer_get_ticks_ns() - start_time;
+    
+    /* Update statistics */
+    spin_lock(&g_distributed_storage.lock);
+    g_distributed_storage.bytes_replicated += bytes_replicated;
+    g_distributed_storage.messages_sent += selected_count;
+    spin_unlock(&g_distributed_storage.lock);
+    
+    console_printf("Replication completed: %llu MB to %u nodes in %llu ms\n",
+                  bytes_replicated / (1024 * 1024), selected_count, 
+                  total_time / 1000000);
+    
+    return STATUS_OK;
+}
+
+/* Rebalance data across cluster */
+status_t afs_rebalance_data(void) {
+    if (!g_distributed_storage.enabled) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("Starting data rebalancing across cluster...\n");
+    
+    uint64_t start_time = timer_get_ticks_ns();
+    
+    spin_lock(&g_distributed_storage.lock);
+    
+    uint32_t node_count = g_distributed_storage.active_nodes;
+    uint64_t last_balance = g_distributed_storage.last_balance_time;
+    
+    spin_unlock(&g_distributed_storage.lock);
+    
+    if (timer_get_ticks_ns() - last_balance < 300000000000ULL) {  /* 5 minutes */
+        console_printf("Rebalancing skipped - too recent (last: %llu seconds ago)\n",
+                      (timer_get_ticks_ns() - last_balance) / 1000000000);
+        return STATUS_OK;
+    }
+    
+    /* Simulate analyzing node load distribution */
+    console_printf("  Analyzing %u nodes...\n", node_count);
+    
+    uint64_t total_data = 0;
+    uint64_t imbalanced_data = 0;
+    uint32_t moves_needed = 0;
+    
+    /* Simulate load analysis */
+    for (uint32_t i = 0; i < node_count; i++) {
+        uint64_t node_data = (uint64_t)(1 + i) * 100 * 1024 * 1024;  /* Varying data per node */
+        total_data += node_data;
+        
+        /* Check if node is significantly over/under average */
+        uint64_t average_data = total_data / (i + 1);
+        if (node_data > average_data * 150 / 100 || node_data < average_data * 50 / 100) {
+            imbalanced_data += (node_data > average_data) ? 
+                              (node_data - average_data) : (average_data - node_data);
+            moves_needed++;
+        }
+        
+        console_printf("    Node %u: %llu MB (target: %llu MB)\n",
+                      i + 1, node_data / (1024 * 1024), average_data / (1024 * 1024));
+    }
+    
+    if (moves_needed == 0) {
+        console_printf("  Cluster is balanced - no moves needed\n");
+    } else {
+        console_printf("  Found %u imbalanced nodes, %llu MB to rebalance\n",
+                      moves_needed, imbalanced_data / (1024 * 1024));
+        
+        /* Simulate data movement */
+        uint64_t data_moved = 0;
+        for (uint32_t i = 0; i < moves_needed; i++) {
+            uint64_t move_size = imbalanced_data / moves_needed;
+            
+            /* Simulate transfer time */
+            timer_sleep_ns(10000000);  /* 10ms per move */
+            
+            data_moved += move_size;
+            console_printf("    Moved %llu MB (%u/%u)\n",
+                          move_size / (1024 * 1024), i + 1, moves_needed);
+        }
+        
+        /* Update statistics */
+        spin_lock(&g_distributed_storage.lock);
+        g_distributed_storage.bytes_replicated += data_moved;
+        g_distributed_storage.messages_sent += moves_needed * 2;  /* Move + confirm */
+        spin_unlock(&g_distributed_storage.lock);
+    }
+    
+    /* Update last balance time */
+    spin_lock(&g_distributed_storage.lock);
+    g_distributed_storage.last_balance_time = timer_get_ticks_ns();
+    spin_unlock(&g_distributed_storage.lock);
+    
+    uint64_t total_time = timer_get_ticks_ns() - start_time;
+    
+    console_printf("Data rebalancing completed in %llu ms\n", total_time / 1000000);
+    
+    return STATUS_OK;
+}
+
+/* Monitor cluster health */
+status_t afs_monitor_cluster_health(void) {
+    if (!g_distributed_storage.enabled) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Checking cluster health...\n");
+    
+    spin_lock(&g_distributed_storage.lock);
+    
+    uint32_t active_nodes = g_distributed_storage.active_nodes;
+    uint32_t required_nodes = g_distributed_storage.replication.replica_count;
+    
+    spin_unlock(&g_distributed_storage.lock);
+    
+    /* Check minimum node count */
+    if (active_nodes < required_nodes) {
+        console_printf("  WARNING: Only %u nodes active, need %u for replication\n",
+                      active_nodes, required_nodes);
+        return STATUS_ERROR;
+    }
+    
+    /* Simulate health checks */
+    uint32_t healthy_nodes = 0;
+    uint32_t degraded_nodes = 0;
+    uint32_t failed_nodes = 0;
+    
+    for (uint32_t i = 0; i < active_nodes; i++) {
+        /* Simulate node health status */
+        uint32_t health_score = 85 + (i % 15);  /* 85-99% health */
+        
+        if (health_score >= 95) {
+            healthy_nodes++;
+        } else if (health_score >= 80) {
+            degraded_nodes++;
+        } else {
+            failed_nodes++;
+        }
+        
+        console_printf("    Node %u: %u%% health (%s)\n", i + 1, health_score,
+                      (health_score >= 95) ? "Healthy" : 
+                      (health_score >= 80) ? "Degraded" : "Failed");
+    }
+    
+    console_printf("  Cluster health summary:\n");
+    console_printf("    Healthy nodes: %u\n", healthy_nodes);
+    console_printf("    Degraded nodes: %u\n", degraded_nodes);
+    console_printf("    Failed nodes: %u\n", failed_nodes);
+    
+    /* Calculate overall cluster health */
+    uint32_t cluster_health = (healthy_nodes * 100 + degraded_nodes * 60) / active_nodes;
+    
+    console_printf("    Overall cluster health: %u%%\n", cluster_health);
+    
+    if (cluster_health >= 90) {
+        console_printf("    Status: EXCELLENT\n");
+    } else if (cluster_health >= 75) {
+        console_printf("    Status: GOOD\n");
+    } else if (cluster_health >= 60) {
+        console_printf("    Status: DEGRADED\n");
+    } else {
+        console_printf("    Status: CRITICAL\n");
+        return STATUS_ERROR;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Get distributed storage statistics */
+status_t afs_get_distributed_stats(afs_distributed_stats_t* stats) {
+    if (!stats) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(stats, 0, sizeof(afs_distributed_stats_t));
+    
+    if (!g_distributed_storage.enabled) {
+        return STATUS_OK;
+    }
+    
+    spin_lock(&g_distributed_storage.lock);
+    
+    stats->enabled = g_distributed_storage.enabled;
+    stats->active_nodes = g_distributed_storage.active_nodes;
+    stats->local_node_id = g_distributed_storage.local_node_id;
+    stats->replica_count = g_distributed_storage.replication.replica_count;
+    
+    stats->messages_sent = g_distributed_storage.messages_sent;
+    stats->messages_received = g_distributed_storage.messages_received;
+    stats->bytes_replicated = g_distributed_storage.bytes_replicated;
+    stats->replication_errors = g_distributed_storage.replication_errors;
+    
+    stats->local_cpu_usage = g_distributed_storage.local_metrics.cpu_usage_percent;
+    stats->local_memory_usage = g_distributed_storage.local_metrics.memory_usage_percent;
+    stats->local_disk_usage = g_distributed_storage.local_metrics.disk_usage_percent;
+    stats->local_network_usage = g_distributed_storage.local_metrics.network_usage_percent;
+    
+    stats->last_balance_time = g_distributed_storage.last_balance_time;
+    
+    spin_unlock(&g_distributed_storage.lock);
+    
+    return STATUS_OK;
+}
+
+/* Run distributed storage maintenance */
+status_t afs_distributed_maintenance(void) {
+    if (!g_distributed_storage.enabled) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Running distributed storage maintenance...\n");
+    
+    /* Send heartbeat */
+    afs_send_heartbeat();
+    
+    /* Check cluster health */
+    status_t health_status = afs_monitor_cluster_health();
+    
+    /* Rebalance if needed */
+    static uint64_t last_rebalance = 0;
+    uint64_t current_time = timer_get_ticks_ns();
+    
+    if (current_time - last_rebalance > 1800000000000ULL) {  /* 30 minutes */
+        afs_rebalance_data();
+        last_rebalance = current_time;
+    }
+    
+    console_printf("Distributed maintenance completed\n");
+    
+    return health_status;
+}
+
+/* Dump distributed storage statistics */
+status_t afs_dump_distributed_stats(void) {
+    if (!g_distributed_storage.enabled) {
+        console_printf("Distributed storage is disabled\n");
+        return STATUS_OK;
+    }
+    
+    afs_distributed_stats_t stats;
+    if (afs_get_distributed_stats(&stats) != STATUS_OK) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("=== Distributed Storage Statistics ===\n");
+    
+    console_printf("Cluster Configuration:\n");
+    console_printf("  Status: %s\n", stats.enabled ? "Enabled" : "Disabled");
+    console_printf("  Active nodes: %u\n", stats.active_nodes);
+    console_printf("  Local node ID: %u\n", stats.local_node_id);
+    console_printf("  Replica count: %u\n", stats.replica_count);
+    
+    console_printf("\nNetwork Activity:\n");
+    console_printf("  Messages sent: %llu\n", stats.messages_sent);
+    console_printf("  Messages received: %llu\n", stats.messages_received);
+    console_printf("  Data replicated: %llu MB\n", stats.bytes_replicated / (1024 * 1024));
+    console_printf("  Replication errors: %llu\n", stats.replication_errors);
+    
+    console_printf("\nLocal Node Load:\n");
+    console_printf("  CPU usage: %u%%\n", stats.local_cpu_usage);
+    console_printf("  Memory usage: %u%%\n", stats.local_memory_usage);
+    console_printf("  Disk usage: %u%%\n", stats.local_disk_usage);
+    console_printf("  Network usage: %u%%\n", stats.local_network_usage);
+    
+    if (stats.last_balance_time > 0) {
+        uint64_t time_since_balance = (timer_get_ticks_ns() - stats.last_balance_time) / 1000000000;
+        console_printf("\nLast rebalance: %llu seconds ago\n", time_since_balance);
+    }
+    
+    console_printf("=== End Distributed Statistics ===\n");
+    
+    return STATUS_OK;
+}

@@ -1,0 +1,85 @@
+#include "syscall.h"
+#include "uapi/syscalls.h"
+
+/* Externs from syscall_fs_net.c */
+long ksys_mount(const char*, const char*, const char*, const char*);
+long ksys_open(const char*, int, int);
+long ksys_read(int, void*, u64);
+long ksys_pwrite(int, const void*, u64, u64);
+long ksys_close(int);
+long ksys_stat(const char*, u_stat_t*);
+long ksys_readdir(const char*, u_dirent_t*, u64);
+long ksys_mkdir(const char*, int);
+long ksys_unlink(const char*);
+
+long ksys_socket(int, int, int);
+long ksys_bind(int, const void*, u64);
+long ksys_sendto(int, const void*, u64, u64, const void*, u64);
+long ksys_recvfrom(int, void*, u64, u64, void*, u64*);
+long ksys_setnonblock(int, int);
+
+/* Firewall */
+long ksys_fw_add_rule(const u_fw_rule_t*);
+long ksys_fw_del_rule(const u_fw_rule_t*);
+long ksys_fw_list_rules(u_fw_rule_t*, u64);
+long ksys_fw_set_default(u8, u8);
+long ksys_fw_get_default(u8*, u8*);
+
+/* Extend dispatcher without modifying original table drastically */
+extern u64 syscall_dispatch(u64,u64,u64,u64,u64,u64,u64);
+
+static long wrap_mount(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
+    (void)a4;(void)a5; return ksys_mount((const char*)a0,(const char*)a1,(const char*)a2,(const char*)a3);
+}
+static long wrap_open(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
+    (void)a3;(void)a4;(void)a5; return ksys_open((const char*)a0,(int)a1,(int)a2);
+}
+static long wrap_read(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
+    (void)a3;(void)a4;(void)a5; return ksys_read((int)a0,(void*)a1,a2);
+}
+static long wrap_pwrite(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
+    (void)a4;(void)a5; return ksys_pwrite((int)a0,(const void*)a1,a2,a3);
+}
+static long wrap_close(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
+    (void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return ksys_close((int)a0);
+}
+static long wrap_stat(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a3;(void)a4;(void)a5; return ksys_stat((const char*)a0,(u_stat_t*)a1); }
+static long wrap_readdir(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a4;(void)a5; return ksys_readdir((const char*)a0,(u_dirent_t*)a1,a2); }
+static long wrap_mkdir(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a2;(void)a3;(void)a4;(void)a5; return ksys_mkdir((const char*)a0,(int)a1); }
+static long wrap_unlink(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return ksys_unlink((const char*)a0); }
+
+static long wrap_socket(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a3;(void)a4;(void)a5; return ksys_socket((int)a0,(int)a1,(int)a2); }
+static long wrap_bind(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a3;(void)a4;(void)a5; return ksys_bind((int)a0,(const void*)a1,a2); }
+static long wrap_sendto(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a5; return ksys_sendto((int)a0,(const void*)a1,a2,a3,(const void*)a4, a5); }
+static long wrap_recvfrom(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ return ksys_recvfrom((int)a0,(void*)a1,a2,a3,(void*)a4,(u64*)a5); }
+static long wrap_setnb(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ (void)a2;(void)a3;(void)a4;(void)a5; return ksys_setnonblock((int)a0,(int)a1); }
+
+/* Provide a local dispatch table extension and chain it in arch trap if needed.
+   Alternatively, merge into the main table in syscall.c in your tree. */
+u64 syscall_dispatch_ext(u64 num, u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5) {
+    switch (num) {
+        case SYS_mount: return wrap_mount(a0,a1,a2,a3,a4,a5);
+        case SYS_open: return wrap_open(a0,a1,a2,a3,a4,a5);
+        case SYS_read: return wrap_read(a0,a1,a2,a3,a4,a5);
+        case SYS_pwrite: return wrap_pwrite(a0,a1,a2,a3,a4,a5);
+        case SYS_close: return wrap_close(a0,a1,a2,a3,a4,a5);
+    case SYS_stat: return wrap_stat(a0,a1,a2,a3,a4,a5);
+    case SYS_readdir: return wrap_readdir(a0,a1,a2,a3,a4,a5);
+    case SYS_mkdir: return wrap_mkdir(a0,a1,a2,a3,a4,a5);
+    case SYS_unlink: return wrap_unlink(a0,a1,a2,a3,a4,a5);
+
+        case SYS_socket: return wrap_socket(a0,a1,a2,a3,a4,a5);
+        case SYS_bind: return wrap_bind(a0,a1,a2,a3,a4,a5);
+        case SYS_sendto: return wrap_sendto(a0,a1,a2,a3,a4,a5);
+        case SYS_recvfrom: return wrap_recvfrom(a0,a1,a2,a3,a4,a5);
+        case SYS_setnonblock: return wrap_setnb(a0,a1,a2,a3,a4,a5);
+        case SYS_fw_add_rule: return (long)ksys_fw_add_rule((const u_fw_rule_t*)a0);
+        case SYS_fw_del_rule: return (long)ksys_fw_del_rule((const u_fw_rule_t*)a0);
+        case SYS_fw_list_rules: return (long)ksys_fw_list_rules((u_fw_rule_t*)a0, a1);
+        case SYS_fw_set_default: return (long)ksys_fw_set_default((u8)a0, (u8)a1);
+        case SYS_fw_get_default: return (long)ksys_fw_get_default((u8*)a0, (u8*)a1);
+        default: break;
+    }
+    /* Fallback to base */
+    return syscall_dispatch(num,a0,a1,a2,a3,a4,a5);
+}

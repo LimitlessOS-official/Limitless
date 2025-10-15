@@ -1,0 +1,104 @@
+#include "block.h"
+#include "kernel.h"
+#include "log.h"
+#include "storage.h"
+
+/*
+ * Block Device Layer Implementation
+ * Provides unified interface for storage devices (ATA, AHCI, NVMe, etc.)
+ */
+
+#define MAX_BLOCK_DEVICES 16
+
+static block_dev_t* g_block_devices[MAX_BLOCK_DEVICES];
+static int g_block_count = 0;
+
+int block_register(block_dev_t* dev) {
+    if (!dev) return K_EINVAL;
+    
+    if (g_block_count >= MAX_BLOCK_DEVICES) {
+        KLOG_ERROR("block", "Maximum block devices reached");
+        return K_ENOSPC;
+    }
+    
+    /* Set device index */
+    dev->index = g_block_count;
+    
+    /* Initialize sector size if not set */
+    if (dev->sector_sz == 0) {
+        dev->sector_sz = 512;  /* Default sector size */
+    }
+    
+    /* Get capacity from device */
+    if (dev->ops.capacity_sectors) {
+        dev->sectors = dev->ops.capacity_sectors(dev);
+    }
+    
+    g_block_devices[g_block_count] = dev;
+    g_block_count++;
+    
+    KLOG_INFO("block", "registered device %s: %llu sectors, %u bytes/sector", 
+              dev->name, dev->sectors, dev->sector_sz);
+    
+    return 0;
+}
+
+int block_count(void) {
+    return g_block_count;
+}
+
+block_dev_t* block_get(int idx) {
+    if (idx < 0 || idx >= g_block_count) {
+        return NULL;
+    }
+    return g_block_devices[idx];
+}
+
+block_dev_t* block_find_by_name(const char* name) {
+    if (!name) return NULL;
+    
+    for (int i = 0; i < g_block_count; i++) {
+        if (k_strcmp(g_block_devices[i]->name, name) == 0) {
+            return g_block_devices[i];
+        }
+    }
+    return NULL;
+}
+
+int block_read(block_dev_t* dev, u64 lba, void* buf, u32 bytes) {
+    if (!dev || !buf) return K_EINVAL;
+    if (!dev->ops.read) return K_ENOSYS;
+    
+    /* Validate bounds */
+    u32 sectors_needed = (bytes + dev->sector_sz - 1) / dev->sector_sz;
+    if (lba + sectors_needed > dev->sectors) {
+        return K_EINVAL;
+    }
+    
+    blk_io_t io = {
+        .lba = lba,
+        .count = sectors_needed,
+        .buf = buf
+    };
+    
+    return dev->ops.read(dev, &io);
+}
+
+int block_write(block_dev_t* dev, u64 lba, const void* buf, u32 bytes) {
+    if (!dev || !buf) return K_EINVAL;
+    if (!dev->ops.write) return K_ENOSYS;
+    
+    /* Validate bounds */
+    u32 sectors_needed = (bytes + dev->sector_sz - 1) / dev->sector_sz;
+    if (lba + sectors_needed > dev->sectors) {
+        return K_EINVAL;
+    }
+    
+    blk_io_t io = {
+        .lba = lba,
+        .count = sectors_needed,
+        .buf = (void*)buf  /* Cast away const for interface compatibility */
+    };
+    
+    return dev->ops.write(dev, &io);
+}

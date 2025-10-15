@@ -1,0 +1,400 @@
+/*
+ * Simple In-Memory File System
+ * Basic VFS implementation for LimitlessOS
+ */
+
+#include "kernel.h"
+
+/* File types */
+typedef enum {
+    FS_TYPE_FILE = 1,
+    FS_TYPE_DIRECTORY = 2,
+    FS_TYPE_SYMLINK = 3,
+    FS_TYPE_DEVICE = 4
+} fs_node_type_t;
+
+/* File permissions */
+#define FS_PERM_READ    0x001
+#define FS_PERM_WRITE   0x002  
+#define FS_PERM_EXECUTE 0x004
+#define FS_PERM_OWNER   0x700
+#define FS_PERM_GROUP   0x070
+#define FS_PERM_OTHER   0x007
+
+/* File System Node (represents a file or directory) */
+typedef struct fs_node {
+    char name[256];           /* File/directory name */
+    fs_node_type_t type;      /* File type */
+    u32 inode;                /* Inode number */
+    u32 size;                 /* File size in bytes */
+    u32 permissions;          /* Permission bits */
+    u32 uid;                  /* Owner user ID */
+    u32 gid;                  /* Owner group ID */
+    
+    /* Directory entries (if this is a directory) */
+    struct fs_node** children;
+    u32 child_count;
+    u32 child_capacity;
+    
+    /* File data (if this is a file) */
+    u8* data;
+    u32 data_capacity;
+    
+    /* Parent directory */
+    struct fs_node* parent;
+} fs_node_t;
+
+/* File descriptor */
+typedef struct file_desc {
+    fs_node_t* node;
+    u32 offset;               /* Current read/write position */
+    u32 flags;                /* Open flags */
+    bool in_use;
+} file_desc_t;
+
+/* File system globals */
+static fs_node_t* g_root_node = NULL;
+static file_desc_t g_file_descriptors[64];
+static u32 g_next_inode = 1;
+static u32 g_file_count = 0;
+static u32 g_dir_count = 0;
+
+/* File open flags */
+#define FS_O_RDONLY  0x000
+#define FS_O_WRONLY  0x001
+#define FS_O_RDWR    0x002
+#define FS_O_CREAT   0x040
+#define FS_O_TRUNC   0x200
+#define FS_O_APPEND  0x400
+
+/* Create new file system node */
+static fs_node_t* fs_create_node(const char* name, fs_node_type_t type) {
+    fs_node_t* node = (fs_node_t*)kalloc(sizeof(fs_node_t));
+    if (!node) return NULL;
+    
+    /* Initialize node */
+    memset(node, 0, sizeof(fs_node_t));
+    
+    /* Copy name safely */
+    for (int i = 0; i < 255 && name[i]; i++) {
+        node->name[i] = name[i];
+    }
+    node->name[255] = '\0';
+    
+    node->type = type;
+    node->inode = g_next_inode++;
+    node->size = 0;
+    node->permissions = 0755;  /* Default permissions */
+    node->uid = 0;
+    node->gid = 0;
+    
+    if (type == FS_TYPE_DIRECTORY) {
+        node->child_capacity = 8;
+        node->children = (fs_node_t**)kalloc(sizeof(fs_node_t*) * node->child_capacity);
+        if (!node->children) {
+            kfree(node);
+            return NULL;
+        }
+        g_dir_count++;
+    } else if (type == FS_TYPE_FILE) {
+        g_file_count++;
+    }
+    
+    return node;
+}
+
+/* Add child to directory */
+static int fs_add_child(fs_node_t* parent, fs_node_t* child) {
+    if (!parent || parent->type != FS_TYPE_DIRECTORY || !child) {
+        return -1;
+    }
+    
+    /* Check if we need to expand children array */
+    if (parent->child_count >= parent->child_capacity) {
+        u32 new_capacity = parent->child_capacity * 2;
+        fs_node_t** new_children = (fs_node_t**)kalloc(sizeof(fs_node_t*) * new_capacity);
+        if (!new_children) return -1;
+        
+        /* Copy existing children */
+        for (u32 i = 0; i < parent->child_count; i++) {
+            new_children[i] = parent->children[i];
+        }
+        
+        kfree(parent->children);
+        parent->children = new_children;
+        parent->child_capacity = new_capacity;
+    }
+    
+    /* Add child */
+    parent->children[parent->child_count++] = child;
+    child->parent = parent;
+    
+    return 0;
+}
+
+/* Find child by name */
+static fs_node_t* fs_find_child(fs_node_t* parent, const char* name) {
+    if (!parent || parent->type != FS_TYPE_DIRECTORY) return NULL;
+    
+    for (u32 i = 0; i < parent->child_count; i++) {
+        if (strcmp(parent->children[i]->name, name) == 0) {
+            return parent->children[i];
+        }
+    }
+    
+    return NULL;
+}
+
+/* Resolve path to node */
+static fs_node_t* fs_resolve_path(const char* path) {
+    if (!path || !g_root_node) return NULL;
+    
+    /* Handle root directory */
+    if (strcmp(path, "/") == 0) {
+        return g_root_node;
+    }
+    
+    /* Start from root */
+    fs_node_t* current = g_root_node;
+    
+    /* Skip leading slash */
+    if (path[0] == '/') path++;
+    
+    /* Parse path components */
+    char component[256];
+    const char* start = path;
+    
+    while (*start) {
+        /* Find next path separator */
+        const char* end = start;
+        while (*end && *end != '/') end++;
+        
+        /* Copy component */
+        u32 len = end - start;
+        if (len >= sizeof(component)) return NULL;  /* Component too long */
+        
+        for (u32 i = 0; i < len; i++) {
+            component[i] = start[i];
+        }
+        component[len] = '\0';
+        
+        /* Find child with this name */
+        current = fs_find_child(current, component);
+        if (!current) return NULL;  /* Path component not found */
+        
+        /* Move to next component */
+        start = end;
+        if (*start == '/') start++;
+    }
+    
+    return current;
+}
+
+/* Initialize simple file system */
+void simple_fs_init(void) {
+    /* Initialize file descriptor table */
+    for (u32 i = 0; i < 64; i++) {
+        g_file_descriptors[i].in_use = false;
+    }
+    
+    /* Create root directory */
+    g_root_node = fs_create_node("", FS_TYPE_DIRECTORY);
+    if (!g_root_node) return;
+    
+    /* Create standard directories */
+    fs_node_t* bin_dir = fs_create_node("bin", FS_TYPE_DIRECTORY);
+    fs_node_t* etc_dir = fs_create_node("etc", FS_TYPE_DIRECTORY);
+    fs_node_t* tmp_dir = fs_create_node("tmp", FS_TYPE_DIRECTORY);
+    fs_node_t* home_dir = fs_create_node("home", FS_TYPE_DIRECTORY);
+    
+    if (bin_dir) fs_add_child(g_root_node, bin_dir);
+    if (etc_dir) fs_add_child(g_root_node, etc_dir);
+    if (tmp_dir) fs_add_child(g_root_node, tmp_dir);
+    if (home_dir) fs_add_child(g_root_node, home_dir);
+    
+    /* Create sample files */
+    fs_node_t* readme = fs_create_node("README.txt", FS_TYPE_FILE);
+    if (readme) {
+        const char* content = "Welcome to LimitlessOS Simple File System!\n"
+                             "This is an in-memory filesystem implementation.\n"
+                             "Features:\n"
+                             "- Directory hierarchy\n"
+                             "- File creation and deletion\n"
+                             "- Read/write operations\n"
+                             "- POSIX-like interface\n";
+        u32 content_len = strlen(content);
+        
+        readme->data = (u8*)kalloc(content_len + 1);
+        if (readme->data) {
+            for (u32 i = 0; i < content_len; i++) {
+                readme->data[i] = content[i];
+            }
+            readme->data[content_len] = '\0';
+            readme->size = content_len;
+            readme->data_capacity = content_len + 1;
+        }
+        
+        fs_add_child(g_root_node, readme);
+    }
+    
+    /* Create version info file */
+    fs_node_t* version = fs_create_node("version", FS_TYPE_FILE);
+    if (version) {
+        const char* ver_content = "LimitlessOS v1.0\nBuild: Development\n";
+        u32 ver_len = strlen(ver_content);
+        
+        version->data = (u8*)kalloc(ver_len + 1);
+        if (version->data) {
+            for (u32 i = 0; i < ver_len; i++) {
+                version->data[i] = ver_content[i];
+            }
+            version->data[ver_len] = '\0';
+            version->size = ver_len;
+            version->data_capacity = ver_len + 1;
+        }
+        
+        if (etc_dir) {
+            fs_add_child(etc_dir, version);
+        }
+    }
+}
+
+/* Open file */
+int simple_fs_open(const char* path, u32 flags) {
+    if (!path) return -1;
+    
+    fs_node_t* node = fs_resolve_path(path);
+    
+    if (!node) return -1;  /* File not found */
+    
+    /* Find available file descriptor */
+    for (u32 fd = 3; fd < 64; fd++) {  /* Start after stdin/stdout/stderr */
+        if (!g_file_descriptors[fd].in_use) {
+            g_file_descriptors[fd].node = node;
+            g_file_descriptors[fd].offset = (flags & FS_O_APPEND) ? node->size : 0;
+            g_file_descriptors[fd].flags = flags;
+            g_file_descriptors[fd].in_use = true;
+            
+            /* Truncate file if requested */
+            if ((flags & FS_O_TRUNC) && node->type == FS_TYPE_FILE) {
+                node->size = 0;
+            }
+            
+            return fd;
+        }
+    }
+    
+    return -1;  /* No available file descriptors */
+}
+
+/* Read from file */
+int simple_fs_read(int fd, void* buffer, u32 count) {
+    if (fd < 0 || fd >= 64 || !g_file_descriptors[fd].in_use || !buffer) {
+        return -1;
+    }
+    
+    file_desc_t* file_desc = &g_file_descriptors[fd];
+    fs_node_t* node = file_desc->node;
+    
+    if (node->type != FS_TYPE_FILE || !node->data) {
+        return -1;
+    }
+    
+    /* Calculate how much we can actually read */
+    u32 available = (file_desc->offset < node->size) ? (node->size - file_desc->offset) : 0;
+    u32 to_read = (count < available) ? count : available;
+    
+    /* Copy data */
+    u8* dest = (u8*)buffer;
+    for (u32 i = 0; i < to_read; i++) {
+        dest[i] = node->data[file_desc->offset + i];
+    }
+    
+    /* Update offset */
+    file_desc->offset += to_read;
+    
+    return to_read;
+}
+
+/* Write to file */
+int simple_fs_write(int fd, const void* buffer, u32 count) {
+    if (fd < 0 || fd >= 64 || !g_file_descriptors[fd].in_use || !buffer) {
+        return -1;
+    }
+    
+    file_desc_t* file_desc = &g_file_descriptors[fd];
+    fs_node_t* node = file_desc->node;
+    
+    if (node->type != FS_TYPE_FILE) {
+        return -1;
+    }
+    
+    /* Ensure we have enough space */
+    u32 needed_size = file_desc->offset + count;
+    if (needed_size > node->data_capacity) {
+        /* Expand data buffer */
+        u32 new_capacity = needed_size * 2;  /* Double it for future growth */
+        u8* new_data = (u8*)kalloc(new_capacity);
+        if (!new_data) return -1;
+        
+        /* Copy existing data */
+        if (node->data) {
+            for (u32 i = 0; i < node->size; i++) {
+                new_data[i] = node->data[i];
+            }
+            kfree(node->data);
+        }
+        
+        node->data = new_data;
+        node->data_capacity = new_capacity;
+    }
+    
+    /* Write data */
+    const u8* src = (const u8*)buffer;
+    for (u32 i = 0; i < count; i++) {
+        node->data[file_desc->offset + i] = src[i];
+    }
+    
+    /* Update file size and offset */
+    file_desc->offset += count;
+    if (file_desc->offset > node->size) {
+        node->size = file_desc->offset;
+    }
+    
+    return count;
+}
+
+/* Close file */
+int simple_fs_close(int fd) {
+    if (fd < 0 || fd >= 64 || !g_file_descriptors[fd].in_use) {
+        return -1;
+    }
+    
+    g_file_descriptors[fd].in_use = false;
+    return 0;
+}
+
+/* List directory contents */
+int simple_fs_list_directory(const char* path) {
+    fs_node_t* dir = fs_resolve_path(path);
+    if (!dir || dir->type != FS_TYPE_DIRECTORY) {
+        return -1;
+    }
+    
+    /* In real implementation would print directory listing */
+    for (u32 i = 0; i < dir->child_count && i < 20; i++) {  /* Limit output */
+        fs_node_t* child = dir->children[i];
+        const char* type_str = (child->type == FS_TYPE_DIRECTORY) ? "DIR " : "FILE";
+        /* Would print: type_str, child->name, child->size */
+        (void)type_str;  /* Suppress unused warning */
+    }
+    
+    return dir->child_count;
+}
+
+/* Get file system statistics */
+void simple_fs_get_stats(u32* total_files, u32* total_dirs, u32* total_inodes) {
+    if (total_files) *total_files = g_file_count;
+    if (total_dirs) *total_dirs = g_dir_count;
+    if (total_inodes) *total_inodes = g_next_inode - 1;
+}

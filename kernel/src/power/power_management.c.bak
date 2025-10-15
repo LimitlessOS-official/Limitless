@@ -1,0 +1,948 @@
+/*
+ * LimitlessOS Advanced Power Management Implementation
+ * Comprehensive power states, thermal management, and battery optimization
+ */
+
+#include "power_management.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <math.h>
+
+/* Global power management system */
+static power_management_t power_mgmt = {0};
+static pthread_mutex_t power_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ACPI interface */
+#define ACPI_BASE_PATH "/sys/class/power_supply"
+#define ACPI_THERMAL_PATH "/sys/class/thermal"
+#define CPUFREQ_PATH "/sys/devices/system/cpu/cpufreq"
+
+/* Threading functions */
+static void *thermal_monitor_thread(void *arg);
+static void *battery_monitor_thread(void *arg);
+static void *governor_thread(void *arg);
+
+/* Internal helper functions */
+static int read_acpi_file(const char *path, char *buffer, size_t size);
+static int write_acpi_file(const char *path, const char *value);
+static uint32_t calculate_cpu_load(uint32_t cpu_id);
+static void update_power_statistics(void);
+
+/* Initialize power management system */
+int power_management_init(void) {
+    printf("Initializing Advanced Power Management System...\n");
+    
+    memset(&power_mgmt, 0, sizeof(power_mgmt));
+    pthread_mutex_init(&power_mgmt.lock, NULL);
+    
+    /* Initialize default configuration */
+    power_mgmt.config.active_policy = POWER_POLICY_BALANCED;
+    power_mgmt.config.cpu_min_freq_mhz = 800;
+    power_mgmt.config.cpu_max_freq_mhz = 3400;
+    power_mgmt.config.cpu_target_freq_mhz = 2400;
+    power_mgmt.config.cpu_turbo_enabled = true;
+    power_mgmt.config.display_brightness = 80;
+    power_mgmt.config.display_timeout_ms = 600000; /* 10 minutes */
+    power_mgmt.config.display_auto_brightness = true;
+    power_mgmt.config.suspend_timeout_ms = 1800000; /* 30 minutes */
+    power_mgmt.config.hibernate_timeout_ms = 3600000; /* 1 hour */
+    power_mgmt.config.wake_on_lan = false;
+    power_mgmt.config.wake_on_usb = true;
+    power_mgmt.config.low_battery_warning = 20;
+    power_mgmt.config.critical_battery = 5;
+    power_mgmt.config.battery_saver_mode = false;
+    power_mgmt.config.charge_limit_percent = 100;
+    power_mgmt.config.active_cooling = true;
+    power_mgmt.config.thermal_throttle_temp = 85000; /* 85°C */
+    
+    /* Initialize thermal zones */
+    thermal_init();
+    
+    /* Initialize ACPI interface */
+    power_acpi_init();
+    
+    /* Initialize CPU power management */
+    dfs_init();
+    
+    /* Update battery information */
+    battery_update_info();
+    
+    /* Set initial power state */
+    power_mgmt.current_state = POWER_STATE_S0_ACTIVE;
+    power_mgmt.target_state = POWER_STATE_S0_ACTIVE;
+    power_mgmt.current_policy = POWER_POLICY_BALANCED;
+    
+    /* Start monitoring threads */
+    power_mgmt.threads_running = true;
+    pthread_create(&power_mgmt.thermal_thread, NULL, thermal_monitor_thread, NULL);
+    pthread_create(&power_mgmt.battery_thread, NULL, battery_monitor_thread, NULL);
+    pthread_create(&power_mgmt.governor_thread, NULL, governor_thread, NULL);
+    
+    power_mgmt.initialized = true;
+    
+    printf("Power management initialized successfully\n");
+    printf("- Current policy: %s\n", power_policy_name(power_mgmt.current_policy));
+    printf("- Battery present: %s\n", power_mgmt.battery_present ? "Yes" : "No");
+    printf("- Thermal zones: %u active\n", power_mgmt.active_thermal_zones);
+    
+    return 0;
+}
+
+/* Cleanup power management */
+int power_management_cleanup(void) {
+    if (!power_mgmt.initialized) return 0;
+    
+    printf("Shutting down power management system...\n");
+    
+    /* Stop monitoring threads */
+    power_mgmt.threads_running = false;
+    pthread_join(power_mgmt.thermal_thread, NULL);
+    pthread_join(power_mgmt.battery_thread, NULL);
+    pthread_join(power_mgmt.governor_thread, NULL);
+    
+    /* Cleanup device list */
+    device_pm_t *device = power_mgmt.device_list;
+    while (device) {
+        device_pm_t *next = device->next;
+        free(device);
+        device = next;
+    }
+    
+    pthread_mutex_destroy(&power_mgmt.lock);
+    power_mgmt.initialized = false;
+    
+    printf("Power management system shutdown complete\n");
+    
+    return 0;
+}
+
+/* Set system power state */
+int power_set_state(power_state_t state) {
+    if (state >= POWER_STATE_MAX) return -EINVAL;
+    
+    pthread_mutex_lock(&power_mgmt.lock);
+    
+    printf("Transitioning from %s to %s\n", 
+           power_state_name(power_mgmt.current_state),
+           power_state_name(state));
+    
+    switch (state) {
+        case POWER_STATE_S0_ACTIVE:
+            /* Resume all devices */
+            device_pm_t *device = power_mgmt.device_list;
+            while (device) {
+                if (device->resume) device->resume(device);
+                device = device->next;
+            }
+            break;
+            
+        case POWER_STATE_S0ix_STANDBY:
+            power_enter_modern_standby();
+            break;
+            
+        case POWER_STATE_S3_SUSPEND:
+            power_suspend_to_ram();
+            break;
+            
+        case POWER_STATE_S4_HIBERNATE:
+            power_hibernate_to_disk();
+            break;
+            
+        case POWER_STATE_S5_SHUTDOWN:
+            power_shutdown_system();
+            break;
+            
+        default:
+            pthread_mutex_unlock(&power_mgmt.lock);
+            return -ENOTSUP;
+    }
+    
+    power_mgmt.current_state = state;
+    power_mgmt.target_state = state;
+    
+    /* Notify event handlers */
+    if (state == POWER_STATE_S3_SUSPEND || state == POWER_STATE_S0ix_STANDBY) {
+        power_notify_event(POWER_EVENT_SUSPEND, &state);
+        power_mgmt.stats.suspend_count++;
+    }
+    
+    pthread_mutex_unlock(&power_mgmt.lock);
+    
+    return 0;
+}
+
+/* Get current power state */
+power_state_t power_get_state(void) {
+    return power_mgmt.current_state;
+}
+
+/* Suspend to RAM (S3) */
+int power_suspend_to_ram(void) {
+    printf("Suspending system to RAM...\n");
+    
+    /* Suspend all devices */
+    device_pm_t *device = power_mgmt.device_list;
+    while (device) {
+        if (device->suspend) device->suspend(device);
+        device = device->next;
+    }
+    
+    /* Set ACPI S3 state */
+    power_set_acpi_state(POWER_STATE_S3_SUSPEND);
+    
+    /* In real implementation, this would:
+     * 1. Save CPU context
+     * 2. Put memory in self-refresh
+     * 3. Turn off CPU and most devices
+     * 4. Keep minimal power to RAM
+     */
+    
+    printf("System suspended to RAM\n");
+    
+    return 0;
+}
+
+/* Hibernate to disk (S4) */
+int power_hibernate_to_disk(void) {
+    printf("Hibernating system to disk...\n");
+    
+    /* Save system state to hibernation file */
+    /* In real implementation, this would:
+     * 1. Create hibernation image
+     * 2. Write RAM contents to swap partition
+     * 3. Save CPU state and device contexts
+     * 4. Power off the system
+     */
+    
+    power_set_acpi_state(POWER_STATE_S4_HIBERNATE);
+    
+    printf("System hibernated to disk\n");
+    
+    return 0;
+}
+
+/* Shutdown system */
+int power_shutdown_system(void) {
+    printf("Shutting down system...\n");
+    
+    /* Notify shutdown event */
+    power_notify_event(POWER_EVENT_SUSPEND, NULL);
+    
+    /* Shutdown all devices */
+    device_pm_t *device = power_mgmt.device_list;
+    while (device) {
+        if (device->suspend) device->suspend(device);
+        device = device->next;
+    }
+    
+    /* Set ACPI S5 state */
+    power_set_acpi_state(POWER_STATE_S5_SHUTDOWN);
+    
+    return 0;
+}
+
+/* Reboot system */
+int power_reboot_system(void) {
+    printf("Rebooting system...\n");
+    
+    /* Shutdown devices and restart */
+    power_shutdown_system();
+    
+    /* Trigger system reboot */
+    write_acpi_file("/proc/sys/kernel/ctrl-alt-del", "1");
+    
+    return 0;
+}
+
+/* Set CPU P-state */
+int cpu_set_pstate(uint32_t cpu_id, cpu_pstate_t pstate) {
+    if (pstate >= CPU_PSTATE_MAX) return -EINVAL;
+    
+    char path[256];
+    snprintf(path, sizeof(path), 
+             "/sys/devices/system/cpu/cpu%u/cpufreq/scaling_governor", cpu_id);
+    
+    const char *governors[] = {"performance", "powersave", "ondemand", "conservative"};
+    
+    if (pstate < sizeof(governors) / sizeof(governors[0])) {
+        write_acpi_file(path, governors[pstate]);
+    }
+    
+    power_mgmt.current_pstate = pstate;
+    
+    return 0;
+}
+
+/* Get CPU P-state */
+cpu_pstate_t cpu_get_pstate(uint32_t cpu_id) {
+    return power_mgmt.current_pstate;
+}
+
+/* Set CPU frequency */
+int cpu_set_frequency(uint32_t cpu_id, uint32_t freq_mhz) {
+    char path[256];
+    char freq_str[32];
+    
+    snprintf(path, sizeof(path), 
+             "/sys/devices/system/cpu/cpu%u/cpufreq/scaling_setspeed", cpu_id);
+    snprintf(freq_str, sizeof(freq_str), "%u", freq_mhz * 1000); /* Convert to kHz */
+    
+    int result = write_acpi_file(path, freq_str);
+    if (result == 0) {
+        power_mgmt.cpu_freq_mhz = freq_mhz;
+    }
+    
+    return result;
+}
+
+/* Get CPU frequency */
+uint32_t cpu_get_frequency(uint32_t cpu_id) {
+    char path[256];
+    char buffer[64];
+    
+    snprintf(path, sizeof(path), 
+             "/sys/devices/system/cpu/cpu%u/cpufreq/scaling_cur_freq", cpu_id);
+    
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        return atoi(buffer) / 1000; /* Convert from kHz to MHz */
+    }
+    
+    return power_mgmt.cpu_freq_mhz;
+}
+
+/* Battery management */
+int battery_update_info(void) {
+    char path[256];
+    char buffer[256];
+    
+    /* Check if battery is present */
+    snprintf(path, sizeof(path), "%s/BAT0/present", ACPI_BASE_PATH);
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        power_mgmt.battery_present = (atoi(buffer) == 1);
+    }
+    
+    if (!power_mgmt.battery_present) {
+        printf("No battery detected\n");
+        return -ENODEV;
+    }
+    
+    /* Read battery capacity */
+    snprintf(path, sizeof(path), "%s/BAT0/capacity", ACPI_BASE_PATH);
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        uint32_t capacity_percent = atoi(buffer);
+        power_mgmt.battery.current_charge_mah = 
+            (power_mgmt.battery.capacity_mah * capacity_percent) / 100;
+    }
+    
+    /* Read battery status */
+    snprintf(path, sizeof(path), "%s/BAT0/status", ACPI_BASE_PATH);
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        power_mgmt.battery.is_charging = (strncmp(buffer, "Charging", 8) == 0);
+    }
+    
+    /* Read voltage */
+    snprintf(path, sizeof(path), "%s/BAT0/voltage_now", ACPI_BASE_PATH);
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        power_mgmt.battery.voltage_mv = atoi(buffer) / 1000;
+    }
+    
+    /* Read current */
+    snprintf(path, sizeof(path), "%s/BAT0/current_now", ACPI_BASE_PATH);
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        power_mgmt.battery.current_ma = atoi(buffer) / 1000;
+        if (!power_mgmt.battery.is_charging) {
+            power_mgmt.battery.current_ma = -power_mgmt.battery.current_ma;
+        }
+    }
+    
+    /* Check AC adapter */
+    snprintf(path, sizeof(path), "%s/ADP1/online", ACPI_BASE_PATH);
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        power_mgmt.battery.is_ac_connected = (atoi(buffer) == 1);
+    }
+    
+    /* Calculate time estimates */
+    if (power_mgmt.battery.current_ma != 0) {
+        if (power_mgmt.battery.is_charging) {
+            uint32_t remaining_capacity = power_mgmt.battery.capacity_mah - 
+                                        power_mgmt.battery.current_charge_mah;
+            power_mgmt.battery.time_to_full = 
+                (remaining_capacity * 60) / abs(power_mgmt.battery.current_ma);
+        } else {
+            power_mgmt.battery.time_to_empty = 
+                (power_mgmt.battery.current_charge_mah * 60) / 
+                abs(power_mgmt.battery.current_ma);
+        }
+    }
+    
+    return 0;
+}
+
+/* Get battery info */
+battery_info_t *battery_get_info(void) {
+    if (!power_mgmt.battery_present) return NULL;
+    return &power_mgmt.battery;
+}
+
+/* Get battery capacity percentage */
+uint32_t battery_get_capacity_percent(void) {
+    if (!power_mgmt.battery_present) return 0;
+    return (power_mgmt.battery.current_charge_mah * 100) / 
+           power_mgmt.battery.capacity_mah;
+}
+
+/* Check if on battery power */
+bool power_is_on_battery(void) {
+    return power_mgmt.battery_present && !power_mgmt.battery.is_ac_connected;
+}
+
+/* Check if battery is low */
+bool power_is_low_battery(void) {
+    if (!power_mgmt.battery_present) return false;
+    uint32_t capacity = battery_get_capacity_percent();
+    return capacity <= power_mgmt.config.low_battery_warning;
+}
+
+/* Thermal management */
+int thermal_init(void) {
+    printf("Initializing thermal management...\n");
+    
+    /* Initialize thermal zones */
+    thermal_add_zone(THERMAL_ZONE_CPU, "CPU");
+    thermal_add_zone(THERMAL_ZONE_GPU, "GPU");
+    thermal_add_zone(THERMAL_ZONE_CHIPSET, "Chipset");
+    thermal_add_zone(THERMAL_ZONE_BATTERY, "Battery");
+    thermal_add_zone(THERMAL_ZONE_AMBIENT, "Ambient");
+    thermal_add_zone(THERMAL_ZONE_STORAGE, "Storage");
+    
+    /* Set default temperature thresholds */
+    for (int i = 0; i < THERMAL_ZONE_MAX; i++) {
+        thermal_sensor_t *sensor = &power_mgmt.thermal_zones[i];
+        sensor->critical_temp = 100000;  /* 100°C */
+        sensor->hot_temp = 85000;        /* 85°C */
+        sensor->warm_temp = 70000;       /* 70°C */
+        sensor->cool_temp = 50000;       /* 50°C */
+    }
+    
+    printf("Thermal management initialized with %u zones\n", 
+           power_mgmt.active_thermal_zones);
+    
+    return 0;
+}
+
+/* Add thermal zone */
+int thermal_add_zone(thermal_zone_t zone, const char *name) {
+    if (zone >= THERMAL_ZONE_MAX || !name) return -EINVAL;
+    
+    thermal_sensor_t *sensor = &power_mgmt.thermal_zones[zone];
+    sensor->zone = zone;
+    strncpy(sensor->name, name, sizeof(sensor->name) - 1);
+    sensor->temperature = 25000; /* Default 25°C */
+    sensor->cooling_active = false;
+    sensor->fan_speed = 0;
+    sensor->throttle_level = 0;
+    
+    power_mgmt.active_thermal_zones++;
+    
+    return 0;
+}
+
+/* Update temperature */
+int thermal_update_temperature(thermal_zone_t zone, uint32_t temp) {
+    if (zone >= THERMAL_ZONE_MAX) return -EINVAL;
+    
+    thermal_sensor_t *sensor = &power_mgmt.thermal_zones[zone];
+    sensor->temperature = temp;
+    
+    /* Check thermal thresholds */
+    if (temp >= sensor->critical_temp) {
+        printf("CRITICAL: %s temperature %u°C exceeded critical threshold\n", 
+               sensor->name, temp / 1000);
+        power_notify_event(POWER_EVENT_THERMAL_CRITICAL, sensor);
+        
+        /* Emergency shutdown if CPU temperature is critical */
+        if (zone == THERMAL_ZONE_CPU) {
+            power_set_state(POWER_STATE_S5_SHUTDOWN);
+        }
+    } else if (temp >= sensor->hot_temp) {
+        printf("WARNING: %s temperature %u°C exceeded hot threshold\n", 
+               sensor->name, temp / 1000);
+        power_notify_event(POWER_EVENT_THERMAL_WARNING, sensor);
+        
+        /* Start thermal throttling */
+        if (zone == THERMAL_ZONE_CPU) {
+            thermal_throttle_cpu(50); /* 50% throttling */
+        }
+    } else if (temp >= sensor->warm_temp && !sensor->cooling_active) {
+        /* Start active cooling */
+        sensor->cooling_active = true;
+        sensor->fan_speed = 2000 + (temp - sensor->warm_temp) / 100;
+        printf("Active cooling started for %s at %u RPM\n", 
+               sensor->name, sensor->fan_speed);
+    } else if (temp <= sensor->cool_temp && sensor->cooling_active) {
+        /* Stop active cooling */
+        sensor->cooling_active = false;
+        sensor->fan_speed = 1000; /* Minimum fan speed */
+        sensor->throttle_level = 0;
+        printf("Active cooling stopped for %s\n", sensor->name);
+    }
+    
+    return 0;
+}
+
+/* Get temperature */
+uint32_t thermal_get_temperature(thermal_zone_t zone) {
+    if (zone >= THERMAL_ZONE_MAX) return 0;
+    return power_mgmt.thermal_zones[zone].temperature;
+}
+
+/* CPU throttling */
+int thermal_throttle_cpu(uint32_t level) {
+    if (level > 100) return -EINVAL;
+    
+    /* Reduce CPU frequency based on throttle level */
+    uint32_t max_freq = power_mgmt.config.cpu_max_freq_mhz;
+    uint32_t throttled_freq = max_freq * (100 - level) / 100;
+    
+    printf("Thermal throttling CPU to %u MHz (%u%% reduction)\n", 
+           throttled_freq, level);
+    
+    /* Set frequency for all CPUs */
+    for (uint32_t cpu = 0; cpu < 8; cpu++) { /* Assume max 8 CPUs */
+        cpu_set_frequency(cpu, throttled_freq);
+    }
+    
+    power_mgmt.thermal_zones[THERMAL_ZONE_CPU].throttle_level = level;
+    
+    return 0;
+}
+
+/* Set power policy */
+int power_set_policy(power_policy_t policy) {
+    if (policy >= POWER_POLICY_MAX) return -EINVAL;
+    
+    printf("Setting power policy to: %s\n", power_policy_name(policy));
+    
+    power_mgmt.current_policy = policy;
+    power_mgmt.config.active_policy = policy;
+    
+    /* Apply policy-specific settings */
+    switch (policy) {
+        case POWER_POLICY_PERFORMANCE:
+            power_mgmt.config.cpu_min_freq_mhz = power_mgmt.config.cpu_max_freq_mhz;
+            power_mgmt.config.cpu_turbo_enabled = true;
+            power_mgmt.config.display_timeout_ms = 1800000; /* 30 minutes */
+            break;
+            
+        case POWER_POLICY_BALANCED:
+            power_mgmt.config.cpu_min_freq_mhz = 
+                power_mgmt.config.cpu_max_freq_mhz / 4;
+            power_mgmt.config.cpu_turbo_enabled = true;
+            power_mgmt.config.display_timeout_ms = 600000; /* 10 minutes */
+            break;
+            
+        case POWER_POLICY_POWER_SAVER:
+            power_mgmt.config.cpu_min_freq_mhz = 800; /* 800 MHz minimum */
+            power_mgmt.config.cpu_max_freq_mhz = 1600; /* Limit max frequency */
+            power_mgmt.config.cpu_turbo_enabled = false;
+            power_mgmt.config.display_timeout_ms = 300000; /* 5 minutes */
+            power_mgmt.config.display_brightness = 50; /* Reduce brightness */
+            break;
+            
+        default:
+            break;
+    }
+    
+    /* Apply CPU governor settings */
+    const char *governor;
+    switch (policy) {
+        case POWER_POLICY_PERFORMANCE: governor = "performance"; break;
+        case POWER_POLICY_POWER_SAVER: governor = "powersave"; break;
+        default: governor = "ondemand"; break;
+    }
+    
+    dfs_set_governor(governor);
+    
+    return 0;
+}
+
+/* Get current power policy */
+power_policy_t power_get_policy(void) {
+    return power_mgmt.current_policy;
+}
+
+/* Modern Standby (S0ix) */
+int power_enter_modern_standby(void) {
+    if (!power_is_modern_standby_supported()) {
+        return power_suspend_to_ram(); /* Fallback to S3 */
+    }
+    
+    printf("Entering Modern Standby (S0ix)...\n");
+    
+    /* Configure S0ix constraints */
+    power_configure_s0ix_constraints();
+    
+    /* Put devices in low power states but keep some active */
+    device_pm_t *device = power_mgmt.device_list;
+    while (device) {
+        if (device->runtime_suspend && !device->can_wakeup) {
+            device->runtime_suspend(device);
+        }
+        device = device->next;
+    }
+    
+    /* Reduce CPU frequency and enter deep C-states */
+    for (uint32_t cpu = 0; cpu < 8; cpu++) {
+        cpu_set_frequency(cpu, power_mgmt.config.cpu_min_freq_mhz);
+        cpu_set_cstate(cpu, CPU_CSTATE_C8);
+    }
+    
+    printf("Entered Modern Standby mode\n");
+    
+    return 0;
+}
+
+/* Exit Modern Standby */
+int power_exit_modern_standby(void) {
+    printf("Exiting Modern Standby...\n");
+    
+    /* Resume devices */
+    device_pm_t *device = power_mgmt.device_list;
+    while (device) {
+        if (device->runtime_resume && device->current_state != DEVICE_POWER_D0) {
+            device->runtime_resume(device);
+        }
+        device = device->next;
+    }
+    
+    /* Restore CPU performance */
+    for (uint32_t cpu = 0; cpu < 8; cpu++) {
+        cpu_set_cstate(cpu, CPU_CSTATE_C0);
+        cpu_set_frequency(cpu, power_mgmt.config.cpu_target_freq_mhz);
+    }
+    
+    power_notify_event(POWER_EVENT_RESUME, NULL);
+    
+    printf("Exited Modern Standby mode\n");
+    
+    return 0;
+}
+
+/* Check Modern Standby support */
+bool power_is_modern_standby_supported(void) {
+    /* Check for S0ix support in ACPI */
+    char buffer[64];
+    int result = read_acpi_file("/sys/power/mem_sleep", buffer, sizeof(buffer));
+    return (result == 0 && strstr(buffer, "s2idle") != NULL);
+}
+
+/* Dynamic Frequency Scaling */
+int dfs_init(void) {
+    printf("Initializing Dynamic Frequency Scaling...\n");
+    
+    /* Set default governor */
+    dfs_set_governor("ondemand");
+    
+    /* Set frequency limits */
+    dfs_set_frequency_range(power_mgmt.config.cpu_min_freq_mhz,
+                           power_mgmt.config.cpu_max_freq_mhz);
+    
+    power_mgmt.cpu_scaling_enabled = true;
+    
+    return 0;
+}
+
+/* Set CPU governor */
+int dfs_set_governor(const char *governor) {
+    if (!governor) return -EINVAL;
+    
+    char path[256];
+    
+    /* Set governor for all CPUs */
+    for (uint32_t cpu = 0; cpu < 8; cpu++) {
+        snprintf(path, sizeof(path), 
+                 "/sys/devices/system/cpu/cpu%u/cpufreq/scaling_governor", cpu);
+        write_acpi_file(path, governor);
+    }
+    
+    printf("CPU governor set to: %s\n", governor);
+    
+    return 0;
+}
+
+/* Device power management registration */
+int device_pm_register(device_pm_t *device) {
+    if (!device) return -EINVAL;
+    
+    pthread_mutex_lock(&power_mgmt.lock);
+    
+    device->next = power_mgmt.device_list;
+    power_mgmt.device_list = device;
+    power_mgmt.device_count++;
+    
+    device->current_state = DEVICE_POWER_D0;
+    device->target_state = DEVICE_POWER_D0;
+    device->runtime_pm_enabled = true;
+    
+    printf("Registered power management for device: %s\n", device->device_name);
+    
+    pthread_mutex_unlock(&power_mgmt.lock);
+    
+    return 0;
+}
+
+/* Monitoring threads */
+static void *thermal_monitor_thread(void *arg) {
+    char path[256];
+    char buffer[64];
+    
+    while (power_mgmt.threads_running) {
+        /* Update thermal zone temperatures */
+        for (int zone = 0; zone < THERMAL_ZONE_MAX; zone++) {
+            snprintf(path, sizeof(path), 
+                     "/sys/class/thermal/thermal_zone%d/temp", zone);
+            
+            if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+                uint32_t temp = atoi(buffer);
+                thermal_update_temperature(zone, temp);
+            }
+        }
+        
+        sleep(5); /* Update every 5 seconds */
+    }
+    
+    return NULL;
+}
+
+static void *battery_monitor_thread(void *arg) {
+    while (power_mgmt.threads_running) {
+        battery_update_info();
+        
+        /* Check for low battery conditions */
+        if (power_is_low_battery()) {
+            uint32_t capacity = battery_get_capacity_percent();
+            if (capacity <= power_mgmt.config.critical_battery) {
+                power_notify_event(POWER_EVENT_BATTERY_CRITICAL, &capacity);
+            } else {
+                power_notify_event(POWER_EVENT_BATTERY_LOW, &capacity);
+            }
+        }
+        
+        sleep(30); /* Update every 30 seconds */
+    }
+    
+    return NULL;
+}
+
+static void *governor_thread(void *arg) {
+    while (power_mgmt.threads_running) {
+        /* Update CPU load and adjust frequencies */
+        for (uint32_t cpu = 0; cpu < 8; cpu++) {
+            uint32_t load = calculate_cpu_load(cpu);
+            dfs_update_load(cpu, load);
+        }
+        
+        update_power_statistics();
+        
+        sleep(1); /* Update every second */
+    }
+    
+    return NULL;
+}
+
+/* Helper functions */
+static int read_acpi_file(const char *path, char *buffer, size_t size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    
+    ssize_t bytes = read(fd, buffer, size - 1);
+    close(fd);
+    
+    if (bytes > 0) {
+        buffer[bytes] = '\0';
+        /* Remove trailing newline */
+        if (buffer[bytes - 1] == '\n') {
+            buffer[bytes - 1] = '\0';
+        }
+        return 0;
+    }
+    
+    return -1;
+}
+
+static int write_acpi_file(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    
+    ssize_t bytes = write(fd, value, strlen(value));
+    close(fd);
+    
+    return (bytes > 0) ? 0 : -1;
+}
+
+static uint32_t calculate_cpu_load(uint32_t cpu_id) {
+    /* Simplified CPU load calculation */
+    static uint64_t prev_idle[8] = {0};
+    static uint64_t prev_total[8] = {0};
+    
+    char path[256];
+    char buffer[512];
+    
+    snprintf(path, sizeof(path), "/proc/stat");
+    
+    if (read_acpi_file(path, buffer, sizeof(buffer)) == 0) {
+        /* Parse CPU usage from /proc/stat */
+        /* This is a simplified implementation */
+        return 50; /* Return 50% as placeholder */
+    }
+    
+    return 0;
+}
+
+static void update_power_statistics(void) {
+    power_mgmt.stats.power_consumed_mwh += 1; /* Simplified */
+}
+
+/* Utility functions */
+const char *power_state_name(power_state_t state) {
+    static const char *names[] = {
+        "S0 Active", "S0ix Standby", "S1 Standby", "S2 Standby",
+        "S3 Suspend", "S4 Hibernate", "S5 Shutdown", "G3 Mechanical Off"
+    };
+    
+    if (state < POWER_STATE_MAX) {
+        return names[state];
+    }
+    return "Unknown";
+}
+
+const char *power_policy_name(power_policy_t policy) {
+    static const char *names[] = {
+        "Performance", "Balanced", "Power Saver", "Custom"
+    };
+    
+    if (policy < POWER_POLICY_MAX) {
+        return names[policy];
+    }
+    return "Unknown";
+}
+
+const char *thermal_zone_name(thermal_zone_t zone) {
+    if (zone < THERMAL_ZONE_MAX) {
+        return power_mgmt.thermal_zones[zone].name;
+    }
+    return "Unknown";
+}
+
+/* ACPI interface */
+int power_acpi_init(void) {
+    printf("Initializing ACPI power interface...\n");
+    
+    /* Initialize battery information */
+    if (access("/sys/class/power_supply/BAT0", F_OK) == 0) {
+        power_mgmt.battery_present = true;
+        
+        /* Set battery defaults */
+        power_mgmt.battery.capacity_mah = 4000; /* 4000 mAh default */
+        strcpy(power_mgmt.battery.manufacturer, "LimitlessOS");
+        strcpy(power_mgmt.battery.model, "Virtual Battery");
+        strcpy(power_mgmt.battery.serial_number, "LOS001");
+        power_mgmt.battery.health_percent = 100;
+        
+        printf("Battery detected and initialized\n");
+    }
+    
+    return 0;
+}
+
+int power_set_acpi_state(power_state_t state) {
+    const char *acpi_states[] = {"mem", "disk", "halt"};
+    
+    switch (state) {
+        case POWER_STATE_S3_SUSPEND:
+        case POWER_STATE_S0ix_STANDBY:
+            return write_acpi_file("/sys/power/state", "mem");
+        case POWER_STATE_S4_HIBERNATE:
+            return write_acpi_file("/sys/power/state", "disk");
+        case POWER_STATE_S5_SHUTDOWN:
+            return write_acpi_file("/sys/power/state", "halt");
+        default:
+            return -ENOTSUP;
+    }
+}
+
+/* Event notification */
+int power_notify_event(power_event_t event, void *data) {
+    if (event >= POWER_EVENT_MAX) return -EINVAL;
+    
+    power_event_handler_t handler = power_mgmt.event_handlers[event];
+    if (handler) {
+        return handler(event, data);
+    }
+    
+    /* Default event handling */
+    switch (event) {
+        case POWER_EVENT_BATTERY_LOW:
+            printf("WARNING: Battery low (%u%%)\n", *(uint32_t*)data);
+            break;
+        case POWER_EVENT_BATTERY_CRITICAL:
+            printf("CRITICAL: Battery critically low (%u%%) - initiating hibernate\n", 
+                   *(uint32_t*)data);
+            power_set_state(POWER_STATE_S4_HIBERNATE);
+            break;
+        case POWER_EVENT_THERMAL_CRITICAL:
+            printf("CRITICAL: Thermal emergency - shutting down\n");
+            power_set_state(POWER_STATE_S5_SHUTDOWN);
+            break;
+        default:
+            break;
+    }
+    
+    return 0;
+}
+
+int dfs_update_load(uint32_t cpu_id, uint32_t load_percent) {
+    /* Adjust frequency based on load */
+    if (power_mgmt.current_policy == POWER_POLICY_PERFORMANCE) {
+        cpu_set_frequency(cpu_id, power_mgmt.config.cpu_max_freq_mhz);
+    } else if (power_mgmt.current_policy == POWER_POLICY_POWER_SAVER) {
+        cpu_set_frequency(cpu_id, power_mgmt.config.cpu_min_freq_mhz);
+    } else {
+        /* Balanced: scale frequency based on load */
+        uint32_t min_freq = power_mgmt.config.cpu_min_freq_mhz;
+        uint32_t max_freq = power_mgmt.config.cpu_max_freq_mhz;
+        uint32_t target_freq = min_freq + ((max_freq - min_freq) * load_percent) / 100;
+        cpu_set_frequency(cpu_id, target_freq);
+    }
+    
+    return 0;
+}
+
+int power_configure_s0ix_constraints(void) {
+    /* Configure platform constraints for S0ix */
+    printf("Configuring S0ix platform constraints...\n");
+    
+    /* In a real implementation, this would configure:
+     * - Platform power management constraints
+     * - Device wake capabilities
+     * - Connected standby requirements
+     */
+    
+    return 0;
+}
+
+int power_register_event_handler(power_event_t event, power_event_handler_t handler) {
+    if (event >= POWER_EVENT_MAX || !handler) return -EINVAL;
+    
+    power_mgmt.event_handlers[event] = handler;
+    
+    return 0;
+}

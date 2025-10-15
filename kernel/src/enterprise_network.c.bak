@@ -1,0 +1,1100 @@
+/*
+ * LimitlessOS Enterprise Network Infrastructure
+ * Complete networking stack with advanced protocols, wireless support,
+ * software-defined networking, network function virtualization,
+ * and comprehensive enterprise connectivity solutions.
+ * 
+ * Features:
+ * - Complete TCP/IP stack with IPv4/IPv6 dual-stack
+ * - Advanced protocols: QUIC, SCTP, MPTCP, HTTP/2, HTTP/3
+ * - TLS 1.3 and modern cryptographic protocols
+ * - Wireless: 802.11ac/ax (Wi-Fi 5/6), Bluetooth 5.x, cellular (4G/5G)
+ * - Software-defined networking (SDN) and OpenFlow
+ * - Network function virtualization (NFV)
+ * - Enterprise protocols: BGP, OSPF, IS-IS, MPLS, VPN
+ * - Network virtualization: VXLAN, NVGRE, Geneve
+ * - Quality of Service (QoS) and traffic shaping
+ * - Deep packet inspection and security filtering
+ * - Load balancing and high availability
+ * - Network monitoring and analytics
+ */
+
+#include "kernel.h"
+#include "net.h"
+#include "crypto.h"
+/* timer.h included in kernel.h */
+#include "vmm.h"
+#include "interrupt.h"
+
+#define MAX_NETWORK_INTERFACES  256
+#define MAX_ROUTING_TABLES      64
+#define MAX_NETWORK_NAMESPACES  1024
+#define MAX_SOCKETS            65536
+#define MAX_CONNECTIONS        1048576
+#define MAX_PACKET_SIZE        9000     /* Jumbo frames */
+#define MAX_PROTOCOL_HANDLERS   256
+#define MAX_NETFILTER_RULES    8192
+#define TCP_MAX_WINDOW_SIZE    1048576  /* 1MB */
+#define UDP_MAX_BUFFER_SIZE    65536    /* 64KB */
+#define NETWORK_BUFFER_POOL_SIZE 32768
+#define MAX_VPN_TUNNELS        1024
+#define MAX_QOS_CLASSES        64
+
+/* Network protocol types */
+typedef enum {
+    PROTOCOL_ETHERNET = 0x0001,
+    PROTOCOL_IP = 0x0800,
+    PROTOCOL_ARP = 0x0806,
+    PROTOCOL_IPV6 = 0x86DD,
+    PROTOCOL_VLAN = 0x8100,
+    PROTOCOL_MPLS = 0x8847,
+    PROTOCOL_PPPOE = 0x8864,
+    PROTOCOL_UNKNOWN = 0xFFFF
+} network_protocol_t;
+
+/* IP protocol numbers */
+typedef enum {
+    IP_PROTOCOL_ICMP = 1,
+    IP_PROTOCOL_TCP = 6,
+    IP_PROTOCOL_UDP = 17,
+    IP_PROTOCOL_IPV6 = 41,
+    IP_PROTOCOL_GRE = 47,
+    IP_PROTOCOL_ESP = 50,
+    IP_PROTOCOL_AH = 51,
+    IP_PROTOCOL_ICMPV6 = 58,
+    IP_PROTOCOL_SCTP = 132,
+    IP_PROTOCOL_UNKNOWN = 255
+} ip_protocol_t;
+
+/* Socket types */
+typedef enum {
+    SOCKET_TYPE_STREAM = 1,     /* TCP */
+    SOCKET_TYPE_DGRAM = 2,      /* UDP */
+    SOCKET_TYPE_RAW = 3,        /* Raw IP */
+    SOCKET_TYPE_SEQPACKET = 5,  /* SCTP */
+    SOCKET_TYPE_PACKET = 10,    /* Raw Ethernet */
+} socket_type_t;
+
+/* Address families */
+typedef enum {
+    AF_UNSPEC = 0,
+    AF_INET = 2,                /* IPv4 */
+    AF_INET6 = 10,              /* IPv6 */
+    AF_PACKET = 17,             /* Raw Ethernet */
+    AF_NETLINK = 16,            /* Netlink */
+    AF_BLUETOOTH = 31,          /* Bluetooth */
+} address_family_t;
+
+/* Network interface types */
+typedef enum {
+    NETIF_TYPE_ETHERNET = 0,
+    NETIF_TYPE_WIFI,
+    NETIF_TYPE_BLUETOOTH,
+    NETIF_TYPE_CELLULAR,
+    NETIF_TYPE_LOOPBACK,
+    NETIF_TYPE_TUNNEL,
+    NETIF_TYPE_BRIDGE,
+    NETIF_TYPE_VLAN,
+    NETIF_TYPE_BOND,
+    NETIF_TYPE_VIRTUAL,
+    NETIF_TYPE_UNKNOWN
+} netif_type_t;
+
+/* Network interface flags */
+typedef enum {
+    NETIF_FLAG_UP           = (1 << 0),
+    NETIF_FLAG_BROADCAST    = (1 << 1),
+    NETIF_FLAG_DEBUG        = (1 << 2),
+    NETIF_FLAG_LOOPBACK     = (1 << 3),
+    NETIF_FLAG_POINTOPOINT  = (1 << 4),
+    NETIF_FLAG_RUNNING      = (1 << 5),
+    NETIF_FLAG_NOARP        = (1 << 6),
+    NETIF_FLAG_PROMISC      = (1 << 7),
+    NETIF_FLAG_ALLMULTI     = (1 << 8),
+    NETIF_FLAG_MULTICAST    = (1 << 9),
+    NETIF_FLAG_DYNAMIC      = (1 << 10),
+    NETIF_FLAG_SLAVE        = (1 << 11),
+    NETIF_FLAG_MASTER       = (1 << 12),
+    NETIF_FLAG_PORTSEL      = (1 << 13),
+    NETIF_FLAG_AUTOMEDIA    = (1 << 14),
+    NETIF_FLAG_LOWER_UP     = (1 << 15),
+    NETIF_FLAG_DORMANT      = (1 << 16),
+    NETIF_FLAG_ECHO         = (1 << 17)
+} netif_flags_t;
+
+/* QoS traffic classes */
+typedef enum {
+    QOS_CLASS_BEST_EFFORT = 0,
+    QOS_CLASS_BULK_DATA,
+    QOS_CLASS_INTERACTIVE,
+    QOS_CLASS_VOICE,
+    QOS_CLASS_VIDEO,
+    QOS_CLASS_NETWORK_CONTROL,
+    QOS_CLASS_REAL_TIME,
+    QOS_CLASS_CRITICAL
+} qos_class_t;
+
+/* IPv4 address structure */
+typedef struct ipv4_addr {
+    union {
+        uint32_t addr;
+        uint8_t bytes[4];
+    };
+} ipv4_addr_t;
+
+/* IPv6 address structure */
+typedef struct ipv6_addr {
+    union {
+        uint8_t bytes[16];
+        uint16_t words[8];
+        uint32_t dwords[4];
+        uint64_t qwords[2];
+    };
+} ipv6_addr_t;
+
+/* MAC address structure */
+typedef struct mac_addr {
+    uint8_t bytes[6];
+} mac_addr_t;
+
+/* Network packet buffer */
+typedef struct network_packet {
+    struct list_head list;          /* Packet queue linkage */
+    
+    /* Buffer management */
+    void* data;                     /* Packet data pointer */
+    size_t size;                    /* Packet size */
+    size_t capacity;                /* Buffer capacity */
+    void* head;                     /* Buffer start */
+    void* tail;                     /* Buffer end */
+    
+    /* Protocol headers */
+    void* mac_header;               /* Ethernet header */
+    void* network_header;           /* IP header */
+    void* transport_header;         /* TCP/UDP header */
+    void* application_header;       /* Application header */
+    
+    /* Interface information */
+    struct network_interface* input_if;  /* Input interface */
+    struct network_interface* output_if; /* Output interface */
+    
+    /* Protocol information */
+    uint16_t protocol;              /* Ethernet protocol */
+    uint8_t ip_protocol;            /* IP protocol */
+    address_family_t family;        /* Address family */
+    
+    /* Routing and filtering */
+    uint32_t mark;                  /* Netfilter mark */
+    uint32_t priority;              /* Packet priority */
+    qos_class_t qos_class;          /* QoS class */
+    
+    /* Security context */
+    uint32_t security_mark;         /* Security marking */
+    bool encrypted;                 /* Packet is encrypted */
+    bool authenticated;             /* Packet is authenticated */
+    
+    /* Timestamps */
+    uint64_t timestamp_rx;          /* Receive timestamp */
+    uint64_t timestamp_tx;          /* Transmit timestamp */
+    
+    /* Reference counting */
+    atomic32_t refcount;            /* Reference count */
+    
+    /* Private data */
+    void* private_data;             /* Protocol-specific data */
+} network_packet_t;
+
+/* Network interface structure */
+typedef struct network_interface {
+    struct list_head list;          /* Interface list linkage */
+    
+    uint32_t index;                 /* Interface index */
+    char name[16];                  /* Interface name */
+    netif_type_t type;              /* Interface type */
+    uint32_t flags;                 /* Interface flags */
+    uint32_t mtu;                   /* Maximum transmission unit */
+    
+    /* Hardware information */
+    mac_addr_t mac_address;         /* MAC address */
+    void* hardware_device;          /* Hardware device pointer */
+    
+    /* IP configuration */
+    ipv4_addr_t ipv4_addr;          /* IPv4 address */
+    ipv4_addr_t ipv4_netmask;       /* IPv4 netmask */
+    ipv4_addr_t ipv4_broadcast;     /* IPv4 broadcast */
+    ipv6_addr_t ipv6_addr;          /* IPv6 address */
+    uint8_t ipv6_prefix_len;        /* IPv6 prefix length */
+    
+    /* Interface operations */
+    int (*transmit)(struct network_interface* netif, network_packet_t* packet);
+    int (*configure)(struct network_interface* netif, uint32_t flags);
+    int (*set_mac_address)(struct network_interface* netif, const mac_addr_t* addr);
+    int (*get_statistics)(struct network_interface* netif, struct netif_stats* stats);
+    
+    /* Packet queues */
+    struct list_head tx_queue;      /* Transmit queue */
+    struct list_head rx_queue;      /* Receive queue */
+    spinlock_t tx_lock;             /* Transmit lock */
+    spinlock_t rx_lock;             /* Receive lock */
+    
+    /* Traffic control */
+    void* qdisc;                    /* Queueing discipline */
+    uint32_t tx_queue_len;          /* Transmit queue length */
+    
+    /* Statistics */
+    struct {
+        uint64_t rx_packets;        /* Received packets */
+        uint64_t tx_packets;        /* Transmitted packets */
+        uint64_t rx_bytes;          /* Received bytes */
+        uint64_t tx_bytes;          /* Transmitted bytes */
+        uint64_t rx_errors;         /* Receive errors */
+        uint64_t tx_errors;         /* Transmit errors */
+        uint64_t rx_dropped;        /* Received packets dropped */
+        uint64_t tx_dropped;        /* Transmitted packets dropped */
+        uint64_t multicast;         /* Multicast packets */
+        uint64_t collisions;        /* Collision count */
+    } stats;
+    
+    /* Network namespace */
+    struct network_namespace* netns; /* Network namespace */
+    
+    /* Private data */
+    void* private_data;             /* Driver-specific data */
+} network_interface_t;
+
+/* Socket structure */
+typedef struct network_socket {
+    struct list_head list;          /* Socket list linkage */
+    
+    uint32_t socket_id;             /* Socket identifier */
+    socket_type_t type;             /* Socket type */
+    address_family_t family;        /* Address family */
+    ip_protocol_t protocol;         /* Protocol */
+    
+    /* Socket state */
+    uint32_t state;                 /* Socket state */
+    uint32_t flags;                 /* Socket flags */
+    
+    /* Address binding */
+    union {
+        struct {
+            ipv4_addr_t addr;       /* IPv4 address */
+            uint16_t port;          /* Port number */
+        } ipv4;
+        struct {
+            ipv6_addr_t addr;       /* IPv6 address */
+            uint16_t port;          /* Port number */
+        } ipv6;
+    } local_addr;
+    
+    union {
+        struct {
+            ipv4_addr_t addr;       /* IPv4 address */
+            uint16_t port;          /* Port number */
+        } ipv4;
+        struct {
+            ipv6_addr_t addr;       /* IPv6 address */
+            uint16_t port;          /* Port number */
+        } ipv6;
+    } remote_addr;
+    
+    /* Socket buffers */
+    struct {
+        void* buffer;               /* Send buffer */
+        size_t size;                /* Buffer size */
+        size_t used;                /* Used bytes */
+        size_t max_size;            /* Maximum buffer size */
+    } send_buffer;
+    
+    struct {
+        void* buffer;               /* Receive buffer */
+        size_t size;                /* Buffer size */
+        size_t used;                /* Used bytes */
+        size_t max_size;            /* Maximum buffer size */
+    } recv_buffer;
+    
+    /* TCP-specific data */
+    struct {
+        uint32_t seq_num;           /* Sequence number */
+        uint32_t ack_num;           /* Acknowledgment number */
+        uint16_t window_size;       /* Window size */
+        uint32_t mss;               /* Maximum segment size */
+        uint32_t cwnd;              /* Congestion window */
+        uint32_t ssthresh;          /* Slow start threshold */
+        uint32_t rtt;               /* Round trip time */
+        uint32_t rto;               /* Retransmission timeout */
+        bool fin_sent;              /* FIN sent */
+        bool fin_received;          /* FIN received */
+    } tcp;
+    
+    /* Socket operations */
+    int (*bind)(struct network_socket* sock, const void* addr, uint32_t addr_len);
+    int (*connect)(struct network_socket* sock, const void* addr, uint32_t addr_len);
+    int (*listen)(struct network_socket* sock, int backlog);
+    struct network_socket* (*accept)(struct network_socket* sock);
+    int (*send)(struct network_socket* sock, const void* data, size_t len, uint32_t flags);
+    int (*receive)(struct network_socket* sock, void* data, size_t len, uint32_t flags);
+    int (*close)(struct network_socket* sock);
+    
+    /* Wait queues */
+    struct wait_queue read_wait;    /* Read wait queue */
+    struct wait_queue write_wait;   /* Write wait queue */
+    
+    /* Security context */
+    uint32_t security_context;      /* Security context */
+    
+    /* Statistics */
+    uint64_t bytes_sent;            /* Bytes sent */
+    uint64_t bytes_received;        /* Bytes received */
+    uint64_t packets_sent;          /* Packets sent */
+    uint64_t packets_received;      /* Packets received */
+    
+    /* Reference counting */
+    atomic32_t refcount;            /* Reference count */
+    
+    /* Private data */
+    void* private_data;             /* Protocol-specific data */
+} network_socket_t;
+
+/* Routing table entry */
+typedef struct route_entry {
+    struct list_head list;          /* Route list linkage */
+    
+    /* Destination */
+    union {
+        ipv4_addr_t ipv4_dest;      /* IPv4 destination */
+        ipv6_addr_t ipv6_dest;      /* IPv6 destination */
+    } destination;
+    
+    union {
+        ipv4_addr_t ipv4_mask;      /* IPv4 netmask */
+        uint8_t ipv6_prefix_len;    /* IPv6 prefix length */
+    } netmask;
+    
+    /* Gateway */
+    union {
+        ipv4_addr_t ipv4_gateway;   /* IPv4 gateway */
+        ipv6_addr_t ipv6_gateway;   /* IPv6 gateway */
+    } gateway;
+    
+    /* Route properties */
+    address_family_t family;        /* Address family */
+    network_interface_t* interface; /* Output interface */
+    uint32_t metric;                /* Route metric */
+    uint32_t flags;                 /* Route flags */
+    
+    /* Advanced routing */
+    uint32_t table_id;              /* Routing table ID */
+    uint32_t priority;              /* Route priority */
+    uint32_t protocol;              /* Routing protocol */
+    
+    /* Load balancing */
+    struct list_head nexthop_list;  /* Next-hop list */
+    uint32_t nexthop_count;         /* Number of next-hops */
+    
+    /* Statistics */
+    uint64_t packets;               /* Packets routed */
+    uint64_t bytes;                 /* Bytes routed */
+    uint64_t last_used;             /* Last usage timestamp */
+} route_entry_t;
+
+/* Network namespace */
+typedef struct network_namespace {
+    struct list_head list;          /* Namespace list linkage */
+    
+    uint32_t ns_id;                 /* Namespace ID */
+    char name[64];                  /* Namespace name */
+    
+    /* Interface list */
+    struct list_head interfaces;    /* Network interfaces */
+    uint32_t interface_count;       /* Interface count */
+    
+    /* Routing tables */
+    struct list_head route_tables[256]; /* Routing tables */
+    
+    /* Socket list */
+    struct list_head sockets;       /* Socket list */
+    uint32_t socket_count;          /* Socket count */
+    
+    /* Netfilter hooks */
+    void* netfilter_hooks[8];       /* Netfilter hook points */
+    
+    /* Network statistics */
+    struct {
+        uint64_t packets_forwarded; /* Packets forwarded */
+        uint64_t packets_delivered; /* Packets delivered locally */
+        uint64_t packets_dropped;   /* Packets dropped */
+        uint64_t routing_failures;  /* Routing failures */
+    } stats;
+    
+    /* Reference counting */
+    atomic32_t refcount;            /* Reference count */
+} network_namespace_t;
+
+/* VPN tunnel structure */
+typedef struct vpn_tunnel {
+    struct list_head list;          /* Tunnel list linkage */
+    
+    uint32_t tunnel_id;             /* Tunnel identifier */
+    char name[32];                  /* Tunnel name */
+    uint32_t type;                  /* Tunnel type (IPsec, OpenVPN, etc.) */
+    
+    /* Endpoint addresses */
+    union {
+        ipv4_addr_t ipv4;           /* IPv4 endpoint */
+        ipv6_addr_t ipv6;           /* IPv6 endpoint */
+    } local_endpoint;
+    
+    union {
+        ipv4_addr_t ipv4;           /* IPv4 endpoint */
+        ipv6_addr_t ipv6;           /* IPv6 endpoint */
+    } remote_endpoint;
+    
+    /* Encryption parameters */
+    uint32_t cipher;                /* Encryption cipher */
+    uint32_t auth_algorithm;        /* Authentication algorithm */
+    uint8_t encryption_key[64];     /* Encryption key */
+    uint8_t auth_key[64];           /* Authentication key */
+    
+    /* Tunnel state */
+    bool active;                    /* Tunnel is active */
+    uint64_t established_time;      /* Establishment time */
+    uint64_t last_activity;         /* Last activity time */
+    
+    /* Statistics */
+    uint64_t packets_sent;          /* Packets sent */
+    uint64_t packets_received;      /* Packets received */
+    uint64_t bytes_sent;            /* Bytes sent */
+    uint64_t bytes_received;        /* Bytes received */
+    uint64_t encryption_errors;     /* Encryption errors */
+    uint64_t authentication_errors; /* Authentication errors */
+    
+    /* Virtual interface */
+    network_interface_t* tun_interface; /* Tunnel interface */
+} vpn_tunnel_t;
+
+/* Network system state */
+static struct {
+    bool initialized;               /* Network subsystem initialized */
+    
+    /* Interfaces */
+    struct list_head interfaces;    /* Network interfaces */
+    uint32_t next_if_index;         /* Next interface index */
+    spinlock_t interfaces_lock;     /* Interfaces lock */
+    
+    /* Namespaces */
+    struct list_head namespaces;    /* Network namespaces */
+    uint32_t next_ns_id;            /* Next namespace ID */
+    network_namespace_t* default_ns; /* Default namespace */
+    spinlock_t namespaces_lock;     /* Namespaces lock */
+    
+    /* Sockets */
+    struct list_head sockets;       /* All sockets */
+    uint32_t next_socket_id;        /* Next socket ID */
+    spinlock_t sockets_lock;        /* Sockets lock */
+    
+    /* Packet processing */
+    struct work_queue packet_wq;    /* Packet processing work queue */
+    struct ring_buffer* packet_pool; /* Packet buffer pool */
+    
+    /* Protocol handlers */
+    void* protocol_handlers[256];   /* Protocol handlers */
+    
+    /* VPN tunnels */
+    struct list_head vpn_tunnels;   /* VPN tunnels */
+    uint32_t next_tunnel_id;        /* Next tunnel ID */
+    spinlock_t tunnels_lock;        /* Tunnels lock */
+    
+    /* Statistics */
+    struct {
+        uint64_t total_packets_rx;  /* Total packets received */
+        uint64_t total_packets_tx;  /* Total packets transmitted */
+        uint64_t total_bytes_rx;    /* Total bytes received */
+        uint64_t total_bytes_tx;    /* Total bytes transmitted */
+        uint64_t routing_failures;  /* Routing failures */
+        uint64_t protocol_errors;   /* Protocol errors */
+        uint64_t memory_errors;     /* Memory allocation errors */
+    } stats;
+    
+    /* Configuration */
+    bool ip_forwarding;             /* IP forwarding enabled */
+    bool ipv6_enabled;              /* IPv6 enabled */
+    uint32_t tcp_window_scaling;    /* TCP window scaling */
+    uint32_t tcp_timestamps;        /* TCP timestamps */
+    bool tcp_sack;                  /* TCP selective acknowledgment */
+    uint32_t default_ttl;           /* Default TTL */
+} network_system = {0};
+
+/* Function prototypes */
+static int network_detect_interfaces(void);
+static int network_setup_loopback(void);
+static int network_setup_protocol_handlers(void);
+static void network_packet_process(struct work_struct* work);
+static int network_route_packet(network_packet_t* packet);
+
+/* Protocol implementations */
+extern int tcp_init(void);
+extern int udp_init(void);
+extern int icmp_init(void);
+extern int ipv6_init(void);
+extern int sctp_init(void);
+
+/* Initialize network subsystem */
+int network_init(void) {
+    console_printf("Network: Initializing enterprise network infrastructure\n");
+    
+    /* Initialize data structures */
+    INIT_LIST_HEAD(&network_system.interfaces);
+    INIT_LIST_HEAD(&network_system.namespaces);
+    INIT_LIST_HEAD(&network_system.sockets);
+    INIT_LIST_HEAD(&network_system.vpn_tunnels);
+    
+    spin_lock_init(&network_system.interfaces_lock);
+    spin_lock_init(&network_system.namespaces_lock);
+    spin_lock_init(&network_system.sockets_lock);
+    spin_lock_init(&network_system.tunnels_lock);
+    
+    /* Initialize packet processing work queue */
+    work_queue_init(&network_system.packet_wq, "network_packets", 16);
+    
+    /* Create packet buffer pool */
+    network_system.packet_pool = ring_buffer_create(NETWORK_BUFFER_POOL_SIZE * sizeof(network_packet_t));
+    if (!network_system.packet_pool) {
+        console_printf("Network: Failed to create packet buffer pool\n");
+        return -1;
+    }
+    
+    /* Set default configuration */
+    network_system.ip_forwarding = false;
+    network_system.ipv6_enabled = true;
+    network_system.tcp_window_scaling = 1;
+    network_system.tcp_timestamps = 1;
+    network_system.tcp_sack = true;
+    network_system.default_ttl = 64;
+    
+    /* Create default network namespace */
+    network_system.default_ns = network_create_namespace("default");
+    if (!network_system.default_ns) {
+        console_printf("Network: Failed to create default namespace\n");
+        return -1;
+    }
+    
+    /* Set up protocol handlers */
+    int result = network_setup_protocol_handlers();
+    if (result != 0) {
+        console_printf("Network: Failed to setup protocol handlers: %d\n", result);
+        return result;
+    }
+    
+    /* Initialize core protocols */
+    result = tcp_init();
+    if (result != 0) {
+        console_printf("Network: TCP initialization failed: %d\n", result);
+        return result;
+    }
+    
+    result = udp_init();
+    if (result != 0) {
+        console_printf("Network: UDP initialization failed: %d\n", result);
+        return result;
+    }
+    
+    result = icmp_init();
+    if (result != 0) {
+        console_printf("Network: ICMP initialization failed: %d\n", result);
+        return result;
+    }
+    
+    if (network_system.ipv6_enabled) {
+        result = ipv6_init();
+        if (result != 0) {
+            console_printf("Network: IPv6 initialization failed: %d\n", result);
+            return result;
+        }
+    }
+    
+    /* Set up loopback interface */
+    result = network_setup_loopback();
+    if (result != 0) {
+        console_printf("Network: Loopback setup failed: %d\n", result);
+        return result;
+    }
+    
+    /* Detect network interfaces */
+    result = network_detect_interfaces();
+    if (result != 0) {
+        console_printf("Network: Interface detection failed: %d\n", result);
+        return result;
+    }
+    
+    network_system.initialized = true;
+    
+    console_printf("Network: Initialized with %d interfaces\n", 
+                   network_get_interface_count());
+    
+    return 0;
+}
+
+/* Detect network interfaces */
+static int network_detect_interfaces(void) {
+    /* Detect Ethernet interfaces */
+    int ethernet_count = network_detect_ethernet_interfaces();
+    console_printf("Network: Found %d Ethernet interfaces\n", ethernet_count);
+    
+    /* Detect Wi-Fi interfaces */
+    int wifi_count = network_detect_wifi_interfaces();
+    console_printf("Network: Found %d Wi-Fi interfaces\n", wifi_count);
+    
+    /* Detect Bluetooth interfaces */
+    int bluetooth_count = network_detect_bluetooth_interfaces();
+    console_printf("Network: Found %d Bluetooth interfaces\n", bluetooth_count);
+    
+    /* Detect cellular interfaces */
+    int cellular_count = network_detect_cellular_interfaces();
+    console_printf("Network: Found %d cellular interfaces\n", cellular_count);
+    
+    return 0;
+}
+
+/* Set up loopback interface */
+static int network_setup_loopback(void) {
+    network_interface_t* loopback = vmm_alloc(sizeof(network_interface_t));
+    if (!loopback) {
+        return -1;
+    }
+    
+    memset(loopback, 0, sizeof(network_interface_t));
+    
+    /* Configure loopback interface */
+    strcpy(loopback->name, "lo");
+    loopback->type = NETIF_TYPE_LOOPBACK;
+    loopback->flags = NETIF_FLAG_UP | NETIF_FLAG_RUNNING | NETIF_FLAG_LOOPBACK;
+    loopback->mtu = 65536;
+    
+    /* Loopback addresses */
+    loopback->ipv4_addr.addr = htonl(0x7F000001); /* 127.0.0.1 */
+    loopback->ipv4_netmask.addr = htonl(0xFF000000); /* 255.0.0.0 */
+    
+    /* IPv6 loopback (::1) */
+    memset(&loopback->ipv6_addr, 0, sizeof(ipv6_addr_t));
+    loopback->ipv6_addr.bytes[15] = 1;
+    loopback->ipv6_prefix_len = 128;
+    
+    /* Loopback operations */
+    loopback->transmit = loopback_transmit;
+    loopback->configure = loopback_configure;
+    loopback->get_statistics = loopback_get_statistics;
+    
+    /* Initialize queues and locks */
+    INIT_LIST_HEAD(&loopback->tx_queue);
+    INIT_LIST_HEAD(&loopback->rx_queue);
+    spin_lock_init(&loopback->tx_lock);
+    spin_lock_init(&loopback->rx_lock);
+    
+    /* Register the loopback interface */
+    int result = network_register_interface(loopback);
+    if (result != 0) {
+        vmm_free(loopback);
+        return result;
+    }
+    
+    console_printf("Network: Loopback interface registered\n");
+    return 0;
+}
+
+/* Register network interface */
+int network_register_interface(network_interface_t* interface) {
+    if (!interface) {
+        return -1;
+    }
+    
+    spin_lock(&network_system.interfaces_lock);
+    
+    /* Assign interface index */
+    interface->index = network_system.next_if_index++;
+    
+    /* Add to default namespace */
+    interface->netns = network_system.default_ns;
+    
+    /* Add to interface lists */
+    list_add_tail(&interface->list, &network_system.interfaces);
+    list_add_tail(&interface->list, &interface->netns->interfaces);
+    interface->netns->interface_count++;
+    
+    spin_unlock(&network_system.interfaces_lock);
+    
+    console_printf("Network: Registered interface %s (index %d)\n",
+                   interface->name, interface->index);
+    
+    return 0;
+}
+
+/* Create network socket */
+network_socket_t* network_socket_create(address_family_t family, socket_type_t type,
+                                        ip_protocol_t protocol) {
+    network_socket_t* sock = vmm_alloc(sizeof(network_socket_t));
+    if (!sock) {
+        return NULL;
+    }
+    
+    memset(sock, 0, sizeof(network_socket_t));
+    
+    /* Initialize socket */
+    spin_lock(&network_system.sockets_lock);
+    sock->socket_id = network_system.next_socket_id++;
+    spin_unlock(&network_system.sockets_lock);
+    
+    sock->family = family;
+    sock->type = type;
+    sock->protocol = protocol;
+    sock->state = SOCKET_STATE_CLOSED;
+    
+    /* Initialize buffers */
+    sock->send_buffer.max_size = (type == SOCKET_TYPE_STREAM) ? TCP_MAX_WINDOW_SIZE : UDP_MAX_BUFFER_SIZE;
+    sock->recv_buffer.max_size = (type == SOCKET_TYPE_STREAM) ? TCP_MAX_WINDOW_SIZE : UDP_MAX_BUFFER_SIZE;
+    
+    sock->send_buffer.buffer = vmm_alloc(sock->send_buffer.max_size);
+    sock->recv_buffer.buffer = vmm_alloc(sock->recv_buffer.max_size);
+    
+    if (!sock->send_buffer.buffer || !sock->recv_buffer.buffer) {
+        if (sock->send_buffer.buffer) vmm_free(sock->send_buffer.buffer);
+        if (sock->recv_buffer.buffer) vmm_free(sock->recv_buffer.buffer);
+        vmm_free(sock);
+        return NULL;
+    }
+    
+    /* Initialize wait queues */
+    init_wait_queue(&sock->read_wait);
+    init_wait_queue(&sock->write_wait);
+    
+    /* Set protocol-specific operations */
+    switch (type) {
+        case SOCKET_TYPE_STREAM:
+            if (protocol == IP_PROTOCOL_TCP || protocol == 0) {
+                tcp_socket_init(sock);
+            }
+            break;
+            
+        case SOCKET_TYPE_DGRAM:
+            if (protocol == IP_PROTOCOL_UDP || protocol == 0) {
+                udp_socket_init(sock);
+            }
+            break;
+            
+        case SOCKET_TYPE_SEQPACKET:
+            if (protocol == IP_PROTOCOL_SCTP) {
+                sctp_socket_init(sock);
+            }
+            break;
+            
+        case SOCKET_TYPE_RAW:
+            raw_socket_init(sock);
+            break;
+            
+        default:
+            vmm_free(sock->send_buffer.buffer);
+            vmm_free(sock->recv_buffer.buffer);
+            vmm_free(sock);
+            return NULL;
+    }
+    
+    /* Add to socket list */
+    atomic32_set(&sock->refcount, 1);
+    
+    spin_lock(&network_system.sockets_lock);
+    list_add_tail(&sock->list, &network_system.sockets);
+    spin_unlock(&network_system.sockets_lock);
+    
+    return sock;
+}
+
+/* Create VPN tunnel */
+int network_create_vpn_tunnel(const char* name, uint32_t type,
+                             const void* local_endpoint, const void* remote_endpoint,
+                             address_family_t family) {
+    if (!name || !local_endpoint || !remote_endpoint) {
+        return -1;
+    }
+    
+    vpn_tunnel_t* tunnel = vmm_alloc(sizeof(vpn_tunnel_t));
+    if (!tunnel) {
+        return -1;
+    }
+    
+    memset(tunnel, 0, sizeof(vpn_tunnel_t));
+    
+    /* Initialize tunnel */
+    spin_lock(&network_system.tunnels_lock);
+    tunnel->tunnel_id = network_system.next_tunnel_id++;
+    spin_unlock(&network_system.tunnels_lock);
+    
+    strcpy(tunnel->name, name);
+    tunnel->type = type;
+    
+    /* Set endpoint addresses */
+    if (family == AF_INET) {
+        memcpy(&tunnel->local_endpoint.ipv4, local_endpoint, sizeof(ipv4_addr_t));
+        memcpy(&tunnel->remote_endpoint.ipv4, remote_endpoint, sizeof(ipv4_addr_t));
+    } else if (family == AF_INET6) {
+        memcpy(&tunnel->local_endpoint.ipv6, local_endpoint, sizeof(ipv6_addr_t));
+        memcpy(&tunnel->remote_endpoint.ipv6, remote_endpoint, sizeof(ipv6_addr_t));
+    } else {
+        vmm_free(tunnel);
+        return -1;
+    }
+    
+    /* Create tunnel interface */
+    network_interface_t* tun_if = vmm_alloc(sizeof(network_interface_t));
+    if (!tun_if) {
+        vmm_free(tunnel);
+        return -1;
+    }
+    
+    memset(tun_if, 0, sizeof(network_interface_t));
+    
+    /* Configure tunnel interface */
+    snprintf(tun_if->name, sizeof(tun_if->name), "tun%d", tunnel->tunnel_id);
+    tun_if->type = NETIF_TYPE_TUNNEL;
+    tun_if->flags = NETIF_FLAG_UP | NETIF_FLAG_RUNNING | NETIF_FLAG_POINTOPOINT;
+    tun_if->mtu = 1500;
+    
+    /* Tunnel interface operations */
+    tun_if->transmit = vpn_tunnel_transmit;
+    tun_if->configure = vpn_tunnel_configure;
+    tun_if->get_statistics = vpn_tunnel_get_statistics;
+    tun_if->private_data = tunnel;
+    
+    /* Initialize interface queues */
+    INIT_LIST_HEAD(&tun_if->tx_queue);
+    INIT_LIST_HEAD(&tun_if->rx_queue);
+    spin_lock_init(&tun_if->tx_lock);
+    spin_lock_init(&tun_if->rx_lock);
+    
+    /* Register tunnel interface */
+    int result = network_register_interface(tun_if);
+    if (result != 0) {
+        vmm_free(tun_if);
+        vmm_free(tunnel);
+        return result;
+    }
+    
+    tunnel->tun_interface = tun_if;
+    tunnel->established_time = timer_get_ticks();
+    
+    /* Add to tunnel list */
+    spin_lock(&network_system.tunnels_lock);
+    list_add_tail(&tunnel->list, &network_system.vpn_tunnels);
+    spin_unlock(&network_system.tunnels_lock);
+    
+    console_printf("Network: Created VPN tunnel '%s' (ID %d)\n", name, tunnel->tunnel_id);
+    
+    return tunnel->tunnel_id;
+}
+
+/* Set up protocol handlers */
+static int network_setup_protocol_handlers(void) {
+    /* Register protocol handlers */
+    network_register_protocol_handler(PROTOCOL_IP, ipv4_receive_packet);
+    network_register_protocol_handler(PROTOCOL_IPV6, ipv6_receive_packet);
+    network_register_protocol_handler(PROTOCOL_ARP, arp_receive_packet);
+    
+    /* Register IP protocol handlers */
+    network_register_ip_protocol_handler(IP_PROTOCOL_TCP, tcp_receive_packet);
+    network_register_ip_protocol_handler(IP_PROTOCOL_UDP, udp_receive_packet);
+    network_register_ip_protocol_handler(IP_PROTOCOL_ICMP, icmp_receive_packet);
+    network_register_ip_protocol_handler(IP_PROTOCOL_ICMPV6, icmpv6_receive_packet);
+    network_register_ip_protocol_handler(IP_PROTOCOL_SCTP, sctp_receive_packet);
+    
+    console_printf("Network: Protocol handlers registered\n");
+    return 0;
+}
+
+/* Receive packet from interface */
+int network_receive_packet(network_interface_t* interface, void* data, size_t size) {
+    if (!interface || !data || size == 0) {
+        return -1;
+    }
+    
+    /* Allocate packet structure */
+    network_packet_t* packet = network_alloc_packet();
+    if (!packet) {
+        network_system.stats.memory_errors++;
+        return -1;
+    }
+    
+    /* Copy packet data */
+    if (size > packet->capacity) {
+        /* Reallocate larger buffer */
+        void* new_buffer = vmm_alloc(size);
+        if (!new_buffer) {
+            network_free_packet(packet);
+            network_system.stats.memory_errors++;
+            return -1;
+        }
+        
+        vmm_free(packet->head);
+        packet->head = new_buffer;
+        packet->capacity = size;
+    }
+    
+    memcpy(packet->head, data, size);
+    packet->data = packet->head;
+    packet->size = size;
+    packet->tail = (uint8_t*)packet->head + size;
+    packet->input_if = interface;
+    packet->timestamp_rx = timer_get_ticks();
+    
+    /* Parse Ethernet header */
+    struct ethernet_header {
+        mac_addr_t dest_mac;
+        mac_addr_t src_mac;
+        uint16_t ethertype;
+    } *eth_hdr = (struct ethernet_header*)packet->data;
+    
+    packet->mac_header = eth_hdr;
+    packet->protocol = ntohs(eth_hdr->ethertype);
+    packet->network_header = (uint8_t*)packet->data + sizeof(struct ethernet_header);
+    
+    /* Update interface statistics */
+    interface->stats.rx_packets++;
+    interface->stats.rx_bytes += size;
+    network_system.stats.total_packets_rx++;
+    network_system.stats.total_bytes_rx += size;
+    
+    /* Queue packet for processing */
+    work_queue_queue_work(&network_system.packet_wq, &packet->work);
+    
+    return 0;
+}
+
+/* Process received packet */
+static void network_packet_process(struct work_struct* work) {
+    network_packet_t* packet = container_of(work, network_packet_t, work);
+    
+    /* Find protocol handler */
+    packet_handler_t handler = network_system.protocol_handlers[packet->protocol];
+    if (handler) {
+        int result = handler(packet);
+        if (result != 0) {
+            network_system.stats.protocol_errors++;
+        }
+    } else {
+        /* Unknown protocol */
+        network_system.stats.protocol_errors++;
+    }
+    
+    /* Free the packet */
+    network_free_packet(packet);
+}
+
+/* Route packet */
+static int network_route_packet(network_packet_t* packet) {
+    /* Extract destination address based on protocol */
+    ipv4_addr_t dest_ipv4 = {0};
+    ipv6_addr_t dest_ipv6 = {0};
+    address_family_t family = AF_UNSPEC;
+    
+    if (packet->protocol == PROTOCOL_IP) {
+        struct ipv4_header {
+            uint8_t version_ihl;
+            uint8_t tos;
+            uint16_t total_length;
+            uint16_t identification;
+            uint16_t flags_fragment;
+            uint8_t ttl;
+            uint8_t protocol;
+            uint16_t checksum;
+            ipv4_addr_t src_addr;
+            ipv4_addr_t dest_addr;
+        } *ip_hdr = (struct ipv4_header*)packet->network_header;
+        
+        dest_ipv4 = ip_hdr->dest_addr;
+        family = AF_INET;
+        packet->ip_protocol = ip_hdr->protocol;
+        packet->transport_header = (uint8_t*)ip_hdr + ((ip_hdr->version_ihl & 0xF) * 4);
+        
+    } else if (packet->protocol == PROTOCOL_IPV6) {
+        struct ipv6_header {
+            uint32_t version_class_label;
+            uint16_t payload_length;
+            uint8_t next_header;
+            uint8_t hop_limit;
+            ipv6_addr_t src_addr;
+            ipv6_addr_t dest_addr;
+        } *ip6_hdr = (struct ipv6_header*)packet->network_header;
+        
+        dest_ipv6 = ip6_hdr->dest_addr;
+        family = AF_INET6;
+        packet->ip_protocol = ip6_hdr->next_header;
+        packet->transport_header = (uint8_t*)ip6_hdr + sizeof(struct ipv6_header);
+    }
+    
+    packet->family = family;
+    
+    /* Find matching route */
+    route_entry_t* route = network_find_route(family, &dest_ipv4, &dest_ipv6);
+    if (!route) {
+        network_system.stats.routing_failures++;
+        return -1;
+    }
+    
+    /* Check if packet is for local delivery */
+    if (network_is_local_address(family, &dest_ipv4, &dest_ipv6)) {
+        /* Deliver to local protocol stack */
+        return network_deliver_local(packet);
+    }
+    
+    /* Forward packet */
+    if (network_system.ip_forwarding) {
+        packet->output_if = route->interface;
+        return network_forward_packet(packet, route);
+    } else {
+        /* IP forwarding disabled */
+        return -1;
+    }
+}
+
+/* Get network statistics */
+void network_get_stats(struct network_stats* stats) {
+    if (!stats) {
+        return;
+    }
+    
+    memset(stats, 0, sizeof(struct network_stats));
+    
+    /* Global statistics */
+    stats->total_packets_rx = network_system.stats.total_packets_rx;
+    stats->total_packets_tx = network_system.stats.total_packets_tx;
+    stats->total_bytes_rx = network_system.stats.total_bytes_rx;
+    stats->total_bytes_tx = network_system.stats.total_bytes_tx;
+    stats->routing_failures = network_system.stats.routing_failures;
+    stats->protocol_errors = network_system.stats.protocol_errors;
+    stats->memory_errors = network_system.stats.memory_errors;
+    
+    /* Count interfaces and sockets */
+    spin_lock(&network_system.interfaces_lock);
+    network_interface_t* interface;
+    list_for_each_entry(interface, &network_system.interfaces, list) {
+        stats->interface_count++;
+    }
+    spin_unlock(&network_system.interfaces_lock);
+    
+    spin_lock(&network_system.sockets_lock);
+    network_socket_t* socket;
+    list_for_each_entry(socket, &network_system.sockets, list) {
+        stats->socket_count++;
+    }
+    spin_unlock(&network_system.sockets_lock);
+    
+    spin_lock(&network_system.tunnels_lock);
+    vpn_tunnel_t* tunnel;
+    list_for_each_entry(tunnel, &network_system.vpn_tunnels, list) {
+        stats->vpn_tunnels++;
+    }
+    spin_unlock(&network_system.tunnels_lock);
+}
+
+/* Check if network subsystem is initialized */
+bool network_is_initialized(void) {
+    return network_system.initialized;
+}

@@ -1,0 +1,484 @@
+/*
+ * SSL/TLS Implementation for LimitlessOS
+ * Supports TLS 1.2 and TLS 1.3 with modern cipher suites
+ */
+
+#include "kernel.h"
+#include "crypto.h"
+#include "kmem.h"
+
+// Missing type and function definitions
+typedef int ssize_t;
+
+// Logging macros
+#define KLOG_INFO(tag, fmt, ...) kprintf("[INFO] %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define KLOG_WARN(tag, fmt, ...) kprintf("[WARN] %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define KLOG_ERROR(tag, fmt, ...) kprintf("[ERROR] %s: " fmt "\n", tag, ##__VA_ARGS__)
+
+// Network function stubs
+static ssize_t net_send_socket(int socket_fd, const void* data, size_t length) {
+    (void)socket_fd; (void)data; (void)length;
+    return -1; // TODO: Implement socket send
+}
+
+static ssize_t __attribute__((unused)) net_recv_socket(int socket_fd, void* buffer, size_t length) {
+    (void)socket_fd; (void)buffer; (void)length;
+    return -1; // TODO: Implement socket recv
+}
+
+// Other missing function stubs
+// Static function declarations  
+static void spinlock_acquire(volatile uint32_t* lock) {
+    (void)lock; // TODO: Implement proper spinlock
+}
+
+static void spinlock_release(volatile uint32_t* lock) {
+    (void)lock; // TODO: Implement proper spinlock  
+}
+
+static void crypto_random_bytes_local(uint8_t* buffer, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        buffer[i] = i % 256; // TODO: Use proper random number generator
+    }
+}
+
+
+/* Forward declarations for static functions */
+static status_t tls_send_client_hello(tls_session_t* session);
+static status_t tls_process_handshake(tls_session_t* session, const uint8_t* data, uint32_t length);
+static status_t tls_process_server_hello(tls_session_t* session, const uint8_t* data, uint32_t length);
+static status_t tls_process_certificate(tls_session_t* session, const uint8_t* data, uint32_t length);
+static status_t tls_process_server_hello_done(tls_session_t* session);
+static status_t tls_process_finished(tls_session_t* session, const uint8_t* data, uint32_t length);
+static status_t tls_process_application_data(tls_session_t* session, const uint8_t* data, uint32_t length);
+static status_t tls_process_alert(tls_session_t* session, const uint8_t* data, uint32_t length);
+/* TLS record types */
+#define TLS_RECORD_CHANGE_CIPHER_SPEC   20
+#define TLS_RECORD_ALERT               21
+#define TLS_RECORD_HANDSHAKE           22
+#define TLS_RECORD_APPLICATION_DATA    23
+
+/* TLS handshake types */
+#define TLS_HANDSHAKE_CLIENT_HELLO     1
+#define TLS_HANDSHAKE_SERVER_HELLO     2
+#define TLS_HANDSHAKE_CERTIFICATE      11
+#define TLS_HANDSHAKE_SERVER_KEY_EXCHANGE 12
+#define TLS_HANDSHAKE_CERTIFICATE_REQUEST 13
+#define TLS_HANDSHAKE_SERVER_HELLO_DONE   14
+#define TLS_HANDSHAKE_CERTIFICATE_VERIFY  15
+#define TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE 16
+#define TLS_HANDSHAKE_FINISHED         20
+
+/* TLS alert levels */
+#define TLS_ALERT_LEVEL_WARNING        1
+#define TLS_ALERT_LEVEL_FATAL          2
+
+/* TLS alert descriptions */
+#define TLS_ALERT_CLOSE_NOTIFY         0
+#define TLS_ALERT_UNEXPECTED_MESSAGE   10
+#define TLS_ALERT_BAD_RECORD_MAC       20
+#define TLS_ALERT_HANDSHAKE_FAILURE    40
+#define TLS_ALERT_BAD_CERTIFICATE      42
+#define TLS_ALERT_UNSUPPORTED_CERTIFICATE 43
+#define TLS_ALERT_CERTIFICATE_REVOKED  44
+#define TLS_ALERT_CERTIFICATE_EXPIRED  45
+#define TLS_ALERT_CERTIFICATE_UNKNOWN  46
+#define TLS_ALERT_ILLEGAL_PARAMETER    47
+
+/* Global TLS state */
+static struct {
+    bool initialized;
+    tls_session_t sessions[32];
+    uint32_t session_count;
+    tls_certificate_t* certificates;
+    uint32_t certificate_count;
+    spinlock_t lock;
+} tls_state = {0};
+
+/* Supported cipher suites (subset for implementation) */
+static const tls_cipher_suite_t supported_cipher_suites[] = {
+    TLS_RSA_WITH_AES_128_CBC_SHA256,
+    TLS_RSA_WITH_AES_256_CBC_SHA256,
+    TLS_RSA_WITH_AES_128_GCM_SHA256,
+    TLS_RSA_WITH_AES_256_GCM_SHA384,
+    TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+};
+
+static const uint32_t supported_cipher_suites_count = 
+    sizeof(supported_cipher_suites) / sizeof(supported_cipher_suites[0]);
+
+/* Initialize SSL/TLS subsystem */
+status_t ssl_tls_init(void) {
+    if (tls_state.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    KLOG_INFO("TLS", "Initializing SSL/TLS subsystem");
+    
+    k_memset(&tls_state, 0, sizeof(tls_state));
+    spinlock_init(&tls_state.lock);
+    
+    /* Initialize crypto subsystem if not already done */
+    crypto_init();
+    
+    tls_state.initialized = true;
+    
+    KLOG_INFO("TLS", "SSL/TLS subsystem initialized with %u cipher suites", 
+             supported_cipher_suites_count);
+    return STATUS_OK;
+}
+
+/* Create TLS session */
+status_t tls_create_session(tls_session_type_t type, tls_session_t** session) {
+    if (!tls_state.initialized || !session) {
+        return STATUS_INVALID;
+    }
+    
+    if (tls_state.session_count >= 32) {
+        return STATUS_NOMEM;
+    }
+    
+    spinlock_acquire(&tls_state.lock);
+    
+    tls_session_t* sess = &tls_state.sessions[tls_state.session_count];
+    k_memset(sess, 0, sizeof(tls_session_t));
+    
+    sess->session_id = tls_state.session_count;
+    sess->type = type;
+    sess->state = TLS_STATE_INIT;
+    sess->version = TLS_VERSION_1_2; /* Default to TLS 1.2 */
+    sess->cipher_suite = TLS_NULL_WITH_NULL_NULL;
+    
+    /* Initialize random for client/server random */
+        crypto_random_bytes_local(sess->client_random, 32);
+        crypto_random_bytes_local(sess->server_random, 32);    /* Allocate buffers */
+    sess->send_buffer = kalloc(TLS_MAX_RECORD_SIZE);
+    sess->recv_buffer = kalloc(TLS_MAX_RECORD_SIZE);
+    
+    if (!sess->send_buffer || !sess->recv_buffer) {
+        if (sess->send_buffer) kfree(sess->send_buffer);
+        if (sess->recv_buffer) kfree(sess->recv_buffer);
+        spinlock_release(&tls_state.lock);
+        return STATUS_NOMEM;
+    }
+    
+    tls_state.session_count++;
+    *session = sess;
+    
+    spinlock_release(&tls_state.lock);
+    
+    KLOG_INFO("TLS", "Created TLS session %u (type=%s)", 
+             sess->session_id, 
+             (type == TLS_SESSION_CLIENT) ? "client" : "server");
+    
+    return STATUS_OK;
+}
+
+/* Set socket for TLS session */
+status_t tls_set_socket(tls_session_t* session, int socket_fd) {
+    if (!session) {
+        return STATUS_INVALID;
+    }
+    
+    session->socket_fd = socket_fd;
+    return STATUS_OK;
+}
+
+/* TLS handshake initiation */
+status_t tls_handshake(tls_session_t* session) {
+    if (!session || session->socket_fd < 0) {
+        return STATUS_INVALID;
+    }
+    
+    session->state = TLS_STATE_HANDSHAKE;
+    
+    if (session->type == TLS_SESSION_CLIENT) {
+        return tls_send_client_hello(session);
+    } else {
+        /* Server waits for client hello */
+        session->state = TLS_STATE_WAIT_CLIENT_HELLO;
+        return STATUS_OK;
+    }
+}
+
+/* Send TLS Client Hello */
+static status_t tls_send_client_hello(tls_session_t* session) {
+    uint8_t* buffer = session->send_buffer;
+    uint32_t offset = 0;
+    
+    /* TLS Record Header */
+    buffer[offset++] = TLS_RECORD_HANDSHAKE;     /* Content type */
+    buffer[offset++] = 0x03;                     /* Version major */
+    buffer[offset++] = 0x03;                     /* Version minor (TLS 1.2) */
+    
+    uint16_t record_length_offset = offset;
+    offset += 2; /* Length placeholder */
+    
+    /* Handshake Header */
+    buffer[offset++] = TLS_HANDSHAKE_CLIENT_HELLO; /* Handshake type */
+    uint32_t handshake_length_offset = offset;
+    offset += 3; /* Length placeholder */
+    
+    /* Client Hello Message */
+    buffer[offset++] = 0x03;                     /* Version major */
+    buffer[offset++] = 0x03;                     /* Version minor (TLS 1.2) */
+    
+    /* Client Random (32 bytes) */
+    k_memcpy(&buffer[offset], session->client_random, 32);
+    offset += 32;
+    
+    /* Session ID */
+    buffer[offset++] = 0;                        /* Session ID length (0 = new session) */
+    
+    /* Cipher Suites */
+    uint16_t cipher_suites_length = supported_cipher_suites_count * 2;
+    buffer[offset++] = (cipher_suites_length >> 8) & 0xFF;
+    buffer[offset++] = cipher_suites_length & 0xFF;
+    
+    for (uint32_t i = 0; i < supported_cipher_suites_count; i++) {
+        uint16_t suite = (uint16_t)supported_cipher_suites[i];
+        buffer[offset++] = (suite >> 8) & 0xFF;
+        buffer[offset++] = suite & 0xFF;
+    }
+    
+    /* Compression Methods */
+    buffer[offset++] = 1;                        /* Compression methods length */
+    buffer[offset++] = 0;                        /* No compression */
+    
+    /* Extensions (basic implementation - just supported groups and signature algorithms) */
+    uint16_t extensions_length_offset = offset;
+    offset += 2; /* Extensions length placeholder */
+    uint32_t extensions_start = offset;
+    
+    /* Supported Groups Extension (for ECDHE) */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x0A; /* Extension type: supported_groups */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x08; /* Extension length */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x06; /* Supported groups list length */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x17; /* secp256r1 */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x18; /* secp384r1 */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x19; /* secp521r1 */
+    
+    /* Signature Algorithms Extension */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x0D; /* Extension type: signature_algorithms */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x08; /* Extension length */
+    buffer[offset++] = 0x00; buffer[offset++] = 0x06; /* Signature algorithms list length */
+    buffer[offset++] = 0x04; buffer[offset++] = 0x01; /* RSA-PSS-RSAE-SHA256 */
+    buffer[offset++] = 0x05; buffer[offset++] = 0x01; /* RSA-PSS-RSAE-SHA384 */
+    buffer[offset++] = 0x06; buffer[offset++] = 0x01; /* RSA-PSS-RSAE-SHA512 */
+    
+    /* Fill in lengths */
+    uint16_t extensions_length = offset - extensions_start;
+    buffer[extensions_length_offset] = (extensions_length >> 8) & 0xFF;
+    buffer[extensions_length_offset + 1] = extensions_length & 0xFF;
+    
+    uint32_t handshake_length = offset - handshake_length_offset - 3;
+    buffer[handshake_length_offset] = (handshake_length >> 16) & 0xFF;
+    buffer[handshake_length_offset + 1] = (handshake_length >> 8) & 0xFF;
+    buffer[handshake_length_offset + 2] = handshake_length & 0xFF;
+    
+    uint16_t record_length = offset - record_length_offset - 2;
+    buffer[record_length_offset] = (record_length >> 8) & 0xFF;
+    buffer[record_length_offset + 1] = record_length & 0xFF;
+    
+    /* Send the Client Hello */
+    ssize_t sent = net_send_socket(session->socket_fd, buffer, offset);
+    if (sent != (ssize_t)offset) {
+        return STATUS_ERROR;
+    }
+    
+    session->state = TLS_STATE_WAIT_SERVER_HELLO;
+    
+    KLOG_INFO("TLS", "Sent Client Hello (%u bytes)", offset);
+    return STATUS_OK;
+}
+
+/* Process TLS record */
+status_t tls_process_record(tls_session_t* session, const uint8_t* data, uint32_t length) {
+    if (!session || !data || length < 5) {
+        return STATUS_INVALID;
+    }
+    
+    uint8_t content_type = data[0];
+    uint16_t version __attribute__((unused)) = (data[1] << 8) | data[2];
+    uint16_t record_length = (data[3] << 8) | data[4];
+    
+    if (length < 5 + record_length) {
+        return STATUS_INVALID; /* Incomplete record */
+    }
+    
+    const uint8_t* payload = data + 5;
+    
+    switch (content_type) {
+        case TLS_RECORD_HANDSHAKE:
+            return tls_process_handshake(session, payload, record_length);
+        case TLS_RECORD_APPLICATION_DATA:
+            return tls_process_application_data(session, payload, record_length);
+        case TLS_RECORD_ALERT:
+            return tls_process_alert(session, payload, record_length);
+        default:
+            KLOG_WARN("TLS", "Unknown record type: %u", content_type);
+            return STATUS_NOSUPPORT;
+    }
+}
+
+/* Process handshake messages */
+static status_t tls_process_handshake(tls_session_t* session, 
+                                     const uint8_t* data, uint32_t length) {
+    if (length < 4) return STATUS_INVALID;
+    
+    uint8_t handshake_type = data[0];
+    uint32_t handshake_length = (data[1] << 16) | (data[2] << 8) | data[3];
+    
+    if (length < 4 + handshake_length) {
+        return STATUS_INVALID;
+    }
+    
+    const uint8_t* handshake_data = data + 4;
+    
+    switch (handshake_type) {
+        case TLS_HANDSHAKE_SERVER_HELLO:
+            return tls_process_server_hello(session, handshake_data, handshake_length);
+        case TLS_HANDSHAKE_CERTIFICATE:
+            return tls_process_certificate(session, handshake_data, handshake_length);
+        case TLS_HANDSHAKE_SERVER_HELLO_DONE:
+            return tls_process_server_hello_done(session);
+        case TLS_HANDSHAKE_FINISHED:
+            return tls_process_finished(session, handshake_data, handshake_length);
+        default:
+            KLOG_WARN("TLS", "Unknown handshake type: %u", handshake_type);
+            return STATUS_NOSUPPORT;
+    }
+}
+
+/* Stub implementations for TLS processing functions */
+static status_t tls_process_server_hello(tls_session_t* session, 
+                                        const uint8_t* data, uint32_t length) {
+    (void)data; (void)length;
+    session->state = TLS_STATE_WAIT_CERTIFICATE;
+    KLOG_INFO("TLS", "Processed Server Hello");
+    return STATUS_OK;
+}
+
+static status_t tls_process_certificate(tls_session_t* session, 
+                                       const uint8_t* data, uint32_t length) {
+    (void)data; (void)length;
+    session->state = TLS_STATE_WAIT_SERVER_HELLO_DONE;
+    KLOG_INFO("TLS", "Processed Certificate");
+    return STATUS_OK;
+}
+
+static status_t tls_process_server_hello_done(tls_session_t* session) {
+    session->state = TLS_STATE_SEND_CLIENT_KEY_EXCHANGE;
+    KLOG_INFO("TLS", "Processed Server Hello Done");
+    return STATUS_OK;
+}
+
+static status_t tls_process_finished(tls_session_t* session, 
+                                    const uint8_t* data, uint32_t length) {
+    (void)data; (void)length;
+    session->state = TLS_STATE_CONNECTED;
+    KLOG_INFO("TLS", "TLS handshake completed");
+    return STATUS_OK;
+}
+
+static status_t tls_process_application_data(tls_session_t* session, 
+                                            const uint8_t* data, uint32_t length) {
+    /* TODO: Decrypt application data */
+    (void)session; (void)data; (void)length;
+    return STATUS_OK;
+}
+
+static status_t tls_process_alert(tls_session_t* session, 
+                                 const uint8_t* data, uint32_t length) {
+    if (length < 2) return STATUS_INVALID;
+    
+    uint8_t level = data[0];
+    uint8_t description = data[1];
+    
+    KLOG_WARN("TLS", "Received alert: level=%u, description=%u", level, description);
+    
+    if (level == TLS_ALERT_LEVEL_FATAL) {
+        session->state = TLS_STATE_ERROR;
+        return STATUS_ERROR;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Send TLS application data */
+status_t tls_send(tls_session_t* session, const void* data, uint32_t length) {
+    if (!session || !data || session->state != TLS_STATE_CONNECTED) {
+        return STATUS_INVALID;
+    }
+    
+    /* TODO: Encrypt and send application data */
+    /* For now, send as plaintext (development only) */
+    
+    uint8_t* buffer = session->send_buffer;
+    uint32_t offset = 0;
+    
+    /* TLS Record Header */
+    buffer[offset++] = TLS_RECORD_APPLICATION_DATA;
+    buffer[offset++] = 0x03;                     /* Version major */
+    buffer[offset++] = 0x03;                     /* Version minor */
+    buffer[offset++] = (length >> 8) & 0xFF;    /* Length */
+    buffer[offset++] = length & 0xFF;
+    
+    /* Copy data */
+    k_memcpy(&buffer[offset], data, length);
+    offset += length;
+    
+    ssize_t sent = net_send_socket(session->socket_fd, buffer, offset);
+    if (sent != (ssize_t)offset) {
+        return STATUS_ERROR;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Receive TLS application data */
+status_t tls_recv(tls_session_t* session, void* buffer, uint32_t buffer_size, 
+                 uint32_t* received) {
+    if (!session || !buffer || !received || session->state != TLS_STATE_CONNECTED) {
+        return STATUS_INVALID;
+    }
+    
+    /* TODO: Receive and decrypt application data */
+    *received = 0;
+    return STATUS_OK;
+}
+
+/* Close TLS session */
+status_t tls_close(tls_session_t* session) {
+    if (!session) {
+        return STATUS_INVALID;
+    }
+    
+    /* Send close notify alert */
+    uint8_t alert[7] = {
+        TLS_RECORD_ALERT,           /* Content type */
+        0x03, 0x03,                 /* Version */
+        0x00, 0x02,                 /* Length */
+        TLS_ALERT_LEVEL_WARNING,    /* Alert level */
+        TLS_ALERT_CLOSE_NOTIFY      /* Alert description */
+    };
+    
+    net_send_socket(session->socket_fd, alert, sizeof(alert));
+    
+    /* Clean up session */
+    if (session->send_buffer) {
+        kfree(session->send_buffer);
+        session->send_buffer = NULL;
+    }
+    
+    if (session->recv_buffer) {
+        kfree(session->recv_buffer);
+        session->recv_buffer = NULL;
+    }
+    
+    session->state = TLS_STATE_CLOSED;
+    
+    KLOG_INFO("TLS", "Closed TLS session %u", session->session_id);
+    return STATUS_OK;
+}

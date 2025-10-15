@@ -1,0 +1,353 @@
+/**
+ * Advanced Driver Framework Integration for LimitlessOS Kernel
+ * Integrates driver framework with kernel initialization
+ */
+
+#include "kernel.h"
+#include "driver_framework.h"
+#include "security.h"
+
+/* External driver framework functions */
+extern status_t driver_framework_init(void);
+extern status_t device_enumeration_init(void);
+extern status_t device_enumerate_all(void);
+extern status_t driver_sandbox_init(void);
+extern status_t hotplug_start_monitoring(void);
+
+/* Driver framework integration state */
+static struct {
+    bool framework_initialized;
+    bool enumeration_initialized;
+    bool sandbox_initialized;
+    bool hotplug_initialized;
+    bool integration_complete;
+    uint64_t init_start_time;
+    uint64_t init_complete_time;
+} driver_integration = {0};
+
+/* Sample drivers to register */
+typedef struct {
+    const char* name;
+    driver_type_t type;
+    const char* description;
+} sample_driver_t;
+
+static sample_driver_t sample_drivers[] = {
+    {"e1000", DRIVER_TYPE_NETWORK, "Intel E1000 Ethernet Driver"},
+    {"virtio_net", DRIVER_TYPE_NETWORK, "Virtio Network Driver"},
+    {"virtio_blk", DRIVER_TYPE_BLOCK, "Virtio Block Driver"},
+    {"qemu_vga", DRIVER_TYPE_DISPLAY, "QEMU VGA Driver"},
+    {"usb_hid", DRIVER_TYPE_INPUT, "USB HID Driver"},
+    {"usb_storage", DRIVER_TYPE_BLOCK, "USB Storage Driver"},
+    {"serial", DRIVER_TYPE_CHARACTER, "Serial Port Driver"},
+    {"rtc", DRIVER_TYPE_SYSTEM, "Real-Time Clock Driver"},
+};
+
+#define SAMPLE_DRIVER_COUNT (sizeof(sample_drivers) / sizeof(sample_drivers[0]))
+
+/* Sample driver callback implementations */
+static status_t sample_driver_probe(device_t* device) {
+    if (!device) return STATUS_ERROR;
+    
+    console_printf("Sample driver probing device: %s\n", device->name);
+    
+    /* Simulate successful probe */
+    return STATUS_OK;
+}
+
+static status_t sample_driver_remove(device_t* device) {
+    if (!device) return STATUS_ERROR;
+    
+    console_printf("Sample driver removing device: %s\n", device->name);
+    
+    return STATUS_OK;
+}
+
+static status_t sample_driver_suspend(device_t* device, power_state_t state) {
+    if (!device) return STATUS_ERROR;
+    
+    console_printf("Sample driver suspending device: %s (state: %s)\n", 
+                  device->name, power_state_to_string(state));
+    
+    return STATUS_OK;
+}
+
+static status_t sample_driver_resume(device_t* device) {
+    if (!device) return STATUS_ERROR;
+    
+    console_printf("Sample driver resuming device: %s\n", device->name);
+    
+    return STATUS_OK;
+}
+
+static status_t sample_driver_read(device_t* device, void* buffer, size_t size, uint64_t offset) {
+    if (!device || !buffer) return STATUS_ERROR;
+    
+    /* Simulate read operation */
+    k_memset(buffer, 0xAA, size);  /* Fill with test pattern */
+    
+    return STATUS_OK;
+}
+
+static status_t sample_driver_write(device_t* device, const void* buffer, size_t size, uint64_t offset) {
+    if (!device || !buffer) return STATUS_ERROR;
+    
+    /* Simulate write operation */
+    return STATUS_OK;
+}
+
+static status_t sample_driver_ioctl(device_t* device, uint32_t cmd, void* arg) {
+    if (!device) return STATUS_ERROR;
+    
+    /* Handle common ioctl commands */
+    switch (cmd) {
+        case 0x1000:  /* Get device info */
+            if (arg) {
+                device_id_t* info = (device_id_t*)arg;
+                *info = device->id_info;
+            }
+            return STATUS_OK;
+            
+        case 0x1001:  /* Reset device */
+            console_printf("Resetting device: %s\n", device->name);
+            return STATUS_OK;
+            
+        default:
+            return STATUS_NOSUPPORT;
+    }
+}
+
+/* Initialize driver framework */
+status_t kernel_driver_framework_init(void) {
+    driver_integration.init_start_time = timer_get_ticks();
+    
+    console_printf("LimitlessOS: Initializing Advanced Driver Framework...\n");
+    
+    /* Initialize core driver framework */
+    status_t status = driver_framework_init();
+    if (status != STATUS_OK) {
+        console_printf("ERROR: Failed to initialize driver framework: %d\n", status);
+        return status;
+    }
+    driver_integration.framework_initialized = true;
+    console_printf("Driver framework core initialized\n");
+    
+    /* Initialize device enumeration */
+    status = device_enumeration_init();
+    if (status != STATUS_OK) {
+        console_printf("ERROR: Failed to initialize device enumeration: %d\n", status);
+        return status;
+    }
+    driver_integration.enumeration_initialized = true;
+    console_printf("Device enumeration initialized\n");
+    
+    /* Initialize driver sandbox system */
+    status = driver_sandbox_init();
+    if (status != STATUS_OK) {
+        console_printf("ERROR: Failed to initialize driver sandboxing: %d\n", status);
+        return status;
+    }
+    driver_integration.sandbox_initialized = true;
+    console_printf("Driver sandboxing initialized\n");
+    
+    /* Register sample drivers */
+    driver_callbacks_t sample_callbacks = {
+        .probe = sample_driver_probe,
+        .remove = sample_driver_remove,
+        .suspend = sample_driver_suspend,
+        .resume = sample_driver_resume,
+        .read = sample_driver_read,
+        .write = sample_driver_write,
+        .ioctl = sample_driver_ioctl,
+        .shutdown = NULL,
+        .reset = NULL,
+        .mmap = NULL,
+        .interrupt_handler = NULL,
+        .dma_complete = NULL,
+        .hotplug_event = NULL,
+        .power_event = NULL,
+        .error_handler = NULL,
+        .statistics = NULL
+    };
+    
+    console_printf("Registering sample drivers...\n");
+    uint32_t drivers_registered = 0;
+    
+    for (uint32_t i = 0; i < SAMPLE_DRIVER_COUNT; i++) {
+        driver_t* driver;
+        status = driver_register(sample_drivers[i].name, 
+                               sample_drivers[i].type,
+                               &sample_callbacks, 
+                               &driver);
+        
+        if (status == STATUS_OK) {
+            /* Set driver description */
+            strncpy(driver->description, sample_drivers[i].description,
+                   sizeof(driver->description) - 1);
+            driver->description[sizeof(driver->description) - 1] = 0;
+            
+            /* Set default driver properties */
+            driver->version = 0x00010000;  /* Version 1.0 */
+            driver->build = 1;
+            strcpy(driver->vendor, "LimitlessOS");
+            driver->capabilities = DRIVER_CAP_HOT_PLUG | DRIVER_CAP_POWER_MGMT;
+            
+            /* Create sandbox for driver if it's not a critical system driver */
+            if (sample_drivers[i].type != DRIVER_TYPE_SYSTEM) {
+                uint32_t memory_limit = 8 * 1024 * 1024;  /* 8MB */
+                uint32_t cpu_quota = 10;  /* 10% */
+                
+                status_t sandbox_status = driver_create_sandbox(driver, memory_limit, cpu_quota);
+                if (sandbox_status == STATUS_OK) {
+                    console_printf("Created sandbox for driver '%s'\n", driver->name);
+                } else {
+                    console_printf("WARNING: Failed to create sandbox for driver '%s': %d\n", 
+                                 driver->name, sandbox_status);
+                }
+            }
+            
+            drivers_registered++;
+            console_printf("Registered driver: %s\n", sample_drivers[i].name);
+        } else {
+            console_printf("WARNING: Failed to register driver '%s': %d\n", 
+                         sample_drivers[i].name, status);
+        }
+    }
+    
+    console_printf("Driver registration complete: %u/%u drivers registered\n",
+                  drivers_registered, SAMPLE_DRIVER_COUNT);
+    
+    /* Perform device enumeration */
+    console_printf("Starting device enumeration...\n");
+    status = device_enumerate_all();
+    if (status != STATUS_OK) {
+        console_printf("WARNING: Device enumeration failed: %d\n", status);
+    } else {
+        console_printf("Device enumeration completed\n");
+    }
+    
+    /* Start hot-plug monitoring */
+    status = hotplug_start_monitoring();
+    if (status == STATUS_OK) {
+        driver_integration.hotplug_initialized = true;
+        console_printf("Hot-plug monitoring started\n");
+    } else {
+        console_printf("WARNING: Failed to start hot-plug monitoring: %d\n", status);
+    }
+    
+    driver_integration.integration_complete = true;
+    driver_integration.init_complete_time = timer_get_ticks();
+    
+    uint64_t init_duration = driver_integration.init_complete_time - driver_integration.init_start_time;
+    console_printf("Advanced Driver Framework initialization complete (%llu ms)\n", 
+                  init_duration * 1000 / TIMER_HZ);
+    
+    /* Audit driver framework initialization */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Advanced driver framework initialized", "driver_framework", 1);
+    
+    return STATUS_OK;
+}
+
+/* Get driver framework status */
+status_t kernel_driver_framework_get_status(kernel_driver_framework_status_t* status) {
+    if (!status) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(status, 0, sizeof(kernel_driver_framework_status_t));
+    
+    status->initialized = driver_integration.integration_complete;
+    status->framework_active = driver_integration.framework_initialized;
+    status->enumeration_active = driver_integration.enumeration_initialized;
+    status->sandbox_active = driver_integration.sandbox_initialized;
+    status->hotplug_active = driver_integration.hotplug_initialized;
+    
+    if (driver_integration.integration_complete) {
+        /* Get framework statistics */
+        driver_framework_stats_t framework_stats;
+        if (driver_framework_get_stats(&framework_stats) == STATUS_OK) {
+            status->total_drivers = framework_stats.total_drivers;
+            status->active_drivers = framework_stats.active_drivers;
+            status->total_devices = framework_stats.total_devices;
+            status->active_devices = framework_stats.active_devices;
+            status->hotplug_events = framework_stats.hotplug_events;
+        }
+        
+        /* Get sandbox statistics */
+        driver_sandbox_stats_t sandbox_stats;
+        if (driver_sandbox_get_stats(&sandbox_stats) == STATUS_OK) {
+            status->sandboxed_drivers = sandbox_stats.total_sandboxes;
+            status->sandbox_memory_used = sandbox_stats.memory_pool_used;
+        }
+    }
+    
+    status->init_time = driver_integration.init_complete_time - driver_integration.init_start_time;
+    
+    return STATUS_OK;
+}
+
+/* Perform driver framework diagnostics */
+status_t kernel_driver_framework_diagnostics(void) {
+    if (!driver_integration.integration_complete) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("=== Driver Framework Diagnostics ===\n");
+    
+    /* Get framework statistics */
+    driver_framework_stats_t framework_stats;
+    if (driver_framework_get_stats(&framework_stats) == STATUS_OK) {
+        console_printf("Framework Statistics:\n");
+        console_printf("  Total Drivers: %u\n", framework_stats.total_drivers);
+        console_printf("  Active Drivers: %u\n", framework_stats.active_drivers);
+        console_printf("  Failed Drivers: %u\n", framework_stats.failed_drivers);
+        console_printf("  Total Devices: %u\n", framework_stats.total_devices);
+        console_printf("  Active Devices: %u\n", framework_stats.active_devices);
+        console_printf("  Hot-plug Events: %u\n", framework_stats.hotplug_events);
+        console_printf("  Memory Usage: %llu KB\n", framework_stats.total_memory_usage / 1024);
+        console_printf("  Framework Uptime: %llu ms\n", 
+                      framework_stats.framework_uptime * 1000 / TIMER_HZ);
+    }
+    
+    /* Get sandbox statistics */
+    driver_sandbox_stats_t sandbox_stats;
+    if (driver_sandbox_get_stats(&sandbox_stats) == STATUS_OK) {
+        console_printf("Sandbox Statistics:\n");
+        console_printf("  Active Sandboxes: %u\n", sandbox_stats.total_sandboxes);
+        console_printf("  Memory Pool Size: %llu MB\n", sandbox_stats.memory_pool_size / (1024 * 1024));
+        console_printf("  Memory Pool Used: %llu MB\n", sandbox_stats.memory_pool_used / (1024 * 1024));
+        console_printf("  Peak Memory Usage: %llu KB\n", sandbox_stats.peak_memory_usage / 1024);
+        console_printf("  Total CPU Time: %llu ms\n", sandbox_stats.total_cpu_time * 1000 / TIMER_HZ);
+        console_printf("  Total Syscalls: %llu\n", sandbox_stats.total_syscalls);
+        console_printf("  Total I/O Operations: %llu\n", sandbox_stats.total_io_operations);
+    }
+    
+    console_printf("=== End Diagnostics ===\n");
+    
+    return STATUS_OK;
+}
+
+/* Shutdown driver framework */
+status_t kernel_driver_framework_shutdown(void) {
+    if (!driver_integration.integration_complete) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Shutting down advanced driver framework...\n");
+    
+    /* Shutdown components in reverse order */
+    if (driver_integration.sandbox_initialized) {
+        driver_sandbox_shutdown();
+    }
+    
+    if (driver_integration.framework_initialized) {
+        driver_framework_shutdown();
+    }
+    
+    k_memset(&driver_integration, 0, sizeof(driver_integration));
+    
+    console_printf("Advanced driver framework shutdown complete\n");
+    
+    return STATUS_OK;
+}

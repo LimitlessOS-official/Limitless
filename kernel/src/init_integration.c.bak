@@ -1,0 +1,12 @@
+#include "exec.h"
+#include "kernel.h"
+
+/*
+ * Kernel entry hook to launch userspace init.
+ * Call this after kernel subsystems are initialized and interrupts enabled.
+ */
+
+void kernel_start_userspace_init(void) {
+    /* TODO: ensure /sbin/init is present in rootfs (tmpfs or ramdisk) */
+    exec_start_pid1("/sbin/init");
+}

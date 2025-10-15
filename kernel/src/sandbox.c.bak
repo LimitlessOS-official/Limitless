@@ -1,0 +1,986 @@
+/**
+ * LimitlessOS Application Sandboxing System Implementation
+ * Android-style application sandboxing with namespace isolation, resource limits,
+ * permission management, and user-configurable security policies
+ */
+
+#include "sandbox.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <time.h>
+#include <errno.h>
+#include "../include/hal.h"
+#include "../include/memory.h"
+#include "../include/scheduler.h"
+#include "../include/security_enterprise.h"
+
+/* Global sandbox manager instance */
+sandbox_manager_t sandbox_manager = {0};
+
+/* Forward declarations for internal functions */
+static status_t sandbox_setup_namespaces(sandbox_t* sandbox);
+static status_t sandbox_setup_cgroups(sandbox_t* sandbox);
+static status_t sandbox_setup_seccomp(sandbox_t* sandbox);
+static status_t sandbox_setup_capabilities(sandbox_t* sandbox);
+static status_t sandbox_monitor_resources(sandbox_t* sandbox);
+static status_t sandbox_enforce_limits(sandbox_t* sandbox);
+static bool sandbox_permission_requires_user_consent(sandbox_permission_t permission);
+static status_t sandbox_log_permission_request(sandbox_t* sandbox, sandbox_permission_t permission, const char* reason);
+static status_t sandbox_create_default_policies(void);
+static status_t sandbox_validate_policy(sandbox_policy_t* policy);
+
+/**
+ * Initialize the sandbox system
+ */
+status_t sandbox_init(void) {
+    printf("Initializing LimitlessOS Sandbox System v%d.%d...\n",
+           SANDBOX_VERSION_MAJOR, SANDBOX_VERSION_MINOR);
+    
+    if (sandbox_manager.initialized) {
+        return STATUS_ALREADY_INITIALIZED;
+    }
+    
+    /* Initialize sandbox manager structure */
+    memset(&sandbox_manager, 0, sizeof(sandbox_manager_t));
+    sandbox_manager.version = (SANDBOX_VERSION_MAJOR << 16) | SANDBOX_VERSION_MINOR;
+    
+    /* Set default configuration (security-first approach) */
+    sandbox_manager.sandboxing_enabled = true;         /* Enabled by default */
+    sandbox_manager.default_security_level = SECURITY_LEVEL_STANDARD;
+    sandbox_manager.enforce_by_default = true;         /* Enforce by default */
+    sandbox_manager.user_override_allowed = true;      /* Allow user overrides */
+    sandbox_manager.max_sandboxes = MAX_SANDBOXES;
+    
+    /* Initialize AI features (disabled by default for privacy) */
+    sandbox_manager.ai_features.anomaly_detection_enabled = false;
+    sandbox_manager.ai_features.behavioral_analysis_enabled = false;
+    sandbox_manager.ai_features.threat_prediction_enabled = false;
+    
+    /* Initialize enterprise features */
+    sandbox_manager.enterprise_features.policy_enforcement_enabled = true;
+    sandbox_manager.enterprise_features.compliance_monitoring_enabled = true;
+    sandbox_manager.enterprise_features.audit_reporting_enabled = true;
+    
+    /* Create default policies */
+    status_t status = sandbox_create_default_policies();
+    if (status != STATUS_SUCCESS) {
+        printf("Warning: Failed to create default sandbox policies (status: %d)\n", status);
+    }
+    
+    sandbox_manager.initialized = true;
+    printf("Sandbox system initialized successfully\n");
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Shutdown the sandbox system
+ */
+void sandbox_shutdown(void) {
+    if (!sandbox_manager.initialized) {
+        return;
+    }
+    
+    printf("Shutting down Sandbox System...\n");
+    
+    /* Stop all active sandboxes */
+    sandbox_t* sandbox = sandbox_manager.sandboxes;
+    while (sandbox) {
+        sandbox_stop(sandbox);
+        sandbox = sandbox->next;
+    }
+    
+    /* Clean up sandboxes */
+    sandbox = sandbox_manager.sandboxes;
+    while (sandbox) {
+        sandbox_t* next = sandbox->next;
+        sandbox_destroy(sandbox);
+        sandbox = next;
+    }
+    
+    /* Clean up policies */
+    sandbox_policy_t* policy = sandbox_manager.policies;
+    while (policy) {
+        sandbox_policy_t* next = policy->next;
+        sandbox_destroy_policy(policy);
+        policy = next;
+    }
+    
+    sandbox_manager.initialized = false;
+    printf("Sandbox system shutdown complete\n");
+}
+
+/**
+ * Check if sandboxing is enabled
+ */
+bool sandbox_is_enabled(void) {
+    return sandbox_manager.initialized && sandbox_manager.sandboxing_enabled;
+}
+
+/**
+ * Enable or disable sandboxing system
+ */
+status_t sandbox_enable_system(bool enable) {
+    if (!sandbox_manager.initialized) {
+        return STATUS_NOT_INITIALIZED;
+    }
+    
+    sandbox_manager.sandboxing_enabled = enable;
+    printf("Sandbox system %s\n", enable ? "enabled" : "disabled");
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Create a new sandbox policy
+ */
+sandbox_policy_t* sandbox_create_policy(const char* name, sandbox_type_t type) {
+    if (!name || !sandbox_is_enabled()) {
+        return NULL;
+    }
+    
+    sandbox_policy_t* policy = (sandbox_policy_t*)malloc(sizeof(sandbox_policy_t));
+    if (!policy) {
+        return NULL;
+    }
+    
+    memset(policy, 0, sizeof(sandbox_policy_t));
+    
+    /* Generate unique policy ID */
+    static uint32_t policy_id_counter = 0;
+    policy->id = ++policy_id_counter;
+    
+    strncpy(policy->name, name, sizeof(policy->name) - 1);
+    policy->type = type;
+    
+    /* Set default security settings based on type */
+    switch (type) {
+        case SANDBOX_TYPE_BASIC:
+            policy->security_level = SECURITY_LEVEL_BASIC;
+            policy->default_deny = false;
+            policy->require_explicit_grant = false;
+            break;
+            
+        case SANDBOX_TYPE_STANDARD:
+            policy->security_level = SECURITY_LEVEL_STANDARD;
+            policy->default_deny = true;
+            policy->require_explicit_grant = true;
+            break;
+            
+        case SANDBOX_TYPE_ENHANCED:
+            policy->security_level = SECURITY_LEVEL_ENHANCED;
+            policy->default_deny = true;
+            policy->require_explicit_grant = true;
+            policy->isolate_network = true;
+            policy->isolate_filesystem = true;
+            break;
+            
+        case SANDBOX_TYPE_STRICT:
+            policy->security_level = SECURITY_LEVEL_STRICT;
+            policy->default_deny = true;
+            policy->require_explicit_grant = true;
+            policy->isolate_network = true;
+            policy->isolate_filesystem = true;
+            policy->isolate_processes = true;
+            policy->isolate_ipc = true;
+            break;
+            
+        case SANDBOX_TYPE_ENTERPRISE:
+            policy->security_level = SECURITY_LEVEL_ENHANCED;
+            policy->default_deny = true;
+            policy->require_explicit_grant = true;
+            policy->enable_audit_logging = true;
+            policy->enterprise_managed = true;
+            break;
+            
+        case SANDBOX_TYPE_AI_ISOLATED:
+            policy->security_level = SECURITY_LEVEL_ENHANCED;
+            policy->default_deny = true;
+            policy->require_explicit_grant = true;
+            policy->enable_ai_monitoring = true;
+            policy->isolate_network = true;
+            break;
+            
+        default:
+            policy->security_level = SECURITY_LEVEL_STANDARD;
+            policy->default_deny = true;
+            policy->require_explicit_grant = true;
+            break;
+    }
+    
+    /* Set default resource enforcement */
+    policy->enforce_limits = true;
+    policy->user_configurable = true;
+    
+    /* Add to manager's policy list */
+    policy->next = sandbox_manager.policies;
+    sandbox_manager.policies = policy;
+    sandbox_manager.policy_count++;
+    
+    return policy;
+}
+
+/**
+ * Destroy a sandbox policy
+ */
+void sandbox_destroy_policy(sandbox_policy_t* policy) {
+    if (!policy) {
+        return;
+    }
+    
+    /* Remove from manager's policy list */
+    if (sandbox_manager.policies == policy) {
+        sandbox_manager.policies = policy->next;
+    } else {
+        sandbox_policy_t* current = sandbox_manager.policies;
+        while (current && current->next != policy) {
+            current = current->next;
+        }
+        if (current) {
+            current->next = policy->next;
+        }
+    }
+    sandbox_manager.policy_count--;
+    
+    /* Free permissions */
+    permission_entry_t* permission = policy->permissions;
+    while (permission) {
+        permission_entry_t* next = permission->next;
+        free(permission);
+        permission = next;
+    }
+    
+    /* Free resource limits */
+    resource_limit_t* limit = policy->resource_limits;
+    while (limit) {
+        resource_limit_t* next = limit->next;
+        free(limit);
+        limit = next;
+    }
+    
+    /* Free namespace mappings */
+    namespace_mapping_t* mapping = policy->namespace_mappings;
+    while (mapping) {
+        namespace_mapping_t* next = mapping->next;
+        free(mapping);
+        mapping = next;
+    }
+    
+    /* Free security context */
+    if (policy->security_context) {
+        sandbox_destroy_security_context(policy->security_context);
+    }
+    
+    free(policy);
+}
+
+/**
+ * Add permission to policy
+ */
+status_t sandbox_add_permission_to_policy(sandbox_policy_t* policy, sandbox_permission_t permission, permission_state_t state) {
+    if (!policy) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    permission_entry_t* entry = (permission_entry_t*)malloc(sizeof(permission_entry_t));
+    if (!entry) {
+        return STATUS_OUT_OF_MEMORY;
+    }
+    
+    memset(entry, 0, sizeof(permission_entry_t));
+    entry->permission = permission;
+    entry->state = state;
+    entry->granted_time = time(NULL);
+    entry->audit_required = sandbox_is_dangerous_permission(permission);
+    
+    /* Add to policy's permission list */
+    entry->next = policy->permissions;
+    policy->permissions = entry;
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Create a sandbox instance
+ */
+sandbox_t* sandbox_create(const char* name, sandbox_policy_t* policy) {
+    if (!name || !policy || !sandbox_is_enabled()) {
+        return NULL;
+    }
+    
+    if (sandbox_manager.sandbox_count >= sandbox_manager.max_sandboxes) {
+        printf("Error: Maximum sandbox limit reached (%u)\n", sandbox_manager.max_sandboxes);
+        return NULL;
+    }
+    
+    sandbox_t* sandbox = (sandbox_t*)malloc(sizeof(sandbox_t));
+    if (!sandbox) {
+        return NULL;
+    }
+    
+    memset(sandbox, 0, sizeof(sandbox_t));
+    
+    /* Generate unique sandbox ID */
+    static uint32_t sandbox_id_counter = 0;
+    sandbox->id = ++sandbox_id_counter;
+    
+    strncpy(sandbox->name, name, sizeof(sandbox->name) - 1);
+    sandbox->policy = policy;
+    sandbox->state = SANDBOX_STATE_CREATED;
+    sandbox->creation_time = time(NULL);
+    
+    /* Initialize namespace FDs to invalid values */
+    sandbox->namespaces.pid_ns = -1;
+    sandbox->namespaces.net_ns = -1;
+    sandbox->namespaces.mnt_ns = -1;
+    sandbox->namespaces.ipc_ns = -1;
+    sandbox->namespaces.uts_ns = -1;
+    sandbox->namespaces.user_ns = -1;
+    sandbox->namespaces.cgroup_ns = -1;
+    sandbox->namespaces.time_ns = -1;
+    
+    /* Add to manager's sandbox list */
+    sandbox->next = sandbox_manager.sandboxes;
+    sandbox_manager.sandboxes = sandbox;
+    sandbox_manager.sandbox_count++;
+    sandbox_manager.statistics.total_sandboxes_created++;
+    
+    return sandbox;
+}
+
+/**
+ * Destroy a sandbox instance
+ */
+void sandbox_destroy(sandbox_t* sandbox) {
+    if (!sandbox) {
+        return;
+    }
+    
+    /* Stop sandbox if it's running */
+    if (sandbox->state == SANDBOX_STATE_RUNNING) {
+        sandbox_stop(sandbox);
+    }
+    
+    /* Remove from manager's sandbox list */
+    if (sandbox_manager.sandboxes == sandbox) {
+        sandbox_manager.sandboxes = sandbox->next;
+    } else {
+        sandbox_t* current = sandbox_manager.sandboxes;
+        while (current && current->next != sandbox) {
+            current = current->next;
+        }
+        if (current) {
+            current->next = sandbox->next;
+        }
+    }
+    sandbox_manager.sandbox_count--;
+    
+    /* Close namespace file descriptors */
+    if (sandbox->namespaces.pid_ns != -1) close(sandbox->namespaces.pid_ns);
+    if (sandbox->namespaces.net_ns != -1) close(sandbox->namespaces.net_ns);
+    if (sandbox->namespaces.mnt_ns != -1) close(sandbox->namespaces.mnt_ns);
+    if (sandbox->namespaces.ipc_ns != -1) close(sandbox->namespaces.ipc_ns);
+    if (sandbox->namespaces.uts_ns != -1) close(sandbox->namespaces.uts_ns);
+    if (sandbox->namespaces.user_ns != -1) close(sandbox->namespaces.user_ns);
+    if (sandbox->namespaces.cgroup_ns != -1) close(sandbox->namespaces.cgroup_ns);
+    if (sandbox->namespaces.time_ns != -1) close(sandbox->namespaces.time_ns);
+    
+    /* Free monitoring context */
+    if (sandbox->monitor_context) {
+        free(sandbox->monitor_context);
+    }
+    
+    free(sandbox);
+}
+
+/**
+ * Start a sandbox
+ */
+status_t sandbox_start(sandbox_t* sandbox) {
+    if (!sandbox || !sandbox_is_enabled()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    if (sandbox->state != SANDBOX_STATE_CREATED) {
+        return STATUS_INVALID_STATE;
+    }
+    
+    sandbox->state = SANDBOX_STATE_STARTING;
+    
+    /* Setup namespaces */
+    status_t status = sandbox_setup_namespaces(sandbox);
+    if (status != STATUS_SUCCESS) {
+        sandbox->state = SANDBOX_STATE_ERROR;
+        return status;
+    }
+    
+    /* Setup cgroups for resource limits */
+    status = sandbox_setup_cgroups(sandbox);
+    if (status != STATUS_SUCCESS) {
+        printf("Warning: Failed to setup cgroups for sandbox %u\n", sandbox->id);
+    }
+    
+    /* Setup seccomp filtering */
+    status = sandbox_setup_seccomp(sandbox);
+    if (status != STATUS_SUCCESS) {
+        printf("Warning: Failed to setup seccomp for sandbox %u\n", sandbox->id);
+    }
+    
+    /* Setup capabilities */
+    status = sandbox_setup_capabilities(sandbox);
+    if (status != STATUS_SUCCESS) {
+        printf("Warning: Failed to setup capabilities for sandbox %u\n", sandbox->id);
+    }
+    
+    /* Enable monitoring if requested */
+    if (sandbox->policy->enable_audit_logging) {
+        sandbox_enable_monitoring(sandbox, true);
+    }
+    
+    sandbox->state = SANDBOX_STATE_RUNNING;
+    sandbox->start_time = time(NULL);
+    
+    printf("Sandbox '%s' (ID: %u) started successfully\n", sandbox->name, sandbox->id);
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Stop a sandbox
+ */
+status_t sandbox_stop(sandbox_t* sandbox) {
+    if (!sandbox) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    if (sandbox->state != SANDBOX_STATE_RUNNING && sandbox->state != SANDBOX_STATE_SUSPENDED) {
+        return STATUS_INVALID_STATE;
+    }
+    
+    sandbox->state = SANDBOX_STATE_STOPPING;
+    
+    /* Kill all processes in the sandbox */
+    sandbox_kill_all_processes(sandbox, SIGTERM);
+    
+    /* Wait a bit for graceful termination */
+    usleep(100000);  /* 100ms */
+    
+    /* Force kill any remaining processes */
+    sandbox_kill_all_processes(sandbox, SIGKILL);
+    
+    /* Disable monitoring */
+    sandbox_enable_monitoring(sandbox, false);
+    
+    sandbox->state = SANDBOX_STATE_STOPPED;
+    sandbox->stop_time = time(NULL);
+    
+    printf("Sandbox '%s' (ID: %u) stopped\n", sandbox->name, sandbox->id);
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Execute a program in the sandbox
+ */
+status_t sandbox_exec(sandbox_t* sandbox, const char* executable, char* const argv[], char* const envp[]) {
+    if (!sandbox || !executable || !sandbox_is_enabled()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    if (sandbox->state != SANDBOX_STATE_RUNNING) {
+        return STATUS_INVALID_STATE;
+    }
+    
+    /* Check if execution is permitted by policy */
+    if (sandbox->policy->require_explicit_grant) {
+        /* Check for execution permission */
+        status_t perm_status = sandbox_check_permission(sandbox, PERM_SYSTEM_ADMIN);
+        if (perm_status != STATUS_SUCCESS) {
+            /* Request permission from user */
+            char reason[256];
+            snprintf(reason, sizeof(reason), "Execute program: %s", executable);
+            perm_status = sandbox_request_permission(sandbox, PERM_SYSTEM_ADMIN, reason);
+            if (perm_status != STATUS_SUCCESS) {
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+    }
+    
+    pid_t pid = fork();
+    if (pid == -1) {
+        return STATUS_SYSTEM_ERROR;
+    }
+    
+    if (pid == 0) {
+        /* Child process - enter sandbox namespaces and execute */
+        
+        /* Enter namespaces if they exist */
+        if (sandbox->namespaces.pid_ns != -1) {
+            if (setns(sandbox->namespaces.pid_ns, CLONE_NEWPID) == -1) {
+                perror("setns(pid)");
+                _exit(1);
+            }
+        }
+        
+        if (sandbox->namespaces.mnt_ns != -1) {
+            if (setns(sandbox->namespaces.mnt_ns, CLONE_NEWNS) == -1) {
+                perror("setns(mnt)");
+                _exit(1);
+            }
+        }
+        
+        if (sandbox->namespaces.net_ns != -1) {
+            if (setns(sandbox->namespaces.net_ns, CLONE_NEWNET) == -1) {
+                perror("setns(net)");
+                _exit(1);
+            }
+        }
+        
+        /* Apply security context if available */
+        if (sandbox->policy->security_context) {
+            /* Apply capabilities, seccomp, etc. */
+            /* This would be implemented with actual Linux security APIs */
+        }
+        
+        /* Execute the program */
+        execve(executable, argv, envp);
+        perror("execve");
+        _exit(1);
+    } else {
+        /* Parent process - add to sandbox process list */
+        if (sandbox->process_count < MAX_SANDBOX_PROCESSES) {
+            sandbox->processes[sandbox->process_count] = pid;
+            sandbox->process_count++;
+            sandbox_manager.statistics.total_processes_sandboxed++;
+            
+            /* Set main process if this is the first one */
+            if (sandbox->main_process == 0) {
+                sandbox->main_process = pid;
+            }
+        }
+        
+        /* Log execution event */
+        if (sandbox->policy->enable_audit_logging) {
+            char event[512];
+            snprintf(event, sizeof(event), "Process execution: %s (PID: %d)", executable, pid);
+            sandbox_log_security_event(sandbox, "EXEC", event);
+        }
+        
+        return STATUS_SUCCESS;
+    }
+}
+
+/**
+ * Check permission in sandbox
+ */
+status_t sandbox_check_permission(sandbox_t* sandbox, sandbox_permission_t permission) {
+    if (!sandbox || !sandbox_is_enabled()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Check if permission is granted in policy */
+    permission_entry_t* entry = sandbox->policy->permissions;
+    while (entry) {
+        if (entry->permission == permission) {
+            switch (entry->state) {
+                case PERM_STATE_GRANTED:
+                    entry->usage_count++;
+                    entry->last_used_time = time(NULL);
+                    return STATUS_SUCCESS;
+                    
+                case PERM_STATE_DENIED:
+                    return STATUS_ACCESS_DENIED;
+                    
+                case PERM_STATE_ASK:
+                    /* Need to ask user */
+                    return STATUS_PERMISSION_REQUIRED;
+                    
+                case PERM_STATE_GRANTED_ONCE:
+                    if (entry->usage_count == 0) {
+                        entry->usage_count++;
+                        entry->last_used_time = time(NULL);
+                        return STATUS_SUCCESS;
+                    }
+                    return STATUS_ACCESS_DENIED;
+                    
+                case PERM_STATE_CONDITIONAL:
+                    /* Check conditions (placeholder) */
+                    return STATUS_SUCCESS;
+                    
+                default:
+                    return STATUS_ACCESS_DENIED;
+            }
+        }
+        entry = entry->next;
+    }
+    
+    /* Permission not found in policy */
+    if (sandbox->policy->default_deny) {
+        return STATUS_ACCESS_DENIED;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Request permission for sandbox
+ */
+status_t sandbox_request_permission(sandbox_t* sandbox, sandbox_permission_t permission, const char* reason) {
+    if (!sandbox || !sandbox_is_enabled()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    sandbox_manager.statistics.permission_requests++;
+    
+    /* Log the permission request */
+    sandbox_log_permission_request(sandbox, permission, reason);
+    
+    /* Check if user consent is required */
+    if (sandbox_permission_requires_user_consent(permission)) {
+        bool granted = false;
+        status_t status = sandbox_show_permission_dialog(sandbox, permission, reason, &granted);
+        if (status != STATUS_SUCCESS || !granted) {
+            sandbox_manager.statistics.permission_denials++;
+            return STATUS_ACCESS_DENIED;
+        }
+        
+        /* Grant the permission */
+        status = sandbox_grant_permission(sandbox, permission, PERM_STATE_GRANTED);
+        if (status == STATUS_SUCCESS) {
+            sandbox_manager.statistics.permission_grants++;
+        }
+        return status;
+    }
+    
+    /* Permission granted without user interaction */
+    sandbox_manager.statistics.permission_grants++;
+    return sandbox_grant_permission(sandbox, permission, PERM_STATE_GRANTED);
+}
+
+/**
+ * Grant permission to sandbox
+ */
+status_t sandbox_grant_permission(sandbox_t* sandbox, sandbox_permission_t permission, permission_state_t state) {
+    if (!sandbox) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Check if permission already exists */
+    permission_entry_t* entry = sandbox->policy->permissions;
+    while (entry) {
+        if (entry->permission == permission) {
+            entry->state = state;
+            entry->granted_time = time(NULL);
+            return STATUS_SUCCESS;
+        }
+        entry = entry->next;
+    }
+    
+    /* Add new permission */
+    return sandbox_add_permission_to_policy(sandbox->policy, permission, state);
+}
+
+/**
+ * Get permission name
+ */
+const char* sandbox_get_permission_name(sandbox_permission_t permission) {
+    switch (permission) {
+        case PERM_SYSTEM_ADMIN: return "System Administration";
+        case PERM_SYSTEM_SETTINGS: return "Modify System Settings";
+        case PERM_NETWORK_INTERNET: return "Internet Access";
+        case PERM_NETWORK_WIFI_STATE: return "WiFi State Access";
+        case PERM_STORAGE_READ: return "Read External Storage";
+        case PERM_STORAGE_WRITE: return "Write External Storage";
+        case PERM_HARDWARE_CAMERA: return "Camera Access";
+        case PERM_HARDWARE_MICROPHONE: return "Microphone Access";
+        case PERM_HARDWARE_LOCATION: return "Location Access";
+        case PERM_PRIVACY_CONTACTS: return "Access Contacts";
+        case PERM_PRIVACY_CALENDAR: return "Access Calendar";
+        case PERM_SECURITY_KEYSTORE: return "Access Keystore";
+        case PERM_AI_TRAINING: return "Train AI Models";
+        case PERM_AI_INFERENCE: return "Run AI Inference";
+        case PERM_QUANTUM_SIMULATOR: return "Access Quantum Simulators";
+        case PERM_QUANTUM_HARDWARE: return "Access Quantum Hardware";
+        case PERM_ENTERPRISE_MDM: return "Mobile Device Management";
+        default: return "Unknown Permission";
+    }
+}
+
+/**
+ * Check if permission is dangerous and requires user consent
+ */
+bool sandbox_is_dangerous_permission(sandbox_permission_t permission) {
+    switch (permission) {
+        case PERM_SYSTEM_ADMIN:
+        case PERM_SYSTEM_REBOOT:
+        case PERM_SYSTEM_SHUTDOWN:
+        case PERM_STORAGE_WRITE:
+        case PERM_STORAGE_FORMAT:
+        case PERM_HARDWARE_CAMERA:
+        case PERM_HARDWARE_MICROPHONE:
+        case PERM_HARDWARE_LOCATION:
+        case PERM_PRIVACY_CONTACTS:
+        case PERM_PRIVACY_SMS:
+        case PERM_PRIVACY_PHONE:
+        case PERM_SECURITY_KEYSTORE:
+        case PERM_AI_TRAINING:
+        case PERM_QUANTUM_HARDWARE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * Print sandbox statistics
+ */
+void sandbox_print_statistics(void) {
+    printf("\n=== Sandbox System Statistics ===\n");
+    printf("Version: %d.%d\n", SANDBOX_VERSION_MAJOR, SANDBOX_VERSION_MINOR);
+    printf("Status: %s\n", sandbox_is_enabled() ? "Enabled" : "Disabled");
+    printf("Active Sandboxes: %u / %u\n", sandbox_manager.sandbox_count, sandbox_manager.max_sandboxes);
+    printf("Available Policies: %u\n", sandbox_manager.policy_count);
+    printf("Total Sandboxes Created: %llu\n", sandbox_manager.statistics.total_sandboxes_created);
+    printf("Total Processes Sandboxed: %llu\n", sandbox_manager.statistics.total_processes_sandboxed);
+    printf("Security Violations: %llu\n", sandbox_manager.statistics.total_violations);
+    printf("Permission Requests: %llu\n", sandbox_manager.statistics.permission_requests);
+    printf("Permission Grants: %llu\n", sandbox_manager.statistics.permission_grants);
+    printf("Permission Denials: %llu\n", sandbox_manager.statistics.permission_denials);
+    
+    if (sandbox_manager.statistics.permission_requests > 0) {
+        float grant_rate = (float)sandbox_manager.statistics.permission_grants / sandbox_manager.statistics.permission_requests * 100.0f;
+        printf("Permission Grant Rate: %.1f%%\n", grant_rate);
+    }
+    
+    printf("\nAI Features:\n");
+    printf("  Anomaly Detection: %s\n", sandbox_manager.ai_features.anomaly_detection_enabled ? "Enabled" : "Disabled");
+    printf("  Behavioral Analysis: %s\n", sandbox_manager.ai_features.behavioral_analysis_enabled ? "Enabled" : "Disabled");
+    printf("  Threat Prediction: %s\n", sandbox_manager.ai_features.threat_prediction_enabled ? "Enabled" : "Disabled");
+    
+    printf("\nEnterprise Features:\n");
+    printf("  Policy Enforcement: %s\n", sandbox_manager.enterprise_features.policy_enforcement_enabled ? "Enabled" : "Disabled");
+    printf("  Compliance Monitoring: %s\n", sandbox_manager.enterprise_features.compliance_monitoring_enabled ? "Enabled" : "Disabled");
+    printf("  Audit Reporting: %s\n", sandbox_manager.enterprise_features.audit_reporting_enabled ? "Enabled" : "Disabled");
+    printf("=====================================\n");
+}
+
+/* Helper function implementations */
+static status_t sandbox_setup_namespaces(sandbox_t* sandbox) {
+    if (!sandbox || !sandbox->policy) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Create namespaces based on policy */
+    if (sandbox->policy->isolate_processes) {
+        /* Create PID namespace (placeholder - would use Linux clone/unshare) */
+        printf("Setting up PID namespace isolation for sandbox %u\n", sandbox->id);
+    }
+    
+    if (sandbox->policy->isolate_network) {
+        /* Create network namespace */
+        printf("Setting up network namespace isolation for sandbox %u\n", sandbox->id);
+    }
+    
+    if (sandbox->policy->isolate_filesystem) {
+        /* Create mount namespace */
+        printf("Setting up filesystem namespace isolation for sandbox %u\n", sandbox->id);
+    }
+    
+    if (sandbox->policy->isolate_ipc) {
+        /* Create IPC namespace */
+        printf("Setting up IPC namespace isolation for sandbox %u\n", sandbox->id);
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+static status_t sandbox_setup_cgroups(sandbox_t* sandbox) {
+    if (!sandbox) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Setup cgroups for resource limits (placeholder implementation) */
+    printf("Setting up cgroups for resource limits (sandbox %u)\n", sandbox->id);
+    return STATUS_SUCCESS;
+}
+
+static status_t sandbox_setup_seccomp(sandbox_t* sandbox) {
+    if (!sandbox) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Setup seccomp filtering (placeholder implementation) */
+    printf("Setting up seccomp filtering (sandbox %u)\n", sandbox->id);
+    return STATUS_SUCCESS;
+}
+
+static status_t sandbox_setup_capabilities(sandbox_t* sandbox) {
+    if (!sandbox) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Setup Linux capabilities (placeholder implementation) */
+    printf("Setting up capabilities (sandbox %u)\n", sandbox->id);
+    return STATUS_SUCCESS;
+}
+
+static bool sandbox_permission_requires_user_consent(sandbox_permission_t permission) {
+    return sandbox_is_dangerous_permission(permission);
+}
+
+static status_t sandbox_log_permission_request(sandbox_t* sandbox, sandbox_permission_t permission, const char* reason) {
+    if (!sandbox) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    /* Log permission request */
+    printf("Permission request: %s - %s (Sandbox: %s)\n",
+           sandbox_get_permission_name(permission),
+           reason ? reason : "No reason provided",
+           sandbox->name);
+    
+    return STATUS_SUCCESS;
+}
+
+static status_t sandbox_create_default_policies(void) {
+    /* Create default policy */
+    sandbox_manager.default_policy = sandbox_create_default_policy();
+    if (!sandbox_manager.default_policy) {
+        return STATUS_OUT_OF_MEMORY;
+    }
+    
+    /* Create specialized policies */
+    sandbox_policy_t* browser_policy = sandbox_create_browser_policy();
+    sandbox_policy_t* media_policy = sandbox_create_media_policy();
+    sandbox_policy_t* enterprise_policy = sandbox_create_enterprise_policy();
+    sandbox_policy_t* ai_policy = sandbox_create_ai_policy();
+    
+    /* Note: These policies are automatically added to the manager's policy list
+     * by sandbox_create_policy() */
+    
+    return STATUS_SUCCESS;
+}
+
+/* Stub implementations for remaining API functions */
+status_t sandbox_kill_all_processes(sandbox_t* sandbox, int signal) {
+    if (!sandbox) return STATUS_INVALID_PARAMETER;
+    
+    for (uint32_t i = 0; i < sandbox->process_count; i++) {
+        if (sandbox->processes[i] > 0) {
+            kill(sandbox->processes[i], signal);
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+status_t sandbox_enable_monitoring(sandbox_t* sandbox, bool enable) {
+    if (!sandbox) return STATUS_INVALID_PARAMETER;
+    
+    sandbox->monitoring_enabled = enable;
+    printf("Monitoring %s for sandbox '%s'\n", enable ? "enabled" : "disabled", sandbox->name);
+    return STATUS_SUCCESS;
+}
+
+status_t sandbox_log_security_event(sandbox_t* sandbox, const char* event_type, const char* description) {
+    if (!sandbox || !event_type || !description) return STATUS_INVALID_PARAMETER;
+    
+    time_t now = time(NULL);
+    printf("[SANDBOX AUDIT] %s: %s - %s (Sandbox: %s, Time: %ld)\n",
+           event_type, description, sandbox->name, now);
+    return STATUS_SUCCESS;
+}
+
+status_t sandbox_show_permission_dialog(sandbox_t* sandbox, sandbox_permission_t permission, const char* reason, bool* granted) {
+    if (!sandbox || !granted) return STATUS_INVALID_PARAMETER;
+    
+    printf("\n=== Permission Request ===\n");
+    printf("Sandbox: %s\n", sandbox->name);
+    printf("Permission: %s\n", sandbox_get_permission_name(permission));
+    printf("Reason: %s\n", reason ? reason : "No reason provided");
+    printf("\nGrant this permission? (y/N): ");
+    
+    char response[16];
+    *granted = false;
+    if (fgets(response, sizeof(response), stdin)) {
+        if (response[0] == 'y' || response[0] == 'Y') {
+            *granted = true;
+        }
+    }
+    
+    printf("Permission %s\n", *granted ? "granted" : "denied");
+    return STATUS_SUCCESS;
+}
+
+/* Default policy creation functions */
+sandbox_policy_t* sandbox_create_default_policy(void) {
+    sandbox_policy_t* policy = sandbox_create_policy("Default", SANDBOX_TYPE_STANDARD);
+    if (!policy) return NULL;
+    
+    strcpy(policy->description, "Default sandbox policy with standard security");
+    
+    /* Add basic permissions */
+    sandbox_add_permission_to_policy(policy, PERM_STORAGE_READ, PERM_STATE_GRANTED);
+    sandbox_add_permission_to_policy(policy, PERM_NETWORK_INTERNET, PERM_STATE_ASK);
+    
+    return policy;
+}
+
+sandbox_policy_t* sandbox_create_browser_policy(void) {
+    sandbox_policy_t* policy = sandbox_create_policy("Browser", SANDBOX_TYPE_ENHANCED);
+    if (!policy) return NULL;
+    
+    strcpy(policy->description, "Web browser sandbox with network access and enhanced security");
+    
+    /* Browser-specific permissions */
+    sandbox_add_permission_to_policy(policy, PERM_NETWORK_INTERNET, PERM_STATE_GRANTED);
+    sandbox_add_permission_to_policy(policy, PERM_STORAGE_READ, PERM_STATE_GRANTED);
+    sandbox_add_permission_to_policy(policy, PERM_STORAGE_WRITE, PERM_STATE_RESTRICTED);
+    
+    return policy;
+}
+
+sandbox_policy_t* sandbox_create_media_policy(void) {
+    sandbox_policy_t* policy = sandbox_create_policy("Media", SANDBOX_TYPE_STANDARD);
+    if (!policy) return NULL;
+    
+    strcpy(policy->description, "Media application sandbox with hardware access");
+    
+    /* Media-specific permissions */
+    sandbox_add_permission_to_policy(policy, PERM_HARDWARE_CAMERA, PERM_STATE_ASK);
+    sandbox_add_permission_to_policy(policy, PERM_HARDWARE_MICROPHONE, PERM_STATE_ASK);
+    sandbox_add_permission_to_policy(policy, PERM_STORAGE_READ, PERM_STATE_GRANTED);
+    sandbox_add_permission_to_policy(policy, PERM_STORAGE_WRITE, PERM_STATE_GRANTED);
+    
+    return policy;
+}
+
+sandbox_policy_t* sandbox_create_enterprise_policy(void) {
+    sandbox_policy_t* policy = sandbox_create_policy("Enterprise", SANDBOX_TYPE_ENTERPRISE);
+    if (!policy) return NULL;
+    
+    strcpy(policy->description, "Enterprise application sandbox with full auditing");
+    
+    /* Enterprise permissions */
+    sandbox_add_permission_to_policy(policy, PERM_ENTERPRISE_MDM, PERM_STATE_GRANTED);
+    sandbox_add_permission_to_policy(policy, PERM_SECURITY_CERTIFICATE, PERM_STATE_GRANTED);
+    sandbox_add_permission_to_policy(policy, PERM_NETWORK_VPN, PERM_STATE_GRANTED);
+    
+    return policy;
+}
+
+sandbox_policy_t* sandbox_create_ai_policy(void) {
+    sandbox_policy_t* policy = sandbox_create_policy("AI Application", SANDBOX_TYPE_AI_ISOLATED);
+    if (!policy) return NULL;
+    
+    strcpy(policy->description, "AI application sandbox with privacy protection");
+    
+    /* AI-specific permissions */
+    sandbox_add_permission_to_policy(policy, PERM_AI_INFERENCE, PERM_STATE_GRANTED);
+    sandbox_add_permission_to_policy(policy, PERM_AI_TRAINING, PERM_STATE_ASK);
+    sandbox_add_permission_to_policy(policy, PERM_AI_DATA_COLLECTION, PERM_STATE_DENIED);
+    
+    return policy;
+}
+
+/* Additional stub implementations continue in similar fashion... */

@@ -1,0 +1,769 @@
+/**
+ * System Monitoring Implementation for LimitlessOS
+ * Enterprise-grade monitoring with comprehensive telemetry and alerting
+ */
+
+#include "system_monitoring.h"
+#include "kernel.h"
+#include "scheduler.h"
+#include "vmm.h"
+#include "auth.h"
+#include "timer.h"
+#include "string.h"
+
+/* Global monitoring system state */
+static system_monitoring_t g_monitoring = {0};
+static monitoring_config_t g_monitoring_config = {0};
+static bool g_monitoring_thread_running = false;
+
+/* Monitoring worker thread */
+static void monitoring_worker_thread(void* arg);
+static void monitoring_collection_thread(void* arg);
+static void monitoring_health_check_thread(void* arg);
+
+/**
+ * Initialize the system monitoring framework
+ */
+status_t system_monitoring_init(void)
+{
+    if (g_monitoring.initialized) {
+        return STATUS_ALREADY_INITIALIZED;
+    }
+    
+    kprintf("System Monitoring: Initializing enterprise monitoring framework...\n");
+    
+    /* Clear monitoring state */
+    memset(&g_monitoring, 0, sizeof(system_monitoring_t));
+    memset(&g_monitoring_config, 0, sizeof(monitoring_config_t));
+    
+    /* Initialize locks */
+    spinlock_init(&g_monitoring.global_lock);
+    spinlock_init(&g_monitoring.metric_lock);
+    spinlock_init(&g_monitoring.health_lock);
+    spinlock_init(&g_monitoring.alert_lock);
+    
+    /* Set default configuration */
+    g_monitoring_config.default_interval = MONITOR_INTERVAL_5S;
+    g_monitoring_config.max_metrics_per_subsystem = MAX_METRICS / MONITOR_SUBSYS_COUNT;
+    g_monitoring_config.max_alerts_per_subsystem = MAX_ALERTS / MONITOR_SUBSYS_COUNT;
+    g_monitoring_config.auto_cleanup_enabled = true;
+    g_monitoring_config.cleanup_interval_ns = 3600000000000ULL; /* 1 hour */
+    
+    /* Set default thresholds */
+    g_monitoring_config.cpu_warning_threshold = DEFAULT_CPU_WARNING_THRESHOLD;
+    g_monitoring_config.cpu_critical_threshold = DEFAULT_CPU_CRITICAL_THRESHOLD;
+    g_monitoring_config.memory_warning_threshold = DEFAULT_MEM_WARNING_THRESHOLD;
+    g_monitoring_config.memory_critical_threshold = DEFAULT_MEM_CRITICAL_THRESHOLD;
+    g_monitoring_config.disk_warning_threshold = DEFAULT_DISK_WARNING_THRESHOLD;
+    g_monitoring_config.disk_critical_threshold = DEFAULT_DISK_CRITICAL_THRESHOLD;
+    
+    /* Initialize monitoring state */
+    g_monitoring.max_metrics = MAX_METRICS;
+    g_monitoring.max_alerts = MAX_ALERTS;
+    g_monitoring.metric_retention_ns = DEFAULT_METRIC_RETENTION_DAYS * 24 * 3600 * 1000000000ULL;
+    g_monitoring.alert_retention_ns = DEFAULT_ALERT_RETENTION_DAYS * 24 * 3600 * 1000000000ULL;
+    g_monitoring.counter_update_interval_ns = MONITOR_INTERVAL_1S;
+    g_monitoring.start_time_ns = timer_get_ns();
+    g_monitoring.overall_health = HEALTH_STATUS_HEALTHY;
+    
+    /* Initialize metric IDs */
+    g_monitoring.next_metric_id = 1;
+    g_monitoring.next_health_check_id = 1;
+    g_monitoring.next_alert_id = 1;
+    
+    /* Create monitoring threads */
+    thread_t monitoring_thread, collection_thread, health_thread;
+    
+    if (thread_create(&monitoring_thread, monitoring_worker_thread, NULL, 
+                     MONITORING_THREAD_STACK_SIZE, THREAD_PRIORITY_SYSTEM) != STATUS_SUCCESS) {
+        kprintf("System Monitoring: Failed to create monitoring worker thread\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    if (thread_create(&collection_thread, monitoring_collection_thread, NULL,
+                     MONITORING_THREAD_STACK_SIZE, THREAD_PRIORITY_SYSTEM) != STATUS_SUCCESS) {
+        kprintf("System Monitoring: Failed to create collection thread\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    if (thread_create(&health_thread, monitoring_health_check_thread, NULL,
+                     MONITORING_THREAD_STACK_SIZE, THREAD_PRIORITY_SYSTEM) != STATUS_SUCCESS) {
+        kprintf("System Monitoring: Failed to create health check thread\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    g_monitoring_thread_running = true;
+    g_monitoring.initialized = true;
+    g_monitoring.enabled = true;
+    
+    kprintf("System Monitoring: Framework initialized with %d max metrics, %d max alerts\n",
+            MAX_METRICS, MAX_ALERTS);
+    
+    /* Register core system metrics */
+    uint32_t metric_id;
+    monitoring_register_metric("cpu_utilization", "CPU utilization percentage",
+                             MONITOR_SUBSYS_CPU, METRIC_TYPE_PERCENTAGE, &metric_id);
+    monitoring_register_metric("memory_utilization", "Memory utilization percentage", 
+                             MONITOR_SUBSYS_MEMORY, METRIC_TYPE_PERCENTAGE, &metric_id);
+    monitoring_register_metric("disk_utilization", "Disk utilization percentage",
+                             MONITOR_SUBSYS_STORAGE, METRIC_TYPE_PERCENTAGE, &metric_id);
+    monitoring_register_metric("network_utilization", "Network utilization percentage",
+                             MONITOR_SUBSYS_NETWORK, METRIC_TYPE_PERCENTAGE, &metric_id);
+    
+    /* Register core health checks */
+    uint32_t check_id;
+    monitoring_register_health_check("cpu_health", "CPU health check",
+                                   MONITOR_SUBSYS_CPU, NULL, NULL, &check_id);
+    monitoring_register_health_check("memory_health", "Memory health check",
+                                   MONITOR_SUBSYS_MEMORY, NULL, NULL, &check_id);
+    monitoring_register_health_check("storage_health", "Storage health check",
+                                   MONITOR_SUBSYS_STORAGE, NULL, NULL, &check_id);
+    
+    kprintf("System Monitoring: Registered core metrics and health checks\n");
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Register a new metric for monitoring
+ */
+status_t monitoring_register_metric(const char* name, const char* description,
+                                  monitor_subsystem_t subsystem, metric_type_t type,
+                                  uint32_t* metric_id)
+{
+    if (!g_monitoring.initialized || !name || !description || !metric_id) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    if (subsystem >= MONITOR_SUBSYS_COUNT || type >= METRIC_TYPE_COUNT) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_acquire(&g_monitoring.metric_lock);
+    
+    if (g_monitoring.metric_count >= g_monitoring.max_metrics) {
+        spinlock_release(&g_monitoring.metric_lock);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    /* Allocate new metric */
+    system_metric_t* metric = kmalloc(sizeof(system_metric_t));
+    if (!metric) {
+        spinlock_release(&g_monitoring.metric_lock);
+        return STATUS_OUT_OF_MEMORY;
+    }
+    
+    /* Initialize metric */
+    memset(metric, 0, sizeof(system_metric_t));
+    metric->metric_id = g_monitoring.next_metric_id++;
+    strncpy(metric->name, name, sizeof(metric->name) - 1);
+    strncpy(metric->description, description, sizeof(metric->description) - 1);
+    metric->subsystem = subsystem;
+    metric->type = type;
+    metric->collection_interval_ns = g_monitoring_config.default_interval;
+    metric->last_update_ns = timer_get_ns();
+    
+    /* Set default thresholds based on subsystem */
+    switch (subsystem) {
+        case MONITOR_SUBSYS_CPU:
+            metric->warning_threshold = g_monitoring_config.cpu_warning_threshold;
+            metric->critical_threshold = g_monitoring_config.cpu_critical_threshold;
+            break;
+        case MONITOR_SUBSYS_MEMORY:
+            metric->warning_threshold = g_monitoring_config.memory_warning_threshold;
+            metric->critical_threshold = g_monitoring_config.memory_critical_threshold;
+            break;
+        case MONITOR_SUBSYS_STORAGE:
+            metric->warning_threshold = g_monitoring_config.disk_warning_threshold;
+            metric->critical_threshold = g_monitoring_config.disk_critical_threshold;
+            break;
+        default:
+            metric->warning_threshold = 80.0;
+            metric->critical_threshold = 95.0;
+            break;
+    }
+    metric->threshold_enabled = true;
+    
+    spinlock_init(&metric->lock);
+    
+    /* Add to list */
+    metric->next = g_monitoring.metric_list;
+    g_monitoring.metric_list = metric;
+    g_monitoring.metric_count++;
+    
+    *metric_id = metric->metric_id;
+    
+    spinlock_release(&g_monitoring.metric_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Update a metric value
+ */
+status_t monitoring_update_metric(uint32_t metric_id, const metric_value_t* value)
+{
+    if (!g_monitoring.initialized || !g_monitoring.enabled || !value) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_acquire(&g_monitoring.metric_lock);
+    
+    /* Find metric */
+    system_metric_t* metric = g_monitoring.metric_list;
+    while (metric && metric->metric_id != metric_id) {
+        metric = metric->next;
+    }
+    
+    if (!metric) {
+        spinlock_release(&g_monitoring.metric_lock);
+        return STATUS_NOT_FOUND;
+    }
+    
+    spinlock_acquire(&metric->lock);
+    spinlock_release(&g_monitoring.metric_lock);
+    
+    /* Update metric value */
+    metric->previous_value = metric->value;
+    metric->value = *value;
+    metric->last_update_ns = timer_get_ns();
+    metric->update_count++;
+    
+    /* Check thresholds for alerting */
+    if (metric->threshold_enabled && metric->type == METRIC_TYPE_PERCENTAGE) {
+        double current_value = value->percentage;
+        
+        if (current_value >= metric->critical_threshold) {
+            char alert_message[512];
+            snprintf(alert_message, sizeof(alert_message),
+                    "Metric %s exceeded critical threshold: %.2f%% >= %.2f%%",
+                    metric->name, current_value, metric->critical_threshold);
+            
+            uint32_t alert_id;
+            monitoring_create_alert(ALERT_SEVERITY_CRITICAL, metric->subsystem,
+                                  "Critical Threshold Exceeded", alert_message,
+                                  metric->name, &alert_id);
+        } else if (current_value >= metric->warning_threshold) {
+            char alert_message[512];
+            snprintf(alert_message, sizeof(alert_message),
+                    "Metric %s exceeded warning threshold: %.2f%% >= %.2f%%",
+                    metric->name, current_value, metric->warning_threshold);
+            
+            uint32_t alert_id;
+            monitoring_create_alert(ALERT_SEVERITY_WARNING, metric->subsystem,
+                                  "Warning Threshold Exceeded", alert_message,
+                                  metric->name, &alert_id);
+        }
+    }
+    
+    spinlock_release(&metric->lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Create a new alert
+ */
+status_t monitoring_create_alert(alert_severity_t severity, monitor_subsystem_t subsystem,
+                               const char* title, const char* message, const char* source,
+                               uint32_t* alert_id)
+{
+    if (!g_monitoring.initialized || !title || !message || !source || !alert_id) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_acquire(&g_monitoring.alert_lock);
+    
+    if (g_monitoring.alert_count >= g_monitoring.max_alerts) {
+        spinlock_release(&g_monitoring.alert_lock);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    /* Allocate new alert */
+    system_alert_t* alert = kmalloc(sizeof(system_alert_t));
+    if (!alert) {
+        spinlock_release(&g_monitoring.alert_lock);
+        return STATUS_OUT_OF_MEMORY;
+    }
+    
+    /* Initialize alert */
+    memset(alert, 0, sizeof(system_alert_t));
+    alert->alert_id = g_monitoring.next_alert_id++;
+    alert->severity = severity;
+    alert->subsystem = subsystem;
+    
+    strncpy(alert->title, title, sizeof(alert->title) - 1);
+    strncpy(alert->message, message, sizeof(alert->message) - 1);
+    strncpy(alert->source, source, sizeof(alert->source) - 1);
+    
+    alert->timestamp_ns = timer_get_ns();
+    alert->first_occurrence_ns = alert->timestamp_ns;
+    alert->occurrence_count = 1;
+    
+    spinlock_init(&alert->lock);
+    
+    /* Add to list */
+    alert->next = g_monitoring.alert_list;
+    g_monitoring.alert_list = alert;
+    g_monitoring.alert_count++;
+    g_monitoring.active_alert_count++;
+    g_monitoring.alerts_generated++;
+    
+    *alert_id = alert->alert_id;
+    
+    spinlock_release(&g_monitoring.alert_lock);
+    
+    /* Log alert to console for critical/emergency alerts */
+    if (severity >= ALERT_SEVERITY_CRITICAL) {
+        kprintf("ALERT [%s]: %s - %s\n", 
+                monitoring_alert_severity_name(severity), title, message);
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Update performance counters
+ */
+status_t monitoring_update_counters(void)
+{
+    if (!g_monitoring.initialized || !g_monitoring.enabled) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    uint64_t current_time = timer_get_ns();
+    
+    /* Check if enough time has passed */
+    if ((current_time - g_monitoring.last_counter_update_ns) < g_monitoring.counter_update_interval_ns) {
+        return STATUS_SUCCESS;
+    }
+    
+    spinlock_acquire(&g_monitoring.global_lock);
+    
+    /* Save previous counters */
+    g_monitoring.previous_counters = g_monitoring.counters;
+    
+    /* Update system uptime */
+    g_monitoring.counters.uptime_seconds = (current_time - g_monitoring.start_time_ns) / 1000000000ULL;
+    
+    /* Update CPU metrics */
+    monitoring_collect_cpu_metrics();
+    
+    /* Update memory metrics */
+    monitoring_collect_memory_metrics();
+    
+    /* Update storage metrics */
+    monitoring_collect_storage_metrics();
+    
+    /* Update network metrics */
+    monitoring_collect_network_metrics();
+    
+    /* Update process metrics */
+    // These would be collected from the process manager
+    
+    /* Update load averages (simplified calculation) */
+    // In a real implementation, these would be calculated based on run queue lengths
+    g_monitoring.counters.load_average_1min = 1.0;   /* Placeholder */
+    g_monitoring.counters.load_average_5min = 0.8;   /* Placeholder */
+    g_monitoring.counters.load_average_15min = 0.6;  /* Placeholder */
+    
+    g_monitoring.last_counter_update_ns = current_time;
+    g_monitoring.data_points_collected++;
+    
+    spinlock_release(&g_monitoring.global_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Collect CPU metrics
+ */
+status_t monitoring_collect_cpu_metrics(void)
+{
+    /* In a real implementation, these would read from hardware performance counters */
+    
+    /* Placeholder CPU metrics - would be read from actual hardware */
+    g_monitoring.counters.cpu_cycles_total += 1000000;       /* CPU cycles */
+    g_monitoring.counters.cpu_instructions_total += 800000;  /* Instructions executed */
+    g_monitoring.counters.cpu_utilization_percent = 25;      /* CPU utilization */
+    g_monitoring.counters.cpu_temperature_celsius = 45;      /* CPU temperature */
+    g_monitoring.counters.context_switches_total += 100;     /* Context switches */
+    g_monitoring.counters.interrupts_total += 50;            /* Interrupts */
+    
+    /* Update CPU utilization metric */
+    metric_value_t cpu_value;
+    cpu_value.percentage = g_monitoring.counters.cpu_utilization_percent;
+    
+    system_metric_t* metric = g_monitoring.metric_list;
+    while (metric) {
+        if (strcmp(metric->name, "cpu_utilization") == 0) {
+            monitoring_update_metric(metric->metric_id, &cpu_value);
+            break;
+        }
+        metric = metric->next;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Collect memory metrics  
+ */
+status_t monitoring_collect_memory_metrics(void)
+{
+    /* Get memory statistics from VMM */
+    vmm_stats_t vmm_stats;
+    if (vmm_get_statistics(&vmm_stats) == STATUS_SUCCESS) {
+        g_monitoring.counters.memory_total_bytes = vmm_stats.total_physical_memory;
+        g_monitoring.counters.memory_free_bytes = vmm_stats.free_physical_memory;
+        g_monitoring.counters.memory_used_bytes = vmm_stats.used_physical_memory;
+        g_monitoring.counters.memory_utilization_percent = 
+            (uint32_t)((vmm_stats.used_physical_memory * 100) / vmm_stats.total_physical_memory);
+        g_monitoring.counters.page_faults_total = vmm_stats.page_faults;
+        g_monitoring.counters.page_faults_major = vmm_stats.major_page_faults;
+    }
+    
+    /* Update memory utilization metric */
+    metric_value_t mem_value;
+    mem_value.percentage = g_monitoring.counters.memory_utilization_percent;
+    
+    system_metric_t* metric = g_monitoring.metric_list;
+    while (metric) {
+        if (strcmp(metric->name, "memory_utilization") == 0) {
+            monitoring_update_metric(metric->metric_id, &mem_value);
+            break;
+        }
+        metric = metric->next;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Collect storage metrics
+ */
+status_t monitoring_collect_storage_metrics(void)
+{
+    /* Placeholder storage metrics - would be collected from storage drivers */
+    g_monitoring.counters.disk_reads_total += 10;
+    g_monitoring.counters.disk_writes_total += 5;
+    g_monitoring.counters.disk_read_bytes_total += 40960;    /* 40KB */
+    g_monitoring.counters.disk_write_bytes_total += 20480;   /* 20KB */
+    g_monitoring.counters.disk_utilization_percent = 15;     /* Disk utilization */
+    
+    /* Update disk utilization metric */
+    metric_value_t disk_value;
+    disk_value.percentage = g_monitoring.counters.disk_utilization_percent;
+    
+    system_metric_t* metric = g_monitoring.metric_list;
+    while (metric) {
+        if (strcmp(metric->name, "disk_utilization") == 0) {
+            monitoring_update_metric(metric->metric_id, &disk_value);
+            break;
+        }
+        metric = metric->next;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Collect network metrics
+ */
+status_t monitoring_collect_network_metrics(void)
+{
+    /* Placeholder network metrics - would be collected from network drivers */
+    g_monitoring.counters.network_rx_packets_total += 20;
+    g_monitoring.counters.network_tx_packets_total += 15;
+    g_monitoring.counters.network_rx_bytes_total += 30720;   /* 30KB */
+    g_monitoring.counters.network_tx_bytes_total += 20480;   /* 20KB */
+    g_monitoring.counters.network_utilization_percent = 5;   /* Network utilization */
+    
+    /* Update network utilization metric */
+    metric_value_t net_value;
+    net_value.percentage = g_monitoring.counters.network_utilization_percent;
+    
+    system_metric_t* metric = g_monitoring.metric_list;
+    while (metric) {
+        if (strcmp(metric->name, "network_utilization") == 0) {
+            monitoring_update_metric(metric->metric_id, &net_value);
+            break;
+        }
+        metric = metric->next;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Generate Prometheus-formatted metrics
+ */
+status_t monitoring_generate_prometheus_metrics(char* buffer, size_t buffer_size)
+{
+    if (!g_monitoring.initialized || !buffer || buffer_size == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    size_t offset = 0;
+    int written;
+    
+    /* Write header */
+    written = snprintf(buffer + offset, buffer_size - offset,
+                      "# LimitlessOS System Metrics\n"
+                      "# Generated at: %llu\n\n", timer_get_ns());
+    if (written < 0 || (size_t)written >= buffer_size - offset) {
+        return STATUS_INSUFFICIENT_BUFFER;
+    }
+    offset += written;
+    
+    spinlock_acquire(&g_monitoring.global_lock);
+    
+    /* Write performance counters */
+    const char* metrics[] = {
+        "limitlessos_cpu_utilization_percent", 
+        "limitlessos_memory_utilization_percent",
+        "limitlessos_disk_utilization_percent",
+        "limitlessos_network_utilization_percent",
+        "limitlessos_uptime_seconds"
+    };
+    
+    double values[] = {
+        (double)g_monitoring.counters.cpu_utilization_percent,
+        (double)g_monitoring.counters.memory_utilization_percent, 
+        (double)g_monitoring.counters.disk_utilization_percent,
+        (double)g_monitoring.counters.network_utilization_percent,
+        (double)g_monitoring.counters.uptime_seconds
+    };
+    
+    for (int i = 0; i < 5; i++) {
+        written = snprintf(buffer + offset, buffer_size - offset,
+                          "# TYPE %s gauge\n%s %.2f\n\n",
+                          metrics[i], metrics[i], values[i]);
+        if (written < 0 || (size_t)written >= buffer_size - offset) {
+            spinlock_release(&g_monitoring.global_lock);
+            return STATUS_INSUFFICIENT_BUFFER;
+        }
+        offset += written;
+    }
+    
+    /* Write counters */
+    written = snprintf(buffer + offset, buffer_size - offset,
+                      "# TYPE limitlessos_cpu_cycles_total counter\n"
+                      "limitlessos_cpu_cycles_total %llu\n\n"
+                      "# TYPE limitlessos_memory_total_bytes gauge\n" 
+                      "limitlessos_memory_total_bytes %llu\n\n"
+                      "# TYPE limitlessos_memory_free_bytes gauge\n"
+                      "limitlessos_memory_free_bytes %llu\n\n"
+                      "# TYPE limitlessos_active_alerts gauge\n"
+                      "limitlessos_active_alerts %u\n\n",
+                      g_monitoring.counters.cpu_cycles_total,
+                      g_monitoring.counters.memory_total_bytes,
+                      g_monitoring.counters.memory_free_bytes,
+                      g_monitoring.active_alert_count);
+    
+    if (written < 0 || (size_t)written >= buffer_size - offset) {
+        spinlock_release(&g_monitoring.global_lock);
+        return STATUS_INSUFFICIENT_BUFFER;
+    }
+    offset += written;
+    
+    spinlock_release(&g_monitoring.global_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Get monitoring statistics
+ */
+status_t monitoring_get_stats(monitoring_stats_t* stats)
+{
+    if (!g_monitoring.initialized || !stats) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    spinlock_acquire(&g_monitoring.global_lock);
+    
+    memset(stats, 0, sizeof(monitoring_stats_t));
+    
+    /* Basic statistics */
+    stats->metrics_collected = g_monitoring.data_points_collected;
+    stats->alerts_active = g_monitoring.active_alert_count;
+    stats->memory_usage_bytes = g_monitoring.metric_count * sizeof(system_metric_t) +
+                               g_monitoring.alert_count * sizeof(system_alert_t) +
+                               g_monitoring.health_check_count * sizeof(health_check_t);
+    
+    /* Calculate monitoring overhead */
+    if (g_monitoring.monitoring_cycles > 0) {
+        stats->average_collection_time_ns = 
+            g_monitoring.monitoring_time_ns / g_monitoring.monitoring_cycles;
+    }
+    
+    /* Count metrics and alerts per subsystem */
+    system_metric_t* metric = g_monitoring.metric_list;
+    while (metric) {
+        if (metric->subsystem < MONITOR_SUBSYS_COUNT) {
+            stats->subsystem_metric_count[metric->subsystem]++;
+        }
+        metric = metric->next;
+    }
+    
+    system_alert_t* alert = g_monitoring.alert_list;
+    while (alert) {
+        if (alert->subsystem < MONITOR_SUBSYS_COUNT && !alert->resolved) {
+            stats->subsystem_alert_count[alert->subsystem]++;
+        }
+        alert = alert->next;
+    }
+    
+    spinlock_release(&g_monitoring.global_lock);
+    
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Main monitoring worker thread
+ */
+static void monitoring_worker_thread(void* arg)
+{
+    kprintf("System Monitoring: Worker thread started\n");
+    
+    while (g_monitoring_thread_running) {
+        if (!g_monitoring.enabled) {
+            thread_sleep_ns(1000000000ULL); /* 1 second */
+            continue;
+        }
+        
+        uint64_t start_time = timer_get_ns();
+        
+        /* Run maintenance tasks */
+        if (g_monitoring_config.auto_cleanup_enabled) {
+            monitoring_cleanup_old_data();
+        }
+        
+        /* Export telemetry to endpoints */
+        monitoring_export_all_telemetry();
+        
+        uint64_t end_time = timer_get_ns();
+        g_monitoring.monitoring_time_ns += (end_time - start_time);
+        g_monitoring.monitoring_cycles++;
+        
+        /* Sleep for interval */
+        thread_sleep_ns(g_monitoring_config.cleanup_interval_ns);
+    }
+    
+    kprintf("System Monitoring: Worker thread stopped\n");
+}
+
+/**
+ * Monitoring collection thread
+ */
+static void monitoring_collection_thread(void* arg)
+{
+    kprintf("System Monitoring: Collection thread started\n");
+    
+    while (g_monitoring_thread_running) {
+        if (!g_monitoring.enabled) {
+            thread_sleep_ns(1000000000ULL); /* 1 second */
+            continue;
+        }
+        
+        /* Update performance counters */
+        monitoring_update_counters();
+        
+        /* Sleep for collection interval */
+        thread_sleep_ns(g_monitoring.counter_update_interval_ns);
+    }
+    
+    kprintf("System Monitoring: Collection thread stopped\n");
+}
+
+/**
+ * Health check thread
+ */
+static void monitoring_health_check_thread(void* arg)
+{
+    kprintf("System Monitoring: Health check thread started\n");
+    
+    while (g_monitoring_thread_running) {
+        if (!g_monitoring.enabled) {
+            thread_sleep_ns(5000000000ULL); /* 5 seconds */
+            continue;
+        }
+        
+        /* Run health checks for all subsystems */
+        for (int i = 0; i < MONITOR_SUBSYS_COUNT; i++) {
+            monitoring_run_health_checks(i);
+        }
+        
+        /* Sleep for health check interval */
+        thread_sleep_ns(MONITOR_INTERVAL_15S); /* 15 seconds */
+    }
+    
+    kprintf("System Monitoring: Health check thread stopped\n");
+}
+
+/**
+ * Utility function to get subsystem name
+ */
+const char* monitoring_subsystem_name(monitor_subsystem_t subsystem)
+{
+    static const char* names[] = {
+        "CPU", "Memory", "Storage", "Network", "Graphics",
+        "Process", "Security", "Filesystem", "Realtime", "Power"
+    };
+    
+    if (subsystem < MONITOR_SUBSYS_COUNT) {
+        return names[subsystem];
+    }
+    return "Unknown";
+}
+
+/**
+ * Utility function to get alert severity name
+ */
+const char* monitoring_alert_severity_name(alert_severity_t severity)
+{
+    static const char* names[] = {
+        "INFO", "WARNING", "ERROR", "CRITICAL", "EMERGENCY"
+    };
+    
+    if (severity <= ALERT_SEVERITY_EMERGENCY) {
+        return names[severity];
+    }
+    return "UNKNOWN";
+}
+
+/**
+ * Placeholder implementations for remaining functions
+ */
+
+status_t monitoring_enable(bool enable)
+{
+    if (!g_monitoring.initialized) {
+        return STATUS_NOT_INITIALIZED;
+    }
+    
+    g_monitoring.enabled = enable;
+    kprintf("System Monitoring: %s\n", enable ? "Enabled" : "Disabled");
+    return STATUS_SUCCESS;
+}
+
+status_t monitoring_run_health_checks(monitor_subsystem_t subsystem)
+{
+    /* Placeholder - would run actual health checks */
+    return STATUS_SUCCESS;
+}
+
+status_t monitoring_export_all_telemetry(void)
+{
+    /* Placeholder - would export to configured endpoints */
+    return STATUS_SUCCESS;
+}
+
+status_t monitoring_cleanup_old_data(void)
+{
+    /* Placeholder - would clean up old metrics and alerts */
+    return STATUS_SUCCESS;
+}
+
+/* Additional utility functions would be implemented here */

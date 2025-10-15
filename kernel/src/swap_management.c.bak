@@ -1,0 +1,608 @@
+/**
+ * Advanced Swap Management System for LimitlessOS
+ * Multi-device swap with intelligent page placement
+ */
+
+#include "kernel.h"
+#include "advanced_vmm.h"
+#include "security.h"
+#include "timer.h"
+#include "storage.h"
+
+/* Swap device types */
+typedef enum {
+    SWAP_TYPE_BLOCK_DEVICE = 0,  /* Traditional block device (SSD/HDD) */
+    SWAP_TYPE_NVME,              /* NVMe device */
+    SWAP_TYPE_RAM_DISK,          /* RAM-based swap */
+    SWAP_TYPE_NETWORK,           /* Network-attached swap */
+    SWAP_TYPE_COMPRESSED         /* Compressed RAM swap */
+} swap_device_type_t;
+
+/* Swap cluster states */
+typedef enum {
+    SWAP_CLUSTER_FREE = 0,
+    SWAP_CLUSTER_ALLOCATED,
+    SWAP_CLUSTER_DIRTY,
+    SWAP_CLUSTER_ERROR
+} swap_cluster_state_t;
+
+/* Initialize swap management system */
+status_t swap_management_init(void) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!g_advanced_vmm.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    k_memset(swap, 0, sizeof(swap_management_t));
+    spinlock_init(&swap->lock);
+    
+    /* Initialize swap device array */
+    for (uint32_t i = 0; i < MAX_SWAP_DEVICES; i++) {
+        swap_device_t* dev = &swap->devices[i];
+        k_memset(dev, 0, sizeof(swap_device_t));
+        spinlock_init(&dev->lock);
+    }
+    
+    /* Set default configuration */
+    swap->enabled = true;
+    swap->device_count = 0;
+    swap->total_pages = 0;
+    swap->free_pages = 0;
+    swap->cluster_size = PAGE_SIZE;  /* 4KB clusters by default */
+    
+    /* Initialize statistics */
+    swap->pages_swapped_out = 0;
+    swap->pages_swapped_in = 0;
+    swap->swap_out_time_ns = 0;
+    swap->swap_in_time_ns = 0;
+    swap->allocation_failures = 0;
+    
+    console_printf("Swap management initialized\n");
+    
+    return STATUS_OK;
+}
+
+/* Add swap device */
+status_t swap_add_device(const char* device_path, uint64_t size_bytes, 
+                        uint32_t priority, swap_device_type_t type) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!device_path || size_bytes == 0) {
+        return STATUS_ERROR;
+    }
+    
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    spin_lock(&swap->lock);
+    
+    if (swap->device_count >= MAX_SWAP_DEVICES) {
+        spin_unlock(&swap->lock);
+        return STATUS_ERROR;
+    }
+    
+    /* Find next available device slot */
+    uint32_t device_id = swap->device_count;
+    swap_device_t* dev = &swap->devices[device_id];
+    
+    /* Initialize device */
+    k_strncpy(dev->device_path, device_path, sizeof(dev->device_path) - 1);
+    dev->device_id = device_id;
+    dev->type = type;
+    dev->size_bytes = size_bytes;
+    dev->priority = priority;
+    dev->enabled = true;
+    
+    /* Calculate cluster information */
+    dev->total_clusters = size_bytes / swap->cluster_size;
+    dev->free_clusters = dev->total_clusters;
+    dev->cluster_map_size = (dev->total_clusters + 7) / 8;  /* Bits to bytes */
+    
+    /* Allocate cluster bitmap */
+    dev->cluster_map = k_malloc(dev->cluster_map_size);
+    if (!dev->cluster_map) {
+        spin_unlock(&swap->lock);
+        return STATUS_ERROR;
+    }
+    
+    /* Clear cluster map (all clusters free) */
+    k_memset(dev->cluster_map, 0, dev->cluster_map_size);
+    
+    /* Set performance characteristics based on device type */
+    switch (type) {
+        case SWAP_TYPE_BLOCK_DEVICE:
+            dev->read_latency_ns = 5000000;   /* 5ms for traditional storage */
+            dev->write_latency_ns = 10000000; /* 10ms for writes */
+            dev->bandwidth_mbps = 100;
+            break;
+            
+        case SWAP_TYPE_NVME:
+            dev->read_latency_ns = 100000;    /* 100μs for NVMe */
+            dev->write_latency_ns = 200000;   /* 200μs for writes */
+            dev->bandwidth_mbps = 3000;
+            break;
+            
+        case SWAP_TYPE_RAM_DISK:
+            dev->read_latency_ns = 1000;      /* 1μs for RAM */
+            dev->write_latency_ns = 1000;
+            dev->bandwidth_mbps = 50000;
+            break;
+            
+        case SWAP_TYPE_NETWORK:
+            dev->read_latency_ns = 100000000; /* 100ms for network */
+            dev->write_latency_ns = 150000000;
+            dev->bandwidth_mbps = 10;
+            break;
+            
+        case SWAP_TYPE_COMPRESSED:
+            dev->read_latency_ns = 10000;     /* 10μs for decompression */
+            dev->write_latency_ns = 50000;    /* 50μs for compression */
+            dev->bandwidth_mbps = 10000;
+            break;
+    }
+    
+    /* Initialize statistics */
+    dev->read_operations = 0;
+    dev->write_operations = 0;
+    dev->read_time_ns = 0;
+    dev->write_time_ns = 0;
+    dev->error_count = 0;
+    
+    /* Update global statistics */
+    swap->device_count++;
+    swap->total_pages += dev->total_clusters;
+    swap->free_pages += dev->free_clusters;
+    
+    spin_unlock(&swap->lock);
+    
+    console_printf("Added swap device: %s (%llu MB, priority %u, type %u)\n",
+                  device_path, size_bytes / (1024 * 1024), priority, type);
+    
+    return STATUS_OK;
+}
+
+/* Remove swap device */
+status_t swap_remove_device(uint32_t device_id) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    spin_lock(&swap->lock);
+    
+    if (device_id >= swap->device_count) {
+        spin_unlock(&swap->lock);
+        return STATUS_ERROR;
+    }
+    
+    swap_device_t* dev = &swap->devices[device_id];
+    
+    /* Check if device has allocated clusters */
+    if (dev->free_clusters < dev->total_clusters) {
+        spin_unlock(&swap->lock);
+        console_printf("Cannot remove swap device %u: clusters in use\n", device_id);
+        return STATUS_ERROR;
+    }
+    
+    /* Free cluster bitmap */
+    if (dev->cluster_map) {
+        k_free(dev->cluster_map);
+    }
+    
+    /* Update global statistics */
+    swap->total_pages -= dev->total_clusters;
+    swap->free_pages -= dev->free_clusters;
+    
+    /* Clear device structure */
+    k_memset(dev, 0, sizeof(swap_device_t));
+    
+    console_printf("Removed swap device %u\n", device_id);
+    
+    spin_unlock(&swap->lock);
+    
+    return STATUS_OK;
+}
+
+/* Select optimal swap device for allocation */
+static uint32_t swap_select_device(size_t size_hint) {
+    extern advanced_vmm_t g_advanced_vmm;
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    uint32_t best_device = UINT32_MAX;
+    uint32_t best_score = 0;
+    
+    /* Score devices based on priority, performance, and availability */
+    for (uint32_t i = 0; i < swap->device_count; i++) {
+        swap_device_t* dev = &swap->devices[i];
+        
+        if (!dev->enabled || dev->free_clusters == 0) {
+            continue;
+        }
+        
+        /* Calculate device score */
+        uint32_t priority_score = dev->priority * 1000;
+        uint32_t availability_score = (dev->free_clusters * 100) / dev->total_clusters;
+        uint32_t performance_score = dev->bandwidth_mbps / 100;
+        uint32_t latency_penalty = dev->read_latency_ns / 1000000;  /* Convert to ms */
+        
+        uint32_t total_score = priority_score + availability_score + 
+                              performance_score - latency_penalty;
+        
+        if (total_score > best_score) {
+            best_score = total_score;
+            best_device = i;
+        }
+    }
+    
+    return best_device;
+}
+
+/* Allocate swap cluster */
+static uint64_t swap_allocate_cluster(uint32_t device_id) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (device_id >= g_advanced_vmm.swap_mgmt.device_count) {
+        return UINT64_MAX;
+    }
+    
+    swap_device_t* dev = &g_advanced_vmm.swap_mgmt.devices[device_id];
+    
+    spin_lock(&dev->lock);
+    
+    if (dev->free_clusters == 0) {
+        spin_unlock(&dev->lock);
+        return UINT64_MAX;
+    }
+    
+    /* Find first free cluster */
+    for (uint32_t byte_idx = 0; byte_idx < dev->cluster_map_size; byte_idx++) {
+        if (dev->cluster_map[byte_idx] != 0xFF) {
+            /* This byte has free bits */
+            for (uint32_t bit_idx = 0; bit_idx < 8; bit_idx++) {
+                uint32_t cluster_id = byte_idx * 8 + bit_idx;
+                
+                if (cluster_id >= dev->total_clusters) {
+                    break;
+                }
+                
+                if (!(dev->cluster_map[byte_idx] & (1U << bit_idx))) {
+                    /* Found free cluster */
+                    dev->cluster_map[byte_idx] |= (1U << bit_idx);
+                    dev->free_clusters--;
+                    
+                    spin_unlock(&dev->lock);
+                    
+                    /* Return swap entry: device_id in upper 16 bits, cluster_id in lower 48 bits */
+                    return ((uint64_t)device_id << 48) | cluster_id;
+                }
+            }
+        }
+    }
+    
+    spin_unlock(&dev->lock);
+    
+    return UINT64_MAX;
+}
+
+/* Free swap cluster */
+static status_t swap_free_cluster(uint64_t swap_entry) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    uint32_t device_id = (uint32_t)(swap_entry >> 48);
+    uint32_t cluster_id = (uint32_t)(swap_entry & 0xFFFFFFFFFFFFULL);
+    
+    if (device_id >= g_advanced_vmm.swap_mgmt.device_count) {
+        return STATUS_ERROR;
+    }
+    
+    swap_device_t* dev = &g_advanced_vmm.swap_mgmt.devices[device_id];
+    
+    if (cluster_id >= dev->total_clusters) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&dev->lock);
+    
+    uint32_t byte_idx = cluster_id / 8;
+    uint32_t bit_idx = cluster_id % 8;
+    
+    if (dev->cluster_map[byte_idx] & (1U << bit_idx)) {
+        /* Cluster was allocated, free it */
+        dev->cluster_map[byte_idx] &= ~(1U << bit_idx);
+        dev->free_clusters++;
+        
+        spin_unlock(&dev->lock);
+        return STATUS_OK;
+    }
+    
+    spin_unlock(&dev->lock);
+    
+    return STATUS_ERROR;  /* Cluster was already free */
+}
+
+/* Swap out page to storage */
+status_t swap_out_page(void* page_addr, uint64_t* swap_entry) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!page_addr || !swap_entry) {
+        return STATUS_ERROR;
+    }
+    
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    if (!swap->enabled) {
+        return STATUS_ERROR;
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    /* Select optimal device */
+    uint32_t device_id = swap_select_device(PAGE_SIZE);
+    if (device_id == UINT32_MAX) {
+        spin_lock(&swap->lock);
+        swap->allocation_failures++;
+        spin_unlock(&swap->lock);
+        return STATUS_ERROR;
+    }
+    
+    /* Allocate cluster */
+    uint64_t cluster_entry = swap_allocate_cluster(device_id);
+    if (cluster_entry == UINT64_MAX) {
+        spin_lock(&swap->lock);
+        swap->allocation_failures++;
+        spin_unlock(&swap->lock);
+        return STATUS_ERROR;
+    }
+    
+    swap_device_t* dev = &swap->devices[device_id];
+    uint32_t cluster_id = (uint32_t)(cluster_entry & 0xFFFFFFFFFFFFULL);
+    
+    /* Write page to swap device */
+    /* In real implementation, would use actual I/O operations */
+    uint64_t offset = cluster_id * swap->cluster_size;
+    
+    /* Simulate write operation */
+    timer_sleep_ns(dev->write_latency_ns);
+    
+    /* Update device statistics */
+    spin_lock(&dev->lock);
+    dev->write_operations++;
+    dev->write_time_ns += dev->write_latency_ns;
+    spin_unlock(&dev->lock);
+    
+    /* Update global statistics */
+    uint64_t swap_time = timer_get_ticks() - start_time;
+    
+    spin_lock(&swap->lock);
+    swap->pages_swapped_out++;
+    swap->swap_out_time_ns += (swap_time * 1000000) / TIMER_HZ;
+    swap->free_pages--;
+    spin_unlock(&swap->lock);
+    
+    *swap_entry = cluster_entry;
+    
+    return STATUS_OK;
+}
+
+/* Swap in page from storage */
+status_t swap_in_page(uint64_t swap_entry, void* page_addr) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!page_addr || swap_entry == 0) {
+        return STATUS_ERROR;
+    }
+    
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    if (!swap->enabled) {
+        return STATUS_ERROR;
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    uint32_t device_id = (uint32_t)(swap_entry >> 48);
+    uint32_t cluster_id = (uint32_t)(swap_entry & 0xFFFFFFFFFFFFULL);
+    
+    if (device_id >= swap->device_count) {
+        return STATUS_ERROR;
+    }
+    
+    swap_device_t* dev = &swap->devices[device_id];
+    uint64_t offset = cluster_id * swap->cluster_size;
+    
+    /* Read page from swap device */
+    /* In real implementation, would use actual I/O operations */
+    
+    /* Simulate read operation */
+    timer_sleep_ns(dev->read_latency_ns);
+    
+    /* Update device statistics */
+    spin_lock(&dev->lock);
+    dev->read_operations++;
+    dev->read_time_ns += dev->read_latency_ns;
+    spin_unlock(&dev->lock);
+    
+    /* Free the swap cluster */
+    swap_free_cluster(swap_entry);
+    
+    /* Update global statistics */
+    uint64_t swap_time = timer_get_ticks() - start_time;
+    
+    spin_lock(&swap->lock);
+    swap->pages_swapped_in++;
+    swap->swap_in_time_ns += (swap_time * 1000000) / TIMER_HZ;
+    swap->free_pages++;
+    spin_unlock(&swap->lock);
+    
+    return STATUS_OK;
+}
+
+/* Get swap statistics */
+status_t swap_get_statistics(swap_stats_t* stats) {
+    extern advanced_vmm_t g_advanced_vmm;
+    
+    if (!stats) {
+        return STATUS_ERROR;
+    }
+    
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    spin_lock(&swap->lock);
+    
+    k_memset(stats, 0, sizeof(swap_stats_t));
+    
+    stats->enabled = swap->enabled;
+    stats->device_count = swap->device_count;
+    stats->total_pages = swap->total_pages;
+    stats->free_pages = swap->free_pages;
+    stats->used_pages = swap->total_pages - swap->free_pages;
+    
+    if (swap->total_pages > 0) {
+        stats->usage_percent = ((swap->total_pages - swap->free_pages) * 100) / swap->total_pages;
+    }
+    
+    stats->pages_swapped_out = swap->pages_swapped_out;
+    stats->pages_swapped_in = swap->pages_swapped_in;
+    stats->allocation_failures = swap->allocation_failures;
+    
+    if (swap->pages_swapped_out > 0) {
+        stats->average_swap_out_time_ns = swap->swap_out_time_ns / swap->pages_swapped_out;
+    }
+    
+    if (swap->pages_swapped_in > 0) {
+        stats->average_swap_in_time_ns = swap->swap_in_time_ns / swap->pages_swapped_in;
+    }
+    
+    spin_unlock(&swap->lock);
+    
+    return STATUS_OK;
+}
+
+/* Dump swap statistics */
+status_t swap_dump_statistics(void) {
+    extern advanced_vmm_t g_advanced_vmm;
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    console_printf("=== Swap Management Statistics ===\n");
+    
+    swap_stats_t stats;
+    if (swap_get_statistics(&stats) == STATUS_OK) {
+        console_printf("Enabled: %s\n", stats.enabled ? "Yes" : "No");
+        console_printf("Device Count: %u\n", stats.device_count);
+        console_printf("Total Pages: %llu (%llu MB)\n", 
+                      stats.total_pages, (stats.total_pages * PAGE_SIZE) / (1024 * 1024));
+        console_printf("Used Pages: %llu (%u%%)\n", stats.used_pages, stats.usage_percent);
+        console_printf("Free Pages: %llu\n", stats.free_pages);
+        
+        console_printf("\nActivity:\n");
+        console_printf("  Pages Swapped Out: %llu\n", stats.pages_swapped_out);
+        console_printf("  Pages Swapped In: %llu\n", stats.pages_swapped_in);
+        console_printf("  Allocation Failures: %llu\n", stats.allocation_failures);
+        
+        console_printf("\nPerformance:\n");
+        console_printf("  Average Swap Out Time: %llu ns\n", stats.average_swap_out_time_ns);
+        console_printf("  Average Swap In Time: %llu ns\n", stats.average_swap_in_time_ns);
+    }
+    
+    /* Per-device statistics */
+    console_printf("\nSwap Devices:\n");
+    for (uint32_t i = 0; i < swap->device_count; i++) {
+        swap_device_t* dev = &swap->devices[i];
+        
+        const char* type_names[] = {"Block", "NVMe", "RAM", "Network", "Compressed"};
+        const char* type_name = (dev->type < 5) ? type_names[dev->type] : "Unknown";
+        
+        console_printf("  Device %u (%s):\n", i, type_name);
+        console_printf("    Path: %s\n", dev->device_path);
+        console_printf("    Size: %llu MB\n", dev->size_bytes / (1024 * 1024));
+        console_printf("    Priority: %u\n", dev->priority);
+        console_printf("    Enabled: %s\n", dev->enabled ? "Yes" : "No");
+        console_printf("    Total Clusters: %u\n", dev->total_clusters);
+        console_printf("    Free Clusters: %u\n", dev->free_clusters);
+        console_printf("    Usage: %u%%\n", 
+                      dev->total_clusters ? ((dev->total_clusters - dev->free_clusters) * 100) / dev->total_clusters : 0);
+        
+        console_printf("    Performance:\n");
+        console_printf("      Read Latency: %u ns\n", dev->read_latency_ns);
+        console_printf("      Write Latency: %u ns\n", dev->write_latency_ns);
+        console_printf("      Bandwidth: %u MB/s\n", dev->bandwidth_mbps);
+        
+        console_printf("    Statistics:\n");
+        console_printf("      Read Operations: %llu\n", dev->read_operations);
+        console_printf("      Write Operations: %llu\n", dev->write_operations);
+        console_printf("      Error Count: %llu\n", dev->error_count);
+        
+        if (dev->read_operations > 0) {
+            console_printf("      Average Read Time: %llu ns\n", 
+                          dev->read_time_ns / dev->read_operations);
+        }
+        
+        if (dev->write_operations > 0) {
+            console_printf("      Average Write Time: %llu ns\n", 
+                          dev->write_time_ns / dev->write_operations);
+        }
+    }
+    
+    console_printf("=== End Swap Statistics ===\n");
+    
+    return STATUS_OK;
+}
+
+/* Balance swap usage across devices */
+status_t swap_balance_devices(void) {
+    extern advanced_vmm_t g_advanced_vmm;
+    swap_management_t* swap = &g_advanced_vmm.swap_mgmt;
+    
+    if (!swap->enabled || swap->device_count <= 1) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Balancing swap usage across devices...\n");
+    
+    /* Calculate average usage */
+    uint32_t total_used = 0;
+    uint32_t active_devices = 0;
+    
+    for (uint32_t i = 0; i < swap->device_count; i++) {
+        swap_device_t* dev = &swap->devices[i];
+        if (dev->enabled && dev->total_clusters > 0) {
+            total_used += (dev->total_clusters - dev->free_clusters);
+            active_devices++;
+        }
+    }
+    
+    if (active_devices == 0) {
+        return STATUS_OK;
+    }
+    
+    uint32_t average_used = total_used / active_devices;
+    uint32_t imbalanced_devices = 0;
+    
+    /* Check for imbalanced devices */
+    for (uint32_t i = 0; i < swap->device_count; i++) {
+        swap_device_t* dev = &swap->devices[i];
+        if (!dev->enabled || dev->total_clusters == 0) continue;
+        
+        uint32_t device_used = dev->total_clusters - dev->free_clusters;
+        uint32_t usage_diff = (device_used > average_used) ? 
+                             (device_used - average_used) : (average_used - device_used);
+        
+        /* If device usage differs by more than 25% from average */
+        if (average_used > 0 && (usage_diff * 100) / average_used > 25) {
+            imbalanced_devices++;
+            console_printf("  Device %u: %u%% usage (avg: %u%%)\n", 
+                          i, (device_used * 100) / dev->total_clusters,
+                          (average_used * 100) / (total_used / active_devices));
+        }
+    }
+    
+    if (imbalanced_devices > 0) {
+        console_printf("Found %u imbalanced swap devices\n", imbalanced_devices);
+        /* In real implementation, would migrate pages between devices */
+    } else {
+        console_printf("Swap usage is balanced across devices\n");
+    }
+    
+    return STATUS_OK;
+}

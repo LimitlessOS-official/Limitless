@@ -1,0 +1,145 @@
+/*
+ * Simple GUI System for LimitlessOS
+ * Provides basic framebuffer-based windowing
+ */
+
+#include "kernel.h"
+
+/* Color definitions */
+#define COLOR_BLACK       0x00000000
+#define COLOR_WHITE       0x00FFFFFF  
+#define COLOR_RED         0x00FF0000
+#define COLOR_GREEN       0x0000FF00
+#define COLOR_BLUE        0x000000FF
+#define COLOR_GRAY        0x00808080
+#define COLOR_LIGHT_GRAY  0x00C0C0C0
+#define COLOR_DARK_BLUE   0x00000080
+
+/* Framebuffer structure */
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t* pixels;
+} framebuffer_t;
+
+static framebuffer_t g_fb = {0};
+
+/* Clear framebuffer to specified color */
+void simple_gui_clear(uint32_t color) {
+    for (uint32_t i = 0; i < g_fb.width * g_fb.height; i++) {
+        g_fb.pixels[i] = color;
+    }
+}
+
+/* Draw a filled rectangle */
+void simple_gui_draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    for (uint32_t j = 0; j < h; j++) {
+        for (uint32_t i = 0; i < w; i++) {
+            if (x + i < g_fb.width && y + j < g_fb.height) {
+                g_fb.pixels[(y + j) * g_fb.width + (x + i)] = color;
+            }
+        }
+    }
+}
+
+/* Simple text rendering (8x16 pixels per character) */
+void simple_gui_draw_char(uint32_t x, uint32_t y, char c, uint32_t color) {
+    /* Simple bitmap font - just draw a colored block for now */
+    for (int j = 0; j < 16; j++) {
+        for (int i = 0; i < 8; i++) {
+            if (x + i < g_fb.width && y + j < g_fb.height) {
+                /* Simple pattern - actual font would need bitmap data */
+                if ((i == 0 || i == 7 || j == 0 || j == 15) && c != ' ') {
+                    g_fb.pixels[(y + j) * g_fb.width + (x + i)] = color;
+                }
+            }
+        }
+    }
+}
+
+/* Draw text string */
+void simple_gui_draw_text(uint32_t x, uint32_t y, const char* text, uint32_t color) {
+    uint32_t pos_x = x;
+    while (*text) {
+        simple_gui_draw_char(pos_x, y, *text, color);
+        pos_x += 8;
+        text++;
+    }
+}
+
+/* Draw a window with title bar */
+void simple_gui_draw_window(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                           const char* title, uint32_t content_color) {
+    /* Draw window border */
+    for (uint32_t i = 0; i < w; i++) {
+        if (y < g_fb.height) g_fb.pixels[y * g_fb.width + x + i] = COLOR_LIGHT_GRAY;
+        if (y + h - 1 < g_fb.height) g_fb.pixels[(y + h - 1) * g_fb.width + x + i] = COLOR_LIGHT_GRAY;
+    }
+    for (uint32_t j = 0; j < h; j++) {
+        if (x < g_fb.width && y + j < g_fb.height) g_fb.pixels[(y + j) * g_fb.width + x] = COLOR_LIGHT_GRAY;
+        if (x + w - 1 < g_fb.width && y + j < g_fb.height) g_fb.pixels[(y + j) * g_fb.width + x + w - 1] = COLOR_LIGHT_GRAY;
+    }
+    
+    /* Draw title bar */
+    for (uint32_t j = 1; j < 20 && j < h - 1; j++) {
+        for (uint32_t i = 1; i < w - 1; i++) {
+            if (x + i < g_fb.width && y + j < g_fb.height) {
+                g_fb.pixels[(y + j) * g_fb.width + x + i] = COLOR_BLUE;
+            }
+        }
+    }
+    
+    /* Fill content area */
+    for (uint32_t j = 21; j < h - 1; j++) {
+        for (uint32_t i = 1; i < w - 1; i++) {
+            if (x + i < g_fb.width && y + j < g_fb.height) {
+                g_fb.pixels[(y + j) * g_fb.width + x + i] = content_color;
+            }
+        }
+    }
+    
+    /* Draw title text in title bar */
+    if (title) {
+        simple_gui_draw_text(x + 4, y + 2, title, COLOR_WHITE);
+    }
+}
+
+/* Draw desktop with taskbar and sample window */
+void simple_gui_draw_desktop(void) {
+    /* Clear screen to desktop background */
+    simple_gui_clear(COLOR_DARK_BLUE);
+    
+    /* Draw taskbar at bottom */
+    for (uint32_t j = g_fb.height - 40; j < g_fb.height; j++) {
+        for (uint32_t i = 0; i < g_fb.width; i++) {
+            g_fb.pixels[j * g_fb.width + i] = COLOR_GRAY;
+        }
+    }
+    
+    /* Draw LimitlessOS text in taskbar */
+    simple_gui_draw_text(10, g_fb.height - 30, "LimitlessOS Desktop", COLOR_WHITE);
+    
+    /* Draw a sample terminal window */
+    simple_gui_draw_window(100, 100, 400, 300, "Terminal", COLOR_BLACK);
+    
+    /* Draw system info window */
+    simple_gui_draw_window(520, 150, 300, 200, "System Info", COLOR_WHITE);
+}
+
+/* Initialize GUI system */
+void simple_gui_init(void) {
+    /* Set up a basic 1024x768 framebuffer in memory */
+    g_fb.width = 1024;
+    g_fb.height = 768;
+    g_fb.pitch = g_fb.width * 4;
+    
+    /* Allocate framebuffer memory */
+    g_fb.pixels = (uint32_t*)kalloc(g_fb.width * g_fb.height * 4);
+    if (!g_fb.pixels) {
+        return; /* Failed to allocate */
+    }
+    
+    /* Clear to dark blue */
+    simple_gui_clear(COLOR_DARK_BLUE);
+}

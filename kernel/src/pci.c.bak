@@ -1,0 +1,52 @@
+#include "pci.h"
+#include "kernel.h"
+
+static void pci_scan_func(u8 bus, u8 slot, u8 func, pci_device_cb cb, void* user) {
+    u32 v = hal_pci_cfg_read32(bus, slot, func, 0x00);
+    u16 vendor = (u16)(v & 0xFFFF);
+    if (vendor == 0xFFFF) return;
+    pci_device_t d = {0};
+    d.bus = bus; d.slot = slot; d.func = func;
+    d.vendor_id = vendor;
+    d.device_id = (u16)(v >> 16);
+
+    u32 classreg = hal_pci_cfg_read32(bus, slot, func, 0x08);
+    d.class_code = (u8)(classreg >> 24);
+    d.subclass   = (u8)(classreg >> 16);
+    d.prog_if    = (u8)(classreg >> 8);
+
+    if (cb) cb(&d, user);
+
+    /* Check multifunction */
+    u32 hdr = hal_pci_cfg_read32(bus, slot, func, 0x0C);
+    (void)hdr;
+}
+
+static void pci_scan_slot(u8 bus, u8 slot, pci_device_cb cb, void* user) {
+    u32 v = hal_pci_cfg_read32(bus, slot, 0, 0x00);
+    if ((v & 0xFFFF) == 0xFFFF) return;
+    pci_scan_func(bus, slot, 0, cb, user);
+
+    u32 hdr = hal_pci_cfg_read32(bus, slot, 0, 0x0C);
+    if (((hdr >> 16) & 0x80) != 0) {
+        /* multifunction */
+        for (u8 func = 1; func < 8; ++func) {
+            pci_scan_func(bus, slot, func, cb, user);
+        }
+    }
+}
+
+static void pci_scan_bus(u8 bus, pci_device_cb cb, void* user) {
+    for (u8 slot = 0; slot < 32; ++slot) {
+        pci_scan_slot(bus, slot, cb, user);
+    }
+}
+
+void pci_init(void) {
+    /* Phase 1: single root bus 0 */
+    pci_scan_bus(0, NULL, NULL);
+}
+
+void pci_enumerate(pci_device_cb cb, void* user) {
+    pci_scan_bus(0, cb, user);
+}

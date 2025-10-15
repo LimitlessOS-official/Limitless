@@ -1,0 +1,577 @@
+/*
+ * init_framework.c - LimitlessOS Comprehensive Initialization Framework
+ * 
+ * Complete system initialization framework integrating all major subsystems
+ * with proper dependency management and comprehensive initialization sequence.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "scheduler.h"
+#include "vmm.h"
+#include "vfs.h"
+#include "syscall.h"
+#include "timer.h"
+#include "network.h"
+#include "security.h"
+#include "pthreads.h"
+#include "service_manager.h"
+
+/* Initialization phases */
+#define INIT_PHASE_EARLY        0   /* Early kernel initialization */
+#define INIT_PHASE_CORE         1   /* Core kernel subsystems */
+#define INIT_PHASE_DRIVERS      2   /* Device drivers and HAL */
+#define INIT_PHASE_FILESYSTEMS  3   /* Filesystem and VFS */
+#define INIT_PHASE_NETWORK      4   /* Network stack */
+#define INIT_PHASE_SECURITY     5   /* Security subsystems */
+#define INIT_PHASE_SERVICES     6   /* System services */
+#define INIT_PHASE_USERSPACE    7   /* Userspace initialization */
+#define INIT_PHASE_COMPLETE     8   /* Initialization complete */
+
+#define MAX_INIT_MODULES        128
+#define MAX_MODULE_NAME         64
+
+/* Initialization module */
+typedef struct init_module {
+    char name[MAX_MODULE_NAME];     /* Module name */
+    int phase;                      /* Initialization phase */
+    int priority;                   /* Priority within phase (lower = earlier) */
+    
+    int (*init_func)(void);         /* Initialization function */
+    void (*cleanup_func)(void);     /* Cleanup function */
+    
+    /* Dependencies */
+    char dependencies[8][MAX_MODULE_NAME]; /* Module dependencies */
+    int dependency_count;
+    
+    /* State */
+    bool initialized;               /* Successfully initialized */
+    bool failed;                    /* Initialization failed */
+    int error_code;                 /* Error code if failed */
+    uint64_t init_time;             /* Initialization time */
+    uint64_t init_duration;         /* Time taken to initialize */
+    
+    struct list_head list;          /* Module list */
+    
+} init_module_t;
+
+/* System initialization state */
+typedef struct init_system {
+    bool initialized;
+    int current_phase;              /* Current initialization phase */
+    
+    /* Modules */
+    struct list_head modules[INIT_PHASE_COMPLETE + 1]; /* Modules by phase */
+    struct list_head all_modules;   /* All modules */
+    spinlock_t module_lock;
+    atomic32_t module_count;
+    
+    /* Statistics */
+    atomic32_t modules_initialized; /* Modules successfully initialized */
+    atomic32_t modules_failed;      /* Modules that failed */
+    uint64_t total_init_time;       /* Total initialization time */
+    
+    /* Configuration */
+    bool verbose_init;              /* Verbose initialization output */
+    bool parallel_init;             /* Parallel initialization where possible */
+    bool continue_on_failure;       /* Continue if non-critical modules fail */
+    
+} init_system_t;
+
+/* Global initialization system */
+static init_system_t g_init_system = {0};
+
+/* Function prototypes */
+static int register_init_module(const char* name, int phase, int priority,
+                               int (*init_func)(void), void (*cleanup_func)(void));
+static int init_phase(int phase);
+static int init_module_with_deps(init_module_t* module);
+
+/* Built-in initialization functions */
+extern int memory_management_init(void);
+extern int process_management_init(void);
+extern int scheduler_init(void);
+extern int filesystem_init(void);
+extern int network_stack_init(void);
+extern int security_subsystem_init(void);
+extern int device_drivers_init(void);
+extern int hal_init(void);
+
+/* Initialize the initialization framework */
+int init_framework_init(void) {
+    if (g_init_system.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing comprehensive initialization framework\n");
+    
+    memset(&g_init_system, 0, sizeof(g_init_system));
+    
+    /* Initialize module lists */
+    for (int phase = 0; phase <= INIT_PHASE_COMPLETE; phase++) {
+        INIT_LIST_HEAD(&g_init_system.modules[phase]);
+    }
+    INIT_LIST_HEAD(&g_init_system.all_modules);
+    
+    spinlock_init(&g_init_system.module_lock);
+    
+    /* Configuration */
+    g_init_system.verbose_init = true;
+    g_init_system.parallel_init = false;  /* Sequential for now */
+    g_init_system.continue_on_failure = true;
+    
+    g_init_system.initialized = true;
+    
+    printf("Initialization framework ready\n");
+    return 0;
+}
+
+/* Register initialization module */
+static int register_init_module(const char* name, int phase, int priority,
+                               int (*init_func)(void), void (*cleanup_func)(void)) {
+    
+    if (!name || !init_func || phase < 0 || phase > INIT_PHASE_COMPLETE) {
+        return -EINVAL;
+    }
+    
+    init_module_t* module = (init_module_t*)vmm_kmalloc(sizeof(init_module_t), 32);
+    if (!module) {
+        return -ENOMEM;
+    }
+    
+    memset(module, 0, sizeof(init_module_t));
+    
+    strncpy(module->name, name, MAX_MODULE_NAME - 1);
+    module->phase = phase;
+    module->priority = priority;
+    module->init_func = init_func;
+    module->cleanup_func = cleanup_func;
+    
+    INIT_LIST_HEAD(&module->list);
+    
+    spin_lock(&g_init_system.module_lock);
+    
+    /* Insert in priority order */
+    init_module_t* pos;
+    bool inserted = false;
+    
+    list_for_each_entry(pos, &g_init_system.modules[phase], list) {
+        if (priority < pos->priority) {
+            list_add_tail(&module->list, &pos->list);
+            inserted = true;
+            break;
+        }
+    }
+    
+    if (!inserted) {
+        list_add_tail(&module->list, &g_init_system.modules[phase]);
+    }
+    
+    list_add(&module->list, &g_init_system.all_modules);
+    atomic32_inc(&g_init_system.module_count);
+    
+    spin_unlock(&g_init_system.module_lock);
+    
+    if (g_init_system.verbose_init) {
+        printf("init: Registered module '%s' (phase=%d, priority=%d)\n", 
+               name, phase, priority);
+    }
+    
+    return 0;
+}
+
+/* Add dependency to module */
+int init_add_dependency(const char* module_name, const char* dependency) {
+    if (!module_name || !dependency) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&g_init_system.module_lock);
+    
+    init_module_t* module;
+    list_for_each_entry(module, &g_init_system.all_modules, list) {
+        if (strcmp(module->name, module_name) == 0) {
+            if (module->dependency_count < 8) {
+                strcpy(module->dependencies[module->dependency_count], dependency);
+                module->dependency_count++;
+                
+                spin_unlock(&g_init_system.module_lock);
+                
+                if (g_init_system.verbose_init) {
+                    printf("init: Added dependency '%s' -> '%s'\n", 
+                           module_name, dependency);
+                }
+                
+                return 0;
+            } else {
+                spin_unlock(&g_init_system.module_lock);
+                return -ENOSPC;
+            }
+        }
+    }
+    
+    spin_unlock(&g_init_system.module_lock);
+    return -ENOENT;
+}
+
+/* Initialize module with dependency checking */
+static int init_module_with_deps(init_module_t* module) {
+    if (!module || module->initialized || module->failed) {
+        return module ? (module->failed ? module->error_code : 0) : -EINVAL;
+    }
+    
+    /* Check dependencies first */
+    for (int i = 0; i < module->dependency_count; i++) {
+        init_module_t* dep_module;
+        bool found = false;
+        
+        list_for_each_entry(dep_module, &g_init_system.all_modules, list) {
+            if (strcmp(dep_module->name, module->dependencies[i]) == 0) {
+                found = true;
+                
+                if (!dep_module->initialized) {
+                    if (dep_module->failed) {
+                        printf("init: Dependency '%s' failed for module '%s'\n",
+                               dep_module->name, module->name);
+                        return -ENOENT;
+                    }
+                    
+                    /* Initialize dependency first */
+                    int dep_result = init_module_with_deps(dep_module);
+                    if (dep_result != 0) {
+                        printf("init: Failed to initialize dependency '%s' for '%s'\n",
+                               dep_module->name, module->name);
+                        return dep_result;
+                    }
+                }
+                break;
+            }
+        }
+        
+        if (!found) {
+            printf("init: Dependency '%s' not found for module '%s'\n",
+                   module->dependencies[i], module->name);
+            return -ENOENT;
+        }
+    }
+    
+    /* Initialize this module */
+    if (g_init_system.verbose_init) {
+        printf("init: Initializing module '%s'...", module->name);
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    int result = module->init_func();
+    
+    uint64_t end_time = timer_get_ticks();
+    module->init_time = start_time;
+    module->init_duration = end_time - start_time;
+    
+    if (result == 0) {
+        module->initialized = true;
+        atomic32_inc(&g_init_system.modules_initialized);
+        
+        if (g_init_system.verbose_init) {
+            printf(" OK (%lu ms)\n", module->init_duration);
+        }
+    } else {
+        module->failed = true;
+        module->error_code = result;
+        atomic32_inc(&g_init_system.modules_failed);
+        
+        if (g_init_system.verbose_init) {
+            printf(" FAILED (error=%d)\n", result);
+        }
+        
+        if (!g_init_system.continue_on_failure) {
+            return result;
+        }
+    }
+    
+    return result;
+}
+
+/* Initialize specific phase */
+static int init_phase(int phase) {
+    if (phase < 0 || phase > INIT_PHASE_COMPLETE) {
+        return -EINVAL;
+    }
+    
+    printf("init: Starting phase %d\n", phase);
+    
+    uint64_t phase_start = timer_get_ticks();
+    int phase_failures = 0;
+    
+    init_module_t* module;
+    list_for_each_entry(module, &g_init_system.modules[phase], list) {
+        int result = init_module_with_deps(module);
+        if (result != 0) {
+            phase_failures++;
+            
+            if (!g_init_system.continue_on_failure) {
+                printf("init: Phase %d failed due to module '%s'\n", 
+                       phase, module->name);
+                return result;
+            }
+        }
+    }
+    
+    uint64_t phase_end = timer_get_ticks();
+    uint64_t phase_duration = phase_end - phase_start;
+    
+    printf("init: Phase %d completed (%lu ms, %d failures)\n", 
+           phase, phase_duration, phase_failures);
+    
+    return 0;
+}
+
+/* Register all built-in modules */
+static void register_builtin_modules(void) {
+    /* Phase 0: Early kernel initialization */
+    register_init_module("memory_management", INIT_PHASE_EARLY, 10, 
+                         memory_management_init, NULL);
+    register_init_module("process_management", INIT_PHASE_EARLY, 20,
+                         process_management_init, NULL);
+    register_init_module("scheduler", INIT_PHASE_EARLY, 30,
+                         scheduler_init, NULL);
+    
+    /* Phase 1: Core kernel subsystems */
+    register_init_module("timer", INIT_PHASE_CORE, 10,
+                         timer_init, NULL);
+    register_init_module("syscalls", INIT_PHASE_CORE, 20,
+                         syscall_init, NULL);
+    
+    /* Phase 2: Device drivers and HAL */
+    register_init_module("hal", INIT_PHASE_DRIVERS, 10,
+                         hal_init, NULL);
+    register_init_module("device_drivers", INIT_PHASE_DRIVERS, 20,
+                         device_drivers_init, NULL);
+    
+    /* Phase 3: Filesystems */
+    register_init_module("vfs", INIT_PHASE_FILESYSTEMS, 10,
+                         vfs_init, NULL);
+    register_init_module("filesystems", INIT_PHASE_FILESYSTEMS, 20,
+                         filesystem_init, NULL);
+    
+    /* Phase 4: Network stack */
+    register_init_module("network_stack", INIT_PHASE_NETWORK, 10,
+                         network_stack_init, NULL);
+    
+    /* Phase 5: Security subsystems */
+    register_init_module("seccomp", INIT_PHASE_SECURITY, 10,
+                         seccomp_init, NULL);
+    register_init_module("capabilities", INIT_PHASE_SECURITY, 20,
+                         capability_system_init, NULL);
+    register_init_module("mac", INIT_PHASE_SECURITY, 30,
+                         mac_init, NULL);
+    register_init_module("containers", INIT_PHASE_SECURITY, 40,
+                         container_system_init, NULL);
+    
+    /* Phase 6: System services */
+    register_init_module("pthreads", INIT_PHASE_SERVICES, 10,
+                         pthread_init, NULL);
+    register_init_module("posix_apis", INIT_PHASE_SERVICES, 20,
+                         posix_api_init, NULL);
+    register_init_module("service_manager", INIT_PHASE_SERVICES, 30,
+                         service_manager_init, NULL);
+    
+    /* Add dependencies */
+    init_add_dependency("process_management", "memory_management");
+    init_add_dependency("scheduler", "process_management");
+    init_add_dependency("syscalls", "scheduler");
+    init_add_dependency("device_drivers", "hal");
+    init_add_dependency("filesystems", "vfs");
+    init_add_dependency("network_stack", "device_drivers");
+    init_add_dependency("capabilities", "seccomp");
+    init_add_dependency("mac", "capabilities");
+    init_add_dependency("containers", "mac");
+    init_add_dependency("posix_apis", "pthreads");
+    init_add_dependency("service_manager", "posix_apis");
+}
+
+/* Main system initialization */
+int system_init(void) {
+    printf("\n=== LimitlessOS Production System Initialization ===\n");
+    
+    uint64_t total_start = timer_get_ticks();
+    
+    /* Initialize the init framework itself */
+    int result = init_framework_init();
+    if (result != 0) {
+        printf("init: Failed to initialize framework\n");
+        return result;
+    }
+    
+    /* Register all built-in modules */
+    register_builtin_modules();
+    
+    printf("init: Registered %u initialization modules\n", 
+           atomic32_read(&g_init_system.module_count));
+    
+    /* Initialize all phases */
+    for (int phase = INIT_PHASE_EARLY; phase < INIT_PHASE_COMPLETE; phase++) {
+        g_init_system.current_phase = phase;
+        
+        result = init_phase(phase);
+        if (result != 0 && !g_init_system.continue_on_failure) {
+            printf("init: System initialization failed at phase %d\n", phase);
+            return result;
+        }
+    }
+    
+    /* Load and start system services */
+    printf("init: Loading system services\n");
+    service_load_all_units();
+    service_start_default_target();
+    
+    uint64_t total_end = timer_get_ticks();
+    g_init_system.total_init_time = total_end - total_start;
+    
+    printf("\n=== System Initialization Complete ===\n");
+    printf("Total time: %lu ms\n", g_init_system.total_init_time);
+    printf("Modules initialized: %u\n", atomic32_read(&g_init_system.modules_initialized));
+    printf("Modules failed: %u\n", atomic32_read(&g_init_system.modules_failed));
+    
+    /* Print detailed initialization report */
+    init_print_report();
+    
+    g_init_system.current_phase = INIT_PHASE_COMPLETE;
+    
+    return 0;
+}
+
+/* Print detailed initialization report */
+void init_print_report(void) {
+    printf("\n=== Initialization Report ===\n");
+    
+    for (int phase = INIT_PHASE_EARLY; phase < INIT_PHASE_COMPLETE; phase++) {
+        printf("\nPhase %d:\n", phase);
+        
+        init_module_t* module;
+        list_for_each_entry(module, &g_init_system.modules[phase], list) {
+            printf("  %-20s %s (%lu ms)",
+                   module->name,
+                   module->initialized ? "OK" : 
+                   module->failed ? "FAILED" : "SKIPPED",
+                   module->init_duration);
+            
+            if (module->failed) {
+                printf(" [error=%d]", module->error_code);
+            }
+            
+            if (module->dependency_count > 0) {
+                printf(" (deps:");
+                for (int i = 0; i < module->dependency_count; i++) {
+                    printf(" %s", module->dependencies[i]);
+                }
+                printf(")");
+            }
+            
+            printf("\n");
+        }
+    }
+    
+    /* Print subsystem statistics */
+    printf("\n=== Subsystem Statistics ===\n");
+    
+    printf("Memory Management:\n");
+    /* vmm_dump_stats(); */
+    
+    printf("\nScheduler:\n");
+    /* scheduler_dump_stats(); */
+    
+    printf("\nFilesystem:\n");
+    /* vfs_dump_stats(); */
+    
+    printf("\nNetwork:\n");
+    /* network_dump_stats(); */
+    
+    printf("\nSecurity:\n");
+    /* seccomp_dump_stats();
+    capability_dump_stats();
+    mac_dump_stats();
+    container_dump_stats(); */
+    
+    printf("\nPOSIX:\n");
+    /* pthread_dump_stats();
+    posix_api_dump_stats(); */
+    
+    printf("\nService Manager:\n");
+    /* service_manager_dump_stats(); */
+}
+
+/* Get initialization statistics */
+void init_get_stats(struct init_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct init_stats));
+    
+    stats->total_modules = atomic32_read(&g_init_system.module_count);
+    stats->modules_initialized = atomic32_read(&g_init_system.modules_initialized);
+    stats->modules_failed = atomic32_read(&g_init_system.modules_failed);
+    stats->total_init_time = g_init_system.total_init_time;
+    stats->current_phase = g_init_system.current_phase;
+}
+
+/* System shutdown */
+void system_shutdown(void) {
+    printf("\n=== LimitlessOS System Shutdown ===\n");
+    
+    /* Stop all services */
+    printf("init: Stopping system services\n");
+    /* TODO: Stop all services in reverse dependency order */
+    
+    /* Cleanup modules in reverse order */
+    for (int phase = INIT_PHASE_COMPLETE - 1; phase >= INIT_PHASE_EARLY; phase--) {
+        init_module_t* module;
+        list_for_each_entry_reverse(module, &g_init_system.modules[phase], list) {
+            if (module->initialized && module->cleanup_func) {
+                printf("init: Cleaning up module '%s'\n", module->name);
+                module->cleanup_func();
+            }
+        }
+    }
+    
+    printf("init: System shutdown complete\n");
+}
+
+/* Emergency recovery mode */
+void emergency_recovery(void) {
+    printf("\n=== Emergency Recovery Mode ===\n");
+    
+    /* Try to start minimal services */
+    printf("init: Starting emergency services\n");
+    
+    /* Start basic shell */
+    printf("init: Starting emergency shell\n");
+    
+    /* TODO: Start minimal recovery environment */
+}
+
+/* Init process entry point */
+void init_main(void) {
+    printf("init: LimitlessOS Init Process Started (PID 1)\n");
+    
+    /* Perform complete system initialization */
+    int result = system_init();
+    
+    if (result != 0) {
+        printf("init: System initialization failed, entering recovery mode\n");
+        emergency_recovery();
+        return;
+    }
+    
+    printf("init: System fully initialized and operational\n");
+    
+    /* Main init loop - manage system services */
+    while (1) {
+        /* Check for service failures and restart as needed */
+        /* Handle process reaping for orphaned processes */
+        /* Monitor system health */
+        
+        /* Sleep for a bit */
+        /* TODO: Use proper event-driven approach */
+        schedule_timeout(HZ);  /* Sleep for 1 second */
+    }
+}

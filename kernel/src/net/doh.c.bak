@@ -1,0 +1,965 @@
+#include "net/doh.h"
+#include "log.h"
+#include "kernel.h"
+#include "vfs.h"
+
+/* Minimal TLS 1.2 implementation for DoH */
+#define TLS_CONTENT_HANDSHAKE 22
+#define TLS_CONTENT_APPLICATION 23
+#define TLS_HANDSHAKE_CLIENT_HELLO 1
+#define TLS_HANDSHAKE_SERVER_HELLO 2
+#define TLS_HANDSHAKE_CERTIFICATE 11
+#define TLS_HANDSHAKE_SERVER_HELLO_DONE 14
+#define TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE 16
+#define TLS_HANDSHAKE_FINISHED 20
+
+/* Cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA */
+#define TLS_RSA_WITH_AES_128_CBC_SHA 0x002F
+
+/* Global state */
+static doh_resolver_t g_resolvers[DOH_MAX_RESOLVERS];
+static doh_cache_entry_t g_cache[DOH_CACHE_SIZE];
+static spinlock_t g_doh_lock;
+static doh_metrics_t g_metrics;
+
+/* AES-128 CBC implementation */
+static const uint8_t aes_sbox[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
+};
+
+static const uint8_t aes_inv_sbox[256] = {
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d
+};
+
+static const uint8_t aes_rcon[11] = {
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
+};
+
+static void aes_key_expansion(const uint8_t* key, uint32_t* round_keys) {
+    for (int i = 0; i < 4; i++) {
+        round_keys[i] = (key[4*i] << 24) | (key[4*i+1] << 16) | (key[4*i+2] << 8) | key[4*i+3];
+    }
+    
+    for (int i = 4; i < 44; i++) {
+        uint32_t temp = round_keys[i-1];
+        if (i % 4 == 0) {
+            temp = ((aes_sbox[(temp >> 16) & 0xff] << 24) |
+                   (aes_sbox[(temp >> 8) & 0xff] << 16) |
+                   (aes_sbox[temp & 0xff] << 8) |
+                   aes_sbox[(temp >> 24) & 0xff]) ^ (aes_rcon[i/4] << 24);
+        }
+        round_keys[i] = round_keys[i-4] ^ temp;
+    }
+}
+
+static void aes_add_round_key(uint8_t* state, const uint32_t* round_key) {
+    for (int i = 0; i < 4; i++) {
+        uint32_t rk = round_key[i];
+        state[4*i] ^= (rk >> 24) & 0xff;
+        state[4*i+1] ^= (rk >> 16) & 0xff;
+        state[4*i+2] ^= (rk >> 8) & 0xff;
+        state[4*i+3] ^= rk & 0xff;
+    }
+}
+
+static void aes_sub_bytes(uint8_t* state) {
+    for (int i = 0; i < 16; i++) {
+        state[i] = aes_sbox[state[i]];
+    }
+}
+
+static void aes_inv_sub_bytes(uint8_t* state) {
+    for (int i = 0; i < 16; i++) {
+        state[i] = aes_inv_sbox[state[i]];
+    }
+}
+
+static void aes_shift_rows(uint8_t* state) {
+    uint8_t temp;
+    temp = state[1]; state[1] = state[5]; state[5] = state[9]; state[9] = state[13]; state[13] = temp;
+    temp = state[2]; state[2] = state[10]; state[10] = temp; temp = state[6]; state[6] = state[14]; state[14] = temp;
+    temp = state[3]; state[3] = state[15]; state[15] = state[11]; state[11] = state[7]; state[7] = temp;
+}
+
+static void aes_inv_shift_rows(uint8_t* state) {
+    uint8_t temp;
+    temp = state[13]; state[13] = state[9]; state[9] = state[5]; state[5] = state[1]; state[1] = temp;
+    temp = state[14]; state[14] = state[6]; state[6] = temp; temp = state[10]; state[10] = state[2]; state[2] = temp;
+    temp = state[7]; state[7] = state[11]; state[11] = state[15]; state[15] = state[3]; state[3] = temp;
+}
+
+static uint8_t aes_gf_mul(uint8_t a, uint8_t b) {
+    uint8_t p = 0;
+    for (int i = 0; i < 8; i++) {
+        if (b & 1) p ^= a;
+        uint8_t carry = a & 0x80;
+        a <<= 1;
+        if (carry) a ^= 0x1b;
+        b >>= 1;
+    }
+    return p;
+}
+
+static void aes_mix_columns(uint8_t* state) {
+    for (int i = 0; i < 4; i++) {
+        uint8_t s0 = state[4*i], s1 = state[4*i+1], s2 = state[4*i+2], s3 = state[4*i+3];
+        state[4*i] = aes_gf_mul(s0, 2) ^ aes_gf_mul(s1, 3) ^ s2 ^ s3;
+        state[4*i+1] = s0 ^ aes_gf_mul(s1, 2) ^ aes_gf_mul(s2, 3) ^ s3;
+        state[4*i+2] = s0 ^ s1 ^ aes_gf_mul(s2, 2) ^ aes_gf_mul(s3, 3);
+        state[4*i+3] = aes_gf_mul(s0, 3) ^ s1 ^ s2 ^ aes_gf_mul(s3, 2);
+    }
+}
+
+static void aes_inv_mix_columns(uint8_t* state) {
+    for (int i = 0; i < 4; i++) {
+        uint8_t s0 = state[4*i], s1 = state[4*i+1], s2 = state[4*i+2], s3 = state[4*i+3];
+        state[4*i] = aes_gf_mul(s0, 14) ^ aes_gf_mul(s1, 11) ^ aes_gf_mul(s2, 13) ^ aes_gf_mul(s3, 9);
+        state[4*i+1] = aes_gf_mul(s0, 9) ^ aes_gf_mul(s1, 14) ^ aes_gf_mul(s2, 11) ^ aes_gf_mul(s3, 13);
+        state[4*i+2] = aes_gf_mul(s0, 13) ^ aes_gf_mul(s1, 9) ^ aes_gf_mul(s2, 14) ^ aes_gf_mul(s3, 11);
+        state[4*i+3] = aes_gf_mul(s0, 11) ^ aes_gf_mul(s1, 13) ^ aes_gf_mul(s2, 9) ^ aes_gf_mul(s3, 14);
+    }
+}
+
+static void aes_encrypt_block(const uint8_t* plaintext, const uint32_t* round_keys, uint8_t* ciphertext) {
+    k_memcpy(ciphertext, plaintext, 16);
+    
+    aes_add_round_key(ciphertext, round_keys);
+    
+    for (int round = 1; round < 10; round++) {
+        aes_sub_bytes(ciphertext);
+        aes_shift_rows(ciphertext);
+        aes_mix_columns(ciphertext);
+        aes_add_round_key(ciphertext, round_keys + 4*round);
+    }
+    
+    aes_sub_bytes(ciphertext);
+    aes_shift_rows(ciphertext);
+    aes_add_round_key(ciphertext, round_keys + 40);
+}
+
+static void aes_decrypt_block(const uint8_t* ciphertext, const uint32_t* round_keys, uint8_t* plaintext) {
+    k_memcpy(plaintext, ciphertext, 16);
+    
+    aes_add_round_key(plaintext, round_keys + 40);
+    
+    for (int round = 9; round > 0; round--) {
+        aes_inv_shift_rows(plaintext);
+        aes_inv_sub_bytes(plaintext);
+        aes_add_round_key(plaintext, round_keys + 4*round);
+        aes_inv_mix_columns(plaintext);
+    }
+    
+    aes_inv_shift_rows(plaintext);
+    aes_inv_sub_bytes(plaintext);
+    aes_add_round_key(plaintext, round_keys);
+}
+
+static void aes128_cbc_encrypt(const uint8_t* key, const uint8_t* iv, uint8_t* data, size_t len) {
+    uint32_t round_keys[44];
+    aes_key_expansion(key, round_keys);
+    
+    uint8_t prev_block[16];
+    k_memcpy(prev_block, iv, 16);
+    
+    for (size_t i = 0; i < len; i += 16) {
+        for (int j = 0; j < 16; j++) {
+            data[i + j] ^= prev_block[j];
+        }
+        aes_encrypt_block(data + i, round_keys, data + i);
+        k_memcpy(prev_block, data + i, 16);
+    }
+}
+
+static void aes128_cbc_decrypt(const uint8_t* key, const uint8_t* iv, uint8_t* data, size_t len) {
+    uint32_t round_keys[44];
+    aes_key_expansion(key, round_keys);
+    
+    uint8_t prev_block[16];
+    k_memcpy(prev_block, iv, 16);
+    
+    for (size_t i = 0; i < len; i += 16) {
+        uint8_t encrypted_block[16];
+        k_memcpy(encrypted_block, data + i, 16);
+        
+        aes_decrypt_block(data + i, round_keys, data + i);
+        
+        for (int j = 0; j < 16; j++) {
+            data[i + j] ^= prev_block[j];
+        }
+        
+        k_memcpy(prev_block, encrypted_block, 16);
+    }
+}
+
+/* SHA-1 implementation for TLS PRF */
+typedef struct {
+    uint32_t h[5];
+    uint8_t buf[64];
+    uint64_t len;
+    uint32_t idx;
+} sha1_ctx_t;
+
+#define SHA1_ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+static void sha1_init(sha1_ctx_t* ctx) {
+    ctx->h[0] = 0x67452301;
+    ctx->h[1] = 0xEFCDAB89;
+    ctx->h[2] = 0x98BADCFE;
+    ctx->h[3] = 0x10325476;
+    ctx->h[4] = 0xC3D2E1F0;
+    ctx->len = 0;
+    ctx->idx = 0;
+}
+
+static void sha1_block(sha1_ctx_t* ctx, const uint8_t block[64]) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) {
+        w[i] = (block[i*4] << 24) | (block[i*4+1] << 16) | (block[i*4+2] << 8) | block[i*4+3];
+    }
+    for (int i = 16; i < 80; i++) {
+        w[i] = SHA1_ROL(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+    }
+    
+    uint32_t a = ctx->h[0], b = ctx->h[1], c = ctx->h[2], d = ctx->h[3], e = ctx->h[4];
+    
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20) {
+            f = (b & c) | ((~b) & d);
+            k = 0x5A827999;
+        } else if (i < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1;
+        } else if (i < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDC;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6;
+        }
+        
+        uint32_t temp = SHA1_ROL(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = SHA1_ROL(b, 30); b = a; a = temp;
+    }
+    
+    ctx->h[0] += a; ctx->h[1] += b; ctx->h[2] += c; ctx->h[3] += d; ctx->h[4] += e;
+}
+
+static void sha1_update(sha1_ctx_t* ctx, const uint8_t* data, size_t len) {
+    ctx->len += len;
+    while (len--) {
+        ctx->buf[ctx->idx++] = *data++;
+        if (ctx->idx == 64) {
+            sha1_block(ctx, ctx->buf);
+            ctx->idx = 0;
+        }
+    }
+}
+
+static void sha1_final(sha1_ctx_t* ctx, uint8_t out[20]) {
+    uint64_t bits = ctx->len * 8;
+    ctx->buf[ctx->idx++] = 0x80;
+    
+    if (ctx->idx > 56) {
+        while (ctx->idx < 64) ctx->buf[ctx->idx++] = 0;
+        sha1_block(ctx, ctx->buf);
+        ctx->idx = 0;
+    }
+    
+    while (ctx->idx < 56) ctx->buf[ctx->idx++] = 0;
+    
+    for (int i = 7; i >= 0; i--) {
+        ctx->buf[ctx->idx++] = (uint8_t)((bits >> (i * 8)) & 0xFF);
+    }
+    
+    sha1_block(ctx, ctx->buf);
+    
+    for (int i = 0; i < 5; i++) {
+        out[i*4] = (uint8_t)(ctx->h[i] >> 24);
+        out[i*4+1] = (uint8_t)(ctx->h[i] >> 16);
+        out[i*4+2] = (uint8_t)(ctx->h[i] >> 8);
+        out[i*4+3] = (uint8_t)(ctx->h[i]);
+    }
+}
+
+/* HMAC-SHA1 for TLS PRF */
+static void hmac_sha1(const uint8_t* key, size_t klen, const uint8_t* data, size_t dlen, uint8_t out[20]) {
+    uint8_t k0[64];
+    k_memset(k0, 0, sizeof(k0));
+    if (klen > 64) {
+        sha1_ctx_t ctx;
+        sha1_init(&ctx);
+        sha1_update(&ctx, key, klen);
+        sha1_final(&ctx, k0);
+    } else {
+        k_memcpy(k0, key, klen);
+    }
+    
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = k0[i] ^ 0x36;
+        opad[i] = k0[i] ^ 0x5C;
+    }
+    
+    sha1_ctx_t ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, ipad, 64);
+    sha1_update(&ctx, data, dlen);
+    uint8_t inner[20];
+    sha1_final(&ctx, inner);
+    
+    sha1_init(&ctx);
+    sha1_update(&ctx, opad, 64);
+    sha1_update(&ctx, inner, 20);
+    sha1_final(&ctx, out);
+}
+
+/* TLS PRF (simplified version) */
+static void tls_prf(const uint8_t* secret, size_t secret_len, const char* label, 
+                   const uint8_t* seed, size_t seed_len, uint8_t* output, size_t output_len) {
+    size_t label_len = k_strlen(label);
+    uint8_t* combined_seed = (uint8_t*)kmalloc(label_len + seed_len);
+    if (!combined_seed) return;
+    
+    k_memcpy(combined_seed, label, label_len);
+    k_memcpy(combined_seed + label_len, seed, seed_len);
+    
+    /* P_hash function using HMAC-SHA1 */
+    uint8_t a[20]; /* A(i) */
+    hmac_sha1(secret, secret_len, combined_seed, label_len + seed_len, a);
+    
+    size_t generated = 0;
+    while (generated < output_len) {
+        uint8_t p[20];
+        uint8_t* input = (uint8_t*)kmalloc(20 + label_len + seed_len);
+        if (!input) break;
+        
+        k_memcpy(input, a, 20);
+        k_memcpy(input + 20, combined_seed, label_len + seed_len);
+        
+        hmac_sha1(secret, secret_len, input, 20 + label_len + seed_len, p);
+        
+        size_t copy_len = (output_len - generated < 20) ? (output_len - generated) : 20;
+        k_memcpy(output + generated, p, copy_len);
+        generated += copy_len;
+        
+        /* A(i+1) = HMAC(secret, A(i)) */
+        hmac_sha1(secret, secret_len, a, 20, a);
+        
+        kfree(input);
+    }
+    
+    kfree(combined_seed);
+}
+
+status_t doh_init(void) {
+    spinlock_init(&g_doh_lock);
+    k_memset(g_resolvers, 0, sizeof(g_resolvers));
+    k_memset(g_cache, 0, sizeof(g_cache));
+    k_memset(&g_metrics, 0, sizeof(g_metrics));
+    log_info("[DoH] DNS-over-HTTPS subsystem initialized");
+    return STATUS_OK;
+}
+
+status_t doh_add_resolver(const char* url, const char* hostname, uint32_t ip_be, uint16_t port) {
+    if (!url || !hostname) return STATUS_INVALID;
+    
+    spin_lock(&g_doh_lock);
+    for (int i = 0; i < DOH_MAX_RESOLVERS; i++) {
+        if (!g_resolvers[i].active) {
+            doh_resolver_t* r = &g_resolvers[i];
+            k_strlcpy(r->url, url, sizeof(r->url));
+            k_strlcpy(r->hostname, hostname, sizeof(r->hostname));
+            r->ip_be = ip_be;
+            r->port = port;
+            r->active = true;
+            r->queries_sent = 0;
+            r->queries_successful = 0;
+            r->queries_failed = 0;
+            spin_unlock(&g_doh_lock);
+            return STATUS_OK;
+        }
+    }
+    spin_unlock(&g_doh_lock);
+    return STATUS_NO_SPACE;
+}
+
+/* Cache lookup */
+static doh_cache_entry_t* cache_lookup(const char* hostname, uint16_t type) {
+    uint64_t now = timer_get_ticks();
+    for (int i = 0; i < DOH_CACHE_SIZE; i++) {
+        doh_cache_entry_t* e = &g_cache[i];
+        if (e->valid && e->type == type && k_strcmp(e->hostname, hostname) == 0) {
+            if (now < e->expiry_ticks) {
+                return e;
+            } else {
+                e->valid = false; /* Expired */
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Cache insert */
+static void cache_insert(const char* hostname, uint16_t type, uint32_t ip_be, uint32_t ttl) {
+    uint64_t now = timer_get_ticks();
+    uint64_t expiry = now + (ttl * timer_get_freq_hz());
+    
+    /* Find empty slot or oldest entry */
+    int slot = -1;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < DOH_CACHE_SIZE; i++) {
+        if (!g_cache[i].valid) {
+            slot = i;
+            break;
+        }
+        if (g_cache[i].expiry_ticks < oldest) {
+            oldest = g_cache[i].expiry_ticks;
+            slot = i;
+        }
+    }
+    
+    if (slot >= 0) {
+        doh_cache_entry_t* e = &g_cache[slot];
+        k_strlcpy(e->hostname, hostname, sizeof(e->hostname));
+        e->type = type;
+        e->ip_be = ip_be;
+        e->expiry_ticks = expiry;
+        e->valid = true;
+    }
+}
+
+/* DNS packet encoding */
+status_t dns_encode_query(const char* hostname, uint16_t type, uint8_t* buffer, size_t buffer_size, size_t* out_len) {
+    if (!hostname || !buffer || buffer_size < 512) return STATUS_INVALID;
+    
+    uint8_t* p = buffer;
+    size_t remaining = buffer_size;
+    
+    /* DNS header */
+    if (remaining < 12) return STATUS_NO_SPACE;
+    
+    uint16_t id = 0x1234; /* Transaction ID */
+    *(uint16_t*)p = htons(id); p += 2; remaining -= 2;
+    *(uint16_t*)p = htons(0x0100); p += 2; remaining -= 2; /* Standard query */
+    *(uint16_t*)p = htons(1); p += 2; remaining -= 2; /* 1 question */
+    *(uint16_t*)p = htons(0); p += 2; remaining -= 2; /* 0 answers */
+    *(uint16_t*)p = htons(0); p += 2; remaining -= 2; /* 0 authority */
+    *(uint16_t*)p = htons(0); p += 2; remaining -= 2; /* 0 additional */
+    
+    /* Encode hostname as labels */
+    const char* domain = hostname;
+    while (*domain) {
+        const char* dot = k_strstr(domain, ".");
+        size_t label_len = dot ? (dot - domain) : k_strlen(domain);
+        
+        if (remaining < label_len + 1) return STATUS_NO_SPACE;
+        
+        *p++ = (uint8_t)label_len;
+        remaining--;
+        k_memcpy(p, domain, label_len);
+        p += label_len;
+        remaining -= label_len;
+        
+        domain = dot ? (dot + 1) : (domain + label_len);
+    }
+    
+    if (remaining < 1) return STATUS_NO_SPACE;
+    *p++ = 0; /* Root label */
+    remaining--;
+    
+    /* Question type and class */
+    if (remaining < 4) return STATUS_NO_SPACE;
+    *(uint16_t*)p = htons(type); p += 2; remaining -= 2;
+    *(uint16_t*)p = htons(1); p += 2; remaining -= 2; /* IN class */
+    
+    *out_len = p - buffer;
+    return STATUS_OK;
+}
+
+/* DNS packet decoding */
+status_t dns_decode_response(const uint8_t* buffer, size_t len, dns_response_t* out_response) {
+    if (!buffer || len < 12 || !out_response) return STATUS_INVALID;
+    
+    const uint8_t* p = buffer;
+    size_t remaining = len;
+    
+    /* Parse header */
+    out_response->transaction_id = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+    out_response->flags = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+    out_response->questions = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+    out_response->answers = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+    out_response->authority = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+    out_response->additional = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+    
+    /* Skip questions section */
+    for (uint16_t i = 0; i < out_response->questions && remaining > 0; i++) {
+        /* Skip name */
+        while (remaining > 0 && *p != 0) {
+            if ((*p & 0xC0) == 0xC0) {
+                /* Compressed name */
+                p += 2;
+                remaining -= 2;
+                break;
+            } else {
+                uint8_t label_len = *p;
+                p += 1 + label_len;
+                remaining -= 1 + label_len;
+            }
+        }
+        if (remaining > 0 && *p == 0) {
+            p++; remaining--; /* Skip root label */
+        }
+        
+        /* Skip type and class */
+        if (remaining >= 4) {
+            p += 4;
+            remaining -= 4;
+        }
+    }
+    
+    /* Parse answer records */
+    out_response->record_count = 0;
+    uint16_t records_to_parse = (out_response->answers < 16) ? out_response->answers : 16;
+    
+    for (uint16_t i = 0; i < records_to_parse && remaining > 0; i++) {
+        dns_record_t* record = &out_response->records[out_response->record_count];
+        
+        /* Skip name (simplified - assume compression) */
+        if (remaining >= 2 && (*p & 0xC0) == 0xC0) {
+            p += 2;
+            remaining -= 2;
+        } else {
+            /* Parse full name */
+            size_t name_pos = 0;
+            while (remaining > 0 && *p != 0 && name_pos < sizeof(record->name) - 1) {
+                uint8_t label_len = *p++;
+                remaining--;
+                if (remaining < label_len) break;
+                
+                if (name_pos > 0) {
+                    record->name[name_pos++] = '.';
+                }
+                
+                size_t copy_len = (label_len < sizeof(record->name) - name_pos - 1) ? 
+                                  label_len : (sizeof(record->name) - name_pos - 1);
+                k_memcpy(record->name + name_pos, p, copy_len);
+                name_pos += copy_len;
+                
+                p += label_len;
+                remaining -= label_len;
+            }
+            if (remaining > 0 && *p == 0) {
+                p++; remaining--; /* Skip root label */
+            }
+            record->name[name_pos] = '\0';
+        }
+        
+        /* Parse type, class, TTL, rdlength */
+        if (remaining < 10) break;
+        
+        record->type = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+        record->class = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+        record->ttl = ntohl(*(uint32_t*)p); p += 4; remaining -= 4;
+        record->rdlength = ntohs(*(uint16_t*)p); p += 2; remaining -= 2;
+        
+        /* Parse rdata */
+        if (remaining < record->rdlength) break;
+        
+        size_t copy_len = (record->rdlength < sizeof(record->rdata)) ? 
+                          record->rdlength : sizeof(record->rdata);
+        k_memcpy(record->rdata, p, copy_len);
+        
+        p += record->rdlength;
+        remaining -= record->rdlength;
+        
+        out_response->record_count++;
+    }
+    
+    g_metrics.dns_packets_parsed++;
+    return STATUS_OK;
+}
+
+/* Simplified socket operations (placeholder - would integrate with network stack) */
+static status_t socket_connect(uint32_t ip_be, uint16_t port, uint32_t* out_fd) {
+    /* Placeholder: would create TCP socket and connect */
+    static uint32_t next_fd = 100;
+    *out_fd = next_fd++;
+    return STATUS_OK;
+}
+
+static status_t socket_send(uint32_t fd, const uint8_t* data, size_t len) {
+    /* Placeholder: would send data over socket */
+    (void)fd; (void)data; (void)len;
+    return STATUS_OK;
+}
+
+static status_t socket_receive(uint32_t fd, uint8_t* buffer, size_t buffer_size, size_t* out_len) {
+    /* Placeholder: would receive data from socket */
+    (void)fd; (void)buffer; (void)buffer_size;
+    *out_len = 0;
+    return STATUS_OK;
+}
+
+static status_t socket_close(uint32_t fd) {
+    /* Placeholder: would close socket */
+    (void)fd;
+    return STATUS_OK;
+}
+
+/* TLS handshake */
+status_t tls_connect(const char* hostname, uint32_t ip_be, uint16_t port, tls_connection_t* out_conn) {
+    if (!hostname || !out_conn) return STATUS_INVALID;
+    
+    k_memset(out_conn, 0, sizeof(*out_conn));
+    
+    /* Create socket connection */
+    status_t result = socket_connect(ip_be, port, &out_conn->socket_fd);
+    if (result != STATUS_OK) return result;
+    
+    /* Generate client random */
+    for (int i = 0; i < 32; i++) {
+        out_conn->client_random[i] = (uint8_t)(timer_get_ticks() >> (i % 8));
+    }
+    
+    /* Send Client Hello */
+    uint8_t client_hello[256];
+    uint8_t* p = client_hello;
+    
+    /* TLS Record Header */
+    *p++ = TLS_CONTENT_HANDSHAKE;
+    *p++ = 3; *p++ = 3; /* TLS 1.2 */
+    uint16_t* length_ptr = (uint16_t*)p; p += 2; /* Length filled later */
+    
+    /* Handshake Header */
+    *p++ = TLS_HANDSHAKE_CLIENT_HELLO;
+    uint8_t* hs_length_ptr = p; p += 3; /* Handshake length filled later */
+    
+    /* Client Hello payload */
+    *p++ = 3; *p++ = 3; /* TLS 1.2 */
+    k_memcpy(p, out_conn->client_random, 32); p += 32;
+    *p++ = 0; /* Session ID length */
+    
+    /* Cipher suites */
+    *(uint16_t*)p = htons(2); p += 2; /* Length */
+    *(uint16_t*)p = htons(TLS_RSA_WITH_AES_128_CBC_SHA); p += 2;
+    
+    /* Compression methods */
+    *p++ = 1; /* Length */
+    *p++ = 0; /* No compression */
+    
+    /* Extensions (SNI) */
+    *(uint16_t*)p = htons(5 + k_strlen(hostname) + 4); p += 2; /* Extensions length */
+    *(uint16_t*)p = htons(0); p += 2; /* SNI extension */
+    *(uint16_t*)p = htons(k_strlen(hostname) + 5); p += 2; /* Extension length */
+    *(uint16_t*)p = htons(k_strlen(hostname) + 3); p += 2; /* Server name list length */
+    *p++ = 0; /* Host name type */
+    *(uint16_t*)p = htons(k_strlen(hostname)); p += 2; /* Host name length */
+    k_memcpy(p, hostname, k_strlen(hostname)); p += k_strlen(hostname);
+    
+    /* Fill in lengths */
+    size_t hs_length = p - hs_length_ptr - 3;
+    hs_length_ptr[0] = (hs_length >> 16) & 0xFF;
+    hs_length_ptr[1] = (hs_length >> 8) & 0xFF;
+    hs_length_ptr[2] = hs_length & 0xFF;
+    
+    size_t record_length = p - client_hello - 5;
+    *length_ptr = htons(record_length);
+    
+    result = socket_send(out_conn->socket_fd, client_hello, p - client_hello);
+    if (result != STATUS_OK) {
+        socket_close(out_conn->socket_fd);
+        return result;
+    }
+    
+    out_conn->state = TLS_STATE_HELLO_SENT;
+    out_conn->established = false;
+    
+    /* For demonstration, mark as established (real implementation would complete handshake) */
+    out_conn->state = TLS_STATE_ESTABLISHED;
+    out_conn->established = true;
+    
+    /* Generate dummy keys using TLS PRF */
+    uint8_t master_secret_input[64];
+    k_memcpy(master_secret_input, out_conn->client_random, 32);
+    k_memcpy(master_secret_input + 32, out_conn->server_random, 32);
+    
+    uint8_t pre_master_secret[48] = {0}; /* Placeholder */
+    tls_prf(pre_master_secret, 48, "master secret", master_secret_input, 64, 
+            out_conn->master_secret, 48);
+    
+    uint8_t key_block[64];
+    tls_prf(out_conn->master_secret, 48, "key expansion", master_secret_input, 64, 
+            key_block, 64);
+    
+    k_memcpy(out_conn->client_write_key, key_block, 16);
+    k_memcpy(out_conn->server_write_key, key_block + 16, 16);
+    k_memcpy(out_conn->client_write_iv, key_block + 32, 16);
+    k_memcpy(out_conn->server_write_iv, key_block + 48, 16);
+    
+    g_metrics.tls_handshakes++;
+    return STATUS_OK;
+}
+
+status_t tls_send(tls_connection_t* conn, const uint8_t* data, size_t len) {
+    if (!conn || !data || !conn->established) return STATUS_INVALID;
+    
+    /* TLS record format: type(1) + version(2) + length(2) + encrypted_data */
+    size_t record_size = 5 + len + 16; /* 16 bytes for padding/MAC */
+    uint8_t* record = (uint8_t*)kmalloc(record_size);
+    if (!record) return STATUS_NO_MEMORY;
+    
+    uint8_t* p = record;
+    *p++ = TLS_CONTENT_APPLICATION;
+    *p++ = 3; *p++ = 3; /* TLS 1.2 */
+    *(uint16_t*)p = htons(len + 16); p += 2;
+    
+    /* Copy and encrypt data */
+    k_memcpy(p, data, len);
+    aes128_cbc_encrypt(conn->client_write_key, conn->client_write_iv, p, len);
+    p += len;
+    
+    /* Add MAC/padding placeholder */
+    k_memset(p, 16, 16); /* PKCS#7 padding */
+    
+    status_t result = socket_send(conn->socket_fd, record, record_size);
+    conn->client_seq++;
+    
+    kfree(record);
+    return result;
+}
+
+status_t tls_receive(tls_connection_t* conn, uint8_t* buffer, size_t buffer_size, size_t* out_len) {
+    if (!conn || !buffer || !out_len || !conn->established) return STATUS_INVALID;
+    
+    /* Simplified: assume we receive a complete TLS record */
+    uint8_t record_header[5];
+    size_t received;
+    status_t result = socket_receive(conn->socket_fd, record_header, 5, &received);
+    if (result != STATUS_OK || received != 5) {
+        *out_len = 0;
+        return result;
+    }
+    
+    uint16_t payload_len = ntohs(*(uint16_t*)(record_header + 3));
+    if (payload_len > buffer_size) return STATUS_NO_SPACE;
+    
+    result = socket_receive(conn->socket_fd, buffer, payload_len, &received);
+    if (result != STATUS_OK) {
+        *out_len = 0;
+        return result;
+    }
+    
+    /* Decrypt data */
+    if (received >= 16) {
+        aes128_cbc_decrypt(conn->server_write_key, conn->server_write_iv, buffer, received - 16);
+        *out_len = received - 16; /* Remove padding/MAC */
+    } else {
+        *out_len = 0;
+    }
+    
+    conn->server_seq++;
+    return STATUS_OK;
+}
+
+status_t tls_close(tls_connection_t* conn) {
+    if (!conn) return STATUS_INVALID;
+    
+    if (conn->established) {
+        /* Send close notify */
+        uint8_t close_notify[] = {21, 3, 3, 0, 2, 1, 0}; /* Alert: close_notify */
+        socket_send(conn->socket_fd, close_notify, sizeof(close_notify));
+    }
+    
+    socket_close(conn->socket_fd);
+    k_memset(conn, 0, sizeof(*conn));
+    return STATUS_OK;
+}
+
+status_t doh_resolve(const char* hostname, uint16_t type, uint32_t* out_ip_be) {
+    if (!hostname || !out_ip_be) return STATUS_INVALID;
+    
+    g_metrics.queries_total++;
+    
+    /* Check cache first */
+    spin_lock(&g_doh_lock);
+    doh_cache_entry_t* cached = cache_lookup(hostname, type);
+    if (cached) {
+        *out_ip_be = cached->ip_be;
+        spin_unlock(&g_doh_lock);
+        g_metrics.cache_hits++;
+        return STATUS_OK;
+    }
+    g_metrics.cache_misses++;
+    
+    /* Find active resolver */
+    doh_resolver_t* resolver = NULL;
+    for (int i = 0; i < DOH_MAX_RESOLVERS; i++) {
+        if (g_resolvers[i].active) {
+            resolver = &g_resolvers[i];
+            break;
+        }
+    }
+    
+    if (!resolver) {
+        spin_unlock(&g_doh_lock);
+        g_metrics.resolver_failures++;
+        return STATUS_ERROR;
+    }
+    
+    resolver->queries_sent++;
+    spin_unlock(&g_doh_lock);
+    
+    /* Encode DNS query */
+    uint8_t dns_query[512];
+    size_t query_len;
+    status_t result = dns_encode_query(hostname, type, dns_query, sizeof(dns_query), &query_len);
+    if (result != STATUS_OK) {
+        resolver->queries_failed++;
+        return result;
+    }
+    
+    /* Establish TLS connection */
+    tls_connection_t tls_conn;
+    result = tls_connect(resolver->hostname, resolver->ip_be, resolver->port, &tls_conn);
+    if (result != STATUS_OK) {
+        resolver->queries_failed++;
+        g_metrics.resolver_failures++;
+        return result;
+    }
+    
+    /* Send HTTP request */
+    char http_request[1024];
+    k_snprintf(http_request, sizeof(http_request),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/dns-message\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        resolver->url, resolver->hostname, query_len);
+    
+    result = tls_send(&tls_conn, (uint8_t*)http_request, k_strlen(http_request));
+    if (result == STATUS_OK) {
+        result = tls_send(&tls_conn, dns_query, query_len);
+    }
+    
+    if (result != STATUS_OK) {
+        tls_close(&tls_conn);
+        resolver->queries_failed++;
+        g_metrics.resolver_failures++;
+        return result;
+    }
+    
+    g_metrics.http_requests++;
+    
+    /* Read HTTP response */
+    uint8_t response_buffer[DOH_BUFFER_SIZE];
+    size_t response_len;
+    result = tls_receive(&tls_conn, response_buffer, sizeof(response_buffer), &response_len);
+    
+    tls_close(&tls_conn);
+    
+    if (result != STATUS_OK || response_len == 0) {
+        resolver->queries_failed++;
+        g_metrics.resolver_failures++;
+        return STATUS_ERROR;
+    }
+    
+    /* Parse HTTP response to extract DNS data */
+    uint8_t* dns_data = NULL;
+    size_t dns_len = 0;
+    
+    /* Find end of HTTP headers */
+    for (size_t i = 0; i < response_len - 3; i++) {
+        if (response_buffer[i] == '\r' && response_buffer[i+1] == '\n' &&
+            response_buffer[i+2] == '\r' && response_buffer[i+3] == '\n') {
+            dns_data = response_buffer + i + 4;
+            dns_len = response_len - i - 4;
+            break;
+        }
+    }
+    
+    if (!dns_data || dns_len == 0) {
+        resolver->queries_failed++;
+        return STATUS_ERROR;
+    }
+    
+    /* Parse DNS response */
+    dns_response_t dns_response;
+    result = dns_decode_response(dns_data, dns_len, &dns_response);
+    if (result != STATUS_OK) {
+        resolver->queries_failed++;
+        return result;
+    }
+    
+    /* Extract IP address from A record */
+    for (int i = 0; i < dns_response.record_count; i++) {
+        dns_record_t* record = &dns_response.records[i];
+        if (record->type == DNS_TYPE_A && record->rdlength == 4) {
+            *out_ip_be = *(uint32_t*)record->rdata;
+            
+            /* Cache the result */
+            spin_lock(&g_doh_lock);
+            cache_insert(hostname, type, *out_ip_be, record->ttl);
+            spin_unlock(&g_doh_lock);
+            
+            resolver->queries_successful++;
+            return STATUS_OK;
+        }
+    }
+    
+    resolver->queries_failed++;
+    return STATUS_NOTFOUND;
+}
+
+status_t doh_resolve_multi(const char* hostname, uint16_t type, dns_record_t* out_records, uint8_t* in_out_count) {
+    /* Similar to doh_resolve but returns multiple records */
+    /* Implementation would follow same pattern but copy all matching records */
+    if (!hostname || !out_records || !in_out_count) return STATUS_INVALID;
+    
+    *in_out_count = 0;
+    return STATUS_ERROR; /* Simplified for now */
+}
+
+status_t doh_flush_cache(void) {
+    spin_lock(&g_doh_lock);
+    k_memset(g_cache, 0, sizeof(g_cache));
+    spin_unlock(&g_doh_lock);
+    return STATUS_OK;
+}
+
+status_t doh_get_metrics(doh_metrics_t* out) {
+    if (!out) return STATUS_INVALID;
+    *out = g_metrics;
+    return STATUS_OK;
+}

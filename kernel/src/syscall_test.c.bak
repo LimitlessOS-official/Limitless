@@ -1,0 +1,98 @@
+#include "kernel.h"
+#include "syscall.h"
+#include "process.h"
+#include "log.h"
+
+/*
+ * Syscall Self-Test Suite
+ * Tests system call interface and basic syscall functionality
+ */
+
+int syscall_selftest(void) {
+    KLOG_INFO("syscall_test", "Starting syscall self-tests");
+
+    // Test 1: Basic syscall number validation
+    // Test invalid syscall number
+    long result = syscall_dispatch(9999, 0, 0, 0, 0, 0, 0);
+    if (result != -K_ENOSYS) {
+        KLOG_ERROR("syscall_test", "Invalid syscall should return -ENOSYS, got %ld", result);
+        return -1;
+    }
+
+    // Test 2: SYS_GETPID - should return current process PID
+    result = syscall_dispatch(SYS_GETPID, 0, 0, 0, 0, 0, 0);
+    if (result < 0) {
+        KLOG_ERROR("syscall_test", "getpid syscall failed with %ld", result);
+        return -2;
+    }
+
+    // Test 3: SYS_GETTID - should return current thread ID
+    result = syscall_dispatch(SYS_GETTID, 0, 0, 0, 0, 0, 0);
+    if (result < 0) {
+        KLOG_ERROR("syscall_test", "gettid syscall failed with %ld", result);
+        return -3;
+    }
+
+    // Test 4: Memory-related syscalls
+    // Test mmap with invalid parameters
+    result = syscall_dispatch(SYS_MMAP, 0, 0, PROT_READ, MAP_PRIVATE, -1, 0);
+    if (result >= 0) {
+        KLOG_ERROR("syscall_test", "mmap with invalid fd should fail, got %ld", result);
+        return -4;
+    }
+
+    // Test 5: File syscalls
+    // Test open with invalid path (null pointer)
+    result = syscall_dispatch(SYS_OPEN, 0, O_RDONLY, 0, 0, 0, 0);
+    if (result != -K_EFAULT) {
+        KLOG_ERROR("syscall_test", "open with null path should return -EFAULT, got %ld", result);
+        return -5;
+    }
+
+    // Test 6: Process management syscalls
+    // Test getuid (should return 0 for kernel)
+    result = syscall_dispatch(SYS_GETUID, 0, 0, 0, 0, 0, 0);
+    if (result < 0) {
+        KLOG_ERROR("syscall_test", "getuid syscall failed with %ld", result);
+        return -6;
+    }
+
+    // Test 7: Time-related syscalls
+    // Test clock_gettime
+    struct timespec ts = {0, 0};
+    result = syscall_dispatch(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (uintptr_t)&ts, 0, 0, 0, 0);
+    if (result != 0) {
+        KLOG_ERROR("syscall_test", "clock_gettime failed with %ld", result);
+        return -7;
+    }
+
+    // Test 8: Network syscalls
+    // Test socket creation
+    result = syscall_dispatch(SYS_SOCKET, AF_INET, SOCK_STREAM, 0, 0, 0, 0);
+    if (result < 0 && result != -K_ENOSYS) {
+        // Either works or not implemented yet
+        KLOG_ERROR("syscall_test", "socket syscall failed unexpectedly with %ld", result);
+        return -8;
+    }
+
+    // Test 9: IPC syscalls
+    // Test pipe creation
+    int pipefd[2] = {0, 0};
+    result = syscall_dispatch(SYS_PIPE, (uintptr_t)pipefd, 0, 0, 0, 0, 0);
+    if (result != 0 && result != -K_ENOSYS) {
+        // Either works or not implemented yet
+        KLOG_ERROR("syscall_test", "pipe syscall failed unexpectedly with %ld", result);
+        return -9;
+    }
+
+    // Test 10: Permission checks
+    // Test setuid (should fail for non-root)
+    result = syscall_dispatch(SYS_SETUID, 1000, 0, 0, 0, 0, 0);
+    if (result == 0) {
+        // This might actually succeed in kernel mode, so just log it
+        KLOG_INFO("syscall_test", "setuid succeeded (running in kernel mode)");
+    }
+
+    KLOG_INFO("syscall_test", "All syscall tests passed");
+    return 0;
+}

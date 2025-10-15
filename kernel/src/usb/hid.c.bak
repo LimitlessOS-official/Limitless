@@ -1,0 +1,121 @@
+#include "usb.h"
+#include "input.h"
+#include "kernel.h"
+
+/*
+ * USB HID (Human Interface Device) Driver
+ * Handles keyboards, mice, and other input devices
+ */
+
+#include "../../include/kernel.h"
+#include "../../include/input.h"
+
+/* HID device structure */
+typedef struct {
+    uint16_t vendor_id;
+    uint16_t product_id;
+    uint8_t interface_class;
+    uint8_t interface_subclass;
+    uint8_t interface_protocol;
+    bool active;
+} usb_hid_device_t;
+
+#define MAX_HID_DEVICES 16
+static usb_hid_device_t g_hid_devices[MAX_HID_DEVICES];
+static uint32_t g_hid_device_count = 0;
+
+/* HID report descriptor parsing */
+static void hid_parse_report_descriptor(const uint8_t* data, size_t length) {
+    (void)data;
+    (void)length;
+    
+    KLOG_INFO("hid", "Parsing HID report descriptor (%zu bytes)", length);
+    /* TODO: Implement HID report descriptor parsing */
+}
+
+/* Initialize HID device */
+static status_t hid_init_device(usb_hid_device_t* device) {
+    if (!device) return STATUS_ERROR;
+    
+    KLOG_INFO("hid", "Initializing HID device VID=%04x PID=%04x",
+              device->vendor_id, device->product_id);
+    
+    /* Determine device type based on interface protocol */
+    switch (device->interface_protocol) {
+        case 1: /* Keyboard */
+            KLOG_INFO("hid", "Detected USB keyboard");
+            /* TODO: Initialize keyboard input handling */
+            break;
+            
+        case 2: /* Mouse */
+            KLOG_INFO("hid", "Detected USB mouse");
+            /* TODO: Initialize mouse input handling */
+            break;
+            
+        default:
+            KLOG_INFO("hid", "Generic HID device (protocol %u)", device->interface_protocol);
+            break;
+    }
+    
+    device->active = true;
+    return STATUS_OK;
+}
+
+/* Register new HID device */
+status_t usb_hid_register_device(uint16_t vid, uint16_t pid, uint8_t iface_class, 
+                                 uint8_t iface_subclass, uint8_t iface_protocol) {
+    if (g_hid_device_count >= MAX_HID_DEVICES) {
+        KLOG_WARN("hid", "Too many HID devices");
+        return STATUS_ERROR;
+    }
+    
+    usb_hid_device_t* device = &g_hid_devices[g_hid_device_count];
+    device->vendor_id = vid;
+    device->product_id = pid;
+    device->interface_class = iface_class;
+    device->interface_subclass = iface_subclass;
+    device->interface_protocol = iface_protocol;
+    
+    status_t result = hid_init_device(device);
+    if (result == STATUS_OK) {
+        g_hid_device_count++;
+        KLOG_INFO("hid", "Registered HID device %u", g_hid_device_count - 1);
+    }
+    
+    return result;
+}
+
+/* Process HID input report */
+void usb_hid_process_report(uint32_t device_id, const uint8_t* report, size_t length) {
+    if (device_id >= g_hid_device_count || !report) return;
+    
+    usb_hid_device_t* device = &g_hid_devices[device_id];
+    if (!device->active) return;
+    
+    /* Process report based on device type */
+    switch (device->interface_protocol) {
+        case 1: /* Keyboard */
+            /* TODO: Parse keyboard report and generate input events */
+            KLOG_DEBUG("hid", "Keyboard report: %u bytes", length);
+            break;
+            
+        case 2: /* Mouse */
+            /* TODO: Parse mouse report and generate input events */
+            KLOG_DEBUG("hid", "Mouse report: %u bytes", length);
+            break;
+            
+        default:
+            KLOG_DEBUG("hid", "Generic HID report: %u bytes", length);
+            break;
+    }
+}
+
+/* Initialize USB HID subsystem */
+void usb_hid_init(void) {
+    KLOG_INFO("hid", "Initializing USB HID driver");
+    
+    g_hid_device_count = 0;
+    k_memset(g_hid_devices, 0, sizeof(g_hid_devices));
+    
+    KLOG_INFO("hid", "USB HID driver initialized");
+}

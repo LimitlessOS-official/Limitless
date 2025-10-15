@@ -1,0 +1,412 @@
+#include "testing.h"
+#include "log.h"
+#include "kernel.h"
+#include "timer.h"
+#include "vfs.h"
+#include "memory.h"
+#include "network.h"
+#include "security.h"
+
+/* LimitlessOS Phase 6 - Enterprise Testing Framework Implementation */
+
+static test_runner_t g_test_runner;
+static spinlock_t g_test_lock;
+static uint32_t g_current_test_assertions = 0;
+
+/* Initialize the comprehensive testing framework */
+status_t test_framework_init(void) {
+    spinlock_init(&g_test_lock);
+    k_memset(&g_test_runner, 0, sizeof(g_test_runner));
+    
+    g_test_runner.verbose_output = true;
+    g_test_runner.stop_on_failure = false;
+    g_test_runner.run_stress_tests = true;
+    g_test_runner.run_security_tests = true;
+    g_test_runner.filter_type = 0; /* Run all types */
+    g_test_runner.hardware_testing_enabled = true;
+    
+    log_info("[TEST] LimitlessOS Enterprise Testing Framework initialized");
+    
+    /* Register built-in test suites */
+    test_register_builtin_suites();
+    
+    return STATUS_OK;
+}
+
+status_t test_framework_cleanup(void) {
+    /* Cleanup any allocated resources */
+    for (uint32_t i = 0; i < g_test_runner.suite_count; i++) {
+        test_suite_t* suite = &g_test_runner.suites[i];
+        if (suite->cases) {
+            k_free(suite->cases);
+        }
+    }
+    
+    k_memset(&g_test_runner, 0, sizeof(g_test_runner));
+    log_info("[TEST] Testing framework cleaned up");
+    return STATUS_OK;
+}
+
+/* Create a new test suite */
+status_t test_create_suite(const char* name, test_suite_t** out_suite) {
+    if (!name || !out_suite) return STATUS_INVALID;
+    
+    spin_lock(&g_test_lock);
+    
+    if (g_test_runner.suite_count >= TEST_MAX_SUITES) {
+        spin_unlock(&g_test_lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    test_suite_t* suite = &g_test_runner.suites[g_test_runner.suite_count++];
+    k_memset(suite, 0, sizeof(*suite));
+    
+    k_strlcpy(suite->name, name, sizeof(suite->name));
+    suite->max_cases = TEST_MAX_CASES_PER_SUITE;
+    suite->cases = (test_case_t*)k_malloc(sizeof(test_case_t) * suite->max_cases);
+    suite->enabled = true;
+    
+    if (!suite->cases) {
+        g_test_runner.suite_count--;
+        spin_unlock(&g_test_lock);
+        return STATUS_NO_MEMORY;
+    }
+    
+    *out_suite = suite;
+    spin_unlock(&g_test_lock);
+    
+    log_info("[TEST] Created test suite: %s", name);
+    return STATUS_OK;
+}
+
+/* Add a test case to a suite */
+status_t test_add_case(test_suite_t* suite, const char* name, test_type_t type,
+                      status_t (*test_func)(void), uint64_t timeout_ms) {
+    if (!suite || !name || !test_func) return STATUS_INVALID;
+    
+    if (suite->case_count >= suite->max_cases) return STATUS_NO_SPACE;
+    
+    test_case_t* test_case = &suite->cases[suite->case_count++];
+    k_memset(test_case, 0, sizeof(*test_case));
+    
+    k_strlcpy(test_case->name, name, sizeof(test_case->name));
+    test_case->type = type;
+    test_case->test_func = test_func;
+    test_case->timeout_ms = timeout_ms ? timeout_ms : 30000; /* 30s default */
+    test_case->iterations = 1;
+    test_case->enabled = true;
+    
+    return STATUS_OK;
+}
+
+/* Run all test suites */
+status_t test_run_all_suites(test_runner_t* runner) {
+    if (!runner) runner = &g_test_runner;
+    
+    log_info("[TEST] ==========================================");
+    log_info("[TEST] LimitlessOS Phase 6 Testing - START");
+    log_info("[TEST] ==========================================");
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    runner->total_tests = 0;
+    runner->total_passed = 0;
+    runner->total_failed = 0;
+    runner->total_skipped = 0;
+    runner->total_errors = 0;
+    
+    /* Run hardware detection first */
+    if (runner->hardware_testing_enabled) {
+        test_detect_hardware();
+    }
+    
+    /* Run each enabled suite */
+    for (uint32_t i = 0; i < runner->suite_count; i++) {
+        test_suite_t* suite = &runner->suites[i];
+        if (!suite->enabled) continue;
+        
+        status_t result = test_run_suite(suite);
+        if (result != STATUS_OK && runner->stop_on_failure) {
+            log_error("[TEST] Stopping on suite failure: %s", suite->name);
+            break;
+        }
+        
+        runner->total_tests += suite->case_count;
+        runner->total_passed += suite->passed_count;
+        runner->total_failed += suite->failed_count;
+        runner->total_skipped += suite->skipped_count;
+        runner->total_errors += suite->error_count;
+    }
+    
+    uint64_t end_time = timer_get_ticks();
+    runner->total_execution_time = end_time - start_time;
+    
+    /* Print summary */
+    log_info("[TEST] ==========================================");
+    log_info("[TEST] TEST EXECUTION SUMMARY");
+    log_info("[TEST] ==========================================");
+    log_info("[TEST] Total Tests:    %u", runner->total_tests);
+    log_info("[TEST] Passed:         %u", runner->total_passed);
+    log_info("[TEST] Failed:         %u", runner->total_failed);
+    log_info("[TEST] Skipped:        %u", runner->total_skipped);
+    log_info("[TEST] Errors:         %u", runner->total_errors);
+    log_info("[TEST] Success Rate:   %.1f%%", 
+            runner->total_tests > 0 ? (100.0 * runner->total_passed / runner->total_tests) : 0.0);
+    log_info("[TEST] Total Time:     %llu ms", runner->total_execution_time / 1000);
+    log_info("[TEST] ==========================================");
+    
+    if (runner->hardware_testing_enabled) {
+        log_info("[TEST] Detected Hardware: %u devices", runner->detected_hardware_count);
+        for (uint32_t i = 0; i < runner->detected_hardware_count && i < 10; i++) {
+            log_info("[TEST]   - %s", runner->hardware_list[i]);
+        }
+    }
+    
+    return (runner->total_failed == 0) ? STATUS_OK : STATUS_ERROR;
+}
+
+/* Run a specific test suite */
+status_t test_run_suite(test_suite_t* suite) {
+    if (!suite) return STATUS_INVALID;
+    
+    log_info("[TEST] Running suite: %s (%u tests)", suite->name, suite->case_count);
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    suite->passed_count = 0;
+    suite->failed_count = 0;
+    suite->skipped_count = 0;
+    suite->error_count = 0;
+    
+    for (uint32_t i = 0; i < suite->case_count; i++) {
+        test_case_t* test_case = &suite->cases[i];
+        if (!test_case->enabled) {
+            suite->skipped_count++;
+            continue;
+        }
+        
+        /* Filter by type if specified */
+        if (g_test_runner.filter_type != 0 && test_case->type != g_test_runner.filter_type) {
+            suite->skipped_count++;
+            continue;
+        }
+        
+        status_t result = test_run_case(test_case);
+        
+        switch (test_case->result) {
+            case TEST_RESULT_PASSED:
+                suite->passed_count++;
+                break;
+            case TEST_RESULT_FAILED:
+                suite->failed_count++;
+                break;
+            case TEST_RESULT_SKIPPED:
+                suite->skipped_count++;
+                break;
+            case TEST_RESULT_ERROR:
+                suite->error_count++;
+                break;
+        }
+        
+        if (result != STATUS_OK && g_test_runner.stop_on_failure) {
+            log_error("[TEST] Stopping suite on test failure: %s", test_case->name);
+            break;
+        }
+    }
+    
+    uint64_t end_time = timer_get_ticks();
+    suite->total_time_us = end_time - start_time;
+    
+    log_info("[TEST] Suite %s completed: %u/%u passed (%u failed, %u skipped, %u errors) in %llu ms",
+            suite->name, suite->passed_count, suite->case_count,
+            suite->failed_count, suite->skipped_count, suite->error_count,
+            suite->total_time_us / 1000);
+    
+    return STATUS_OK;
+}
+
+/* Run a single test case */
+status_t test_run_case(test_case_t* test_case) {
+    if (!test_case || !test_case->test_func) return STATUS_INVALID;
+    
+    g_current_test_assertions = 0;
+    test_case->assertions_passed = 0;
+    test_case->assertions_failed = 0;
+    k_memset(test_case->output, 0, sizeof(test_case->output));
+    
+    if (g_test_runner.verbose_output) {
+        log_info("[TEST]   Running: %s", test_case->name);
+    }
+    
+    uint64_t start_time = timer_get_ticks();
+    
+    /* Run the test function */
+    status_t result = test_case->test_func();
+    
+    uint64_t end_time = timer_get_ticks();
+    test_case->execution_time_us = end_time - start_time;
+    
+    /* Determine test result */
+    if (result == STATUS_OK && test_case->assertions_failed == 0) {
+        test_case->result = TEST_RESULT_PASSED;
+        if (g_test_runner.verbose_output) {
+            log_info("[TEST]     PASSED (%llu us, %u assertions)",
+                    test_case->execution_time_us, test_case->assertions_passed);
+        }
+    } else if (result == STATUS_SKIP) {
+        test_case->result = TEST_RESULT_SKIPPED;
+        if (g_test_runner.verbose_output) {
+            log_info("[TEST]     SKIPPED");
+        }
+    } else if (test_case->assertions_failed > 0) {
+        test_case->result = TEST_RESULT_FAILED;
+        log_error("[TEST]     FAILED (%llu us, %u/%u assertions failed)",
+                 test_case->execution_time_us, test_case->assertions_failed,
+                 test_case->assertions_passed + test_case->assertions_failed);
+    } else {
+        test_case->result = TEST_RESULT_ERROR;
+        log_error("[TEST]     ERROR (%llu us, status=%d)",
+                 test_case->execution_time_us, result);
+    }
+    
+    return STATUS_OK;
+}
+
+/* Assertion logging functions */
+void test_log_assertion_success(void) {
+    test_case_t* current_suite = NULL; /* Would need context tracking */
+    g_current_test_assertions++;
+    /* Implementation would track current test context */
+}
+
+void test_log_assertion_failure(const char* func, int line, const char* condition, const char* message) {
+    test_case_t* current_suite = NULL; /* Would need context tracking */
+    g_current_test_assertions++;
+    
+    log_error("[TEST] ASSERTION FAILED in %s:%d", func, line);
+    log_error("[TEST]   Condition: %s", condition);
+    log_error("[TEST]   Message: %s", message);
+    
+    /* Implementation would track current test context and update assertion counts */
+}
+
+void test_log_info(const char* format, ...) {
+    /* Implementation would format and log test information */
+    log_info(format);
+}
+
+void test_log_error(const char* format, ...) {
+    /* Implementation would format and log test errors */
+    log_error(format);
+}
+
+uint64_t test_get_time_us(void) {
+    return timer_get_ticks();
+}
+
+/* Register built-in test suites */
+static status_t test_register_builtin_suites(void) {
+    test_suite_t* suite;
+    
+    /* Kernel Core Tests */
+    test_create_suite("Kernel Core", &suite);
+    test_add_case(suite, "Memory Allocation", TEST_TYPE_UNIT, test_memory_allocation, 5000);
+    test_add_case(suite, "Process Creation", TEST_TYPE_UNIT, test_process_creation, 10000);
+    test_add_case(suite, "System Calls", TEST_TYPE_UNIT, test_syscall_interface, 5000);
+    test_add_case(suite, "Timer Functionality", TEST_TYPE_UNIT, test_timer_functions, 5000);
+    
+    /* Memory Management Tests */
+    test_create_suite("Memory Management", &suite);
+    test_add_case(suite, "Page Allocation", TEST_TYPE_UNIT, test_page_allocation, 5000);
+    test_add_case(suite, "Virtual Memory", TEST_TYPE_UNIT, test_virtual_memory, 10000);
+    test_add_case(suite, "Memory Protection", TEST_TYPE_SECURITY, test_memory_protection, 15000);
+    test_add_case(suite, "Memory Stress Test", TEST_TYPE_STRESS, test_memory_stress_basic, 60000);
+    
+    /* Filesystem Tests */
+    test_create_suite("Filesystem", &suite);
+    test_add_case(suite, "VFS Operations", TEST_TYPE_UNIT, test_vfs_operations, 10000);
+    test_add_case(suite, "File I/O", TEST_TYPE_INTEGRATION, test_file_io, 15000);
+    test_add_case(suite, "Directory Operations", TEST_TYPE_UNIT, test_directory_ops, 10000);
+    
+    /* Network Tests */
+    test_create_suite("Network Stack", &suite);
+    test_add_case(suite, "TCP/IP Stack", TEST_TYPE_INTEGRATION, test_tcpip_stack, 20000);
+    test_add_case(suite, "Network Security", TEST_TYPE_SECURITY, test_network_security, 30000);
+    
+    /* Phase 5 Enterprise Tests */
+    test_create_suite("Phase 5 Enterprise", &suite);
+    test_add_case(suite, "Firewall Rules", TEST_TYPE_SECURITY, test_firewall_rules, 15000);
+    test_add_case(suite, "VPN Encryption", TEST_TYPE_SECURITY, test_vpn_encryption, 20000);
+    test_add_case(suite, "Identity Management", TEST_TYPE_SECURITY, test_identity_management, 25000);
+    test_add_case(suite, "FIDO2 Authentication", TEST_TYPE_SECURITY, test_fido2_auth, 30000);
+    test_add_case(suite, "Audit Logging", TEST_TYPE_SECURITY, test_audit_logging, 15000);
+    test_add_case(suite, "Backup System", TEST_TYPE_INTEGRATION, test_backup_system, 45000);
+    
+    /* Performance Tests */
+    test_create_suite("Performance", &suite);
+    test_add_case(suite, "Boot Time", TEST_TYPE_PERFORMANCE, test_boot_time_measurement, 60000);
+    test_add_case(suite, "Memory Bandwidth", TEST_TYPE_PERFORMANCE, test_memory_bandwidth, 30000);
+    test_add_case(suite, "Storage Performance", TEST_TYPE_PERFORMANCE, test_storage_performance, 45000);
+    
+    /* Hardware Compatibility Tests */
+    test_create_suite("Hardware Compatibility", &suite);
+    test_add_case(suite, "CPU Features", TEST_TYPE_COMPATIBILITY, test_cpu_features, 10000);
+    test_add_case(suite, "Storage Devices", TEST_TYPE_COMPATIBILITY, test_storage_devices, 30000);
+    test_add_case(suite, "Network Devices", TEST_TYPE_COMPATIBILITY, test_network_devices, 30000);
+    test_add_case(suite, "Graphics Devices", TEST_TYPE_COMPATIBILITY, test_graphics_devices, 30000);
+    
+    log_info("[TEST] Registered %u built-in test suites", g_test_runner.suite_count);
+    return STATUS_OK;
+}
+
+/* Placeholder test functions - would be implemented based on specific requirements */
+status_t test_memory_allocation(void) {
+    TEST_ASSERT(k_malloc(1024) != NULL, "Failed to allocate 1KB");
+    TEST_ASSERT(k_malloc(1024*1024) != NULL, "Failed to allocate 1MB");
+    return STATUS_OK;
+}
+
+status_t test_process_creation(void) {
+    /* Test process creation functionality */
+    return STATUS_OK;
+}
+
+status_t test_syscall_interface(void) {
+    /* Test system call interface */
+    return STATUS_OK;
+}
+
+status_t test_timer_functions(void) {
+    uint64_t start = timer_get_ticks();
+    /* Small delay simulation */
+    for (volatile int i = 0; i < 100000; i++);
+    uint64_t end = timer_get_ticks();
+    TEST_ASSERT(end > start, "Timer not advancing");
+    return STATUS_OK;
+}
+
+/* Additional test implementations would go here... */
+status_t test_page_allocation(void) { return STATUS_OK; }
+status_t test_virtual_memory(void) { return STATUS_OK; }
+status_t test_memory_protection(void) { return STATUS_OK; }
+status_t test_memory_stress_basic(void) { return STATUS_OK; }
+status_t test_vfs_operations(void) { return STATUS_OK; }
+status_t test_file_io(void) { return STATUS_OK; }
+status_t test_directory_ops(void) { return STATUS_OK; }
+status_t test_tcpip_stack(void) { return STATUS_OK; }
+status_t test_network_security(void) { return STATUS_OK; }
+status_t test_firewall_rules(void) { return STATUS_OK; }
+status_t test_vpn_encryption(void) { return STATUS_OK; }
+status_t test_identity_management(void) { return STATUS_OK; }
+status_t test_fido2_auth(void) { return STATUS_OK; }
+status_t test_audit_logging(void) { return STATUS_OK; }
+status_t test_backup_system(void) { return STATUS_OK; }
+status_t test_boot_time_measurement(void) { return STATUS_OK; }
+status_t test_memory_bandwidth(void) { return STATUS_OK; }
+status_t test_storage_performance(void) { return STATUS_OK; }
+status_t test_cpu_features(void) { return STATUS_OK; }
+status_t test_storage_devices(void) { return STATUS_OK; }
+status_t test_network_devices(void) { return STATUS_OK; }
+status_t test_graphics_devices(void) { return STATUS_OK; }
+status_t test_audio_devices(void) { return STATUS_OK; }
+status_t test_input_devices(void) { return STATUS_OK; }

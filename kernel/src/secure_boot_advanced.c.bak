@@ -1,0 +1,755 @@
+/*
+ * secure_boot_advanced.c - LimitlessOS Advanced Secure Boot Implementation
+ * 
+ * Enterprise-grade secure boot chain with Ed25519 signature verification,
+ * TPM integration, rollback protection, and OTA updates.
+ */
+
+#include <kernel/secure_boot.h>
+#include <kernel/crypto.h>
+#include <kernel/vfs.h>
+#include <kernel/string.h>
+#include <kernel/klog.h>
+#include <kernel/timer.h>
+#include <kernel/tpm.h>
+
+#define MAX_BOOT_STAGES         8
+#define MAX_SIGNATURES          16
+#define SIGNATURE_SIZE          64
+#define PUBLIC_KEY_SIZE         32
+#define HASH_SIZE               32
+#define MAX_ROLLBACK_VERSIONS   100
+#define MAX_OTA_COMPONENTS      32
+
+/* Boot stage types */
+typedef enum {
+    BOOT_STAGE_BOOTLOADER,
+    BOOT_STAGE_KERNEL,
+    BOOT_STAGE_INITRAMFS,
+    BOOT_STAGE_DRIVERS,
+    BOOT_STAGE_USERSPACE,
+    BOOT_STAGE_SERVICES,
+    BOOT_STAGE_APPLICATIONS
+} boot_stage_t;
+
+/* Signature verification result */
+typedef enum {
+    SIG_VERIFY_SUCCESS,
+    SIG_VERIFY_INVALID_SIGNATURE,
+    SIG_VERIFY_INVALID_KEY,
+    SIG_VERIFY_HASH_MISMATCH,
+    SIG_VERIFY_ROLLBACK_VIOLATION,
+    SIG_VERIFY_EXPIRED,
+    SIG_VERIFY_REVOKED
+} sig_verify_result_t;
+
+/* Boot component structure */
+typedef struct boot_component {
+    char name[64];
+    boot_stage_t stage;
+    uint64_t version;
+    uint64_t timestamp;
+    uint8_t hash[HASH_SIZE];
+    uint8_t signature[SIGNATURE_SIZE];
+    uint8_t public_key_id[16];
+    void* data;
+    size_t size;
+    uint32_t flags;
+} boot_component_t;
+
+/* Public key entry */
+typedef struct public_key_entry {
+    uint8_t key_id[16];
+    uint8_t public_key[PUBLIC_KEY_SIZE];
+    uint64_t valid_from;
+    uint64_t valid_until;
+    uint32_t key_usage;
+    bool revoked;
+    char description[128];
+} public_key_entry_t;
+
+/* Rollback protection entry */
+typedef struct rollback_entry {
+    char component_name[64];
+    uint64_t min_version;
+    uint64_t last_boot_version;
+    uint32_t rollback_count;
+    uint64_t last_update_time;
+} rollback_entry_t;
+
+/* OTA update package */
+typedef struct ota_package {
+    char version[32];
+    char description[256];
+    uint64_t timestamp;
+    uint64_t size;
+    uint8_t hash[HASH_SIZE];
+    uint8_t signature[SIGNATURE_SIZE];
+    
+    /* Update components */
+    struct {
+        char name[64];
+        uint64_t old_version;
+        uint64_t new_version;
+        uint64_t offset;
+        uint64_t size;
+        uint8_t hash[HASH_SIZE];
+    } components[MAX_OTA_COMPONENTS];
+    uint32_t component_count;
+    
+    /* Update flags */
+    bool requires_reboot;
+    bool rollback_safe;
+    uint32_t criticality;
+} ota_package_t;
+
+/* TPM PCR measurements */
+typedef struct pcr_measurements {
+    uint8_t pcr_values[24][HASH_SIZE];  /* 24 PCRs as per TPM 2.0 spec */
+    bool pcr_extended[24];
+    uint32_t extend_count[24];
+} pcr_measurements_t;
+
+/* Secure boot state */
+static struct {
+    bool secure_boot_enabled;
+    bool verification_enforced;
+    bool tpm_available;
+    
+    /* Root of trust */
+    uint8_t root_public_key[PUBLIC_KEY_SIZE];
+    
+    /* Key storage */
+    public_key_entry_t public_keys[64];
+    uint32_t public_key_count;
+    
+    /* Boot components */
+    boot_component_t boot_components[MAX_BOOT_STAGES];
+    uint32_t boot_component_count;
+    
+    /* Rollback protection */
+    rollback_entry_t rollback_table[MAX_ROLLBACK_VERSIONS];
+    uint32_t rollback_entry_count;
+    
+    /* TPM measurements */
+    pcr_measurements_t pcr_measurements;
+    
+    /* Boot attestation */
+    struct {
+        uint8_t attestation_nonce[32];
+        uint8_t quote_signature[256];
+        uint64_t quote_timestamp;
+        bool quote_valid;
+    } attestation;
+    
+    /* Statistics */
+    struct {
+        uint32_t successful_boots;
+        uint32_t failed_verifications;
+        uint32_t rollback_violations;
+        uint32_t key_rotations;
+        uint32_t tpm_operations;
+        uint64_t last_boot_time;
+    } stats;
+    
+    spinlock_t lock;
+} secure_boot_state;
+
+/* Function prototypes */
+static sig_verify_result_t verify_ed25519_signature(const void* data, size_t data_size,
+                                                   const uint8_t* signature, const uint8_t* public_key);
+static public_key_entry_t* find_public_key(const uint8_t* key_id);
+static status_t load_public_keys(void);
+static status_t verify_boot_component(boot_component_t* component);
+static status_t check_rollback_protection(boot_component_t* component);
+static void extend_pcr(uint32_t pcr_index, const uint8_t* data, size_t size);
+static uint32_t calculate_sha256(const void* data, size_t size, uint8_t* hash);
+static status_t generate_attestation_quote(void);
+
+/* Initialize secure boot system */
+status_t secure_boot_advanced_init(void) {
+    KLOG_INFO("SECURE_BOOT", "Initializing advanced secure boot system");
+    
+    memset(&secure_boot_state, 0, sizeof(secure_boot_state));
+    spin_lock_init(&secure_boot_state.lock);
+    
+    /* Initialize TPM if available */
+    status_t tpm_status = tpm_init();
+    if (tpm_status == STATUS_OK) {
+        secure_boot_state.tpm_available = true;
+        KLOG_INFO("SECURE_BOOT", "TPM 2.0 available and initialized");
+        
+        /* Initialize PCR banks */
+        for (uint32_t i = 0; i < 24; i++) {
+            memset(secure_boot_state.pcr_measurements.pcr_values[i], 0, HASH_SIZE);
+            secure_boot_state.pcr_measurements.pcr_extended[i] = false;
+            secure_boot_state.pcr_measurements.extend_count[i] = 0;
+        }
+    } else {
+        secure_boot_state.tmp_available = false;
+        KLOG_WARN("SECURE_BOOT", "TPM not available, software-only measurements");
+    }
+    
+    /* Load root public key from firmware/UEFI variables */
+    status_t key_status = load_root_public_key(secure_boot_state.root_public_key);
+    if (key_status != STATUS_OK) {
+        KLOG_WARN("SECURE_BOOT", "Failed to load root public key, secure boot disabled");
+        secure_boot_state.secure_boot_enabled = false;
+        return STATUS_OK;  /* Continue without secure boot */
+    }
+    
+    /* Load public key database */
+    status_t status = load_public_keys();
+    if (status != STATUS_OK) {
+        KLOG_ERROR("SECURE_BOOT", "Failed to load public keys: %d", status);
+        secure_boot_state.secure_boot_enabled = false;
+        return STATUS_OK;
+    }
+    
+    /* Load rollback protection database */
+    status = load_rollback_database();
+    if (status != STATUS_OK) {
+        KLOG_WARN("SECURE_BOOT", "Failed to load rollback database, creating new one");
+        initialize_rollback_database();
+    }
+    
+    secure_boot_state.secure_boot_enabled = true;
+    secure_boot_state.verification_enforced = true;
+    
+    /* Generate initial attestation nonce */
+    crypto_random(secure_boot_state.attestation.attestation_nonce, 32);
+    
+    KLOG_INFO("SECURE_BOOT", "Advanced secure boot system initialized successfully");
+    return STATUS_OK;
+}
+
+/* Verify boot component with advanced features */
+status_t secure_boot_advanced_verify_component(const char* name, const void* data, size_t size,
+                                              const uint8_t* signature, uint64_t version) {
+    if (!secure_boot_state.secure_boot_enabled) {
+        return STATUS_OK;  /* Secure boot disabled */
+    }
+    
+    if (!name || !data || !signature) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    KLOG_DEBUG("SECURE_BOOT", "Verifying component: %s (version %lu)", name, version);
+    
+    spin_lock(&secure_boot_state.lock);
+    
+    /* Find available component slot */
+    if (secure_boot_state.boot_component_count >= MAX_BOOT_STAGES) {
+        spin_unlock(&secure_boot_state.lock);
+        return STATUS_LIMIT_EXCEEDED;
+    }
+    
+    boot_component_t* component = &secure_boot_state.boot_components[secure_boot_state.boot_component_count];
+    memset(component, 0, sizeof(boot_component_t));
+    
+    /* Fill component information */
+    strncpy(component->name, name, sizeof(component->name) - 1);
+    component->version = version;
+    component->timestamp = timer_get_ticks();
+    component->data = (void*)data;
+    component->size = size;
+    memcpy(component->signature, signature, SIGNATURE_SIZE);
+    
+    /* Determine boot stage */
+    if (strcmp(name, "bootloader") == 0) {
+        component->stage = BOOT_STAGE_BOOTLOADER;
+    } else if (strcmp(name, "kernel") == 0) {
+        component->stage = BOOT_STAGE_KERNEL;
+    } else if (strcmp(name, "initramfs") == 0) {
+        component->stage = BOOT_STAGE_INITRAMFS;
+    } else if (strstr(name, "driver")) {
+        component->stage = BOOT_STAGE_DRIVERS;
+    } else if (strstr(name, "service")) {
+        component->stage = BOOT_STAGE_SERVICES;
+    } else {
+        component->stage = BOOT_STAGE_APPLICATIONS;
+    }
+    
+    /* Calculate hash of component */
+    calculate_sha256(data, size, component->hash);
+    
+    /* Extract public key ID from signature metadata */
+    /* For Ed25519, we use a key derivation from the signature */
+    crypto_derive_key_id(signature, SIGNATURE_SIZE, component->public_key_id);
+    
+    /* Verify component */
+    status_t status = verify_boot_component(component);
+    if (status != STATUS_OK) {
+        secure_boot_state.stats.failed_verifications++;
+        spin_unlock(&secure_boot_state.lock);
+        
+        if (secure_boot_state.verification_enforced) {
+            KLOG_ERROR("SECURE_BOOT", "Component verification failed: %s", name);
+            return status;
+        } else {
+            KLOG_WARN("SECURE_BOOT", "Component verification failed but enforcement disabled: %s", name);
+            return STATUS_OK;
+        }
+    }
+    
+    /* Check rollback protection */
+    status = check_rollback_protection(component);
+    if (status != STATUS_OK) {
+        secure_boot_state.stats.rollback_violations++;
+        spin_unlock(&secure_boot_state.lock);
+        
+        KLOG_ERROR("SECURE_BOOT", "Rollback protection violation: %s", name);
+        return status;
+    }
+    
+    /* Extend PCR with component measurement */
+    uint32_t pcr_index = (uint32_t)component->stage;
+    if (pcr_index < 8) {  /* Use PCRs 0-7 for boot stages */
+        extend_pcr(pcr_index, component->hash, HASH_SIZE);
+    }
+    
+    secure_boot_state.boot_component_count++;
+    spin_unlock(&secure_boot_state.lock);
+    
+    KLOG_INFO("SECURE_BOOT", "Component verification successful: %s", name);
+    return STATUS_OK;
+}
+
+/* Verify Ed25519 signature using libsodium-style interface */
+static sig_verify_result_t verify_ed25519_signature(const void* data, size_t data_size,
+                                                   const uint8_t* signature, const uint8_t* public_key) {
+    /* Calculate message hash first */
+    uint8_t message_hash[HASH_SIZE];
+    calculate_sha256(data, data_size, message_hash);
+    
+    /* Verify Ed25519 signature */
+    if (crypto_ed25519_verify(signature, message_hash, HASH_SIZE, public_key) != 0) {
+        return SIG_VERIFY_INVALID_SIGNATURE;
+    }
+    
+    return SIG_VERIFY_SUCCESS;
+}
+
+/* Verify boot component */
+static status_t verify_boot_component(boot_component_t* component) {
+    /* Find public key */
+    public_key_entry_t* key_entry = find_public_key(component->public_key_id);
+    if (!key_entry) {
+        KLOG_ERROR("SECURE_BOOT", "Public key not found for component %s", component->name);
+        return STATUS_NOT_FOUND;
+    }
+    
+    /* Check key validity period */
+    uint64_t current_time = timer_get_ticks();
+    if (current_time < key_entry->valid_from || current_time > key_entry->valid_until) {
+        KLOG_ERROR("SECURE_BOOT", "Public key expired for component %s", component->name);
+        return STATUS_EXPIRED;
+    }
+    
+    /* Check if key is revoked */
+    if (key_entry->revoked) {
+        KLOG_ERROR("SECURE_BOOT", "Public key revoked for component %s", component->name);
+        return STATUS_REVOKED;
+    }
+    
+    /* Verify signature */
+    sig_verify_result_t result = verify_ed25519_signature(component->data, component->size,
+                                                         component->signature, key_entry->public_key);
+    
+    switch (result) {
+        case SIG_VERIFY_SUCCESS:
+            return STATUS_OK;
+        case SIG_VERIFY_INVALID_SIGNATURE:
+            return STATUS_SIGNATURE_INVALID;
+        case SIG_VERIFY_INVALID_KEY:
+            return STATUS_KEY_INVALID;
+        case SIG_VERIFY_HASH_MISMATCH:
+            return STATUS_HASH_MISMATCH;
+        default:
+            return STATUS_VERIFICATION_FAILED;
+    }
+}
+
+/* Check rollback protection */
+static status_t check_rollback_protection(boot_component_t* component) {
+    /* Find rollback entry for this component */
+    rollback_entry_t* entry = NULL;
+    
+    for (uint32_t i = 0; i < secure_boot_state.rollback_entry_count; i++) {
+        if (strcmp(secure_boot_state.rollback_table[i].component_name, component->name) == 0) {
+            entry = &secure_boot_state.rollback_table[i];
+            break;
+        }
+    }
+    
+    if (!entry) {
+        /* Create new rollback entry */
+        if (secure_boot_state.rollback_entry_count >= MAX_ROLLBACK_VERSIONS) {
+            return STATUS_LIMIT_EXCEEDED;
+        }
+        
+        entry = &secure_boot_state.rollback_table[secure_boot_state.rollback_entry_count++];
+        memset(entry, 0, sizeof(rollback_entry_t));
+        strncpy(entry->component_name, component->name, sizeof(entry->component_name) - 1);
+        entry->min_version = component->version;
+        entry->last_boot_version = component->version;
+        entry->last_update_time = timer_get_ticks();
+        
+        return STATUS_OK;
+    }
+    
+    /* Check if this version would be a rollback */
+    if (component->version < entry->min_version) {
+        KLOG_ERROR("SECURE_BOOT", "Rollback violation: %s version %lu < minimum %lu",
+                  component->name, component->version, entry->min_version);
+        entry->rollback_count++;
+        return STATUS_ROLLBACK_VIOLATION;
+    }
+    
+    /* Update rollback entry */
+    if (component->version > entry->last_boot_version) {
+        entry->last_boot_version = component->version;
+        if (component->version > entry->min_version) {
+            entry->min_version = component->version;
+        }
+        entry->last_update_time = timer_get_ticks();
+    }
+    
+    return STATUS_OK;
+}
+
+/* Extend Platform Configuration Register */
+static void extend_pcr(uint32_t pcr_index, const uint8_t* data, size_t size) {
+    if (pcr_index >= 24) {
+        return;
+    }
+    
+    /* PCR extend operation: PCR_new = SHA256(PCR_old || data) */
+    uint8_t combined[HASH_SIZE + size];
+    memcpy(combined, secure_boot_state.pcr_measurements.pcr_values[pcr_index], HASH_SIZE);
+    memcpy(combined + HASH_SIZE, data, size);
+    
+    calculate_sha256(combined, sizeof(combined), secure_boot_state.pcr_measurements.pcr_values[pcr_index]);
+    
+    /* Update PCR state */
+    secure_boot_state.pcr_measurements.pcr_extended[pcr_index] = true;
+    secure_boot_state.pcr_measurements.extend_count[pcr_index]++;
+    
+    /* If TPM is available, extend hardware PCR as well */
+    if (secure_boot_state.tpm_available) {
+        tpm_pcr_extend(pcr_index, data, size);
+        secure_boot_state.stats.tpm_operations++;
+    }
+    
+    KLOG_DEBUG("SECURE_BOOT", "PCR[%u] extended with %zu bytes (count: %u)", 
+              pcr_index, size, secure_boot_state.pcr_measurements.extend_count[pcr_index]);
+}
+
+/* OTA Update System */
+status_t secure_boot_verify_ota_package(const char* package_path, ota_package_t* package_info) {
+    if (!secure_boot_state.secure_boot_enabled) {
+        return STATUS_DISABLED;
+    }
+    
+    file_t* package_file = vfs_open(package_path, O_RDONLY);
+    if (!package_file) {
+        return STATUS_NOT_FOUND;
+    }
+    
+    /* Read package header */
+    size_t bytes_read = vfs_read(package_file, package_info, sizeof(ota_package_t));
+    if (bytes_read != sizeof(ota_package_t)) {
+        vfs_close(package_file);
+        return STATUS_IO_ERROR;
+    }
+    
+    /* Verify package signature */
+    uint8_t package_hash[HASH_SIZE];
+    vfs_seek(package_file, sizeof(ota_package_t), SEEK_SET);
+    
+    /* Calculate hash of package data */
+    uint8_t* buffer = kmalloc(65536);  /* 64KB buffer */
+    if (!buffer) {
+        vfs_close(package_file);
+        return STATUS_NO_MEMORY;
+    }
+    
+    crypto_hash_ctx_t hash_ctx;
+    crypto_sha256_init(&hash_ctx);
+    
+    size_t remaining = package_info->size;
+    while (remaining > 0) {
+        size_t to_read = remaining > 65536 ? 65536 : remaining;
+        size_t read = vfs_read(package_file, buffer, to_read);
+        if (read == 0) break;
+        
+        crypto_sha256_update(&hash_ctx, buffer, read);
+        remaining -= read;
+    }
+    
+    crypto_sha256_final(&hash_ctx, package_hash);
+    vfs_close(package_file);
+    kfree(buffer);
+    
+    /* Verify hash matches */
+    if (memcmp(package_hash, package_info->hash, HASH_SIZE) != 0) {
+        KLOG_ERROR("SECURE_BOOT", "OTA package hash verification failed");
+        return STATUS_HASH_MISMATCH;
+    }
+    
+    /* Extract key ID from signature and find public key */
+    uint8_t key_id[16];
+    crypto_derive_key_id(package_info->signature, SIGNATURE_SIZE, key_id);
+    
+    public_key_entry_t* key_entry = find_public_key(key_id);
+    if (!key_entry) {
+        KLOG_ERROR("SECURE_BOOT", "OTA package signing key not found");
+        return STATUS_KEY_NOT_FOUND;
+    }
+    
+    /* Verify package signature */
+    sig_verify_result_t result = verify_ed25519_signature(package_hash, HASH_SIZE,
+                                                         package_info->signature, key_entry->public_key);
+    
+    if (result != SIG_VERIFY_SUCCESS) {
+        KLOG_ERROR("SECURE_BOOT", "OTA package signature verification failed");
+        return STATUS_SIGNATURE_INVALID;
+    }
+    
+    /* Check component rollback protection */
+    for (uint32_t i = 0; i < package_info->component_count; i++) {
+        rollback_entry_t* rollback_entry = NULL;
+        
+        for (uint32_t j = 0; j < secure_boot_state.rollback_entry_count; j++) {
+            if (strcmp(secure_boot_state.rollback_table[j].component_name, 
+                      package_info->components[i].name) == 0) {
+                rollback_entry = &secure_boot_state.rollback_table[j];
+                break;
+            }
+        }
+        
+        if (rollback_entry && package_info->components[i].new_version < rollback_entry->min_version) {
+            KLOG_ERROR("SECURE_BOOT", "OTA would cause rollback violation: %s %lu < %lu",
+                      package_info->components[i].name,
+                      package_info->components[i].new_version,
+                      rollback_entry->min_version);
+            return STATUS_ROLLBACK_VIOLATION;
+        }
+    }
+    
+    KLOG_INFO("SECURE_BOOT", "OTA package verification successful: %s", package_info->version);
+    return STATUS_OK;
+}
+
+/* Generate TPM attestation quote */
+static status_t generate_attestation_quote(void) {
+    if (!secure_boot_state.tpm_available) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    
+    /* Generate fresh nonce for attestation */
+    crypto_random(secure_boot_state.attestation.attestation_nonce, 32);
+    
+    /* Create PCR selection - use PCRs 0-7 for boot measurements */
+    tpm_pcr_selection_t pcr_selection = {0};
+    for (uint32_t i = 0; i < 8; i++) {
+        pcr_selection.pcr_select[i / 8] |= (1 << (i % 8));
+    }
+    pcr_selection.hash_alg = TPM_ALG_SHA256;
+    
+    /* Generate TPM quote */
+    status_t status = tmp_quote(
+        &pcr_selection,
+        secure_boot_state.attestation.attestation_nonce,
+        32,
+        secure_boot_state.attestation.quote_signature,
+        sizeof(secure_boot_state.attestation.quote_signature)
+    );
+    
+    if (status == STATUS_OK) {
+        secure_boot_state.attestation.quote_timestamp = timer_get_ticks();
+        secure_boot_state.attestation.quote_valid = true;
+        secure_boot_state.stats.tpm_operations++;
+        
+        KLOG_INFO("SECURE_BOOT", "TPM attestation quote generated successfully");
+    } else {
+        secure_boot_state.attestation.quote_valid = false;
+        KLOG_ERROR("SECURE_BOOT", "Failed to generate TPM quote: %d", status);
+    }
+    
+    return status;
+}
+
+/* Get attestation quote for remote verification */
+status_t secure_boot_get_attestation_quote(secure_boot_attestation_t* attestation) {
+    if (!attestation) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    if (!secure_boot_state.secure_boot_enabled) {
+        return STATUS_DISABLED;
+    }
+    
+    spin_lock(&secure_boot_state.lock);
+    
+    /* Generate fresh attestation if needed */
+    if (!secure_boot_state.attestation.quote_valid || 
+        (timer_get_ticks() - secure_boot_state.attestation.quote_timestamp) > (5 * 60 * TIMER_HZ)) {
+        
+        spin_unlock(&secure_boot_state.lock);
+        
+        status_t status = generate_attestation_quote();
+        if (status != STATUS_OK) {
+            return status;
+        }
+        
+        spin_lock(&secure_boot_state.lock);
+    }
+    
+    /* Copy attestation data */
+    memset(attestation, 0, sizeof(secure_boot_attestation_t));
+    
+    attestation->secure_boot_enabled = secure_boot_state.secure_boot_enabled;
+    attestation->tpm_available = secure_boot_state.tpm_available;
+    attestation->quote_valid = secure_boot_state.attestation.quote_valid;
+    attestation->timestamp = secure_boot_state.attestation.quote_timestamp;
+    
+    memcpy(attestation->nonce, secure_boot_state.attestation.attestation_nonce, 32);
+    
+    if (secure_boot_state.attestation.quote_valid) {
+        memcpy(attestation->quote_signature, secure_boot_state.attestation.quote_signature,
+               sizeof(attestation->quote_signature));
+    }
+    
+    /* Copy PCR values */
+    for (uint32_t i = 0; i < 8; i++) {
+        memcpy(attestation->pcr_values[i], secure_boot_state.pcr_measurements.pcr_values[i], HASH_SIZE);
+        attestation->pcr_extended[i] = secure_boot_state.pcr_measurements.pcr_extended[i];
+    }
+    
+    /* Copy boot component information */
+    attestation->component_count = secure_boot_state.boot_component_count;
+    for (uint32_t i = 0; i < secure_boot_state.boot_component_count && i < 16; i++) {
+        boot_component_t* component = &secure_boot_state.boot_components[i];
+        
+        strncpy(attestation->components[i].name, component->name, 
+                sizeof(attestation->components[i].name) - 1);
+        attestation->components[i].version = component->version;
+        attestation->components[i].stage = (uint32_t)component->stage;
+        memcpy(attestation->components[i].hash, component->hash, HASH_SIZE);
+    }
+    
+    spin_unlock(&secure_boot_state.lock);
+    
+    return STATUS_OK;
+}
+
+/* Find public key by ID */
+static public_key_entry_t* find_public_key(const uint8_t* key_id) {
+    for (uint32_t i = 0; i < secure_boot_state.public_key_count; i++) {
+        if (memcmp(secure_boot_state.public_keys[i].key_id, key_id, 16) == 0) {
+            return &secure_boot_state.public_keys[i];
+        }
+    }
+    return NULL;
+}
+
+/* Load public keys from secure storage */
+static status_t load_public_keys(void) {
+    file_t* key_file = vfs_open("/boot/secure/public_keys.db", O_RDONLY);
+    if (!key_file) {
+        return STATUS_NOT_FOUND;
+    }
+    
+    /* Read public key database header */
+    struct {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t key_count;
+        uint32_t checksum;
+    } header;
+    
+    size_t bytes_read = vfs_read(key_file, &header, sizeof(header));
+    if (bytes_read != sizeof(header) || header.magic != 0x4B455953) {  /* "KEYS" */
+        vfs_close(key_file);
+        return STATUS_INVALID_FORMAT;
+    }
+    
+    if (header.key_count > 64) {
+        vfs_close(key_file);
+        return STATUS_LIMIT_EXCEEDED;
+    }
+    
+    /* Read public keys */
+    bytes_read = vfs_read(key_file, secure_boot_state.public_keys, 
+                         header.key_count * sizeof(public_key_entry_t));
+    vfs_close(key_file);
+    
+    if (bytes_read != header.key_count * sizeof(public_key_entry_t)) {
+        return STATUS_IO_ERROR;
+    }
+    
+    secure_boot_state.public_key_count = header.key_count;
+    
+    KLOG_INFO("SECURE_BOOT", "Loaded %u public keys", secure_boot_state.public_key_count);
+    return STATUS_OK;
+}
+
+/* Calculate SHA256 hash */
+static uint32_t calculate_sha256(const void* data, size_t size, uint8_t* hash) {
+    crypto_hash_ctx_t ctx;
+    crypto_sha256_init(&ctx);
+    crypto_sha256_update(&ctx, data, size);
+    crypto_sha256_final(&ctx, hash);
+    return HASH_SIZE;
+}
+
+/* Get secure boot status */
+void secure_boot_advanced_get_status(secure_boot_status_t* status) {
+    if (!status) return;
+    
+    spin_lock(&secure_boot_state.lock);
+    
+    memset(status, 0, sizeof(secure_boot_status_t));
+    
+    status->enabled = secure_boot_state.secure_boot_enabled;
+    status->enforced = secure_boot_state.verification_enforced;
+    status->tpm_available = secure_boot_state.tpm_available;
+    status->public_key_count = secure_boot_state.public_key_count;
+    status->boot_component_count = secure_boot_state.boot_component_count;
+    status->rollback_entry_count = secure_boot_state.rollback_entry_count;
+    
+    /* Copy PCR values */
+    for (uint32_t i = 0; i < 8; i++) {
+        memcpy(status->pcr_values[i], secure_boot_state.pcr_measurements.pcr_values[i], HASH_SIZE);
+    }
+    
+    /* Copy statistics */
+    status->successful_boots = secure_boot_state.stats.successful_boots;
+    status->failed_verifications = secure_boot_state.stats.failed_verifications;
+    status->rollback_violations = secure_boot_state.stats.rollback_violations;
+    status->key_rotations = secure_boot_state.stats.key_rotations;
+    status->tpm_operations = secure_boot_state.stats.tmp_operations;
+    status->last_boot_time = secure_boot_state.stats.last_boot_time;
+    
+    spin_unlock(&secure_boot_state.lock);
+}
+
+/* Boot completion notification */
+void secure_boot_advanced_notify_boot_complete(void) {
+    spin_lock(&secure_boot_state.lock);
+    
+    secure_boot_state.stats.successful_boots++;
+    secure_boot_state.stats.last_boot_time = timer_get_ticks();
+    
+    spin_unlock(&secure_boot_state.lock);
+    
+    /* Generate fresh attestation for this boot */
+    generate_attestation_quote();
+    
+    /* Save boot statistics */
+    save_boot_statistics();
+    
+    KLOG_INFO("SECURE_BOOT", "Advanced secure boot completed successfully (boot #%u)",
+             secure_boot_state.stats.successful_boots);
+}

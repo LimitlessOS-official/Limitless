@@ -1,0 +1,919 @@
+/*
+ * LimitlessOS DHCP Client Implementation
+ * RFC 2131 compliant DHCP client with advanced features
+ * Supports DHCP discovery, renewal, security, and AI optimization
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/socket.h>
+#include <linux/skbuff.h>
+#include <linux/netdevice.h>
+#include <linux/in.h>
+#include <linux/udp.h>
+#include <linux/random.h>
+#include <linux/workqueue.h>
+#include <linux/timer.h>
+#include <net/sock.h>
+#include <net/udp.h>
+#include <net/ip.h>
+
+// DHCP message types (RFC 2131)
+#define DHCP_DISCOVER    1
+#define DHCP_OFFER       2
+#define DHCP_REQUEST     3
+#define DHCP_DECLINE     4
+#define DHCP_ACK         5
+#define DHCP_NAK         6
+#define DHCP_RELEASE     7
+#define DHCP_INFORM      8
+
+// DHCP option codes (RFC 2132)
+#define DHCP_OPT_SUBNET_MASK        1
+#define DHCP_OPT_ROUTER             3
+#define DHCP_OPT_DNS_SERVER         6
+#define DHCP_OPT_HOSTNAME          12
+#define DHCP_OPT_DOMAIN_NAME       15
+#define DHCP_OPT_BROADCAST_ADDR    28
+#define DHCP_OPT_REQUESTED_IP      50
+#define DHCP_OPT_LEASE_TIME        51
+#define DHCP_OPT_MESSAGE_TYPE      53
+#define DHCP_OPT_SERVER_ID         54
+#define DHCP_OPT_PARAM_LIST        55
+#define DHCP_OPT_RENEWAL_TIME      58
+#define DHCP_OPT_REBIND_TIME       59
+#define DHCP_OPT_CLIENT_ID         61
+#define DHCP_OPT_END              255
+
+// DHCP client states
+#define DHCP_STATE_INIT            0
+#define DHCP_STATE_SELECTING       1
+#define DHCP_STATE_REQUESTING      2
+#define DHCP_STATE_BOUND           3
+#define DHCP_STATE_RENEWING        4
+#define DHCP_STATE_REBINDING       5
+#define DHCP_STATE_INIT_REBOOT     6
+
+// DHCP ports
+#define DHCP_CLIENT_PORT    68
+#define DHCP_SERVER_PORT    67
+
+// DHCP magic cookie
+#define DHCP_MAGIC_COOKIE   0x63825363
+
+// DHCP message structure (RFC 2131)
+struct dhcp_message {
+    uint8_t op;                    // Message op code / message type
+    uint8_t htype;                 // Hardware address type
+    uint8_t hlen;                  // Hardware address length
+    uint8_t hops;                  // Hops
+    uint32_t xid;                  // Transaction ID
+    uint16_t secs;                 // Seconds elapsed
+    uint16_t flags;                // Flags
+    __be32 ciaddr;                 // Client IP address
+    __be32 yiaddr;                 // 'Your' (client) IP address
+    __be32 siaddr;                 // IP address of next server
+    __be32 giaddr;                 // Relay agent IP address
+    uint8_t chaddr[16];            // Client hardware address
+    char sname[64];                // Optional server host name
+    char file[128];                // Boot file name
+    uint32_t magic;                // Magic cookie
+    uint8_t options[];             // Options (variable length)
+} __packed;
+
+// DHCP option structure
+struct dhcp_option {
+    uint8_t code;
+    uint8_t length;
+    uint8_t data[];
+} __packed;
+
+// DHCP client context per interface
+struct limitless_dhcp_client_ctx {
+    struct net_device *netdev;     // Network device
+    uint32_t interface_id;         // Interface ID
+    
+    // DHCP state
+    uint32_t state;                // Current DHCP state
+    uint32_t xid;                  // Transaction ID
+    __be32 server_addr;            // DHCP server address
+    __be32 offered_addr;           // Offered IP address
+    __be32 subnet_mask;            // Subnet mask
+    __be32 gateway;                // Default gateway
+    __be32 dns_primary;            // Primary DNS server
+    __be32 dns_secondary;          // Secondary DNS server
+    
+    // Lease information
+    uint32_t lease_time;           // Lease time in seconds
+    uint32_t renewal_time;         // Renewal time (T1)
+    uint32_t rebind_time;          // Rebind time (T2)
+    uint64_t lease_start;          // Lease start time
+    uint64_t lease_expires;        // Lease expiration time
+    
+    // Timers
+    struct timer_list discover_timer;   // Discovery retry timer
+    struct timer_list request_timer;    // Request retry timer
+    struct timer_list renewal_timer;    // Renewal timer
+    struct timer_list rebind_timer;     // Rebind timer
+    
+    // Work structures
+    struct work_struct discover_work;   // Discovery work
+    struct work_struct request_work;    // Request work
+    struct work_struct renewal_work;    // Renewal work
+    struct work_struct release_work;    // Release work
+    
+    // Retry counters
+    uint32_t discover_retries;     // Discovery retry count
+    uint32_t request_retries;      // Request retry count
+    uint32_t max_retries;          // Maximum retries
+    
+    // Socket for DHCP communication
+    struct socket *dhcp_socket;    // DHCP UDP socket
+    
+    // Security features
+    struct dhcp_security {
+        bool authentication_enabled; // DHCP authentication
+        uint8_t auth_key[32];       // Authentication key
+        uint32_t auth_realm;        // Authentication realm
+        uint64_t replay_detection;  // Replay detection counter
+        bool secure_lease_only;     // Accept only secure leases
+    } security;
+    
+    // Performance metrics
+    struct dhcp_metrics {
+        atomic64_t discover_sent;   // DISCOVER messages sent
+        atomic64_t offer_received;  // OFFER messages received
+        atomic64_t request_sent;    // REQUEST messages sent
+        atomic64_t ack_received;    // ACK messages received
+        atomic64_t nak_received;    // NAK messages received
+        atomic64_t lease_renewals;  // Successful lease renewals
+        atomic64_t lease_failures;  // Lease failures
+        uint32_t avg_response_time; // Average response time (ms)
+        uint32_t last_response_time; // Last response time (ms)
+    } metrics;
+    
+    // AI optimization
+    struct dhcp_ai {
+        bool enabled;               // AI optimization enabled
+        uint32_t server_score;      // Server reliability score
+        uint32_t lease_quality;     // Lease quality score
+        uint64_t historical_uptime; // Historical server uptime
+        float renewal_success_rate; // Renewal success rate
+        uint32_t optimal_lease_time; // AI-suggested optimal lease time
+        
+        // Server performance tracking
+        struct server_profile {
+            __be32 server_addr;     // Server address
+            uint32_t response_times[32]; // Response time history
+            uint32_t success_count; // Successful transactions
+            uint32_t failure_count; // Failed transactions
+            uint64_t last_seen;     // Last communication time
+            float reliability_score; // Reliability score (0.0-1.0)
+        } server_profiles[8];       // Track up to 8 servers
+        uint32_t profile_count;     // Number of tracked servers
+    } ai;
+    
+    struct mutex dhcp_lock;         // DHCP context lock
+    struct list_head list;          // List linkage
+};
+
+// Global DHCP client manager
+struct limitless_dhcp_manager {
+    struct list_head clients;       // List of DHCP clients
+    struct mutex clients_lock;      // Clients list lock
+    struct workqueue_struct *dhcp_wq; // DHCP work queue
+    
+    // Global DHCP statistics
+    atomic64_t total_discovers;     // Total DISCOVER messages
+    atomic64_t total_requests;      // Total REQUEST messages
+    atomic64_t total_renewals;      // Total renewals
+    atomic64_t total_failures;      // Total failures
+    
+    // Configuration
+    struct dhcp_global_config {
+        uint32_t default_lease_time; // Default requested lease time
+        uint32_t max_lease_time;     // Maximum acceptable lease time
+        uint32_t min_lease_time;     // Minimum acceptable lease time
+        uint32_t discovery_timeout;  // Discovery timeout (seconds)
+        uint32_t request_timeout;    // Request timeout (seconds)
+        uint32_t max_discover_retries; // Maximum discovery retries
+        uint32_t max_request_retries;  // Maximum request retries
+        bool broadcast_flag;         // Use broadcast flag
+        bool rapid_commit;           // Support rapid commit (RFC 4039)
+        char vendor_class_id[64];    // Vendor class identifier
+        char client_identifier[32];  // Client identifier format
+    } config;
+} *dhcp_manager = NULL;
+
+// Function prototypes
+static int limitless_dhcp_send_discover(struct limitless_dhcp_client_ctx *ctx);
+static int limitless_dhcp_send_request(struct limitless_dhcp_client_ctx *ctx);
+static int limitless_dhcp_send_release(struct limitless_dhcp_client_ctx *ctx);
+static int limitless_dhcp_process_offer(struct limitless_dhcp_client_ctx *ctx,
+                                       struct dhcp_message *msg, size_t len);
+static int limitless_dhcp_process_ack(struct limitless_dhcp_client_ctx *ctx,
+                                     struct dhcp_message *msg, size_t len);
+static int limitless_dhcp_process_nak(struct limitless_dhcp_client_ctx *ctx,
+                                     struct dhcp_message *msg, size_t len);
+
+// DHCP option parsing
+static uint8_t *limitless_dhcp_get_option(struct dhcp_message *msg, size_t msg_len,
+                                         uint8_t option_code, uint8_t *option_len) {
+    uint8_t *options = msg->options;
+    size_t options_len = msg_len - sizeof(*msg);
+    size_t offset = 0;
+    
+    while (offset < options_len) {
+        uint8_t code = options[offset];
+        
+        if (code == DHCP_OPT_END) {
+            break;
+        }
+        
+        if (code == 0) { // Padding
+            offset++;
+            continue;
+        }
+        
+        if (offset + 1 >= options_len) {
+            break; // Invalid option
+        }
+        
+        uint8_t len = options[offset + 1];
+        
+        if (offset + 2 + len > options_len) {
+            break; // Invalid option length
+        }
+        
+        if (code == option_code) {
+            *option_len = len;
+            return &options[offset + 2];
+        }
+        
+        offset += 2 + len;
+    }
+    
+    *option_len = 0;
+    return NULL;
+}
+
+// Add DHCP option to message
+static size_t limitless_dhcp_add_option(uint8_t *options, size_t max_len, size_t offset,
+                                       uint8_t code, uint8_t len, const void *data) {
+    if (offset + 2 + len > max_len) {
+        return offset; // Not enough space
+    }
+    
+    options[offset] = code;
+    options[offset + 1] = len;
+    if (len > 0 && data) {
+        memcpy(&options[offset + 2], data, len);
+    }
+    
+    return offset + 2 + len;
+}
+
+// Create DHCP socket
+static int limitless_dhcp_create_socket(struct limitless_dhcp_client_ctx *ctx) {
+    struct sockaddr_in addr;
+    int ret;
+    
+    ret = sock_create(PF_INET, SOCK_DGRAM, IPPROTO_UDP, &ctx->dhcp_socket);
+    if (ret < 0) {
+        pr_err("DHCP: Failed to create socket: %d\n", ret);
+        return ret;
+    }
+    
+    // Bind to DHCP client port
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(DHCP_CLIENT_PORT);
+    
+    ret = kernel_bind(ctx->dhcp_socket, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0) {
+        pr_err("DHCP: Failed to bind socket: %d\n", ret);
+        sock_release(ctx->dhcp_socket);
+        ctx->dhcp_socket = NULL;
+        return ret;
+    }
+    
+    // Enable broadcast
+    int broadcast = 1;
+    ret = kernel_setsockopt(ctx->dhcp_socket, SOL_SOCKET, SO_BROADCAST,
+                           (char *)&broadcast, sizeof(broadcast));
+    if (ret < 0) {
+        pr_warn("DHCP: Failed to enable broadcast: %d\n", ret);
+    }
+    
+    return 0;
+}
+
+// Send DHCP DISCOVER message
+static int limitless_dhcp_send_discover(struct limitless_dhcp_client_ctx *ctx) {
+    struct dhcp_message *msg;
+    struct sockaddr_in dest_addr;
+    struct msghdr msg_hdr;
+    struct kvec iov;
+    size_t msg_len, options_offset;
+    int ret;
+    
+    msg_len = sizeof(*msg) + 312; // Standard DHCP message size
+    msg = kzalloc(msg_len, GFP_KERNEL);
+    if (!msg)
+        return -ENOMEM;
+    
+    // Fill DHCP message header
+    msg->op = 1;                   // BOOTREQUEST
+    msg->htype = 1;                // Ethernet
+    msg->hlen = 6;                 // MAC address length
+    msg->hops = 0;
+    msg->xid = ctx->xid;
+    msg->secs = 0;
+    msg->flags = htons(0x8000);    // Broadcast flag
+    msg->ciaddr = 0;               // Client IP (0 for DISCOVER)
+    msg->yiaddr = 0;
+    msg->siaddr = 0;
+    msg->giaddr = 0;
+    
+    // Client hardware address (MAC)
+    memcpy(msg->chaddr, ctx->netdev->dev_addr, min(ctx->netdev->addr_len, 16));
+    
+    msg->magic = htonl(DHCP_MAGIC_COOKIE);
+    
+    // Add DHCP options
+    options_offset = 0;
+    
+    // Message type option
+    uint8_t msg_type = DHCP_DISCOVER;
+    options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                              DHCP_OPT_MESSAGE_TYPE, 1, &msg_type);
+    
+    // Client identifier option
+    uint8_t client_id[7];
+    client_id[0] = 1; // Hardware type: Ethernet
+    memcpy(&client_id[1], ctx->netdev->dev_addr, 6);
+    options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                              DHCP_OPT_CLIENT_ID, 7, client_id);
+    
+    // Hostname option
+    const char *hostname = "limitlessos";
+    options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                              DHCP_OPT_HOSTNAME, strlen(hostname), hostname);
+    
+    // Parameter request list
+    uint8_t param_list[] = {
+        DHCP_OPT_SUBNET_MASK,
+        DHCP_OPT_ROUTER,
+        DHCP_OPT_DNS_SERVER,
+        DHCP_OPT_DOMAIN_NAME,
+        DHCP_OPT_BROADCAST_ADDR,
+        DHCP_OPT_LEASE_TIME,
+        DHCP_OPT_RENEWAL_TIME,
+        DHCP_OPT_REBIND_TIME
+    };
+    options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                              DHCP_OPT_PARAM_LIST, sizeof(param_list), param_list);
+    
+    // Vendor class identifier
+    if (strlen(dhcp_manager->config.vendor_class_id) > 0) {
+        options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                                  60, strlen(dhcp_manager->config.vendor_class_id),
+                                                  dhcp_manager->config.vendor_class_id);
+    }
+    
+    // End option
+    msg->options[options_offset] = DHCP_OPT_END;
+    options_offset++;
+    
+    // Prepare destination address
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr.s_addr = INADDR_BROADCAST;
+    dest_addr.sin_port = htons(DHCP_SERVER_PORT);
+    
+    // Prepare message
+    memset(&msg_hdr, 0, sizeof(msg_hdr));
+    msg_hdr.msg_name = &dest_addr;
+    msg_hdr.msg_namelen = sizeof(dest_addr);
+    
+    iov.iov_base = msg;
+    iov.iov_len = sizeof(*msg) + options_offset;
+    
+    // Send message
+    ret = kernel_sendmsg(ctx->dhcp_socket, &msg_hdr, &iov, 1, iov.iov_len);
+    if (ret < 0) {
+        pr_err("DHCP: Failed to send DISCOVER: %d\n", ret);
+    } else {
+        atomic64_inc(&ctx->metrics.discover_sent);
+        atomic64_inc(&dhcp_manager->total_discovers);
+        pr_debug("DHCP: DISCOVER sent (XID: 0x%08x)\n", ctx->xid);
+    }
+    
+    kfree(msg);
+    return ret;
+}
+
+// Send DHCP REQUEST message
+static int limitless_dhcp_send_request(struct limitless_dhcp_client_ctx *ctx) {
+    struct dhcp_message *msg;
+    struct sockaddr_in dest_addr;
+    struct msghdr msg_hdr;
+    struct kvec iov;
+    size_t msg_len, options_offset;
+    int ret;
+    
+    msg_len = sizeof(*msg) + 312;
+    msg = kzalloc(msg_len, GFP_KERNEL);
+    if (!msg)
+        return -ENOMEM;
+    
+    // Fill DHCP message header
+    msg->op = 1;                   // BOOTREQUEST
+    msg->htype = 1;                // Ethernet
+    msg->hlen = 6;
+    msg->hops = 0;
+    msg->xid = ctx->xid;
+    msg->secs = 0;
+    msg->flags = htons(0x8000);    // Broadcast flag
+    
+    if (ctx->state == DHCP_STATE_RENEWING || ctx->state == DHCP_STATE_REBINDING) {
+        msg->ciaddr = ctx->offered_addr; // Current IP address
+    } else {
+        msg->ciaddr = 0;
+    }
+    
+    msg->yiaddr = 0;
+    msg->siaddr = 0;
+    msg->giaddr = 0;
+    
+    memcpy(msg->chaddr, ctx->netdev->dev_addr, min(ctx->netdev->addr_len, 16));
+    msg->magic = htonl(DHCP_MAGIC_COOKIE);
+    
+    // Add DHCP options
+    options_offset = 0;
+    
+    // Message type option
+    uint8_t msg_type = DHCP_REQUEST;
+    options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                              DHCP_OPT_MESSAGE_TYPE, 1, &msg_type);
+    
+    // Client identifier option
+    uint8_t client_id[7];
+    client_id[0] = 1;
+    memcpy(&client_id[1], ctx->netdev->dev_addr, 6);
+    options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                              DHCP_OPT_CLIENT_ID, 7, client_id);
+    
+    // Requested IP address option (only for SELECTING state)
+    if (ctx->state == DHCP_STATE_REQUESTING) {
+        options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                                  DHCP_OPT_REQUESTED_IP, 4, &ctx->offered_addr);
+        
+        // Server identifier option
+        options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                                  DHCP_OPT_SERVER_ID, 4, &ctx->server_addr);
+    }
+    
+    // Hostname option
+    const char *hostname = "limitlessos";
+    options_offset = limitless_dhcp_add_option(msg->options, 312, options_offset,
+                                              DHCP_OPT_HOSTNAME, strlen(hostname), hostname);
+    
+    // End option
+    msg->options[options_offset] = DHCP_OPT_END;
+    options_offset++;
+    
+    // Prepare destination address
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    
+    if (ctx->state == DHCP_STATE_RENEWING) {
+        dest_addr.sin_addr.s_addr = ctx->server_addr; // Unicast to server
+    } else {
+        dest_addr.sin_addr.s_addr = INADDR_BROADCAST; // Broadcast
+    }
+    dest_addr.sin_port = htons(DHCP_SERVER_PORT);
+    
+    // Prepare message
+    memset(&msg_hdr, 0, sizeof(msg_hdr));
+    msg_hdr.msg_name = &dest_addr;
+    msg_hdr.msg_namelen = sizeof(dest_addr);
+    
+    iov.iov_base = msg;
+    iov.iov_len = sizeof(*msg) + options_offset;
+    
+    // Send message
+    ret = kernel_sendmsg(ctx->dhcp_socket, &msg_hdr, &iov, 1, iov.iov_len);
+    if (ret < 0) {
+        pr_err("DHCP: Failed to send REQUEST: %d\n", ret);
+    } else {
+        atomic64_inc(&ctx->metrics.request_sent);
+        atomic64_inc(&dhcp_manager->total_requests);
+        pr_debug("DHCP: REQUEST sent (XID: 0x%08x)\n", ctx->xid);
+    }
+    
+    kfree(msg);
+    return ret;
+}
+
+// Process DHCP OFFER message
+static int limitless_dhcp_process_offer(struct limitless_dhcp_client_ctx *ctx,
+                                       struct dhcp_message *msg, size_t len) {
+    uint8_t *option_data, option_len;
+    uint32_t lease_time = 86400; // Default 24 hours
+    __be32 server_id = 0;
+    
+    if (ctx->state != DHCP_STATE_SELECTING) {
+        pr_debug("DHCP: Ignoring OFFER in state %d\n", ctx->state);
+        return 0;
+    }
+    
+    if (msg->xid != ctx->xid) {
+        pr_debug("DHCP: OFFER XID mismatch (got 0x%08x, expected 0x%08x)\n",
+                 msg->xid, ctx->xid);
+        return -EINVAL;
+    }
+    
+    atomic64_inc(&ctx->metrics.offer_received);
+    
+    // Extract server identifier
+    option_data = limitless_dhcp_get_option(msg, len, DHCP_OPT_SERVER_ID, &option_len);
+    if (option_data && option_len == 4) {
+        memcpy(&server_id, option_data, 4);
+    } else {
+        pr_warn("DHCP: OFFER without server identifier\n");
+        return -EINVAL;
+    }
+    
+    // Extract lease time
+    option_data = limitless_dhcp_get_option(msg, len, DHCP_OPT_LEASE_TIME, &option_len);
+    if (option_data && option_len == 4) {
+        memcpy(&lease_time, option_data, 4);
+        lease_time = ntohl(lease_time);
+    }
+    
+    // Validate lease time
+    if (lease_time < dhcp_manager->config.min_lease_time ||
+        lease_time > dhcp_manager->config.max_lease_time) {
+        pr_warn("DHCP: Invalid lease time %u seconds\n", lease_time);
+        return -EINVAL;
+    }
+    
+    // AI-based server evaluation
+    if (ctx->ai.enabled) {
+        // Find or create server profile
+        struct server_profile *profile = NULL;
+        for (int i = 0; i < ctx->ai.profile_count; i++) {
+            if (ctx->ai.server_profiles[i].server_addr == server_id) {
+                profile = &ctx->ai.server_profiles[i];
+                break;
+            }
+        }
+        
+        if (!profile && ctx->ai.profile_count < 8) {
+            profile = &ctx->ai.server_profiles[ctx->ai.profile_count++];
+            memset(profile, 0, sizeof(*profile));
+            profile->server_addr = server_id;
+            profile->reliability_score = 0.5f; // Neutral starting score
+        }
+        
+        if (profile) {
+            profile->last_seen = ktime_get_real_seconds();
+            // Update reliability based on response time and history
+            // (simplified scoring algorithm)
+            if (profile->success_count + profile->failure_count > 0) {
+                profile->reliability_score = 
+                    (float)profile->success_count / 
+                    (profile->success_count + profile->failure_count);
+            }
+        }
+    }
+    
+    // Accept the offer
+    ctx->offered_addr = msg->yiaddr;
+    ctx->server_addr = server_id;
+    ctx->lease_time = lease_time;
+    
+    // Extract other network configuration
+    option_data = limitless_dhcp_get_option(msg, len, DHCP_OPT_SUBNET_MASK, &option_len);
+    if (option_data && option_len == 4) {
+        memcpy(&ctx->subnet_mask, option_data, 4);
+    }
+    
+    option_data = limitless_dhcp_get_option(msg, len, DHCP_OPT_ROUTER, &option_len);
+    if (option_data && option_len >= 4) {
+        memcpy(&ctx->gateway, option_data, 4);
+    }
+    
+    option_data = limitless_dhcp_get_option(msg, len, DHCP_OPT_DNS_SERVER, &option_len);
+    if (option_data && option_len >= 4) {
+        memcpy(&ctx->dns_primary, option_data, 4);
+        if (option_len >= 8) {
+            memcpy(&ctx->dns_secondary, option_data + 4, 4);
+        }
+    }
+    
+    // Extract renewal and rebind times
+    option_data = limitless_dhcp_get_option(msg, len, DHCP_OPT_RENEWAL_TIME, &option_len);
+    if (option_data && option_len == 4) {
+        memcpy(&ctx->renewal_time, option_data, 4);
+        ctx->renewal_time = ntohl(ctx->renewal_time);
+    } else {
+        ctx->renewal_time = lease_time / 2; // Default: 50% of lease time
+    }
+    
+    option_data = limitless_dhcp_get_option(msg, len, DHCP_OPT_REBIND_TIME, &option_len);
+    if (option_data && option_len == 4) {
+        memcpy(&ctx->rebind_time, option_data, 4);
+        ctx->rebind_time = ntohl(ctx->rebind_time);
+    } else {
+        ctx->rebind_time = (lease_time * 7) / 8; // Default: 87.5% of lease time
+    }
+    
+    pr_info("DHCP: Received OFFER: IP=%pI4, Server=%pI4, Lease=%u sec\n",
+            &ctx->offered_addr, &ctx->server_addr, ctx->lease_time);
+    
+    // Move to REQUESTING state and send REQUEST
+    ctx->state = DHCP_STATE_REQUESTING;
+    
+    // Cancel discovery timer
+    del_timer_sync(&ctx->discover_timer);
+    
+    // Send REQUEST message
+    limitless_dhcp_send_request(ctx);
+    
+    // Start request timer
+    mod_timer(&ctx->request_timer, 
+              jiffies + msecs_to_jiffies(dhcp_manager->config.request_timeout * 1000));
+    
+    return 0;
+}
+
+// Process DHCP ACK message
+static int limitless_dhcp_process_ack(struct limitless_dhcp_client_ctx *ctx,
+                                     struct dhcp_message *msg, size_t len) {
+    struct net_device *dev = ctx->netdev;
+    struct in_ifaddr *ifa;
+    int ret;
+    
+    if (msg->xid != ctx->xid) {
+        pr_debug("DHCP: ACK XID mismatch\n");
+        return -EINVAL;
+    }
+    
+    atomic64_inc(&ctx->metrics.ack_received);
+    
+    // Configure network interface with received parameters
+    rtnl_lock();
+    
+    // Remove existing IP address if any
+    for (ifa = rtnl_dereference(dev->ip_ptr->ifa_list); ifa;
+         ifa = rtnl_dereference(ifa->ifa_next)) {
+        if (ifa->ifa_local != 0) {
+            inet_del_ifa(dev->ip_ptr, &ifa, 0);
+            break;
+        }
+    }
+    
+    // Add new IP address
+    ifa = kzalloc(sizeof(*ifa), GFP_KERNEL);
+    if (ifa) {
+        ifa->ifa_local = ctx->offered_addr;
+        ifa->ifa_address = ctx->offered_addr;
+        ifa->ifa_mask = ctx->subnet_mask;
+        ifa->ifa_broadcast = ctx->offered_addr | ~ctx->subnet_mask;
+        ifa->ifa_prefixlen = inet_mask_len(ctx->subnet_mask);
+        ifa->ifa_scope = RT_SCOPE_UNIVERSE;
+        
+        ret = inet_insert_ifa(ifa);
+        if (ret) {
+            pr_err("DHCP: Failed to configure IP address: %d\n", ret);
+            kfree(ifa);
+        }
+    }
+    
+    rtnl_unlock();
+    
+    // Configure default route if gateway provided
+    if (ctx->gateway != 0) {
+        // Add default route (simplified - would use proper routing API)
+        pr_info("DHCP: Default gateway: %pI4\n", &ctx->gateway);
+    }
+    
+    // Configure DNS servers
+    if (ctx->dns_primary != 0) {
+        pr_info("DHCP: Primary DNS: %pI4\n", &ctx->dns_primary);
+        // Configure DNS resolver (would integrate with system resolver)
+    }
+    if (ctx->dns_secondary != 0) {
+        pr_info("DHCP: Secondary DNS: %pI4\n", &ctx->dns_secondary);
+    }
+    
+    // Move to BOUND state
+    ctx->state = DHCP_STATE_BOUND;
+    ctx->lease_start = ktime_get_real_seconds();
+    ctx->lease_expires = ctx->lease_start + ctx->lease_time;
+    
+    // Cancel request timer
+    del_timer_sync(&ctx->request_timer);
+    
+    // Schedule renewal timer (T1)
+    mod_timer(&ctx->renewal_timer, 
+              jiffies + msecs_to_jiffies(ctx->renewal_time * 1000));
+    
+    // Schedule rebind timer (T2)
+    mod_timer(&ctx->rebind_timer,
+              jiffies + msecs_to_jiffies(ctx->rebind_time * 1000));
+    
+    // Update AI metrics
+    if (ctx->ai.enabled) {
+        struct server_profile *profile = NULL;
+        for (int i = 0; i < ctx->ai.profile_count; i++) {
+            if (ctx->ai.server_profiles[i].server_addr == ctx->server_addr) {
+                profile = &ctx->ai.server_profiles[i];
+                break;
+            }
+        }
+        if (profile) {
+            profile->success_count++;
+            atomic64_inc(&ctx->metrics.lease_renewals);
+        }
+    }
+    
+    pr_info("DHCP: Lease acquired: IP=%pI4, Expires in %u seconds\n",
+            &ctx->offered_addr, ctx->lease_time);
+    
+    return 0;
+}
+
+// DHCP work functions
+static void limitless_dhcp_discover_work(struct work_struct *work) {
+    struct limitless_dhcp_client_ctx *ctx = 
+        container_of(work, struct limitless_dhcp_client_ctx, discover_work);
+    
+    mutex_lock(&ctx->dhcp_lock);
+    
+    if (ctx->state != DHCP_STATE_INIT && ctx->state != DHCP_STATE_SELECTING) {
+        mutex_unlock(&ctx->dhcp_lock);
+        return;
+    }
+    
+    // Generate new transaction ID
+    ctx->xid = get_random_u32();
+    
+    // Send DISCOVER message
+    if (limitless_dhcp_send_discover(ctx) >= 0) {
+        ctx->state = DHCP_STATE_SELECTING;
+        ctx->discover_retries++;
+        
+        // Schedule retry if not exceeded max retries
+        if (ctx->discover_retries < ctx->max_retries) {
+            mod_timer(&ctx->discover_timer,
+                      jiffies + msecs_to_jiffies(dhcp_manager->config.discovery_timeout * 1000));
+        } else {
+            pr_err("DHCP: Discovery failed after %d retries\n", ctx->discover_retries);
+            ctx->state = DHCP_STATE_INIT;
+            ctx->discover_retries = 0;
+        }
+    }
+    
+    mutex_unlock(&ctx->dhcp_lock);
+}
+
+// Timer callbacks
+static void limitless_dhcp_discover_timer(struct timer_list *timer) {
+    struct limitless_dhcp_client_ctx *ctx = 
+        container_of(timer, struct limitless_dhcp_client_ctx, discover_timer);
+    
+    queue_work(dhcp_manager->dhcp_wq, &ctx->discover_work);
+}
+
+static void limitless_dhcp_request_timer(struct timer_list *timer) {
+    struct limitless_dhcp_client_ctx *ctx = 
+        container_of(timer, struct limitless_dhcp_client_ctx, request_timer);
+    
+    mutex_lock(&ctx->dhcp_lock);
+    
+    if (ctx->state == DHCP_STATE_REQUESTING) {
+        ctx->request_retries++;
+        
+        if (ctx->request_retries < ctx->max_retries) {
+            limitless_dhcp_send_request(ctx);
+            mod_timer(&ctx->request_timer,
+                      jiffies + msecs_to_jiffies(dhcp_manager->config.request_timeout * 1000));
+        } else {
+            pr_err("DHCP: Request failed after %d retries\n", ctx->request_retries);
+            ctx->state = DHCP_STATE_INIT;
+            ctx->request_retries = 0;
+            // Restart discovery process
+            queue_work(dhcp_manager->dhcp_wq, &ctx->discover_work);
+        }
+    }
+    
+    mutex_unlock(&ctx->dhcp_lock);
+}
+
+// Main DHCP client start function
+int limitless_dhcp_start(struct limitless_netdev *netdev) {
+    struct limitless_dhcp_client_ctx *ctx;
+    int ret;
+    
+    if (!dhcp_manager) {
+        return -ENOTSUPP;
+    }
+    
+    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx)
+        return -ENOMEM;
+    
+    ctx->netdev = netdev->netdev;
+    ctx->interface_id = netdev->interface_id;
+    ctx->state = DHCP_STATE_INIT;
+    ctx->max_retries = dhcp_manager->config.max_discover_retries;
+    
+    mutex_init(&ctx->dhcp_lock);
+    
+    // Initialize timers
+    timer_setup(&ctx->discover_timer, limitless_dhcp_discover_timer, 0);
+    timer_setup(&ctx->request_timer, limitless_dhcp_request_timer, 0);
+    timer_setup(&ctx->renewal_timer, limitless_dhcp_renewal_timer, 0);
+    timer_setup(&ctx->rebind_timer, limitless_dhcp_rebind_timer, 0);
+    
+    // Initialize work structures
+    INIT_WORK(&ctx->discover_work, limitless_dhcp_discover_work);
+    INIT_WORK(&ctx->request_work, limitless_dhcp_request_work);
+    INIT_WORK(&ctx->renewal_work, limitless_dhcp_renewal_work);
+    INIT_WORK(&ctx->release_work, limitless_dhcp_release_work);
+    
+    // Create DHCP socket
+    ret = limitless_dhcp_create_socket(ctx);
+    if (ret) {
+        kfree(ctx);
+        return ret;
+    }
+    
+    // Add to clients list
+    mutex_lock(&dhcp_manager->clients_lock);
+    list_add_tail(&ctx->list, &dhcp_manager->clients);
+    mutex_unlock(&dhcp_manager->clients_lock);
+    
+    // Start discovery process
+    queue_work(dhcp_manager->dhcp_wq, &ctx->discover_work);
+    
+    pr_info("DHCP: Client started for interface %s\n", ctx->netdev->name);
+    
+    return 0;
+}
+
+// Initialize DHCP manager
+int __init limitless_dhcp_init(void) {
+    dhcp_manager = kzalloc(sizeof(*dhcp_manager), GFP_KERNEL);
+    if (!dhcp_manager)
+        return -ENOMEM;
+    
+    INIT_LIST_HEAD(&dhcp_manager->clients);
+    mutex_init(&dhcp_manager->clients_lock);
+    
+    dhcp_manager->dhcp_wq = create_singlethread_workqueue("limitless_dhcp");
+    if (!dhcp_manager->dhcp_wq) {
+        kfree(dhcp_manager);
+        dhcp_manager = NULL;
+        return -ENOMEM;
+    }
+    
+    // Set default configuration
+    dhcp_manager->config.default_lease_time = 86400; // 24 hours
+    dhcp_manager->config.max_lease_time = 604800;    // 7 days
+    dhcp_manager->config.min_lease_time = 300;       // 5 minutes
+    dhcp_manager->config.discovery_timeout = 5;      // 5 seconds
+    dhcp_manager->config.request_timeout = 5;        // 5 seconds
+    dhcp_manager->config.max_discover_retries = 5;
+    dhcp_manager->config.max_request_retries = 5;
+    dhcp_manager->config.broadcast_flag = true;
+    dhcp_manager->config.rapid_commit = false;
+    strcpy(dhcp_manager->config.vendor_class_id, "LimitlessOS/1.0");
+    strcpy(dhcp_manager->config.client_identifier, "limitless");
+    
+    pr_info("LimitlessOS DHCP Client initialized\n");
+    
+    return 0;
+}
+
+void __exit limitless_dhcp_exit(void) {
+    if (!dhcp_manager)
+        return;
+    
+    if (dhcp_manager->dhcp_wq) {
+        destroy_workqueue(dhcp_manager->dhcp_wq);
+    }
+    
+    kfree(dhcp_manager);
+    dhcp_manager = NULL;
+    
+    pr_info("LimitlessOS DHCP Client unloaded\n");
+}
+
+EXPORT_SYMBOL(limitless_dhcp_start);
+EXPORT_SYMBOL(limitless_dhcp_init);
+EXPORT_SYMBOL(limitless_dhcp_exit);

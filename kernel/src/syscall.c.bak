@@ -1,0 +1,658 @@
+// Pipe /* File descriptor types */
+#define FD_TYPE_FILE 2
+
+/* Pipe syscall implementations */
+long sys_pipe(int fds[2]) {
+    process_t* p = process_current();
+    if (!p || !fds) return -K_EINVAL;
+    pipe_t* pipe = NULL;
+    int rc = pipe_create(&pipe, &pipe);
+    if (rc != 0 || !pipe) return -K_ENOMEM;
+    int fd_read = fd_alloc(p->fdtab, pipe, FD_TYPE_PIPE, 0); // read end
+    int fd_write = fd_alloc(p->fdtab, pipe, FD_TYPE_PIPE, 1); // write end
+    if (fd_read < 0 || fd_write < 0) {
+        if (fd_read >= 0) fd_close(p->fdtab, fd_read);
+        if (fd_write >= 0) fd_close(p->fdtab, fd_write);
+        pipe_close_read(pipe);
+        pipe_close_write(pipe);
+        return -K_EMFILE;
+    }
+    fds[0] = fd_read;
+    fds[1] = fd_write;
+    return 0;
+}de "pipe.h"
+#include "fd.h"
+#include "process.h"
+#include "syscall.h"
+// FD type for pipes
+#define FD_TYPE_PIPE 1
+
+// Pipe syscall implementations
+long sys_pipe(int fds[2]) {
+    process_t* p = process_current();
+    if (!p || !fds) return -K_EINVAL;
+    pipe_t* pipe = NULL;
+    int rc = pipe_create(&pipe, &pipe);
+    if (rc != 0 || !pipe) return -K_ENOMEM;
+    int fd_read = fd_alloc(p->fdtab, pipe, FD_TYPE_PIPE, 0); // read end
+    int fd_write = fd_alloc(p->fdtab, pipe, FD_TYPE_PIPE, 1); // write end
+    if (fd_read < 0 || fd_write < 0) {
+        if (fd_read >= 0) fd_close(p->fdtab, fd_read);
+        if (fd_write >= 0) fd_close(p->fdtab, fd_write);
+        pipe_close_read(pipe);
+        pipe_close_write(pipe);
+        return -K_EMFILE;
+    }
+    fds[0] = fd_read;
+    fds[1] = fd_write;
+    return 0;
+}
+
+long sys_read(int fd, void* buf, u64 len) {
+    process_t* p = process_current();
+    if (!p || !buf) return -K_EINVAL;
+    
+    u32 type = 0;
+    void* obj = fd_get_obj(p->fdtab, fd, &type);
+    if (!obj) return -K_EBADF;
+    
+    if (type == FD_TYPE_PIPE) {
+        return pipe_read((pipe_t*)obj, buf, (u32)len);
+    } else if (type == FD_TYPE_FILE) {
+        file_t* file = (file_t*)obj;
+        u64 bytes_read = 0;
+        int result = vfs_read(file, buf, len, &bytes_read);
+        if (result != 0) {
+            return -result;
+        }
+        return (long)bytes_read;
+    }
+    
+    return -K_EBADF;
+}
+
+
+long sys_close(int fd) {
+    process_t* p = process_current();
+    if (!p) return -K_EINVAL;
+    
+    u32 type = 0;
+    void* obj = fd_get_obj(p->fdtab, fd, &type);
+    if (!obj) return -K_EBADF;
+    
+    /* Close the underlying object */
+    if (type == FD_TYPE_PIPE) {
+        fd_entry_t* entry = &p->fdtab->entries[fd];
+        if (entry->flags == 0) pipe_close_read((pipe_t*)obj);
+        else pipe_close_write((pipe_t*)obj);
+    } else if (type == FD_TYPE_FILE) {
+        file_t* file = (file_t*)obj;
+        vfs_close(file);
+    }
+    
+    /* Remove from fd table */
+    return fd_close(p->fdtab, fd);
+}
+static long wrap_pipe(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_pipe((int*)a0);}
+static long wrap_read(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_read((int)a0,(void*)a1,a2);}
+static long wrap_close(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_close((int)a0);}
+#include "wait.h"
+long sys_fork(void) {
+    process_t* parent = process_current();
+    if (!parent) return -K_EINVAL;
+    process_t* child = NULL;
+    int rc = process_fork(parent, &child);
+    if (rc != K_OK) return -rc;
+    return (long)process_get_pid(child);
+}
+
+long sys_waitpid(int pid, int* status, int options) {
+    return process_waitpid((pid_t)pid, status, options);
+}
+#include "syscall.h"
+#include "uapi/syscalls.h"
+#include "exec.h"
+#include "kipc.h"
+#include "vfs.h"
+#include "process.h"
+#include "scheduler.h"
+#include "kernel.h"
+#include "signal.h"
+#include "uapi/syscalls.h"
+#include "net/ipv4.h"
+#include "auth.h"
+#include "update.h"
+#include "log.h"
+#include "syscall_hooks.h"
+
+extern void console_write(const char* s);
+
+long sys_write(int fd, const void* buf, u64 len) {
+    /* fd 1/2 -> kernel console; 0 ignored */
+    if (!buf) return -K_EINVAL;
+    if (fd == 1 || fd == 2) {
+        /* naive: ensure string is bounded */
+        char tmp[256];
+        u64 left = len;
+        const char* p = (const char*)buf;
+        while (left) {
+            u64 n = left > sizeof(tmp)-1 ? sizeof(tmp)-1 : left;
+            k_memcpy(tmp, p, (size_t)n);
+            tmp[n] = 0;
+            console_write(tmp);
+            p += n; left -= n;
+        }
+        return (long)len;
+    }
+    return -K_ENOTSUP;
+}
+
+long sys_exit(int status) {
+    process_t* p = process_current();
+    process_exit(p, status);
+    /* not reached */
+    return 0;
+}
+
+long sys_yield(void) {
+    return process_yield();
+}
+
+long sys_sleep_ms(u32 ms) {
+    u64 start = timer_get_ticks();
+    u64 freq = timer_get_freq_hz(); if (!freq) freq = 1000;
+    for (;;) {
+        u64 elapsed_ms = ((timer_get_ticks() - start) * 1000) / freq;
+        if (elapsed_ms >= ms) break;
+        scheduler_yield(); /* cooperative yield until proper sleep queue */
+    }
+    return 0;
+}
+
+long sys_getpid(void) {
+    process_t* p = process_current();
+    return p ? (long)process_get_pid(p) : -1;
+}
+
+/* VFS syscalls */
+long sys_open(const char* pathname, int flags, int mode) {
+    if (!pathname) return -K_EINVAL;
+    
+    process_t* p = process_current();
+    if (!p || !p->fdtab) return -K_EINVAL;
+    
+    /* Convert POSIX flags to VFS flags */
+    int vfs_flags = 0;
+    if (flags & 0x0000) vfs_flags |= VFS_O_RDONLY;    /* O_RDONLY */
+    if (flags & 0x0001) vfs_flags |= VFS_O_WRONLY;    /* O_WRONLY */
+    if (flags & 0x0002) vfs_flags |= VFS_O_RDWR;      /* O_RDWR */
+    if (flags & 0x0100) vfs_flags |= VFS_O_CREAT;     /* O_CREAT */
+    
+    /* Open file through VFS */
+    file_t* file = NULL;
+    int result = vfs_open(pathname, vfs_flags, &file);
+    if (result != 0) {
+        return -result;  /* Convert to negative errno */
+    }
+    
+    /* Allocate file descriptor */
+    int fd = fd_alloc(p->fdtab, file, FD_TYPE_FILE, vfs_flags);
+    if (fd < 0) {
+        vfs_close(file);
+        return fd;  /* Already negative */
+    }
+    
+    return fd;
+}
+
+long sys_stat(const char* pathname, void* statbuf) {
+    if (!pathname || !statbuf) return -K_EINVAL;
+    
+    /* Lookup file via VFS */
+    vnode_t* vnode = NULL;
+    int result = vfs_lookup(pathname, &vnode);
+    if (result != 0) {
+        return -result;
+    }
+    
+    /* Fill stat structure */
+    struct stat {
+        u64 st_size;
+        u32 st_mode;
+        u32 st_uid;
+        u32 st_gid;
+        u64 st_ino;
+        u32 st_nlink;
+        u32 pad[10];  /* Additional fields */
+    } *st = (struct stat*)statbuf;
+    
+    k_memset(st, 0, sizeof(*st));
+    st->st_size = vnode->size;
+    st->st_mode = vnode->mode;
+    st->st_uid = vnode->uid;
+    st->st_gid = vnode->gid;
+    st->st_ino = vnode->ino;
+    st->st_nlink = 1;
+    
+    /* Set file type bits */
+    if (vnode->type == VNODE_DIR) st->st_mode |= 0040000;      /* S_IFDIR */
+    else if (vnode->type == VNODE_FILE) st->st_mode |= 0100000; /* S_IFREG */
+    else if (vnode->type == VNODE_SYMLINK) st->st_mode |= 0120000; /* S_IFLNK */
+    
+    return 0;
+}
+
+long sys_lseek(int fd, u64 offset, int whence) {
+    if (fd < 0) return -K_EBADF;
+    
+    process_t* p = process_current();
+    if (!p || !p->fdtab) return -K_EBADF;
+    
+    /* Get file object */
+    u32 type = 0;
+    file_t* file = (file_t*)fd_get_obj(p->fdtab, fd, &type);
+    if (!file || type != FD_TYPE_FILE) return -K_EBADF;
+    
+    /* Seek in file */
+    int result = vfs_seek(file, (s64)offset, whence);
+    if (result != 0) {
+        return -result;
+    }
+    
+    return (long)vfs_tell(file);
+}
+
+long sys_access(const char* pathname, int mode) {
+    if (!pathname) return -K_EINVAL;
+    
+    /* Check if file exists and is accessible */
+    vnode_t* vnode = NULL;
+    int result = vfs_lookup(pathname, &vnode);
+    if (result != 0) {
+        return -result;
+    }
+    
+    /* Check permissions */
+    process_t* p = process_current();
+    u32 uid = p ? p->uid : 0;
+    u32 gid = p ? p->gid : 0;
+    
+    /* Root can access everything */
+    if (uid == 0) return 0;
+    
+    u32 file_mode = vnode->mode;
+    int allowed = 0;
+    
+    if (uid == vnode->uid) {
+        /* Owner permissions */
+        if ((mode & 4) && !(file_mode & 0400)) return -K_EACCES; /* Read */
+        if ((mode & 2) && !(file_mode & 0200)) return -K_EACCES; /* Write */
+        if ((mode & 1) && !(file_mode & 0100)) return -K_EACCES; /* Execute */
+        allowed = 1;
+    } else if (gid == vnode->gid) {
+        /* Group permissions */
+        if ((mode & 4) && !(file_mode & 0040)) return -K_EACCES;
+        if ((mode & 2) && !(file_mode & 0020)) return -K_EACCES;
+        if ((mode & 1) && !(file_mode & 0010)) return -K_EACCES;
+        allowed = 1;
+    } else {
+        /* Other permissions */
+        if ((mode & 4) && !(file_mode & 0004)) return -K_EACCES;
+        if ((mode & 2) && !(file_mode & 0002)) return -K_EACCES;
+        if ((mode & 1) && !(file_mode & 0001)) return -K_EACCES;
+        allowed = 1;
+    }
+    
+    return allowed ? 0 : -K_EACCES;
+}
+
+long sys_mkdir(const char* pathname, int mode) {
+    if (!pathname) return -K_EINVAL;
+    
+    /* Create directory via VFS */
+    int result = vfs_mkdir_path(pathname, (u32)mode);
+    return result == 0 ? 0 : -result;
+}
+
+long sys_chdir(const char* path) {
+    if (!path) return -K_EINVAL;
+    
+    /* Verify directory exists */
+    vnode_t* vnode = NULL;
+    int result = vfs_lookup(path, &vnode);
+    if (result != 0) {
+        return -result;
+    }
+    
+    if (vnode->type != VNODE_DIR) {
+        return -K_ENOTDIR;
+    }
+    
+    /* Update process current directory */
+    process_t* p = process_current();
+    if (!p) return -K_EINVAL;
+    
+    /* TODO: Store cwd in process structure */
+    /* For now, just succeed */
+    return 0;
+}
+
+/* Memory management syscalls */
+long sys_mmap(void* addr, u64 length, int prot, int flags, int fd, u64 offset) {
+    if (length == 0) return -K_EINVAL;
+    
+    process_t* p = process_current();
+    if (!p) return -K_EINVAL;
+    
+    /* TODO: Implement mmap via VMM when available */
+    /* For now, return a dummy address */
+    return (long)0x10000000;
+}
+
+long sys_munmap(void* addr, u64 length) {
+    if (!addr || length == 0) return -K_EINVAL;
+    
+    /* TODO: Implement munmap via VMM */
+    return 0;
+}
+
+long sys_brk(void* addr) {
+    process_t* p = process_current();
+    if (!p) return -K_EINVAL;
+    
+    /* TODO: Implement heap management */
+    return (long)addr;
+}
+
+/* Identity syscalls */
+long sys_getuid(void) {
+    process_t* p = process_current();
+    return p ? (long)p->uid : (long)UID_INVALID;
+}
+
+long sys_setuid(u32 uid) {
+    process_t* p = process_current();
+    if (!p) return -K_EINVAL;
+    /* Allow only root to change uid arbitrarily in Phase 3 */
+    if (p->uid != UID_ROOT) return -K_EPERM;
+    p->uid = (uid_t)uid;
+    p->gid = (gid_t)uid;
+    return 0;
+}
+
+long sys_auth_login(const char* username, const char* password) {
+    uid_t uid = UID_INVALID;
+    status_t st = auth_verify_password(username, password, &uid);
+    if (FAILED(st)) return -st;
+    /* On success, set current process uid to the authenticated uid */
+    process_t* p = process_current();
+    if (!p) return -K_EINVAL;
+    p->uid = uid;
+    p->gid = uid;
+    return (long)uid;
+}
+
+long sys_execve(const char* path, const char* const argv[], const char* const envp[]) {
+    u32 pid = 0;
+    int rc = exec_spawn(path, argv, envp, &pid);
+    if (rc != 0) return -rc;
+    return (long)pid;
+}
+
+long sys_ipc_create(u32* out_ep) {
+    if (!out_ep) return -K_EINVAL;
+    kendpoint_t ep=0;
+    int rc = kipc_endpoint_create(&ep);
+    if (rc != 0) return -rc;
+    *out_ep = ep;
+    return 0;
+}
+
+long sys_ipc_close(u32 ep) {
+    return -kipc_endpoint_close((kendpoint_t)ep);
+}
+
+long sys_ipc_send(const kipc_msg_t* m) {
+    if (!m) return -K_EINVAL;
+    return -kipc_send(m);
+}
+
+long sys_ipc_recv(u32 ep, kipc_msg_t* out, u32 timeout_ms) {
+    if (!out) return -K_EINVAL;
+    return -kipc_recv((kendpoint_t)ep, out, timeout_ms);
+}
+
+/* Minimal networking syscalls for Phase 1 */
+static u16 icmp_checksum(const u8* d, u32 len) {
+    u32 s=0; while (len>1){ s += ((u16)d[0]<<8)|d[1]; d+=2; len-=2; } if (len) s+=((u16)*d)<<8; while (s>>16) s=(s&0xFFFF)+(s>>16); return (u16)~s;
+}
+
+long sys_netping(u32 dst_ip_be, u16 ident, u16 seq, u32 timeout_ms) {
+    int sid = icmp_socket_open(); if (sid < 0) return sid;
+    u8 pkt[64]; k_memset(pkt,0,sizeof(pkt));
+    pkt[0]=8; pkt[1]=0; pkt[4]=(u8)(ident>>8); pkt[5]=(u8)(ident&0xFF); pkt[6]=(u8)(seq>>8); pkt[7]=(u8)(seq&0xFF);
+    u16 c = icmp_checksum(pkt, 8); pkt[2]=(u8)(c>>8); pkt[3]=(u8)c;
+    int rc = icmp_sendto(sid, pkt, 8, dst_ip_be); if (rc<0) return rc;
+    u64 start=timer_get_ticks(), hz=timer_get_freq_hz(); u8 buf[128]; u32 src=0;
+    for(;;){ int n = icmp_recvfrom(sid, buf, sizeof(buf), &src); if (n>=8 && buf[0]==0 /*echo reply*/){ return 0; }
+        if (timeout_ms){ u64 ms=((timer_get_ticks()-start)*1000)/(hz?hz:1000); if (ms>timeout_ms) return K_ETIMEDOUT; }
+        net_pump(); }
+}
+
+long sys_netconnect(u32 dst_ip_be, u16 dst_port_be, const void* payload, u32 len) {
+    int sid = udp_socket_open(); if (sid<0) return sid;
+    return udp_sendto(sid, payload, len, dst_ip_be, dst_port_be);
+}
+
+/* Dispatcher table */
+typedef long (*sys_fn_t)(u64,u64,u64,u64,u64,u64);
+
+static long wrap_write(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_write((int)a0,(const void*)a1,a2);}
+static long wrap_exit(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_exit((int)a0);}
+static long wrap_yield(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_yield();}
+static long wrap_sleep(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_sleep_ms((u32)a0);}
+static long wrap_getpid(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_getpid();}
+
+static long wrap_execve(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_execve((const char*)a0,(const char* const*)a1,(const char* const*)a2);}
+
+static long wrap_ipc_create(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_ipc_create((u32*)a0);}
+static long wrap_ipc_close(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_ipc_close((u32)a0);}
+static long wrap_ipc_send(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_ipc_send((const kipc_msg_t*)a0);}
+static long wrap_ipc_recv(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_ipc_recv((u32)a0,(kipc_msg_t*)a1,(u32)a2);}
+
+typedef struct { u64 num; sys_fn_t fn; } sysent_t;
+static long wrap_netping(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a4;(void)a5;return sys_netping((u32)a0,(u16)a1,(u16)a2,(u32)a3);} 
+static long wrap_netconnect(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a4;(void)a5;return sys_netconnect((u32)a0,(u16)a1,(const void*)a2,(u32)a3);} 
+static long wrap_getuid(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_getuid();}
+static long wrap_setuid(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_setuid((u32)a0);} 
+static long wrap_getgid(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;process_t* p=process_current();return p?(long)p->gid:-1;} 
+static long wrap_setgid(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;process_t* p=process_current(); if(!p) return -K_EINVAL; if(p->uid!=UID_ROOT) return -K_EPERM; p->gid=(gid_t)a0; return 0;} 
+static long wrap_auth_login(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return sys_auth_login((const char*)a0,(const char*)a1);} 
+static long wrap_update_get_meta(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;update_meta_t m; int rc=update_get_meta(&m); if(rc!=0) return -rc; if(a0){k_memcpy((void*)a0,&m,sizeof(m));} return 0;} 
+static long wrap_update_begin(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return -update_begin(a0?(char*)a0:NULL);} 
+static long wrap_update_apply(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return -update_apply_ota((const char*)a0);} 
+static long wrap_update_finalize(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return -update_finalize();} 
+static long wrap_update_mark_success(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return -update_mark_success();} 
+static long wrap_update_rollback(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return -update_rollback();} 
+static long wrap_klog_read(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return (long)klog_read((char*)a0,(u32)a1);} 
+static long wrap_umask(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; extern long sys_umask_impl(u32); return sys_umask_impl((u32)a0);} 
+static long wrap_chmod(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5; extern long sys_chmod_impl(const char*,u32); return sys_chmod_impl((const char*)a0,(u32)a1);} 
+static long wrap_chown(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5; extern long sys_chown_impl(const char*,u32,u32); return sys_chown_impl((const char*)a0,(u32)a1,(u32)a2);} 
+static long wrap_symlink(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5; extern long sys_symlink_impl(const char*,const char*); return sys_symlink_impl((const char*)a0,(const char*)a1);} 
+static long wrap_readlink(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5; extern long sys_readlink_impl(const char*,char*,u64); return sys_readlink_impl((const char*)a0,(char*)a1,a2);}
+
+/* VFS syscall wrappers */
+static long wrap_open(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_open((const char*)a0,(int)a1,(int)a2);}
+static long wrap_stat(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return sys_stat((const char*)a0,(void*)a1);}
+static long wrap_lseek(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_lseek((int)a0,a1,(int)a2);}
+static long wrap_access(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return sys_access((const char*)a0,(int)a1);}
+static long wrap_mkdir(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return sys_mkdir((const char*)a0,(int)a1);}
+static long wrap_chdir(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_chdir((const char*)a0);}
+
+/* VFS unlink syscall */
+long sys_unlink(const char* pathname) {
+    if (!pathname) return -K_EINVAL;
+    
+    int result = vfs_unlink_path(pathname);
+    return result == 0 ? 0 : -result;
+}
+
+long sys_rmdir(const char* pathname) {
+    if (!pathname) return -K_EINVAL;
+    
+    /* Check if it's a directory first */
+    vnode_t* vnode = NULL;
+    int result = vfs_lookup(pathname, &vnode);
+    if (result != 0) return -result;
+    
+    if (vnode->type != VNODE_DIR) {
+        return -K_ENOTDIR;
+    }
+    
+    /* Use unlink for removal */
+    result = vfs_unlink_path(pathname);
+    return result == 0 ? 0 : -result;
+}
+
+/* Memory management syscall wrappers */
+static long wrap_mmap(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){return sys_mmap((void*)a0,a1,(int)a2,(int)a3,(int)a4,a5);}
+static long wrap_munmap(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return sys_munmap((void*)a0,a1);}
+static long wrap_brk(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_brk((void*)a0);}
+static long wrap_unlink(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_unlink((const char*)a0);}
+static long wrap_rmdir(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_rmdir((const char*)a0);}
+
+/* Network syscall wrappers */
+static long wrap_socket(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_socket((int)a0,(int)a1,(int)a2);}
+static long wrap_bind(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_bind((int)a0,(const void*)a1,(u32)a2);}
+static long wrap_listen(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return sys_listen((int)a0,(int)a1);}
+static long wrap_accept(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_accept((int)a0,(void*)a1,(u32*)a2);}
+static long wrap_connect(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_connect((int)a0,(const void*)a1,(u32)a2);}
+static long wrap_send(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a4;(void)a5;return sys_send((int)a0,(const void*)a1,a2,(int)a3);}
+static long wrap_recv(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a4;(void)a5;return sys_recv((int)a0,(void*)a1,a2,(int)a3);}
+static long wrap_sendto(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){return sys_sendto((int)a0,(const void*)a1,a2,(int)a3,(const void*)a4,(u32)a5);}
+static long wrap_recvfrom(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){return sys_recvfrom((int)a0,(void*)a1,a2,(int)a3,(void*)a4,(u32*)a5);}
+static long wrap_close_socket(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_close_socket((int)a0);}
+static long wrap_net_init(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_net_init();}
+static long wrap_net_icmp_ping(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_net_icmp_ping((u32)a0,(u16)a1,(u32)a2);}
+
+/* Graphics syscall wrappers */
+static long wrap_graphics_init(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_graphics_init();}
+static long wrap_graphics_get_screen_info(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_graphics_get_screen_info((u32*)a0,(u32*)a1,(u32*)a2);}
+static long wrap_graphics_create_window(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a5;return sys_graphics_create_window((u32)a0,(u32)a1,(u32)a2,(u32)a3,(u32)a4);}
+static long wrap_graphics_create_buffer(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_graphics_create_buffer((u32)a0,(u32)a1,(u32)a2);}
+static long wrap_graphics_fill_rect(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){return sys_graphics_fill_rect((u32)a0,(u32)a1,(u32)a2,(u32)a3,(u32)a4,(u32)a5);}
+static long wrap_graphics_blit(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){return sys_graphics_blit((u32)a0,(u32)a1,(u32)a2,(u32)a3,(u32)a4,(u32)a5);}  /* Note: 8 args, truncated */
+static long wrap_graphics_present(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_graphics_present();}
+static long wrap_graphics_destroy_window(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_graphics_destroy_window((u32)a0);}
+static long wrap_graphics_destroy_buffer(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_graphics_destroy_buffer((u32)a0);}
+
+/* Signal syscall wrappers */
+static long wrap_sigaction(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_sigaction((int)a0,(const void*)a1,(void*)a2);}
+static long wrap_sigprocmask(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a3;(void)a4;(void)a5;return sys_sigprocmask((int)a0,(const void*)a1,(void*)a2);}
+static long wrap_kill(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a2;(void)a3;(void)a4;(void)a5;return sys_kill((int)a0,(int)a1);}
+static long wrap_sigreturn(u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;return sys_sigreturn();} 
+
+static const sysent_t g_table[] = {
+    { SYS_pipe,      wrap_pipe },
+    { SYS_read,      wrap_read },
+    { SYS_close,     wrap_close },
+    { SYS_fork,      (sys_fn_t)sys_fork },
+    { SYS_waitpid,   (sys_fn_t)sys_waitpid },
+    { SYS_write,     wrap_write },
+    { SYS_exit,      wrap_exit },
+    { SYS_yield,     wrap_yield },
+    { SYS_sleep_ms,  wrap_sleep },
+    { SYS_getpid,    wrap_getpid },
+    { SYS_execve,    wrap_execve },
+    { SYS_ipc_create,wrap_ipc_create },
+    { SYS_ipc_close, wrap_ipc_close },
+    { SYS_ipc_send,  wrap_ipc_send },
+    { SYS_ipc_recv,  wrap_ipc_recv },
+    { SYS_socket,    wrap_socket },
+    { SYS_bind,      wrap_bind },
+    { SYS_listen,    wrap_listen },
+    { SYS_accept,    wrap_accept },
+    { SYS_connect,   wrap_connect },
+    { SYS_send,      wrap_send },
+    { SYS_recv,      wrap_recv },
+    { SYS_sendto,    wrap_sendto },
+    { SYS_recvfrom,  wrap_recvfrom },
+    { SYS_close_socket, wrap_close_socket },
+    { SYS_netping,   wrap_netping },
+    { SYS_netconnect,wrap_netconnect },
+    { SYS_net_init,  wrap_net_init },
+    { SYS_net_icmp_ping, wrap_net_icmp_ping },
+    { SYS_graphics_init, wrap_graphics_init },
+    { SYS_graphics_get_screen_info, wrap_graphics_get_screen_info },
+    { SYS_graphics_create_window, wrap_graphics_create_window },
+    { SYS_graphics_create_buffer, wrap_graphics_create_buffer },
+    { SYS_graphics_fill_rect, wrap_graphics_fill_rect },
+    { SYS_graphics_blit, wrap_graphics_blit },
+    { SYS_graphics_present, wrap_graphics_present },
+    { SYS_graphics_destroy_window, wrap_graphics_destroy_window },
+    { SYS_graphics_destroy_buffer, wrap_graphics_destroy_buffer },
+    { SYS_getuid,    wrap_getuid },
+    { SYS_setuid,    wrap_setuid },
+    { SYS_getgid,    wrap_getgid },
+    { SYS_setgid,    wrap_setgid },
+    { SYS_kill,      wrap_kill },
+    { SYS_rt_sigaction, wrap_sigaction },
+    { SYS_rt_sigprocmask, wrap_sigprocmask },
+    { SYS_rt_sigreturn, wrap_sigreturn },
+    { SYS_auth_login,wrap_auth_login },
+    { SYS_update_get_meta,  wrap_update_get_meta },
+    { SYS_update_begin,     wrap_update_begin },
+    { SYS_update_apply,     wrap_update_apply },
+    { SYS_update_finalize,  wrap_update_finalize },
+    { SYS_update_mark_success, wrap_update_mark_success },
+    { SYS_update_rollback,  wrap_update_rollback },
+    { SYS_klog_read, wrap_klog_read },
+    { SYS_umask,     wrap_umask },
+    { SYS_chmod,     wrap_chmod },
+    { SYS_chown,     wrap_chown },
+    { SYS_symlink,   wrap_symlink },
+    { SYS_readlink,  wrap_readlink },
+        { 58,      (sys_fn_t)sys_fork }, // SYS_fork
+        { 61,   (sys_fn_t)sys_waitpid }, // SYS_waitpid
+    
+    /* Standard POSIX syscalls */
+    { 2,       wrap_open },     // SYS_open
+    { 4,       wrap_stat },     // SYS_stat
+    { 8,       wrap_lseek },    // SYS_lseek
+    { 9,       wrap_mmap },     // SYS_mmap
+    { 11,      wrap_munmap },   // SYS_munmap
+    { 12,      wrap_brk },      // SYS_brk
+    { 21,      wrap_access },   // SYS_access
+    { 80,      wrap_chdir },    // SYS_chdir
+    { 83,      wrap_mkdir },    // SYS_mkdir
+    { 84,      wrap_rmdir },    // SYS_rmdir
+    { 87,      wrap_unlink },   // SYS_unlink
+};
+
+/* Internal hook helpers (from syscall_hooks.c) */
+extern long __syscall_hooks_invoke_pre(u64 num, u64* a0,u64* a1,u64* a2,u64* a3,u64* a4,u64* a5);
+extern long __syscall_hooks_invoke_post(u64 num, long in_res, long* final_res);
+
+u64 syscall_dispatch(u64 num, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    /* Pre hooks can mutate args or abort */
+    long pre_rc = __syscall_hooks_invoke_pre(num, &a0,&a1,&a2,&a3,&a4,&a5);
+    if (pre_rc != 0) return (u64)pre_rc;
+
+    long result = -K_ENOSYS;
+    long final_res = result; /* declared early to avoid C label + decl rule */
+    for (u32 i=0;i<sizeof(g_table)/sizeof(g_table[0]);++i) {
+        if (g_table[i].num == num) {
+            result = g_table[i].fn(a0,a1,a2,a3,a4,a5);
+            goto done_dispatch;
+        }
+    }
+    /* If an extension dispatcher is linked, delegate unknown syscalls there */
+    extern u64 syscall_dispatch_ext(u64,u64,u64,u64,u64,u64,u64) __attribute__((weak));
+    if (syscall_dispatch_ext) {
+        result = (long)syscall_dispatch_ext(num, a0,a1,a2,a3,a4,a5);
+    }
+done_dispatch:
+    final_res = result;
+    __syscall_hooks_invoke_post(num, result, &final_res);
+    return (u64)final_res;
+}

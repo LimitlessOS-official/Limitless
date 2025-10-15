@@ -1,0 +1,504 @@
+/**
+ * Secure Boot Verification System for LimitlessOS
+ * Ensures boot integrity and validates system components
+ */
+
+#include "kernel.h"
+#include "security.h"
+#include "vmm.h"
+#include "string.h"
+
+/* Secure boot state */
+typedef struct {
+    bool initialized;
+    bool enabled;
+    bool verification_passed;
+    
+    /* Boot measurements */
+    struct {
+        uint8_t bootloader_hash[32];
+        uint8_t kernel_hash[32];
+        uint8_t initrd_hash[32];
+        uint8_t config_hash[32];
+        bool measurements_valid;
+    } measurements;
+    
+    /* Trusted certificates */
+    struct {
+        uint8_t public_key[256];  /* RSA-2048 public key */
+        uint32_t key_size;
+        char issuer[128];
+        uint64_t expiry_time;
+        bool is_valid;
+    } certificates[MAX_BOOT_CERTIFICATES];
+    uint32_t certificate_count;
+    
+    /* Boot policy */
+    struct {
+        bool require_signed_kernel;
+        bool require_signed_modules;
+        bool allow_unsigned_debug;
+        bool enforce_module_whitelist;
+        char trusted_root_ca[128];
+    } policy;
+    
+    /* Verification chain */
+    struct {
+        char component_name[64];
+        uint8_t signature[256];
+        uint32_t signature_size;
+        bool verified;
+        uint64_t verification_time;
+    } verification_chain[MAX_BOOT_COMPONENTS];
+    uint32_t chain_length;
+    
+    spinlock_t lock;
+} secure_boot_system_t;
+
+static secure_boot_system_t g_secure_boot = {0};
+
+/* Simplified RSA signature verification (placeholder) */
+static bool rsa_verify_signature(const uint8_t* public_key, uint32_t key_size,
+                                const uint8_t* data, uint32_t data_size,
+                                const uint8_t* signature, uint32_t signature_size) {
+    /* In real implementation, would perform proper RSA verification */
+    /* For demonstration, use simple checksum verification */
+    uint32_t data_checksum = 0;
+    uint32_t sig_checksum = 0;
+    
+    for (uint32_t i = 0; i < data_size; i++) {
+        data_checksum += data[i];
+    }
+    
+    for (uint32_t i = 0; i < signature_size && i < 4; i++) {
+        sig_checksum = (sig_checksum << 8) | signature[i];
+    }
+    
+    /* Simple verification: signature should match data checksum XOR with key */
+    uint32_t key_checksum = 0;
+    for (uint32_t i = 0; i < key_size && i < 4; i++) {
+        key_checksum = (key_checksum << 8) | public_key[i];
+    }
+    
+    return (data_checksum ^ key_checksum) == sig_checksum;
+}
+
+/* Initialize secure boot system */
+status_t secure_boot_init(void) {
+    if (g_secure_boot.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    k_memset(&g_secure_boot, 0, sizeof(secure_boot_system_t));
+    spinlock_init(&g_secure_boot.lock);
+    
+    /* Set default boot policy */
+    g_secure_boot.policy.require_signed_kernel = true;
+    g_secure_boot.policy.require_signed_modules = true;
+    g_secure_boot.policy.allow_unsigned_debug = false;
+    g_secure_boot.policy.enforce_module_whitelist = true;
+    k_strcpy(g_secure_boot.policy.trusted_root_ca, "LimitlessOS Root CA");
+    
+    /* Load default trusted certificate (simplified) */
+    if (g_secure_boot.certificate_count < MAX_BOOT_CERTIFICATES) {
+        /* Generate a default certificate for demonstration */
+        struct {
+            uint8_t public_key[256];
+            uint32_t key_size;
+            char issuer[128];
+            uint64_t expiry_time;
+            bool is_valid;
+        }* cert = &g_secure_boot.certificates[0];
+        
+        /* Generate default public key (simplified) */
+        cert->key_size = 256;
+        for (uint32_t i = 0; i < cert->key_size; i++) {
+            cert->public_key[i] = (uint8_t)(0x42 + i);  /* Deterministic key for testing */
+        }
+        
+        k_strcpy(cert->issuer, "LimitlessOS Root CA");
+        cert->expiry_time = timer_get_ticks() + (365 * 24 * 60 * 60 * TIMER_HZ);  /* 1 year */
+        cert->is_valid = true;
+        
+        g_secure_boot.certificate_count = 1;
+    }
+    
+    g_secure_boot.enabled = false;  /* Disabled by default, enabled by boot loader */
+    g_secure_boot.initialized = true;
+    
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Secure boot system initialized", "secure_boot", 1);
+    
+    return STATUS_OK;
+}
+
+/* Enable secure boot */
+status_t secure_boot_enable(void) {
+    if (!g_secure_boot.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    g_secure_boot.enabled = true;
+    
+    /* Start verification process */
+    g_secure_boot.verification_passed = false;
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Secure boot enabled", "secure_boot", 1);
+    
+    return STATUS_OK;
+}
+
+/* Add trusted certificate */
+status_t secure_boot_add_certificate(const uint8_t* public_key, uint32_t key_size,
+                                    const char* issuer, uint64_t expiry_time) {
+    if (!g_secure_boot.initialized || !public_key || !issuer || key_size > 256) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    if (g_secure_boot.certificate_count >= MAX_BOOT_CERTIFICATES) {
+        spin_unlock(&g_secure_boot.lock);
+        return STATUS_FULL;
+    }
+    
+    struct {
+        uint8_t public_key[256];
+        uint32_t key_size;
+        char issuer[128];
+        uint64_t expiry_time;
+        bool is_valid;
+    }* cert = &g_secure_boot.certificates[g_secure_boot.certificate_count];
+    
+    k_memcpy(cert->public_key, public_key, key_size);
+    cert->key_size = key_size;
+    
+    strncpy(cert->issuer, issuer, sizeof(cert->issuer) - 1);
+    cert->issuer[sizeof(cert->issuer) - 1] = 0;
+    
+    cert->expiry_time = expiry_time;
+    cert->is_valid = true;
+    
+    g_secure_boot.certificate_count++;
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    security_audit_event(SECURITY_EVENT_CRYPTO_OPERATION, 0, 0,
+                        "Trusted certificate added", issuer, 1);
+    
+    return STATUS_OK;
+}
+
+/* Verify component signature */
+status_t secure_boot_verify_component(const char* component_name, const uint8_t* data, uint32_t data_size,
+                                     const uint8_t* signature, uint32_t signature_size) {
+    if (!g_secure_boot.initialized || !component_name || !data || !signature) {
+        return STATUS_ERROR;
+    }
+    
+    if (!g_secure_boot.enabled) {
+        /* If secure boot is disabled, allow unsigned components */
+        return STATUS_OK;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    bool verification_passed = false;
+    
+    /* Try to verify signature with each trusted certificate */
+    for (uint32_t i = 0; i < g_secure_boot.certificate_count; i++) {
+        struct {
+            uint8_t public_key[256];
+            uint32_t key_size;
+            char issuer[128];
+            uint64_t expiry_time;
+            bool is_valid;
+        }* cert = &g_secure_boot.certificates[i];
+        
+        if (!cert->is_valid || timer_get_ticks() > cert->expiry_time) {
+            continue;  /* Certificate expired or invalid */
+        }
+        
+        if (rsa_verify_signature(cert->public_key, cert->key_size,
+                               data, data_size, signature, signature_size)) {
+            verification_passed = true;
+            break;
+        }
+    }
+    
+    /* Record verification in chain */
+    if (g_secure_boot.chain_length < MAX_BOOT_COMPONENTS) {
+        struct {
+            char component_name[64];
+            uint8_t signature[256];
+            uint32_t signature_size;
+            bool verified;
+            uint64_t verification_time;
+        }* entry = &g_secure_boot.verification_chain[g_secure_boot.chain_length];
+        
+        strncpy(entry->component_name, component_name, sizeof(entry->component_name) - 1);
+        entry->component_name[sizeof(entry->component_name) - 1] = 0;
+        
+        k_memcpy(entry->signature, signature, 
+                min(signature_size, sizeof(entry->signature)));
+        entry->signature_size = min(signature_size, sizeof(entry->signature));
+        
+        entry->verified = verification_passed;
+        entry->verification_time = timer_get_ticks();
+        
+        g_secure_boot.chain_length++;
+    }
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    /* Audit verification result */
+    if (verification_passed) {
+        security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                            "Component signature verified", component_name, 1);
+    } else {
+        security_audit_event(SECURITY_EVENT_ACCESS_DENIED, 0, 0,
+                            "Component signature verification failed", component_name, 0);
+    }
+    
+    return verification_passed ? STATUS_OK : STATUS_DENIED;
+}
+
+/* Measure boot component */
+status_t secure_boot_measure_component(const char* component_name, const uint8_t* data, uint32_t data_size) {
+    if (!g_secure_boot.initialized || !component_name || !data) {
+        return STATUS_ERROR;
+    }
+    
+    /* Compute hash of component */
+    uint8_t hash[32];
+    crypto_hash(HASH_ALG_SHA256, data, data_size, hash, &(size_t){32});
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    /* Store measurement based on component type */
+    if (strcmp(component_name, "bootloader") == 0) {
+        k_memcpy(g_secure_boot.measurements.bootloader_hash, hash, 32);
+    } else if (strcmp(component_name, "kernel") == 0) {
+        k_memcpy(g_secure_boot.measurements.kernel_hash, hash, 32);
+    } else if (strcmp(component_name, "initrd") == 0) {
+        k_memcpy(g_secure_boot.measurements.initrd_hash, hash, 32);
+    } else if (strcmp(component_name, "config") == 0) {
+        k_memcpy(g_secure_boot.measurements.config_hash, hash, 32);
+    }
+    
+    g_secure_boot.measurements.measurements_valid = true;
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    security_audit_event(SECURITY_EVENT_CRYPTO_OPERATION, 0, 0,
+                        "Boot component measured", component_name, 1);
+    
+    return STATUS_OK;
+}
+
+/* Validate boot chain */
+status_t secure_boot_validate_chain(void) {
+    if (!g_secure_boot.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    if (!g_secure_boot.enabled) {
+        /* If secure boot disabled, validation always passes */
+        g_secure_boot.verification_passed = true;
+        return STATUS_OK;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    bool chain_valid = true;
+    uint32_t verified_components = 0;
+    
+    /* Check that all required components are verified */
+    for (uint32_t i = 0; i < g_secure_boot.chain_length; i++) {
+        struct {
+            char component_name[64];
+            uint8_t signature[256];
+            uint32_t signature_size;
+            bool verified;
+            uint64_t verification_time;
+        }* entry = &g_secure_boot.verification_chain[i];
+        
+        if (entry->verified) {
+            verified_components++;
+        } else {
+            /* Check if this component is required */
+            if ((g_secure_boot.policy.require_signed_kernel && strcmp(entry->component_name, "kernel") == 0) ||
+                (g_secure_boot.policy.require_signed_modules && strstr(entry->component_name, "module"))) {
+                chain_valid = false;
+                break;
+            }
+        }
+    }
+    
+    /* Minimum required: kernel must be verified if policy requires it */
+    if (g_secure_boot.policy.require_signed_kernel && verified_components == 0) {
+        chain_valid = false;
+    }
+    
+    g_secure_boot.verification_passed = chain_valid;
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    if (chain_valid) {
+        security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                            "Boot chain validation passed", "secure_boot", 1);
+    } else {
+        security_audit_event(SECURITY_EVENT_ACCESS_DENIED, 0, 0,
+                            "Boot chain validation failed", "secure_boot", 0);
+    }
+    
+    return chain_valid ? STATUS_OK : STATUS_DENIED;
+}
+
+/* Get boot measurements */
+status_t secure_boot_get_measurements(secure_boot_measurements_t* measurements) {
+    if (!g_secure_boot.initialized || !measurements) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    k_memset(measurements, 0, sizeof(secure_boot_measurements_t));
+    
+    if (g_secure_boot.measurements.measurements_valid) {
+        k_memcpy(measurements->bootloader_hash, g_secure_boot.measurements.bootloader_hash, 32);
+        k_memcpy(measurements->kernel_hash, g_secure_boot.measurements.kernel_hash, 32);
+        k_memcpy(measurements->initrd_hash, g_secure_boot.measurements.initrd_hash, 32);
+        k_memcpy(measurements->config_hash, g_secure_boot.measurements.config_hash, 32);
+        measurements->measurements_valid = true;
+    }
+    
+    measurements->secure_boot_enabled = g_secure_boot.enabled;
+    measurements->verification_passed = g_secure_boot.verification_passed;
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    return STATUS_OK;
+}
+
+/* Get verification chain */
+status_t secure_boot_get_chain(secure_boot_chain_t* chain) {
+    if (!g_secure_boot.initialized || !chain) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    k_memset(chain, 0, sizeof(secure_boot_chain_t));
+    
+    chain->enabled = g_secure_boot.enabled;
+    chain->verification_passed = g_secure_boot.verification_passed;
+    chain->component_count = min(g_secure_boot.chain_length, MAX_BOOT_COMPONENTS);
+    
+    for (uint32_t i = 0; i < chain->component_count; i++) {
+        struct {
+            char component_name[64];
+            uint8_t signature[256];
+            uint32_t signature_size;
+            bool verified;
+            uint64_t verification_time;
+        }* src = &g_secure_boot.verification_chain[i];
+        
+        secure_boot_component_t* dst = &chain->components[i];
+        
+        strncpy(dst->name, src->component_name, sizeof(dst->name) - 1);
+        dst->name[sizeof(dst->name) - 1] = 0;
+        
+        dst->verified = src->verified;
+        dst->verification_time = src->verification_time;
+        dst->signature_size = src->signature_size;
+        
+        k_memcpy(dst->signature, src->signature, 
+                min(src->signature_size, sizeof(dst->signature)));
+    }
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    return STATUS_OK;
+}
+
+/* Set boot policy */
+status_t secure_boot_set_policy(const secure_boot_policy_t* policy) {
+    if (!g_secure_boot.initialized || !policy) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    g_secure_boot.policy.require_signed_kernel = policy->require_signed_kernel;
+    g_secure_boot.policy.require_signed_modules = policy->require_signed_modules;
+    g_secure_boot.policy.allow_unsigned_debug = policy->allow_unsigned_debug;
+    g_secure_boot.policy.enforce_module_whitelist = policy->enforce_module_whitelist;
+    
+    if (policy->trusted_root_ca) {
+        strncpy(g_secure_boot.policy.trusted_root_ca, policy->trusted_root_ca,
+                sizeof(g_secure_boot.policy.trusted_root_ca) - 1);
+        g_secure_boot.policy.trusted_root_ca[sizeof(g_secure_boot.policy.trusted_root_ca) - 1] = 0;
+    }
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Secure boot policy updated", "boot_policy", 1);
+    
+    return STATUS_OK;
+}
+
+/* Get boot policy */
+status_t secure_boot_get_policy(secure_boot_policy_t* policy) {
+    if (!g_secure_boot.initialized || !policy) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    k_memset(policy, 0, sizeof(secure_boot_policy_t));
+    
+    policy->require_signed_kernel = g_secure_boot.policy.require_signed_kernel;
+    policy->require_signed_modules = g_secure_boot.policy.require_signed_modules;
+    policy->allow_unsigned_debug = g_secure_boot.policy.allow_unsigned_debug;
+    policy->enforce_module_whitelist = g_secure_boot.policy.enforce_module_whitelist;
+    
+    strncpy(policy->trusted_root_ca, g_secure_boot.policy.trusted_root_ca,
+            sizeof(policy->trusted_root_ca) - 1);
+    policy->trusted_root_ca[sizeof(policy->trusted_root_ca) - 1] = 0;
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    return STATUS_OK;
+}
+
+/* Check if secure boot is enabled and verified */
+bool secure_boot_is_verified(void) {
+    if (!g_secure_boot.initialized) {
+        return false;
+    }
+    
+    return g_secure_boot.enabled && g_secure_boot.verification_passed;
+}
+
+/* Shutdown secure boot system */
+status_t secure_boot_shutdown(void) {
+    if (!g_secure_boot.initialized) {
+        return STATUS_OK;
+    }
+    
+    spin_lock(&g_secure_boot.lock);
+    
+    /* Clear sensitive data */
+    k_memset(&g_secure_boot, 0, sizeof(secure_boot_system_t));
+    
+    spin_unlock(&g_secure_boot.lock);
+    
+    return STATUS_OK;
+}

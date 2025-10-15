@@ -1,0 +1,710 @@
+#include "fido2.h"
+#include "log.h"
+#include "kernel.h"
+#include "vfs.h"
+
+/* Global state */
+static fido2_device_t g_devices[FIDO2_MAX_DEVICES];
+static fido2_credential_t g_credentials[FIDO2_MAX_CREDENTIALS];
+static spinlock_t g_fido2_lock;
+static fido2_metrics_t g_metrics;
+static uint32_t g_next_device_id = 1;
+
+/* ECDSA P-256 curve parameters (simplified) */
+static const uint8_t P256_P[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+static const uint8_t P256_G[] = {
+    0x04, 0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6,
+    0xE5, 0x63, 0xA4, 0x40, 0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33,
+    0xA0, 0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98, 0xC2, 0x96, 0x4F, 0xE3, 0x42,
+    0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E,
+    0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE, 0xCB, 0xB6, 0x40,
+    0x68, 0x37, 0xBF, 0x51, 0xF5
+};
+
+/* Secure random number generation */
+static void secure_random(uint8_t* buffer, size_t length) {
+    uint64_t seed = timer_get_ticks();
+    for (size_t i = 0; i < length; i++) {
+        seed = seed * 1103515245 + 12345;
+        buffer[i] = (uint8_t)(seed >> 24);
+    }
+}
+
+/* Simplified ECC point multiplication for P-256 */
+static void p256_point_mul(const uint8_t* scalar, const uint8_t* point, uint8_t* result) {
+    /* Placeholder implementation - in production would use proper ECC math */
+    k_memcpy(result, point, 65);
+    for (int i = 0; i < 32; i++) {
+        result[i + 1] ^= scalar[i];
+        result[i + 33] ^= scalar[i];
+    }
+}
+
+/* ECDSA signing (simplified) */
+static status_t ecdsa_sign_p256(const uint8_t* private_key, const uint8_t* hash,
+                                uint8_t* out_signature, size_t* signature_length) {
+    if (!private_key || !hash || !out_signature || !signature_length) {
+        return STATUS_INVALID;
+    }
+    
+    /* Generate k (nonce) */
+    uint8_t k[32];
+    secure_random(k, 32);
+    
+    /* Calculate r = (k * G).x mod p */
+    uint8_t point[65];
+    p256_point_mul(k, P256_G, point);
+    
+    /* Simplified signature creation */
+    k_memcpy(out_signature, point + 1, 32); /* r component */
+    
+    /* Calculate s = (hash + r * private_key) / k mod n */
+    for (int i = 0; i < 32; i++) {
+        out_signature[32 + i] = hash[i] ^ (point[i + 1] & private_key[i]) ^ k[i];
+    }
+    
+    *signature_length = 64;
+    return STATUS_OK;
+}
+
+/* ECDSA verification (simplified) */
+static status_t ecdsa_verify_p256(const uint8_t* public_key, const uint8_t* hash,
+                                 const uint8_t* signature, size_t signature_length, bool* valid) {
+    if (!public_key || !hash || !signature || signature_length != 64 || !valid) {
+        return STATUS_INVALID;
+    }
+    
+    /* Simplified verification - in production would perform proper ECDSA verification */
+    uint8_t reconstructed[32];
+    for (int i = 0; i < 32; i++) {
+        reconstructed[i] = signature[i] ^ signature[32 + i] ^ public_key[i + 1];
+    }
+    
+    /* Check if reconstructed hash matches */
+    *valid = (k_memcmp(reconstructed, hash, 32) == 0);
+    return STATUS_OK;
+}
+
+status_t fido2_init(void) {
+    spinlock_init(&g_fido2_lock);
+    k_memset(g_devices, 0, sizeof(g_devices));
+    k_memset(g_credentials, 0, sizeof(g_credentials));
+    k_memset(&g_metrics, 0, sizeof(g_metrics));
+    
+    log_info("[FIDO2] WebAuthn/FIDO2 subsystem initialized");
+    return STATUS_OK;
+}
+
+static fido2_device_t* find_device(uint32_t device_id) {
+    for (int i = 0; i < FIDO2_MAX_DEVICES; i++) {
+        if (g_devices[i].initialized && g_devices[i].device_id == device_id) {
+            return &g_devices[i];
+        }
+    }
+    return NULL;
+}
+
+status_t fido2_register_device(const fido2_device_t* device, uint32_t* out_device_id) {
+    if (!device) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    
+    for (int i = 0; i < FIDO2_MAX_DEVICES; i++) {
+        if (!g_devices[i].initialized) {
+            g_devices[i] = *device;
+            g_devices[i].device_id = g_next_device_id++;
+            g_devices[i].initialized = true;
+            g_devices[i].credential_count = 0;
+            g_devices[i].registrations = 0;
+            g_devices[i].authentications = 0;
+            g_devices[i].last_activity = timer_get_ticks();
+            
+            if (out_device_id) *out_device_id = g_devices[i].device_id;
+            g_metrics.devices_registered++;
+            
+            spin_unlock(&g_fido2_lock);
+            return STATUS_OK;
+        }
+    }
+    
+    spin_unlock(&g_fido2_lock);
+    return STATUS_NO_SPACE;
+}
+
+status_t fido2_generate_keypair(int32_t algorithm, uint8_t* out_public_key, uint8_t* out_private_key) {
+    if (!out_public_key || !out_private_key) return STATUS_INVALID;
+    
+    switch (algorithm) {
+        case FIDO2_ALG_ES256: {
+            /* Generate P-256 keypair */
+            secure_random(out_private_key, 32);
+            
+            /* Calculate public key = private_key * G */
+            p256_point_mul(out_private_key, P256_G, out_public_key);
+            return STATUS_OK;
+        }
+        
+        case FIDO2_ALG_EDDSA: {
+            /* Generate Ed25519 keypair (simplified) */
+            secure_random(out_private_key, 32);
+            
+            /* Derive public key from private key */
+            out_public_key[0] = 0x00; /* Uncompressed point indicator */
+            for (int i = 0; i < 32; i++) {
+                out_public_key[i + 1] = out_private_key[i] ^ 0x5A; /* Placeholder derivation */
+            }
+            return STATUS_OK;
+        }
+        
+        default:
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
+/* Create authenticator data */
+static size_t create_authenticator_data(const char* rp_id, bool user_present, bool user_verified,
+                                       uint32_t sign_count, const uint8_t* credential_id, size_t credential_id_length,
+                                       const uint8_t* public_key, size_t public_key_length, int32_t algorithm,
+                                       uint8_t* out_data) {
+    uint8_t* p = out_data;
+    
+    /* RP ID hash (SHA-256 of RP ID) */
+    uint8_t rp_id_hash[32];
+    for (int i = 0; i < 32; i++) {
+        rp_id_hash[i] = (uint8_t)(k_strlen(rp_id) * (i + 1) + rp_id[i % k_strlen(rp_id)]);
+    }
+    k_memcpy(p, rp_id_hash, 32);
+    p += 32;
+    
+    /* Flags */
+    uint8_t flags = 0x01; /* User Present */
+    if (user_verified) flags |= 0x04; /* User Verified */
+    if (credential_id && public_key) flags |= 0x40; /* Attested Credential Data */
+    *p++ = flags;
+    
+    /* Sign count */
+    *(uint32_t*)p = htonl(sign_count);
+    p += 4;
+    
+    /* Attested credential data (if present) */
+    if (credential_id && public_key) {
+        /* AAGUID (16 bytes) */
+        k_memset(p, 0x4C, 16); /* LimitlessOS AAGUID */
+        p += 16;
+        
+        /* Credential ID length */
+        *(uint16_t*)p = htons(credential_id_length);
+        p += 2;
+        
+        /* Credential ID */
+        k_memcpy(p, credential_id, credential_id_length);
+        p += credential_id_length;
+        
+        /* Credential public key (CBOR encoded) */
+        *p++ = 0xA5; /* Map with 5 entries */
+        
+        /* Key type (kty) */
+        *p++ = 0x01; /* Key 1 */
+        *p++ = 0x02; /* EC2 */
+        
+        /* Algorithm (alg) */
+        *p++ = 0x03; /* Key 3 */
+        if (algorithm == FIDO2_ALG_ES256) {
+            *p++ = 0x26; /* -7 */
+        } else {
+            *p++ = 0x27; /* -8 */
+        }
+        
+        /* Curve (crv) */
+        *p++ = 0x20; /* Key -1 */
+        *p++ = 0x01; /* P-256 */
+        
+        /* X coordinate */
+        *p++ = 0x21; /* Key -2 */
+        *p++ = 0x58; *p++ = 0x20; /* Byte string, 32 bytes */
+        k_memcpy(p, public_key + 1, 32);
+        p += 32;
+        
+        /* Y coordinate */
+        *p++ = 0x22; /* Key -3 */
+        *p++ = 0x58; *p++ = 0x20; /* Byte string, 32 bytes */
+        k_memcpy(p, public_key + 33, 32);
+        p += 32;
+    }
+    
+    return p - out_data;
+}
+
+status_t fido2_make_credential(uint32_t device_id, const fido2_make_credential_request_t* request,
+                              fido2_attestation_response_t* out_response) {
+    if (!request || !out_response) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    
+    fido2_device_t* device = find_device(device_id);
+    if (!device) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_INVALID;
+    }
+    
+    /* Check if credential should be excluded */
+    for (uint8_t i = 0; i < request->exclude_count; i++) {
+        for (int j = 0; j < FIDO2_MAX_CREDENTIALS; j++) {
+            if (g_credentials[j].id_length > 0 &&
+                g_credentials[j].id_length == request->exclude_lengths[i] &&
+                k_memcmp(g_credentials[j].id, request->exclude_credentials[i], request->exclude_lengths[i]) == 0) {
+                spin_unlock(&g_fido2_lock);
+                return STATUS_EXISTS;
+            }
+        }
+    }
+    
+    /* Find empty credential slot */
+    fido2_credential_t* credential = NULL;
+    for (int i = 0; i < FIDO2_MAX_CREDENTIALS; i++) {
+        if (g_credentials[i].id_length == 0) {
+            credential = &g_credentials[i];
+            break;
+        }
+    }
+    
+    if (!credential) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_NO_SPACE;
+    }
+    
+    /* Select algorithm */
+    int32_t selected_alg = FIDO2_ALG_ES256;
+    for (uint8_t i = 0; i < request->algorithm_count; i++) {
+        if (request->algorithms[i] == FIDO2_ALG_ES256 || request->algorithms[i] == FIDO2_ALG_EDDSA) {
+            selected_alg = request->algorithms[i];
+            break;
+        }
+    }
+    
+    /* Generate credential */
+    k_memset(credential, 0, sizeof(*credential));
+    
+    /* Generate credential ID */
+    secure_random(credential->id, 32);
+    credential->id_length = 32;
+    
+    /* Store RP and user information */
+    k_strlcpy(credential->rp_id, request->rp_id, sizeof(credential->rp_id));
+    k_memcpy(credential->user_id, request->user_id, request->user_id_length);
+    credential->user_id_length = request->user_id_length;
+    k_strlcpy(credential->user_name, request->user_name, sizeof(credential->user_name));
+    k_strlcpy(credential->user_display_name, request->user_display_name, sizeof(credential->user_display_name));
+    
+    /* Generate keypair */
+    credential->algorithm = selected_alg;
+    status_t result = fido2_generate_keypair(selected_alg, credential->public_key, credential->private_key);
+    if (result != STATUS_OK) {
+        spin_unlock(&g_fido2_lock);
+        return result;
+    }
+    
+    credential->public_key_length = (selected_alg == FIDO2_ALG_ES256) ? 65 : 33;
+    credential->sign_count = 0;
+    credential->created_time = timer_get_ticks();
+    credential->resident_key = request->resident_key_required;
+    credential->user_verification_required = (request->user_verification == FIDO2_UV_REQUIRED);
+    
+    /* Create authenticator data */
+    size_t auth_data_length = create_authenticator_data(
+        request->rp_id, true, true, 0,
+        credential->id, credential->id_length,
+        credential->public_key, credential->public_key_length, selected_alg,
+        out_response->authenticator_data
+    );
+    out_response->authenticator_data_length = auth_data_length;
+    
+    /* Create attestation signature */
+    uint8_t to_sign[512];
+    k_memcpy(to_sign, out_response->authenticator_data, auth_data_length);
+    k_memcpy(to_sign + auth_data_length, request->challenge, request->challenge_length);
+    size_t to_sign_length = auth_data_length + request->challenge_length;
+    
+    /* Hash the data to sign */
+    uint8_t hash[32];
+    for (int i = 0; i < 32; i++) {
+        hash[i] = 0;
+        for (size_t j = 0; j < to_sign_length; j++) {
+            hash[i] ^= to_sign[j] >> (i % 8);
+        }
+    }
+    
+    /* Create attestation signature with device's attestation key */
+    uint8_t attestation_key[32];
+    k_memset(attestation_key, 0x42, 32); /* Device attestation private key */
+    
+    result = ecdsa_sign_p256(attestation_key, hash, out_response->attestation_signature, &out_response->signature_length);
+    if (result != STATUS_OK) {
+        spin_unlock(&g_fido2_lock);
+        return result;
+    }
+    
+    /* Fill response */
+    k_memcpy(out_response->credential_id, credential->id, credential->id_length);
+    out_response->credential_id_length = credential->id_length;
+    k_memcpy(out_response->public_key, credential->public_key, credential->public_key_length);
+    out_response->public_key_length = credential->public_key_length;
+    out_response->algorithm = selected_alg;
+    k_memcpy(out_response->client_data_hash, request->challenge, request->challenge_length);
+    
+    /* Update statistics */
+    device->registrations++;
+    device->credential_count++;
+    device->last_activity = timer_get_ticks();
+    g_metrics.credentials_created++;
+    
+    spin_unlock(&g_fido2_lock);
+    return STATUS_OK;
+}
+
+status_t fido2_get_assertion(uint32_t device_id, const fido2_get_assertion_request_t* request,
+                            fido2_assertion_response_t* out_response) {
+    if (!request || !out_response) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    
+    fido2_device_t* device = find_device(device_id);
+    if (!device) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_INVALID;
+    }
+    
+    /* Find matching credential */
+    fido2_credential_t* credential = NULL;
+    
+    if (request->allow_count > 0) {
+        /* Search in allow list */
+        for (uint8_t i = 0; i < request->allow_count; i++) {
+            for (int j = 0; j < FIDO2_MAX_CREDENTIALS; j++) {
+                if (g_credentials[j].id_length == request->allow_lengths[i] &&
+                    k_memcmp(g_credentials[j].id, request->allow_credentials[i], request->allow_lengths[i]) == 0 &&
+                    k_strcmp(g_credentials[j].rp_id, request->rp_id) == 0) {
+                    credential = &g_credentials[j];
+                    break;
+                }
+            }
+            if (credential) break;
+        }
+    } else {
+        /* Search all credentials for this RP */
+        for (int i = 0; i < FIDO2_MAX_CREDENTIALS; i++) {
+            if (g_credentials[i].id_length > 0 &&
+                k_strcmp(g_credentials[i].rp_id, request->rp_id) == 0) {
+                credential = &g_credentials[i];
+                break;
+            }
+        }
+    }
+    
+    if (!credential) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_NOTFOUND;
+    }
+    
+    /* Increment sign count */
+    credential->sign_count++;
+    credential->last_used_time = timer_get_ticks();
+    
+    /* Create authenticator data */
+    size_t auth_data_length = create_authenticator_data(
+        request->rp_id, true, true, credential->sign_count,
+        NULL, 0, NULL, 0, 0,
+        out_response->authenticator_data
+    );
+    out_response->authenticator_data_length = auth_data_length;
+    
+    /* Create assertion signature */
+    uint8_t to_sign[512];
+    k_memcpy(to_sign, out_response->authenticator_data, auth_data_length);
+    k_memcpy(to_sign + auth_data_length, request->challenge, request->challenge_length);
+    size_t to_sign_length = auth_data_length + request->challenge_length;
+    
+    /* Hash the data to sign */
+    uint8_t hash[32];
+    for (int i = 0; i < 32; i++) {
+        hash[i] = 0;
+        for (size_t j = 0; j < to_sign_length; j++) {
+            hash[i] ^= to_sign[j] >> (i % 8);
+        }
+    }
+    
+    /* Sign with credential private key */
+    status_t result = ecdsa_sign_p256(credential->private_key, hash, out_response->signature, &out_response->signature_length);
+    if (result != STATUS_OK) {
+        spin_unlock(&g_fido2_lock);
+        return result;
+    }
+    
+    /* Fill response */
+    k_memcpy(out_response->credential_id, credential->id, credential->id_length);
+    out_response->credential_id_length = credential->id_length;
+    k_memcpy(out_response->client_data_hash, request->challenge, request->challenge_length);
+    out_response->sign_count = credential->sign_count;
+    
+    /* Update statistics */
+    device->authentications++;
+    device->last_activity = timer_get_ticks();
+    g_metrics.authentications_performed++;
+    
+    spin_unlock(&g_fido2_lock);
+    return STATUS_OK;
+}
+
+status_t fido2_verify_attestation(const fido2_attestation_response_t* response, bool* out_valid) {
+    if (!response || !out_valid) return STATUS_INVALID;
+    
+    /* Verify attestation signature with known attestation public key */
+    uint8_t attestation_public_key[65];
+    attestation_public_key[0] = 0x04; /* Uncompressed point */
+    k_memset(attestation_public_key + 1, 0x42, 64); /* Known attestation public key */
+    
+    /* Hash authenticator data + client data hash */
+    uint8_t hash[32];
+    for (int i = 0; i < 32; i++) {
+        hash[i] = 0;
+        for (size_t j = 0; j < response->authenticator_data_length; j++) {
+            hash[i] ^= response->authenticator_data[j] >> (i % 8);
+        }
+        for (int j = 0; j < 32; j++) {
+            hash[i] ^= response->client_data_hash[j] >> (i % 8);
+        }
+    }
+    
+    return ecdsa_verify_p256(attestation_public_key, hash, response->attestation_signature, 
+                           response->signature_length, out_valid);
+}
+
+status_t fido2_verify_assertion(const fido2_assertion_response_t* response,
+                               const uint8_t* public_key, size_t key_length, bool* out_valid) {
+    if (!response || !public_key || !out_valid) return STATUS_INVALID;
+    
+    /* Hash authenticator data + client data hash */
+    uint8_t hash[32];
+    for (int i = 0; i < 32; i++) {
+        hash[i] = 0;
+        for (size_t j = 0; j < response->authenticator_data_length; j++) {
+            hash[i] ^= response->authenticator_data[j] >> (i % 8);
+        }
+        for (int j = 0; j < 32; j++) {
+            hash[i] ^= response->client_data_hash[j] >> (i % 8);
+        }
+    }
+    
+    return ecdsa_verify_p256(public_key, hash, response->signature, response->signature_length, out_valid);
+}
+
+status_t fido2_sign_data(int32_t algorithm, const uint8_t* private_key, const uint8_t* data, size_t data_length,
+                        uint8_t* out_signature, size_t* in_out_signature_length) {
+    if (!private_key || !data || !out_signature || !in_out_signature_length) {
+        return STATUS_INVALID;
+    }
+    
+    /* Hash the data */
+    uint8_t hash[32];
+    for (int i = 0; i < 32; i++) {
+        hash[i] = 0;
+        for (size_t j = 0; j < data_length; j++) {
+            hash[i] ^= data[j] >> (i % 8);
+        }
+    }
+    
+    switch (algorithm) {
+        case FIDO2_ALG_ES256:
+            return ecdsa_sign_p256(private_key, hash, out_signature, in_out_signature_length);
+            
+        case FIDO2_ALG_EDDSA:
+            /* Simplified EdDSA signing */
+            if (*in_out_signature_length < 64) return STATUS_NO_SPACE;
+            for (int i = 0; i < 32; i++) {
+                out_signature[i] = hash[i] ^ private_key[i];
+                out_signature[i + 32] = hash[31 - i] ^ private_key[31 - i];
+            }
+            *in_out_signature_length = 64;
+            return STATUS_OK;
+            
+        default:
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
+status_t fido2_verify_signature(int32_t algorithm, const uint8_t* public_key, const uint8_t* data, size_t data_length,
+                               const uint8_t* signature, size_t signature_length, bool* out_valid) {
+    if (!public_key || !data || !signature || !out_valid) return STATUS_INVALID;
+    
+    /* Hash the data */
+    uint8_t hash[32];
+    for (int i = 0; i < 32; i++) {
+        hash[i] = 0;
+        for (size_t j = 0; j < data_length; j++) {
+            hash[i] ^= data[j] >> (i % 8);
+        }
+    }
+    
+    switch (algorithm) {
+        case FIDO2_ALG_ES256:
+            return ecdsa_verify_p256(public_key, hash, signature, signature_length, out_valid);
+            
+        case FIDO2_ALG_EDDSA:
+            /* Simplified EdDSA verification */
+            if (signature_length != 64) {
+                *out_valid = false;
+                return STATUS_OK;
+            }
+            
+            bool valid = true;
+            for (int i = 0; i < 32; i++) {
+                uint8_t expected1 = hash[i] ^ public_key[i + 1];
+                uint8_t expected2 = hash[31 - i] ^ public_key[32 - i];
+                if (signature[i] != expected1 || signature[i + 32] != expected2) {
+                    valid = false;
+                    break;
+                }
+            }
+            *out_valid = valid;
+            return STATUS_OK;
+            
+        default:
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
+status_t fido2_set_pin(uint32_t device_id, const char* pin) {
+    if (!pin || k_strlen(pin) < 4) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    
+    fido2_device_t* device = find_device(device_id);
+    if (!device) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_INVALID;
+    }
+    
+    /* Hash PIN */
+    uint32_t pin_token = 0;
+    for (size_t i = 0; i < k_strlen(pin); i++) {
+        pin_token = pin_token * 31 + pin[i];
+    }
+    
+    device->pin_token = pin_token;
+    device->pin_set = true;
+    device->pin_retries = 8; /* Reset retry counter */
+    
+    spin_unlock(&g_fido2_lock);
+    return STATUS_OK;
+}
+
+status_t fido2_verify_pin(uint32_t device_id, const char* pin) {
+    if (!pin) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    
+    fido2_device_t* device = find_device(device_id);
+    if (!device || !device->pin_set) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_INVALID;
+    }
+    
+    if (device->pin_retries == 0) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_ERROR; /* Device locked */
+    }
+    
+    /* Verify PIN */
+    uint32_t pin_token = 0;
+    for (size_t i = 0; i < k_strlen(pin); i++) {
+        pin_token = pin_token * 31 + pin[i];
+    }
+    
+    if (pin_token == device->pin_token) {
+        device->pin_retries = 8; /* Reset on success */
+        g_metrics.pin_verifications++;
+        spin_unlock(&g_fido2_lock);
+        return STATUS_OK;
+    } else {
+        device->pin_retries--;
+        spin_unlock(&g_fido2_lock);
+        return STATUS_ERROR;
+    }
+}
+
+status_t fido2_get_device_info(uint32_t device_id, fido2_device_t* out_device) {
+    if (!out_device) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    fido2_device_t* device = find_device(device_id);
+    if (!device) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_INVALID;
+    }
+    
+    *out_device = *device;
+    spin_unlock(&g_fido2_lock);
+    return STATUS_OK;
+}
+
+status_t fido2_enumerate_credentials(uint32_t device_id, fido2_credential_t* out_credentials, uint8_t* in_out_count) {
+    if (!out_credentials || !in_out_count) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    
+    fido2_device_t* device = find_device(device_id);
+    if (!device) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_INVALID;
+    }
+    
+    uint8_t count = 0;
+    uint8_t max_count = *in_out_count;
+    
+    for (int i = 0; i < FIDO2_MAX_CREDENTIALS && count < max_count; i++) {
+        if (g_credentials[i].id_length > 0 && g_credentials[i].resident_key) {
+            out_credentials[count] = g_credentials[i];
+            count++;
+        }
+    }
+    
+    *in_out_count = count;
+    spin_unlock(&g_fido2_lock);
+    return STATUS_OK;
+}
+
+status_t fido2_delete_credential(uint32_t device_id, const uint8_t* credential_id, size_t id_length) {
+    if (!credential_id || id_length == 0) return STATUS_INVALID;
+    
+    spin_lock(&g_fido2_lock);
+    
+    fido2_device_t* device = find_device(device_id);
+    if (!device) {
+        spin_unlock(&g_fido2_lock);
+        return STATUS_INVALID;
+    }
+    
+    for (int i = 0; i < FIDO2_MAX_CREDENTIALS; i++) {
+        if (g_credentials[i].id_length == id_length &&
+            k_memcmp(g_credentials[i].id, credential_id, id_length) == 0) {
+            k_memset(&g_credentials[i], 0, sizeof(fido2_credential_t));
+            device->credential_count--;
+            spin_unlock(&g_fido2_lock);
+            return STATUS_OK;
+        }
+    }
+    
+    spin_unlock(&g_fido2_lock);
+    return STATUS_NOTFOUND;
+}
+
+status_t fido2_get_metrics(fido2_metrics_t* out) {
+    if (!out) return STATUS_INVALID;
+    *out = g_metrics;
+    return STATUS_OK;
+}

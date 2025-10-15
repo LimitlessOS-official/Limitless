@@ -1,0 +1,68 @@
+/* stub_platform.c - comprehensive temporary stub symbol implementations */
+#include "kernel.h"
+#include "vmm.h"
+struct list_head { struct list_head* next; struct list_head* prev; }; /* minimal */
+#include "net.h"
+
+/* Logging */
+void kprintf(const char* fmt, ...){ (void)fmt; }
+void klog_printf(const char* tag, const char* fmt, ...){ (void)tag;(void)fmt; }
+void kernel_log(const char* s){ (void)s; }
+int k_snprintf(char* buf, size_t sz, const char* fmt, ...){ (void)buf;(void)sz;(void)fmt; return 0; }
+
+/* VFS (only provide stubs for missing path helpers / utilities) */
+__attribute__((weak)) int   vfs_register_filesystem(const char* name, void* ops){ (void)name;(void)ops; return 0; }
+/* HAL functions now implemented in hal/ library */
+__attribute__((weak)) int   vfs_mkdir_path(const char* path, int mode){ (void)path;(void)mode; return 0; }
+__attribute__((weak)) int   vfs_unlink_path(const char* path){ (void)path; return 0; }
+__attribute__((weak)) void* vfs_node_alloc(void){ return (void*)1; }
+__attribute__((weak)) int   vfs_strcmp(const char* a, const char* b){ while(*a && *a==*b){ a++; b++; } return (unsigned char)*a - (unsigned char)*b; }
+__attribute__((weak)) char* vfs_strcpy(char* d, const char* s){ char* r=d; while((*d++ = *s++)){} return r; }
+__attribute__((weak)) int   run_ext4_extent_tests(void){ return 0; }
+
+/* VMM */
+/* Core file API not stubbed (real implementation expected). Provide weaker path/utility helpers only. */
+__attribute__((weak)) int   vfs_symlink_path(const char* target, const char* linkpath){ (void)target;(void)linkpath; return 0; }
+__attribute__((weak)) int   vfs_readlink_path(const char* path, char* buf, size_t bufsz){ (void)path;(void)buf;(void)bufsz; return -1; }
+__attribute__((weak)) int   klog_read(char* buf, size_t sz){ (void)buf;(void)sz; return 0; }
+/* VFS core file operations now implemented in vfs.c - no stubs needed */
+/* VMM functions now implemented in vmm.c */
+
+/* HAL interrupt, timer, and PCI functions now implemented in hal/ library */
+
+/* Networking & protocols */
+__attribute__((weak)) int net_pump(void){ return 0; }
+__attribute__((weak)) int ipv4_send_packet(const void* data, size_t len){ (void)data;(void)len; return 0; }
+__attribute__((weak)) int net_if_config_static(int ifidx, uint32_t ip, uint32_t mask, uint32_t gw){ (void)ifidx;(void)ip;(void)mask;(void)gw; return 0; }
+__attribute__((weak)) void* _net_get_if0(void){ return 0; }
+__attribute__((weak)) void icmp_init(void){}
+__attribute__((weak)) void udp_init(void){}
+__attribute__((weak)) int udp_bind(void* sock, int port){ (void)sock;(void)port; return 0; }
+/* Do not duplicate existing UDP/ICMP symbols */
+void mac_addr_copy(mac_addr_t* dst, const mac_addr_t* src){ if(!dst||!src) return; for(int i=0;i<6;i++) dst->addr[i]=src->addr[i]; }
+
+/* Process */
+/* Process and scheduler functions now implemented in process.c and scheduler.c */
+
+/* Entry */
+void kernel_main(void){}
+
+/* Block device stubs */
+__attribute__((weak)) status_t bdev_read_bytes(void* bdev, uint64_t offset, void* buffer, size_t size) {
+    /* Simplified block device read */
+    (void)bdev;
+    (void)offset;
+    (void)buffer;
+    (void)size;
+    return 0; /* Success */
+}
+
+/* PCI configuration space access stubs */
+__attribute__((weak)) uint32_t hal_pci_cfg_read32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    /* Simplified PCI config read */
+    (void)bus;
+    (void)device;
+    (void)function;
+    (void)offset;
+    return 0xFFFFFFFF; /* Invalid device */
+}

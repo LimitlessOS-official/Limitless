@@ -1,0 +1,828 @@
+/*
+ * pthreads.c - LimitlessOS POSIX Threads Implementation
+ * 
+ * Full POSIX threads (pthreads) implementation providing thread creation,
+ * synchronization primitives, thread-local storage, and thread cancellation.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "scheduler.h"
+#include "syscall.h"
+#include "vmm.h"
+#include "timer.h"
+
+#define PTHREAD_MAX_THREADS         8192
+#define PTHREAD_STACK_MIN           16384
+#define PTHREAD_STACK_DEFAULT       2097152  /* 2MB */
+#define PTHREAD_KEYS_MAX            1024
+#define PTHREAD_DESTRUCTOR_ITERATIONS 4
+
+/* Thread states */
+#define PTHREAD_STATE_NEW           0
+#define PTHREAD_STATE_RUNNABLE      1
+#define PTHREAD_STATE_BLOCKED       2
+#define PTHREAD_STATE_TERMINATED    3
+#define PTHREAD_STATE_DETACHED      4
+
+/* Thread cancellation states */
+#define PTHREAD_CANCEL_ENABLE       0
+#define PTHREAD_CANCEL_DISABLE      1
+
+/* Thread cancellation types */
+#define PTHREAD_CANCEL_DEFERRED     0
+#define PTHREAD_CANCEL_ASYNCHRONOUS 1
+
+/* Mutex types */
+#define PTHREAD_MUTEX_NORMAL        0
+#define PTHREAD_MUTEX_RECURSIVE     1
+#define PTHREAD_MUTEX_ERRORCHECK    2
+#define PTHREAD_MUTEX_DEFAULT       PTHREAD_MUTEX_NORMAL
+
+/* Condition variable */
+typedef struct pthread_cond {
+    uint32_t magic;                 /* Magic number for validation */
+    spinlock_t lock;                /* Internal lock */
+    struct list_head waiters;       /* Waiting threads */
+    atomic32_t waiter_count;        /* Number of waiters */
+    
+    /* Statistics */
+    atomic64_t signal_count;        /* Times signaled */
+    atomic64_t broadcast_count;     /* Times broadcasted */
+    atomic64_t wait_count;          /* Times waited on */
+    
+} pthread_cond_t;
+
+/* Mutex */
+typedef struct pthread_mutex {
+    uint32_t magic;                 /* Magic number for validation */
+    int type;                       /* Mutex type */
+    atomic32_t count;               /* Lock count (for recursive) */
+    
+    /* Owner tracking */
+    pthread_t owner;                /* Current owner */
+    atomic32_t lock_state;          /* Lock state */
+    
+    /* Wait queue */
+    spinlock_t wait_lock;           /* Wait queue lock */
+    struct list_head waiters;       /* Waiting threads */
+    atomic32_t waiter_count;        /* Number of waiters */
+    
+    /* Priority inheritance */
+    int original_priority;          /* Owner's original priority */
+    int ceiling_priority;           /* Priority ceiling */
+    
+    /* Statistics */
+    atomic64_t lock_count;          /* Times locked */
+    atomic64_t unlock_count;        /* Times unlocked */
+    atomic64_t contention_count;    /* Lock contentions */
+    
+} pthread_mutex_t;
+
+/* Read-write lock */
+typedef struct pthread_rwlock {
+    uint32_t magic;                 /* Magic number for validation */
+    
+    /* Lock state */
+    atomic32_t readers;             /* Number of readers */
+    atomic32_t writers;             /* Number of writers (0 or 1) */
+    pthread_t writer_owner;         /* Writer owner */
+    
+    /* Wait queues */
+    spinlock_t lock;                /* Internal lock */
+    struct list_head reader_waiters; /* Waiting readers */
+    struct list_head writer_waiters; /* Waiting writers */
+    atomic32_t reader_waiter_count;
+    atomic32_t writer_waiter_count;
+    
+    /* Writer preference */
+    bool writer_preferred;          /* Prefer writers */
+    
+    /* Statistics */
+    atomic64_t read_locks;          /* Read locks acquired */
+    atomic64_t write_locks;         /* Write locks acquired */
+    atomic64_t read_contention;     /* Read contentions */
+    atomic64_t write_contention;    /* Write contentions */
+    
+} pthread_rwlock_t;
+
+/* Semaphore */
+typedef struct pthread_sem {
+    uint32_t magic;                 /* Magic number for validation */
+    atomic32_t value;               /* Semaphore value */
+    atomic32_t max_value;           /* Maximum value */
+    
+    /* Wait queue */
+    spinlock_t lock;                /* Internal lock */
+    struct list_head waiters;       /* Waiting threads */
+    atomic32_t waiter_count;        /* Number of waiters */
+    
+    /* Statistics */
+    atomic64_t post_count;          /* Times posted */
+    atomic64_t wait_count;          /* Times waited */
+    
+} pthread_sem_t;
+
+/* Barrier */
+typedef struct pthread_barrier {
+    uint32_t magic;                 /* Magic number for validation */
+    uint32_t count;                 /* Total participants */
+    atomic32_t current_count;       /* Current waiting count */
+    uint32_t generation;            /* Current generation */
+    
+    spinlock_t lock;                /* Internal lock */
+    struct list_head waiters;       /* Waiting threads */
+    
+} pthread_barrier_t;
+
+/* Thread-specific data key */
+typedef struct pthread_key {
+    bool in_use;                    /* Key is allocated */
+    void (*destructor)(void*);      /* Destructor function */
+    
+    atomic32_t ref_count;           /* Reference count */
+    
+} pthread_key_t;
+
+/* Thread control block */
+typedef struct pthread_tcb {
+    pthread_t tid;                  /* Thread ID */
+    process_t* process;             /* Parent process */
+    
+    /* Thread state */
+    int state;                      /* Thread state */
+    void* (*start_routine)(void*);  /* Entry point */
+    void* arg;                      /* Argument */
+    void* return_value;             /* Return value */
+    
+    /* Stack information */
+    void* stack_base;               /* Stack base */
+    size_t stack_size;              /* Stack size */
+    void* stack_guard;              /* Stack guard page */
+    
+    /* Attributes */
+    int detach_state;               /* Detached or joinable */
+    int cancel_state;               /* Cancellation state */
+    int cancel_type;                /* Cancellation type */
+    bool cancel_pending;            /* Cancellation pending */
+    
+    /* Scheduling */
+    int policy;                     /* Scheduling policy */
+    int priority;                   /* Thread priority */
+    
+    /* Thread-specific data */
+    void* tsd_data[PTHREAD_KEYS_MAX]; /* Thread-specific data */
+    
+    /* Synchronization */
+    struct list_head join_list;     /* Threads waiting to join */
+    pthread_mutex_t* blocked_mutex; /* Mutex we're blocked on */
+    pthread_cond_t* blocked_cond;   /* Condition variable we're blocked on */
+    
+    /* Cleanup handlers */
+    struct cleanup_handler {
+        void (*routine)(void*);
+        void* arg;
+        struct cleanup_handler* next;
+    } *cleanup_handlers;
+    
+    /* Statistics */
+    uint64_t creation_time;         /* Thread creation time */
+    uint64_t cpu_time;              /* CPU time used */
+    atomic64_t context_switches;    /* Context switches */
+    
+    struct list_head thread_list;   /* Global thread list */
+    struct list_head process_threads; /* Process thread list */
+    
+    spinlock_t lock;                /* Thread lock */
+    
+} pthread_tcb_t;
+
+/* Thread attributes */
+typedef struct pthread_attr {
+    int detach_state;               /* Detached state */
+    size_t stack_size;              /* Stack size */
+    void* stack_addr;               /* Stack address */
+    size_t guard_size;              /* Guard page size */
+    int policy;                     /* Scheduling policy */
+    int priority;                   /* Thread priority */
+    int inheritsched;               /* Inherit scheduling */
+    int scope;                      /* Contention scope */
+    
+} pthread_attr_t;
+
+/* Global pthread state */
+static struct {
+    bool initialized;
+    
+    /* Thread management */
+    struct list_head threads;       /* All threads */
+    spinlock_t thread_lock;
+    atomic32_t thread_count;
+    pthread_t next_tid;
+    
+    /* Thread-specific data keys */
+    pthread_key_t keys[PTHREAD_KEYS_MAX];
+    spinlock_t key_lock;
+    
+    /* Default attributes */
+    pthread_attr_t default_attr;
+    
+    /* Statistics */
+    atomic64_t threads_created;     /* Threads created */
+    atomic64_t threads_destroyed;   /* Threads destroyed */
+    atomic64_t context_switches;    /* Total context switches */
+    atomic64_t mutex_contentions;   /* Mutex contentions */
+    atomic64_t cond_signals;        /* Condition signals */
+    
+} g_pthread_system = {0};
+
+/* Function prototypes */
+static pthread_tcb_t* pthread_get_tcb(pthread_t tid);
+static int pthread_create_stack(pthread_tcb_t* tcb, const pthread_attr_t* attr);
+static void pthread_cleanup_thread(pthread_tcb_t* tcb);
+static void pthread_run_destructors(pthread_tcb_t* tcb);
+
+/* Initialize pthread subsystem */
+int pthread_init(void) {
+    if (g_pthread_system.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing POSIX threads (pthreads)\n");
+    
+    memset(&g_pthread_system, 0, sizeof(g_pthread_system));
+    
+    INIT_LIST_HEAD(&g_pthread_system.threads);
+    spinlock_init(&g_pthread_system.thread_lock);
+    spinlock_init(&g_pthread_system.key_lock);
+    g_pthread_system.next_tid = 1;
+    
+    /* Initialize default attributes */
+    pthread_attr_t* attr = &g_pthread_system.default_attr;
+    attr->detach_state = PTHREAD_CREATE_JOINABLE;
+    attr->stack_size = PTHREAD_STACK_DEFAULT;
+    attr->stack_addr = NULL;
+    attr->guard_size = 4096;
+    attr->policy = SCHED_OTHER;
+    attr->priority = 0;
+    attr->inheritsched = PTHREAD_INHERIT_SCHED;
+    attr->scope = PTHREAD_SCOPE_SYSTEM;
+    
+    g_pthread_system.initialized = true;
+    
+    printf("pthreads initialized\n");
+    return 0;
+}
+
+/* Get thread control block */
+static pthread_tcb_t* pthread_get_tcb(pthread_t tid) {
+    spin_lock(&g_pthread_system.thread_lock);
+    
+    pthread_tcb_t* tcb;
+    list_for_each_entry(tcb, &g_pthread_system.threads, thread_list) {
+        if (tcb->tid == tid) {
+            spin_unlock(&g_pthread_system.thread_lock);
+            return tcb;
+        }
+    }
+    
+    spin_unlock(&g_pthread_system.thread_lock);
+    return NULL;
+}
+
+/* Create thread stack */
+static int pthread_create_stack(pthread_tcb_t* tcb, const pthread_attr_t* attr) {
+    size_t stack_size = attr ? attr->stack_size : PTHREAD_STACK_DEFAULT;
+    
+    if (stack_size < PTHREAD_STACK_MIN) {
+        stack_size = PTHREAD_STACK_MIN;
+    }
+    
+    /* Align to page boundary */
+    stack_size = (stack_size + 4095) & ~4095;
+    
+    if (attr && attr->stack_addr) {
+        /* Use provided stack */
+        tcb->stack_base = attr->stack_addr;
+        tcb->stack_size = stack_size;
+        return 0;
+    }
+    
+    /* Allocate stack */
+    void* stack = vmm_alloc_pages((stack_size + 4095) / 4096);
+    if (!stack) {
+        return -ENOMEM;
+    }
+    
+    /* Set up guard page */
+    size_t guard_size = attr ? attr->guard_size : 4096;
+    if (guard_size > 0) {
+        vmm_protect_pages(stack, guard_size / 4096, VM_PROT_NONE);
+        tcb->stack_guard = stack;
+        tcb->stack_base = (char*)stack + guard_size;
+        tcb->stack_size = stack_size - guard_size;
+    } else {
+        tcb->stack_base = stack;
+        tcb->stack_size = stack_size;
+        tcb->stack_guard = NULL;
+    }
+    
+    return 0;
+}
+
+/* Thread entry point wrapper */
+static void pthread_entry_wrapper(void* arg) {
+    pthread_tcb_t* tcb = (pthread_tcb_t*)arg;
+    
+    /* Set thread-specific pointer */
+    /* set_thread_pointer(tcb); */
+    
+    /* Call user function */
+    tcb->return_value = tcb->start_routine(tcb->arg);
+    
+    /* Thread is terminating */
+    tcb->state = PTHREAD_STATE_TERMINATED;
+    
+    /* Run cleanup handlers */
+    while (tcb->cleanup_handlers) {
+        struct cleanup_handler* handler = tcb->cleanup_handlers;
+        tcb->cleanup_handlers = handler->next;
+        
+        handler->routine(handler->arg);
+        vmm_kfree(handler, sizeof(struct cleanup_handler));
+    }
+    
+    /* Run TSD destructors */
+    pthread_run_destructors(tcb);
+    
+    /* Wake up any joiners */
+    /* TODO: Implement joiner wakeup */
+    
+    /* If detached, clean up immediately */
+    if (tcb->detach_state == PTHREAD_CREATE_DETACHED) {
+        pthread_cleanup_thread(tcb);
+    }
+    
+    /* Exit thread */
+    process_exit(0);
+}
+
+/* Create thread */
+int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
+                   void* (*start_routine)(void*), void* arg) {
+    
+    if (!thread || !start_routine) {
+        return EINVAL;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)vmm_kmalloc(sizeof(pthread_tcb_t), 32);
+    if (!tcb) {
+        return ENOMEM;
+    }
+    
+    memset(tcb, 0, sizeof(pthread_tcb_t));
+    
+    /* Initialize TCB */
+    spin_lock(&g_pthread_system.thread_lock);
+    tcb->tid = g_pthread_system.next_tid++;
+    spin_unlock(&g_pthread_system.thread_lock);
+    
+    tcb->process = current_process;
+    tcb->state = PTHREAD_STATE_NEW;
+    tcb->start_routine = start_routine;
+    tcb->arg = arg;
+    
+    /* Set attributes */
+    const pthread_attr_t* use_attr = attr ? attr : &g_pthread_system.default_attr;
+    tcb->detach_state = use_attr->detach_state;
+    tcb->policy = use_attr->policy;
+    tcb->priority = use_attr->priority;
+    
+    /* Initialize cancellation state */
+    tcb->cancel_state = PTHREAD_CANCEL_ENABLE;
+    tcb->cancel_type = PTHREAD_CANCEL_DEFERRED;
+    tcb->cancel_pending = false;
+    
+    /* Create stack */
+    int result = pthread_create_stack(tcb, use_attr);
+    if (result != 0) {
+        vmm_kfree(tcb, sizeof(pthread_tcb_t));
+        return result;
+    }
+    
+    /* Initialize lists and locks */
+    INIT_LIST_HEAD(&tcb->join_list);
+    INIT_LIST_HEAD(&tcb->thread_list);
+    INIT_LIST_HEAD(&tcb->process_threads);
+    spinlock_init(&tcb->lock);
+    
+    tcb->creation_time = timer_get_ticks();
+    
+    /* Add to global thread list */
+    spin_lock(&g_pthread_system.thread_lock);
+    list_add(&tcb->thread_list, &g_pthread_system.threads);
+    atomic32_inc(&g_pthread_system.thread_count);
+    spin_unlock(&g_pthread_system.thread_lock);
+    
+    /* Create kernel thread */
+    process_t* kernel_thread = process_create_kernel_thread(
+        pthread_entry_wrapper, tcb, tcb->stack_base, tcb->stack_size);
+    
+    if (!kernel_thread) {
+        pthread_cleanup_thread(tcb);
+        return EAGAIN;
+    }
+    
+    tcb->state = PTHREAD_STATE_RUNNABLE;
+    
+    /* Set scheduling parameters */
+    scheduler_set_priority(kernel_thread, tcb->priority);
+    
+    *thread = tcb->tid;
+    
+    atomic64_inc(&g_pthread_system.threads_created);
+    
+    printf("pthreads: Created thread %lu\n", tcb->tid);
+    
+    return 0;
+}
+
+/* Join thread */
+int pthread_join(pthread_t thread, void** retval) {
+    pthread_tcb_t* tcb = pthread_get_tcb(thread);
+    if (!tcb) {
+        return ESRCH;
+    }
+    
+    if (tcb->detach_state == PTHREAD_CREATE_DETACHED) {
+        return EINVAL;
+    }
+    
+    /* Wait for thread to terminate */
+    while (tcb->state != PTHREAD_STATE_TERMINATED) {
+        /* TODO: Proper thread waiting mechanism */
+        scheduler_yield();
+    }
+    
+    if (retval) {
+        *retval = tcb->return_value;
+    }
+    
+    /* Clean up thread */
+    pthread_cleanup_thread(tcb);
+    
+    return 0;
+}
+
+/* Detach thread */
+int pthread_detach(pthread_t thread) {
+    pthread_tcb_t* tcb = pthread_get_tcb(thread);
+    if (!tcb) {
+        return ESRCH;
+    }
+    
+    spin_lock(&tcb->lock);
+    
+    if (tcb->detach_state == PTHREAD_CREATE_DETACHED) {
+        spin_unlock(&tcb->lock);
+        return EINVAL;
+    }
+    
+    tcb->detach_state = PTHREAD_CREATE_DETACHED;
+    
+    bool should_cleanup = (tcb->state == PTHREAD_STATE_TERMINATED);
+    
+    spin_unlock(&tcb->lock);
+    
+    if (should_cleanup) {
+        pthread_cleanup_thread(tcb);
+    }
+    
+    return 0;
+}
+
+/* Exit thread */
+void pthread_exit(void* retval) {
+    /* This would be called from current thread context */
+    if (current_process && current_process->pthread_tcb) {
+        pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+        tcb->return_value = retval;
+        tcb->state = PTHREAD_STATE_TERMINATED;
+    }
+    
+    process_exit(0);
+}
+
+/* Cancel thread */
+int pthread_cancel(pthread_t thread) {
+    pthread_tcb_t* tcb = pthread_get_tcb(thread);
+    if (!tcb) {
+        return ESRCH;
+    }
+    
+    spin_lock(&tcb->lock);
+    
+    if (tcb->cancel_state == PTHREAD_CANCEL_DISABLE) {
+        spin_unlock(&tcb->lock);
+        return 0;
+    }
+    
+    tcb->cancel_pending = true;
+    
+    if (tcb->cancel_type == PTHREAD_CANCEL_ASYNCHRONOUS) {
+        /* TODO: Send cancellation signal immediately */
+    }
+    
+    spin_unlock(&tcb->lock);
+    
+    return 0;
+}
+
+/* Set cancellation state */
+int pthread_setcancelstate(int state, int* oldstate) {
+    if (!current_process || !current_process->pthread_tcb) {
+        return ESRCH;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    
+    if (oldstate) {
+        *oldstate = tcb->cancel_state;
+    }
+    
+    tcb->cancel_state = state;
+    
+    /* Check for pending cancellation */
+    if (state == PTHREAD_CANCEL_ENABLE && tcb->cancel_pending) {
+        pthread_exit(PTHREAD_CANCELED);
+    }
+    
+    return 0;
+}
+
+/* Set cancellation type */
+int pthread_setcanceltype(int type, int* oldtype) {
+    if (!current_process || !current_process->pthread_tcb) {
+        return ESRCH;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    
+    if (oldtype) {
+        *oldtype = tcb->cancel_type;
+    }
+    
+    tcb->cancel_type = type;
+    
+    return 0;
+}
+
+/* Test cancellation */
+void pthread_testcancel(void) {
+    if (!current_process || !current_process->pthread_tcb) {
+        return;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    
+    if (tcb->cancel_state == PTHREAD_CANCEL_ENABLE && tcb->cancel_pending) {
+        pthread_exit(PTHREAD_CANCELED);
+    }
+}
+
+/* Cleanup thread */
+static void pthread_cleanup_thread(pthread_tcb_t* tcb) {
+    if (!tcb) {
+        return;
+    }
+    
+    /* Remove from lists */
+    spin_lock(&g_pthread_system.thread_lock);
+    list_del(&tcb->thread_list);
+    atomic32_dec(&g_pthread_system.thread_count);
+    spin_unlock(&g_pthread_system.thread_lock);
+    
+    /* Free stack if we allocated it */
+    if (tcb->stack_base && !tcb->stack_guard) {
+        vmm_free_pages(tcb->stack_base, (tcb->stack_size + 4095) / 4096);
+    } else if (tcb->stack_guard) {
+        /* Free including guard page */
+        size_t total_size = tcb->stack_size + ((char*)tcb->stack_base - (char*)tcb->stack_guard);
+        vmm_free_pages(tcb->stack_guard, (total_size + 4095) / 4096);
+    }
+    
+    /* Free TCB */
+    vmm_kfree(tcb, sizeof(pthread_tcb_t));
+    
+    atomic64_inc(&g_pthread_system.threads_destroyed);
+}
+
+/* Run TSD destructors */
+static void pthread_run_destructors(pthread_tcb_t* tcb) {
+    for (int iter = 0; iter < PTHREAD_DESTRUCTOR_ITERATIONS; iter++) {
+        bool called_any = false;
+        
+        spin_lock(&g_pthread_system.key_lock);
+        
+        for (int i = 0; i < PTHREAD_KEYS_MAX; i++) {
+            if (g_pthread_system.keys[i].in_use && 
+                g_pthread_system.keys[i].destructor &&
+                tcb->tsd_data[i]) {
+                
+                void* data = tcb->tsd_data[i];
+                tcb->tsd_data[i] = NULL;
+                
+                spin_unlock(&g_pthread_system.key_lock);
+                
+                g_pthread_system.keys[i].destructor(data);
+                called_any = true;
+                
+                spin_lock(&g_pthread_system.key_lock);
+            }
+        }
+        
+        spin_unlock(&g_pthread_system.key_lock);
+        
+        if (!called_any) {
+            break;
+        }
+    }
+}
+
+/* Create thread-specific data key */
+int pthread_key_create(pthread_key_t** key, void (*destructor)(void*)) {
+    if (!key) {
+        return EINVAL;
+    }
+    
+    spin_lock(&g_pthread_system.key_lock);
+    
+    /* Find free key */
+    for (int i = 0; i < PTHREAD_KEYS_MAX; i++) {
+        if (!g_pthread_system.keys[i].in_use) {
+            g_pthread_system.keys[i].in_use = true;
+            g_pthread_system.keys[i].destructor = destructor;
+            atomic32_set(&g_pthread_system.keys[i].ref_count, 1);
+            
+            *key = &g_pthread_system.keys[i];
+            
+            spin_unlock(&g_pthread_system.key_lock);
+            return 0;
+        }
+    }
+    
+    spin_unlock(&g_pthread_system.key_lock);
+    return EAGAIN;
+}
+
+/* Delete thread-specific data key */
+int pthread_key_delete(pthread_key_t* key) {
+    if (!key || key < g_pthread_system.keys || 
+        key >= g_pthread_system.keys + PTHREAD_KEYS_MAX) {
+        return EINVAL;
+    }
+    
+    spin_lock(&g_pthread_system.key_lock);
+    
+    if (!key->in_use) {
+        spin_unlock(&g_pthread_system.key_lock);
+        return EINVAL;
+    }
+    
+    key->in_use = false;
+    key->destructor = NULL;
+    
+    spin_unlock(&g_pthread_system.key_lock);
+    
+    /* Clear data in all threads */
+    spin_lock(&g_pthread_system.thread_lock);
+    
+    pthread_tcb_t* tcb;
+    int key_index = key - g_pthread_system.keys;
+    
+    list_for_each_entry(tcb, &g_pthread_system.threads, thread_list) {
+        tcb->tsd_data[key_index] = NULL;
+    }
+    
+    spin_unlock(&g_pthread_system.thread_lock);
+    
+    return 0;
+}
+
+/* Set thread-specific data */
+int pthread_setspecific(pthread_key_t* key, const void* value) {
+    if (!key || key < g_pthread_system.keys || 
+        key >= g_pthread_system.keys + PTHREAD_KEYS_MAX) {
+        return EINVAL;
+    }
+    
+    if (!current_process || !current_process->pthread_tcb) {
+        return ESRCH;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    int key_index = key - g_pthread_system.keys;
+    
+    tcb->tsd_data[key_index] = (void*)value;
+    
+    return 0;
+}
+
+/* Get thread-specific data */
+void* pthread_getspecific(pthread_key_t* key) {
+    if (!key || key < g_pthread_system.keys || 
+        key >= g_pthread_system.keys + PTHREAD_KEYS_MAX) {
+        return NULL;
+    }
+    
+    if (!current_process || !current_process->pthread_tcb) {
+        return NULL;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    int key_index = key - g_pthread_system.keys;
+    
+    return tcb->tsd_data[key_index];
+}
+
+/* Get current thread ID */
+pthread_t pthread_self(void) {
+    if (!current_process || !current_process->pthread_tcb) {
+        return 0;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    return tcb->tid;
+}
+
+/* Compare thread IDs */
+int pthread_equal(pthread_t t1, pthread_t t2) {
+    return t1 == t2;
+}
+
+/* Push cleanup handler */
+void pthread_cleanup_push(void (*routine)(void*), void* arg) {
+    if (!current_process || !current_process->pthread_tcb) {
+        return;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    
+    struct cleanup_handler* handler = 
+        (struct cleanup_handler*)vmm_kmalloc(sizeof(struct cleanup_handler), 32);
+    
+    if (handler) {
+        handler->routine = routine;
+        handler->arg = arg;
+        handler->next = tcb->cleanup_handlers;
+        tcb->cleanup_handlers = handler;
+    }
+}
+
+/* Pop cleanup handler */
+void pthread_cleanup_pop(int execute) {
+    if (!current_process || !current_process->pthread_tcb) {
+        return;
+    }
+    
+    pthread_tcb_t* tcb = (pthread_tcb_t*)current_process->pthread_tcb;
+    
+    if (tcb->cleanup_handlers) {
+        struct cleanup_handler* handler = tcb->cleanup_handlers;
+        tcb->cleanup_handlers = handler->next;
+        
+        if (execute) {
+            handler->routine(handler->arg);
+        }
+        
+        vmm_kfree(handler, sizeof(struct cleanup_handler));
+    }
+}
+
+/* Get pthread statistics */
+void pthread_get_stats(struct pthread_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct pthread_stats));
+    
+    stats->active_threads = atomic32_read(&g_pthread_system.thread_count);
+    stats->threads_created = atomic64_read(&g_pthread_system.threads_created);
+    stats->threads_destroyed = atomic64_read(&g_pthread_system.threads_destroyed);
+    stats->context_switches = atomic64_read(&g_pthread_system.context_switches);
+    stats->mutex_contentions = atomic64_read(&g_pthread_system.mutex_contentions);
+    stats->cond_signals = atomic64_read(&g_pthread_system.cond_signals);
+}
+
+/* Debug output */
+void pthread_dump_stats(void) {
+    struct pthread_stats stats;
+    pthread_get_stats(&stats);
+    
+    printf("pthreads Statistics:\n");
+    printf("  Active threads: %u\n", stats.active_threads);
+    printf("  Threads created: %lu\n", stats.threads_created);
+    printf("  Threads destroyed: %lu\n", stats.threads_destroyed);
+    printf("  Context switches: %lu\n", stats.context_switches);
+    printf("  Mutex contentions: %lu\n", stats.mutex_contentions);
+    printf("  Condition signals: %lu\n", stats.cond_signals);
+}

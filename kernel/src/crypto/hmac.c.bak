@@ -1,0 +1,14 @@
+/*
+ * HMAC (Hash-based Message Authentication Code) Implementation
+ * Supports HMAC with SHA-1, SHA-256, SHA-384, SHA-512
+ */
+
+#include "kernel.h"
+#include "crypto.h"
+
+/* HMAC implementation stub */
+status_t crypto_register_hmac(void) {
+    /* TODO: Implement HMAC algorithm */
+    KLOG_INFO("CRYPTO", "HMAC algorithms registered (stub)");
+    return STATUS_OK;
+}

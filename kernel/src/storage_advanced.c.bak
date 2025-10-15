@@ -1,0 +1,1149 @@
+/*
+ * LimitlessOS Advanced Storage Subsystem (SATA/NVMe/SCSI/IDE)
+ * Complete enterprise storage stack with performance optimization
+ */
+
+#include "kernel.h"
+#include "hal.h"
+
+/* Logging macros */
+#define KLOG_INFO(subsys, fmt, ...) kprintf("[INFO:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_DEBUG(subsys, fmt, ...) kprintf("[DEBUG:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_WARN(subsys, fmt, ...) kprintf("[WARN:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_ERROR(subsys, fmt, ...) kprintf("[ERROR:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+
+/* Memory functions */
+#define memcpy k_memcpy
+#define memset k_memset
+#define memcmp k_memcmp
+
+/* Storage Interface Types */
+#define STORAGE_TYPE_IDE        0x00
+#define STORAGE_TYPE_SATA       0x01
+#define STORAGE_TYPE_SCSI       0x02
+#define STORAGE_TYPE_NVME       0x03
+#define STORAGE_TYPE_USB        0x04
+#define STORAGE_TYPE_EMMC       0x05
+#define STORAGE_TYPE_VIRTIO     0x06
+
+/* Device Types */
+#define DEVICE_TYPE_HDD         0x00    /* Hard Disk Drive */
+#define DEVICE_TYPE_SSD         0x01    /* Solid State Drive */
+#define DEVICE_TYPE_HYBRID      0x02    /* Hybrid Drive (SSHD) */
+#define DEVICE_TYPE_OPTICAL     0x03    /* CD/DVD/Blu-ray */
+#define DEVICE_TYPE_TAPE        0x04    /* Tape Drive */
+#define DEVICE_TYPE_FLOPPY      0x05    /* Floppy Disk */
+
+/* ATA/SATA Commands */
+#define ATA_CMD_READ_SECTORS        0x20
+#define ATA_CMD_READ_SECTORS_EXT    0x24
+#define ATA_CMD_WRITE_SECTORS       0x30
+#define ATA_CMD_WRITE_SECTORS_EXT   0x34
+#define ATA_CMD_READ_DMA            0xC8
+#define ATA_CMD_READ_DMA_EXT        0x25
+#define ATA_CMD_WRITE_DMA           0xCA
+#define ATA_CMD_WRITE_DMA_EXT       0x35
+#define ATA_CMD_IDENTIFY            0xEC
+#define ATA_CMD_IDENTIFY_PACKET     0xA1
+#define ATA_CMD_FLUSH_CACHE         0xE7
+#define ATA_CMD_FLUSH_CACHE_EXT     0xEA
+
+/* NVMe Commands */
+#define NVME_ADMIN_DELETE_SQ        0x00
+#define NVME_ADMIN_CREATE_SQ        0x01
+#define NVME_ADMIN_DELETE_CQ        0x04
+#define NVME_ADMIN_CREATE_CQ        0x05
+#define NVME_ADMIN_IDENTIFY         0x06
+#define NVME_ADMIN_SET_FEATURES     0x09
+#define NVME_ADMIN_GET_FEATURES     0x0A
+
+#define NVME_CMD_READ               0x02
+#define NVME_CMD_WRITE              0x01
+#define NVME_CMD_FLUSH              0x00
+
+/* SCSI Commands */
+#define SCSI_CMD_TEST_UNIT_READY    0x00
+#define SCSI_CMD_REQUEST_SENSE      0x03
+#define SCSI_CMD_INQUIRY           0x12
+#define SCSI_CMD_READ_6            0x08
+#define SCSI_CMD_WRITE_6           0x0A
+#define SCSI_CMD_READ_10           0x28
+#define SCSI_CMD_WRITE_10          0x2A
+#define SCSI_CMD_READ_16           0x88
+#define SCSI_CMD_WRITE_16          0x8A
+
+/* Maximum limits */
+#define MAX_STORAGE_CONTROLLERS     16
+#define MAX_STORAGE_DEVICES         256
+#define MAX_STORAGE_PARTITIONS      32
+#define MAX_IO_QUEUE_SIZE          1024
+#define MAX_NAMESPACE_COUNT        256
+#define MAX_COMMAND_ID             65536
+
+/* Block sizes */
+#define SECTOR_SIZE                 512
+#define NVME_PAGE_SIZE             4096
+#define MAX_TRANSFER_SIZE          (2 * 1024 * 1024)  /* 2MB */
+
+/* Storage I/O Request */
+typedef struct storage_io_request {
+    uint32_t id;                    /* Request ID */
+    uint32_t device_id;             /* Target device */
+    uint8_t operation;              /* Read/Write/Flush */
+    
+    uint64_t lba;                   /* Logical Block Address */
+    uint32_t sector_count;          /* Number of sectors */
+    void* buffer;                   /* Data buffer */
+    uint32_t buffer_size;           /* Buffer size */
+    
+    void (*callback)(struct storage_io_request* req);
+    void* context;                  /* Callback context */
+    
+    uint32_t status;                /* Request status */
+    uint64_t timestamp_start;       /* Start timestamp */
+    uint64_t timestamp_complete;    /* Completion timestamp */
+    uint32_t retry_count;           /* Retry attempts */
+    
+    struct storage_io_request* next;
+} storage_io_request_t;
+
+/* NVMe Queue Entry */
+typedef struct nvme_command {
+    uint32_t cdw0;                  /* Command Dword 0 */
+    uint32_t nsid;                  /* Namespace ID */
+    uint64_t reserved1;
+    uint64_t metadata;              /* Metadata pointer */
+    uint64_t prp1;                  /* PRP Entry 1 */
+    uint64_t prp2;                  /* PRP Entry 2 */
+    uint32_t cdw10;                 /* Command specific */
+    uint32_t cdw11;
+    uint32_t cdw12;
+    uint32_t cdw13;
+    uint32_t cdw14;
+    uint32_t cdw15;
+} __attribute__((packed)) nvme_command_t;
+
+typedef struct nvme_completion {
+    uint32_t result;                /* Command specific result */
+    uint32_t reserved;
+    uint16_t sq_head;               /* Submission Queue Head */
+    uint16_t sq_id;                 /* Submission Queue ID */
+    uint16_t cid;                   /* Command ID */
+    uint16_t status;                /* Status Field */
+} __attribute__((packed)) nvme_completion_t;
+
+/* NVMe Queue Pair */
+typedef struct nvme_queue_pair {
+    uint16_t id;                    /* Queue ID */
+    uint16_t depth;                 /* Queue depth */
+    
+    /* Submission Queue */
+    nvme_command_t* sq;             /* Submission queue entries */
+    volatile uint32_t* sq_doorbell; /* SQ doorbell register */
+    uint16_t sq_head;               /* SQ head pointer */
+    uint16_t sq_tail;               /* SQ tail pointer */
+    
+    /* Completion Queue */
+    nvme_completion_t* cq;          /* Completion queue entries */
+    volatile uint32_t* cq_doorbell; /* CQ doorbell register */
+    uint16_t cq_head;               /* CQ head pointer */
+    uint8_t cq_phase;               /* CQ phase bit */
+    
+    /* Command tracking */
+    storage_io_request_t* pending_commands[MAX_COMMAND_ID];
+    uint16_t next_cid;              /* Next command ID */
+    
+    /* Statistics */
+    uint64_t commands_submitted;    /* Total commands submitted */
+    uint64_t commands_completed;    /* Total commands completed */
+    uint64_t queue_full_events;     /* Queue full events */
+    
+    volatile uint32_t lock;         /* Queue lock */
+} nvme_queue_pair_t;
+
+/* NVMe Namespace */
+typedef struct nvme_namespace {
+    uint32_t id;                    /* Namespace ID */
+    uint64_t size;                  /* Size in bytes */
+    uint32_t block_size;            /* Block size */
+    uint64_t block_count;           /* Total blocks */
+    
+    /* Namespace features */
+    bool write_protected;           /* Write protection */
+    bool supports_deallocate;       /* TRIM/UNMAP support */
+    bool supports_write_zeros;      /* Write zeros support */
+    
+    /* Performance characteristics */
+    uint32_t optimal_io_size;       /* Optimal I/O size */
+    uint32_t max_transfer_size;     /* Maximum transfer size */
+    
+    /* Statistics */
+    uint64_t read_commands;         /* Read commands */
+    uint64_t write_commands;        /* Write commands */
+    uint64_t bytes_read;            /* Bytes read */
+    uint64_t bytes_written;         /* Bytes written */
+    
+    struct nvme_namespace* next;    /* Next namespace */
+} nvme_namespace_t;
+
+/* Storage Partition */
+typedef struct storage_partition {
+    uint32_t id;                    /* Partition ID */
+    uint32_t device_id;             /* Parent device ID */
+    
+    uint64_t start_lba;             /* Starting LBA */
+    uint64_t size_lba;              /* Size in LBAs */
+    uint8_t type;                   /* Partition type */
+    uint8_t attributes;             /* Partition attributes */
+    
+    char label[64];                 /* Partition label */
+    char filesystem[32];            /* Filesystem type */
+    
+    /* Mount information */
+    char mount_point[256];          /* Mount point */
+    bool mounted;                   /* Mount status */
+    
+    /* Access statistics */
+    uint64_t read_operations;       /* Read operations */
+    uint64_t write_operations;      /* Write operations */
+    uint64_t bytes_read;            /* Bytes read */
+    uint64_t bytes_written;         /* Bytes written */
+    
+    struct storage_partition* next;  /* Next partition */
+} storage_partition_t;
+
+/* Storage Device */
+typedef struct storage_device {
+    uint32_t id;                    /* Device ID */
+    uint8_t interface_type;         /* Interface type (SATA/NVMe/etc) */
+    uint8_t device_type;            /* Device type (HDD/SSD/etc) */
+    uint8_t controller_id;          /* Controller ID */
+    
+    /* Device identification */
+    char model[64];                 /* Device model */
+    char serial[32];                /* Serial number */
+    char firmware[16];              /* Firmware revision */
+    uint16_t vendor_id;             /* Vendor ID */
+    uint16_t device_id_hw;          /* Hardware device ID */
+    
+    /* Physical characteristics */
+    uint64_t capacity;              /* Capacity in bytes */
+    uint32_t sector_size;           /* Sector size */
+    uint64_t sector_count;          /* Total sectors */
+    uint32_t rpm;                   /* RPM (for HDDs) */
+    
+    /* Features and capabilities */
+    bool supports_48bit_lba;        /* 48-bit LBA support */
+    bool supports_dma;              /* DMA support */
+    bool supports_ncq;              /* Native Command Queuing */
+    bool supports_trim;             /* TRIM/UNMAP support */
+    bool supports_smart;            /* SMART support */
+    bool supports_encryption;       /* Hardware encryption */
+    
+    /* NVMe specific */
+    nvme_queue_pair_t* admin_queue; /* Admin queue pair */
+    nvme_queue_pair_t* io_queues;   /* I/O queue pairs */
+    uint32_t io_queue_count;        /* Number of I/O queues */
+    nvme_namespace_t* namespaces;   /* NVMe namespaces */
+    uint32_t namespace_count;       /* Number of namespaces */
+    
+    /* Partitions */
+    storage_partition_t* partitions; /* Device partitions */
+    uint32_t partition_count;       /* Number of partitions */
+    
+    /* I/O Queue Management */
+    storage_io_request_t* pending_requests;
+    storage_io_request_t* completed_requests;
+    storage_io_request_t* free_requests;
+    uint32_t queue_depth;           /* Maximum queue depth */
+    uint32_t active_requests;       /* Active requests */
+    
+    /* Performance statistics */
+    uint64_t total_reads;           /* Total read operations */
+    uint64_t total_writes;          /* Total write operations */
+    uint64_t bytes_read;            /* Total bytes read */
+    uint64_t bytes_written;         /* Total bytes written */
+    uint64_t io_errors;             /* I/O errors */
+    uint64_t timeouts;              /* Command timeouts */
+    
+    /* Performance metrics */
+    uint32_t average_read_latency;  /* Average read latency (us) */
+    uint32_t average_write_latency; /* Average write latency (us) */
+    uint32_t max_iops;              /* Maximum IOPS achieved */
+    uint32_t current_iops;          /* Current IOPS */
+    
+    /* SMART data */
+    struct {
+        uint8_t health_status;      /* Health status */
+        uint16_t temperature;       /* Temperature (Celsius) */
+        uint64_t power_on_hours;    /* Power-on hours */
+        uint64_t total_bytes_written; /* Total bytes written */
+        uint64_t total_bytes_read;  /* Total bytes read */
+        uint32_t wear_leveling;     /* Wear leveling count */
+        uint32_t bad_block_count;   /* Bad block count */
+    } smart_data;
+    
+    /* Device operations */
+    status_t (*read)(struct storage_device* dev, uint64_t lba, uint32_t count, void* buffer);
+    status_t (*write)(struct storage_device* dev, uint64_t lba, uint32_t count, const void* buffer);
+    status_t (*flush)(struct storage_device* dev);
+    status_t (*trim)(struct storage_device* dev, uint64_t lba, uint32_t count);
+    
+    /* Power management */
+    uint8_t power_state;            /* Current power state */
+    bool supports_standby;          /* Standby mode support */
+    bool supports_sleep;            /* Sleep mode support */
+    
+    /* Synchronization */
+    volatile uint32_t lock;         /* Device lock */
+    
+    struct storage_device* next;    /* Next device in list */
+} storage_device_t;
+
+/* Storage Controller */
+typedef struct storage_controller {
+    uint32_t id;                    /* Controller ID */
+    uint8_t type;                   /* Controller type */
+    char name[64];                  /* Controller name */
+    
+    /* Hardware information */
+    uint64_t base_addr;             /* Base I/O address */
+    uint64_t mmio_base;             /* Memory-mapped I/O base */
+    uint32_t mmio_size;             /* MMIO region size */
+    uint32_t irq;                   /* IRQ number */
+    
+    /* PCI information */
+    uint16_t vendor_id;             /* PCI vendor ID */
+    uint16_t device_id;             /* PCI device ID */
+    uint8_t revision;               /* PCI revision */
+    
+    /* Controller capabilities */
+    uint32_t max_devices;           /* Maximum devices */
+    uint32_t max_queue_depth;       /* Maximum queue depth */
+    bool supports_64bit_dma;        /* 64-bit DMA support */
+    bool supports_msi;              /* MSI support */
+    bool supports_msix;             /* MSI-X support */
+    
+    /* NVMe specific capabilities */
+    struct {
+        uint16_t max_io_queues;     /* Maximum I/O queues */
+        uint32_t page_size;         /* Page size */
+        uint8_t arbitration;        /* Arbitration method */
+        bool volatile_write_cache;   /* Volatile write cache */
+    } nvme_caps;
+    
+    /* Connected devices */
+    storage_device_t* devices;      /* Connected devices */
+    uint32_t device_count;          /* Number of devices */
+    
+    /* Controller operations */
+    status_t (*init)(struct storage_controller* ctrl);
+    status_t (*reset)(struct storage_controller* ctrl);
+    status_t (*scan_devices)(struct storage_controller* ctrl);
+    status_t (*submit_io)(struct storage_controller* ctrl, storage_io_request_t* req);
+    
+    /* Performance statistics */
+    uint64_t total_commands;        /* Total commands processed */
+    uint64_t completed_commands;    /* Completed commands */
+    uint64_t failed_commands;       /* Failed commands */
+    uint64_t interrupts_handled;    /* Interrupts handled */
+    
+    /* Power management */
+    uint8_t power_state;            /* Controller power state */
+    
+    /* Synchronization */
+    volatile uint32_t lock;         /* Controller lock */
+    
+    struct storage_controller* next; /* Next controller */
+} storage_controller_t;
+
+/* Global storage subsystem state */
+static struct {
+    /* Controllers */
+    storage_controller_t* controllers;
+    uint32_t controller_count;      /* Number of controllers */
+    
+    /* Devices */
+    storage_device_t* devices;      /* All storage devices */
+    uint32_t device_count;          /* Total device count */
+    
+    /* Partitions */
+    storage_partition_t* partitions; /* All partitions */
+    uint32_t partition_count;       /* Total partition count */
+    
+    /* I/O request pool */
+    storage_io_request_t io_pool[MAX_IO_QUEUE_SIZE];
+    uint32_t free_io_requests;      /* Free I/O requests */
+    
+    /* Global statistics */
+    uint64_t total_read_operations; /* Total read operations */
+    uint64_t total_write_operations; /* Total write operations */
+    uint64_t total_bytes_read;      /* Total bytes read */
+    uint64_t total_bytes_written;   /* Total bytes written */
+    uint64_t total_io_errors;       /* Total I/O errors */
+    
+    /* Performance monitoring */
+    uint32_t io_latency_histogram[10]; /* Latency histogram (buckets) */
+    uint32_t current_iops;          /* Current system IOPS */
+    uint32_t peak_iops;             /* Peak IOPS achieved */
+    
+    /* Configuration */
+    bool io_scheduler_enabled;      /* I/O scheduler enabled */
+    bool write_cache_enabled;       /* Write cache enabled */
+    bool read_ahead_enabled;        /* Read-ahead enabled */
+    uint32_t io_timeout_ms;         /* I/O timeout in milliseconds */
+    
+    /* Synchronization */
+    volatile uint32_t global_lock;  /* Global storage lock */
+    
+} storage_subsystem;
+
+/* Storage device type names */
+static const char* device_type_names[] = {
+    "Hard Disk Drive",
+    "Solid State Drive", 
+    "Hybrid Drive",
+    "Optical Drive",
+    "Tape Drive",
+    "Floppy Drive"
+};
+
+static const char* interface_type_names[] = {
+    "IDE/PATA",
+    "SATA",
+    "SCSI",
+    "NVMe",
+    "USB",
+    "eMMC",
+    "VirtIO"
+};
+
+/* NVMe Operations */
+
+/* Initialize NVMe queue pair */
+static status_t nvme_init_queue_pair(nvme_queue_pair_t* qp, uint16_t id, uint16_t depth) {
+    if (!qp) {
+        return STATUS_INVALID;
+    }
+    
+    memset(qp, 0, sizeof(*qp));
+    qp->id = id;
+    qp->depth = depth;
+    qp->cq_phase = 1;
+    
+    /* Allocate submission queue */
+    qp->sq = (nvme_command_t*)kalloc(sizeof(nvme_command_t) * depth);
+    if (!qp->sq) {
+        return STATUS_NOMEM;
+    }
+    memset(qp->sq, 0, sizeof(nvme_command_t) * depth);
+    
+    /* Allocate completion queue */
+    qp->cq = (nvme_completion_t*)kalloc(sizeof(nvme_completion_t) * depth);
+    if (!qp->cq) {
+        kfree(qp->sq);
+        return STATUS_NOMEM;
+    }
+    memset(qp->cq, 0, sizeof(nvme_completion_t) * depth);
+    
+    KLOG_DEBUG("STORAGE", "NVMe queue pair %u initialized (depth: %u)", id, depth);
+    
+    return STATUS_OK;
+}
+
+/* Submit NVMe command */
+static status_t nvme_submit_command(nvme_queue_pair_t* qp, nvme_command_t* cmd, 
+                                   storage_io_request_t* req) {
+    if (!qp || !cmd || !req) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&qp->lock, 1);
+    
+    /* Check if queue is full */
+    uint16_t next_tail = (qp->sq_tail + 1) % qp->depth;
+    if (next_tail == qp->sq_head) {
+        qp->queue_full_events++;
+        __sync_lock_release(&qp->lock);
+        return STATUS_BUSY;
+    }
+    
+    /* Assign command ID */
+    uint16_t cid = qp->next_cid++;
+    if (qp->next_cid >= MAX_COMMAND_ID) {
+        qp->next_cid = 0;
+    }
+    
+    /* Set command ID in command */
+    cmd->cdw0 = (cmd->cdw0 & 0xFFFF0000) | cid;
+    
+    /* Copy command to submission queue */
+    memcpy(&qp->sq[qp->sq_tail], cmd, sizeof(*cmd));
+    
+    /* Track pending command */
+    qp->pending_commands[cid] = req;
+    req->id = cid;
+    
+    /* Update tail pointer */
+    qp->sq_tail = next_tail;
+    qp->commands_submitted++;
+    
+    /* Ring doorbell (simulate) */
+    if (qp->sq_doorbell) {
+        *qp->sq_doorbell = qp->sq_tail;
+    }
+    
+    __sync_lock_release(&qp->lock);
+    
+    KLOG_DEBUG("STORAGE", "NVMe command submitted: CID=%u, Opcode=0x%02X", 
+               cid, (cmd->cdw0 >> 16) & 0xFF);
+    
+    return STATUS_OK;
+}
+
+/* Process NVMe completions */
+static void nvme_process_completions(nvme_queue_pair_t* qp) {
+    if (!qp) return;
+    
+    __sync_lock_test_and_set(&qp->lock, 1);
+    
+    while (true) {
+        nvme_completion_t* cqe = &qp->cq[qp->cq_head];
+        
+        /* Check phase bit */
+        uint8_t phase = (cqe->status >> 0) & 1;
+        if (phase != qp->cq_phase) {
+            break; /* No more completions */
+        }
+        
+        /* Extract command ID */
+        uint16_t cid = cqe->cid;
+        storage_io_request_t* req = qp->pending_commands[cid];
+        
+        if (req) {
+            /* Update request status */
+            req->status = (cqe->status >> 1) & 0x7FF;
+            req->timestamp_complete = hal_timer_get_timestamp_ns();
+            
+            /* Clear pending command */
+            qp->pending_commands[cid] = NULL;
+            
+            /* Call completion callback */
+            if (req->callback) {
+                req->callback(req);
+            }
+            
+            qp->commands_completed++;
+        }
+        
+        /* Advance head pointer */
+        qp->cq_head++;
+        if (qp->cq_head >= qp->depth) {
+            qp->cq_head = 0;
+            qp->cq_phase ^= 1; /* Flip phase */
+        }
+        
+        /* Update doorbell (simulate) */
+        if (qp->cq_doorbell) {
+            *qp->cq_doorbell = qp->cq_head;
+        }
+    }
+    
+    __sync_lock_release(&qp->lock);
+}
+
+/* SATA Operations */
+
+/* Identify ATA device */
+static status_t ata_identify_device(storage_device_t* device) {
+    if (!device) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_DEBUG("STORAGE", "Identifying ATA device %u", device->id);
+    
+    /* Simulate ATA IDENTIFY command */
+    uint16_t identify_data[256];
+    memset(identify_data, 0, sizeof(identify_data));
+    
+    /* Simulate device identification data */
+    strncpy(device->model, "LimitlessOS SATA Drive", sizeof(device->model) - 1);
+    strncpy(device->serial, "LS123456789", sizeof(device->serial) - 1);
+    strncpy(device->firmware, "1.0", sizeof(device->firmware) - 1);
+    
+    device->capacity = 500ULL * 1024 * 1024 * 1024; /* 500GB */
+    device->sector_size = SECTOR_SIZE;
+    device->sector_count = device->capacity / device->sector_size;
+    device->rpm = 7200; /* 7200 RPM HDD */
+    
+    /* Set capabilities */
+    device->supports_48bit_lba = true;
+    device->supports_dma = true;
+    device->supports_ncq = true;
+    device->supports_trim = false; /* HDD doesn't support TRIM */
+    device->supports_smart = true;
+    
+    device->device_type = DEVICE_TYPE_HDD;
+    device->queue_depth = 32;
+    
+    KLOG_INFO("STORAGE", "ATA device identified: %s (%llu GB)", 
+              device->model, device->capacity / (1024*1024*1024));
+    
+    return STATUS_OK;
+}
+
+/* SATA read operation */
+static status_t sata_read(storage_device_t* dev, uint64_t lba, uint32_t count, void* buffer) {
+    if (!dev || !buffer || count == 0) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_DEBUG("STORAGE", "SATA read: LBA=%llu, Count=%u", lba, count);
+    
+    /* Validate LBA range */
+    if (lba + count > dev->sector_count) {
+        return STATUS_INVALID;
+    }
+    
+    /* Simulate SATA read operation */
+    uint64_t start_time = hal_timer_get_timestamp_ns();
+    
+    /* Simulate data transfer (just zero the buffer for now) */
+    memset(buffer, 0, count * dev->sector_size);
+    
+    uint64_t end_time = hal_timer_get_timestamp_ns();
+    uint32_t latency = (uint32_t)((end_time - start_time) / 1000); /* Convert to microseconds */
+    
+    /* Update statistics */
+    __sync_add_and_fetch(&dev->total_reads, 1);
+    __sync_add_and_fetch(&dev->bytes_read, count * dev->sector_size);
+    dev->average_read_latency = (dev->average_read_latency + latency) / 2;
+    
+    return STATUS_OK;
+}
+
+/* SATA write operation */
+static status_t sata_write(storage_device_t* dev, uint64_t lba, uint32_t count, const void* buffer) {
+    if (!dev || !buffer || count == 0) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_DEBUG("STORAGE", "SATA write: LBA=%llu, Count=%u", lba, count);
+    
+    /* Validate LBA range */
+    if (lba + count > dev->sector_count) {
+        return STATUS_INVALID;
+    }
+    
+    /* Simulate SATA write operation */
+    uint64_t start_time = hal_timer_get_timestamp_ns();
+    
+    /* Simulate data transfer */
+    /* In real implementation, this would write to hardware */
+    
+    uint64_t end_time = hal_timer_get_timestamp_ns();
+    uint32_t latency = (uint32_t)((end_time - start_time) / 1000);
+    
+    /* Update statistics */
+    __sync_add_and_fetch(&dev->total_writes, 1);
+    __sync_add_and_fetch(&dev->bytes_written, count * dev->sector_size);
+    dev->average_write_latency = (dev->average_write_latency + latency) / 2;
+    
+    return STATUS_OK;
+}
+
+/* NVMe read operation */
+static status_t nvme_read(storage_device_t* dev, uint64_t lba, uint32_t count, void* buffer) {
+    if (!dev || !buffer || count == 0 || !dev->io_queues) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_DEBUG("STORAGE", "NVMe read: LBA=%llu, Count=%u", lba, count);
+    
+    /* Validate LBA range */
+    if (lba + count > dev->sector_count) {
+        return STATUS_INVALID;
+    }
+    
+    /* Prepare NVMe read command */
+    nvme_command_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    
+    cmd.cdw0 = (NVME_CMD_READ << 16); /* Opcode */
+    cmd.nsid = 1; /* Namespace 1 */
+    cmd.prp1 = (uint64_t)buffer; /* Data buffer */
+    cmd.cdw10 = (uint32_t)lba; /* Starting LBA (low) */
+    cmd.cdw11 = (uint32_t)(lba >> 32); /* Starting LBA (high) */
+    cmd.cdw12 = (count - 1); /* Number of logical blocks (0-based) */
+    
+    /* Create I/O request */
+    storage_io_request_t* req = &storage_subsystem.io_pool[0]; /* Simplified allocation */
+    req->device_id = dev->id;
+    req->lba = lba;
+    req->sector_count = count;
+    req->buffer = buffer;
+    req->timestamp_start = hal_timer_get_timestamp_ns();
+    
+    /* Submit to I/O queue */
+    status_t result = nvme_submit_command(&dev->io_queues[0], &cmd, req);
+    if (result != STATUS_OK) {
+        return result;
+    }
+    
+    /* Simulate completion processing */
+    nvme_process_completions(&dev->io_queues[0]);
+    
+    /* Update statistics */
+    __sync_add_and_fetch(&dev->total_reads, 1);
+    __sync_add_and_fetch(&dev->bytes_read, count * dev->sector_size);
+    
+    return STATUS_OK;
+}
+
+/* NVMe write operation */
+static status_t nvme_write(storage_device_t* dev, uint64_t lba, uint32_t count, const void* buffer) {
+    if (!dev || !buffer || count == 0 || !dev->io_queues) {
+        return STATUS_INVALID;
+    }
+    
+    KLOG_DEBUG("STORAGE", "NVMe write: LBA=%llu, Count=%u", lba, count);
+    
+    /* Validate LBA range */
+    if (lba + count > dev->sector_count) {
+        return STATUS_INVALID;
+    }
+    
+    /* Prepare NVMe write command */
+    nvme_command_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    
+    cmd.cdw0 = (NVME_CMD_WRITE << 16); /* Opcode */
+    cmd.nsid = 1; /* Namespace 1 */
+    cmd.prp1 = (uint64_t)buffer; /* Data buffer */
+    cmd.cdw10 = (uint32_t)lba; /* Starting LBA (low) */
+    cmd.cdw11 = (uint32_t)(lba >> 32); /* Starting LBA (high) */
+    cmd.cdw12 = (count - 1); /* Number of logical blocks (0-based) */
+    
+    /* Create I/O request */
+    storage_io_request_t* req = &storage_subsystem.io_pool[1]; /* Simplified allocation */
+    req->device_id = dev->id;
+    req->lba = lba;
+    req->sector_count = count;
+    req->buffer = (void*)buffer;
+    req->timestamp_start = hal_timer_get_timestamp_ns();
+    
+    /* Submit to I/O queue */
+    status_t result = nvme_submit_command(&dev->io_queues[0], &cmd, req);
+    if (result != STATUS_OK) {
+        return result;
+    }
+    
+    /* Simulate completion processing */
+    nvme_process_completions(&dev->io_queues[0]);
+    
+    /* Update statistics */
+    __sync_add_and_fetch(&dev->total_writes, 1);
+    __sync_add_and_fetch(&dev->bytes_written, count * dev->sector_size);
+    
+    return STATUS_OK;
+}
+
+/* Device Management */
+
+/* Create storage device */
+static storage_device_t* storage_create_device(uint8_t interface_type, uint8_t controller_id) {
+    storage_device_t* device = (storage_device_t*)kalloc(sizeof(storage_device_t));
+    if (!device) {
+        return NULL;
+    }
+    
+    memset(device, 0, sizeof(*device));
+    device->id = storage_subsystem.device_count + 1;
+    device->interface_type = interface_type;
+    device->controller_id = controller_id;
+    
+    /* Set up function pointers based on interface type */
+    switch (interface_type) {
+        case STORAGE_TYPE_SATA:
+        case STORAGE_TYPE_IDE:
+            device->read = sata_read;
+            device->write = sata_write;
+            break;
+            
+        case STORAGE_TYPE_NVME:
+            device->read = nvme_read;
+            device->write = nvme_write;
+            
+            /* Initialize NVMe queues */
+            device->io_queue_count = 1;
+            device->io_queues = (nvme_queue_pair_t*)kalloc(sizeof(nvme_queue_pair_t));
+            if (device->io_queues) {
+                nvme_init_queue_pair(&device->io_queues[0], 1, 64);
+            }
+            break;
+            
+        default:
+            KLOG_WARN("STORAGE", "Unknown interface type: %u", interface_type);
+            kfree(device);
+            return NULL;
+    }
+    
+    return device;
+}
+
+/* Initialize SATA controller */
+static status_t sata_controller_init(storage_controller_t* ctrl) {
+    KLOG_INFO("STORAGE", "Initializing SATA controller %s", ctrl->name);
+    
+    ctrl->max_devices = 4; /* SATA typically supports 4 devices per controller */
+    ctrl->max_queue_depth = 32;
+    ctrl->supports_64bit_dma = true;
+    
+    return STATUS_OK;
+}
+
+/* Scan SATA devices */
+static status_t sata_scan_devices(storage_controller_t* ctrl) {
+    KLOG_INFO("STORAGE", "Scanning SATA devices on controller %s", ctrl->name);
+    
+    /* Simulate finding SATA devices */
+    for (int i = 0; i < 2; i++) { /* Simulate 2 SATA devices */
+        storage_device_t* device = storage_create_device(STORAGE_TYPE_SATA, ctrl->id);
+        if (!device) {
+            continue;
+        }
+        
+        /* Identify the device */
+        if (ata_identify_device(device) == STATUS_OK) {
+            /* Add to controller */
+            device->next = ctrl->devices;
+            ctrl->devices = device;
+            ctrl->device_count++;
+            
+            /* Add to global device list */
+            device->next = storage_subsystem.devices;
+            storage_subsystem.devices = device;
+            storage_subsystem.device_count++;
+            
+            KLOG_INFO("STORAGE", "SATA device added: %s (%u GB)", 
+                      device->model, (uint32_t)(device->capacity / (1024*1024*1024)));
+        } else {
+            kfree(device);
+        }
+    }
+    
+    return STATUS_OK;
+}
+
+/* Initialize NVMe controller */
+static status_t nvme_controller_init(storage_controller_t* ctrl) {
+    KLOG_INFO("STORAGE", "Initializing NVMe controller %s", ctrl->name);
+    
+    ctrl->max_devices = 1; /* NVMe controllers typically have one device with multiple namespaces */
+    ctrl->max_queue_depth = 1024;
+    ctrl->supports_64bit_dma = true;
+    
+    /* Set NVMe capabilities */
+    ctrl->nvme_caps.max_io_queues = 8;
+    ctrl->nvme_caps.page_size = NVME_PAGE_SIZE;
+    ctrl->nvme_caps.arbitration = 0; /* Round robin */
+    ctrl->nvme_caps.volatile_write_cache = true;
+    
+    return STATUS_OK;
+}
+
+/* Scan NVMe devices */
+static status_t nvme_scan_devices(storage_controller_t* ctrl) {
+    KLOG_INFO("STORAGE", "Scanning NVMe devices on controller %s", ctrl->name);
+    
+    /* Create NVMe device */
+    storage_device_t* device = storage_create_device(STORAGE_TYPE_NVME, ctrl->id);
+    if (!device) {
+        return STATUS_NOMEM;
+    }
+    
+    /* Simulate NVMe device identification */
+    strncpy(device->model, "LimitlessOS NVMe SSD", sizeof(device->model) - 1);
+    strncpy(device->serial, "NVME123456789", sizeof(device->serial) - 1);
+    strncpy(device->firmware, "1.0", sizeof(device->firmware) - 1);
+    
+    device->capacity = 1ULL * 1024 * 1024 * 1024 * 1024; /* 1TB */
+    device->sector_size = SECTOR_SIZE;
+    device->sector_count = device->capacity / device->sector_size;
+    device->device_type = DEVICE_TYPE_SSD;
+    device->queue_depth = 1024;
+    
+    /* Set NVMe capabilities */
+    device->supports_48bit_lba = true;
+    device->supports_dma = true;
+    device->supports_ncq = true;
+    device->supports_trim = true; /* SSD supports TRIM */
+    device->supports_smart = true;
+    device->supports_encryption = true;
+    
+    /* Create namespace */
+    nvme_namespace_t* ns = (nvme_namespace_t*)kalloc(sizeof(nvme_namespace_t));
+    if (ns) {
+        memset(ns, 0, sizeof(*ns));
+        ns->id = 1;
+        ns->size = device->capacity;
+        ns->block_size = device->sector_size;
+        ns->block_count = device->sector_count;
+        ns->supports_deallocate = true;
+        ns->supports_write_zeros = true;
+        ns->optimal_io_size = 128 * 1024; /* 128KB */
+        ns->max_transfer_size = MAX_TRANSFER_SIZE;
+        
+        device->namespaces = ns;
+        device->namespace_count = 1;
+    }
+    
+    /* Add to controller */
+    device->next = ctrl->devices;
+    ctrl->devices = device;
+    ctrl->device_count++;
+    
+    /* Add to global device list */
+    device->next = storage_subsystem.devices;
+    storage_subsystem.devices = device;
+    storage_subsystem.device_count++;
+    
+    KLOG_INFO("STORAGE", "NVMe device added: %s (%u GB)", 
+              device->model, (uint32_t)(device->capacity / (1024*1024*1024)));
+    
+    return STATUS_OK;
+}
+
+/* Initialize storage controller */
+static storage_controller_t* storage_init_controller(uint8_t type, const char* name) {
+    storage_controller_t* ctrl = (storage_controller_t*)kalloc(sizeof(storage_controller_t));
+    if (!ctrl) {
+        return NULL;
+    }
+    
+    memset(ctrl, 0, sizeof(*ctrl));
+    ctrl->id = storage_subsystem.controller_count + 1;
+    ctrl->type = type;
+    strncpy(ctrl->name, name, sizeof(ctrl->name) - 1);
+    
+    /* Set up operations based on controller type */
+    switch (type) {
+        case STORAGE_TYPE_SATA:
+        case STORAGE_TYPE_IDE:
+            ctrl->init = sata_controller_init;
+            ctrl->scan_devices = sata_scan_devices;
+            break;
+            
+        case STORAGE_TYPE_NVME:
+            ctrl->init = nvme_controller_init;
+            ctrl->scan_devices = nvme_scan_devices;
+            break;
+            
+        default:
+            KLOG_WARN("STORAGE", "Unknown controller type: %u", type);
+            kfree(ctrl);
+            return NULL;
+    }
+    
+    /* Initialize controller */
+    if (ctrl->init && ctrl->init(ctrl) != STATUS_OK) {
+        KLOG_ERROR("STORAGE", "Failed to initialize storage controller %s", name);
+        kfree(ctrl);
+        return NULL;
+    }
+    
+    /* Scan for devices */
+    if (ctrl->scan_devices && ctrl->scan_devices(ctrl) != STATUS_OK) {
+        KLOG_WARN("STORAGE", "Device scan failed for controller %s", name);
+    }
+    
+    return ctrl;
+}
+
+/* Create partition */
+static storage_partition_t* storage_create_partition(uint32_t device_id, uint64_t start_lba, 
+                                                   uint64_t size_lba, uint8_t type) {
+    storage_partition_t* partition = (storage_partition_t*)kalloc(sizeof(storage_partition_t));
+    if (!partition) {
+        return NULL;
+    }
+    
+    memset(partition, 0, sizeof(*partition));
+    partition->id = storage_subsystem.partition_count + 1;
+    partition->device_id = device_id;
+    partition->start_lba = start_lba;
+    partition->size_lba = size_lba;
+    partition->type = type;
+    
+    /* Set default label based on type */
+    switch (type) {
+        case 0x07: /* NTFS */
+            strncpy(partition->filesystem, "NTFS", sizeof(partition->filesystem) - 1);
+            strncpy(partition->label, "System", sizeof(partition->label) - 1);
+            break;
+        case 0x83: /* Linux */
+            strncpy(partition->filesystem, "ext4", sizeof(partition->filesystem) - 1);
+            strncpy(partition->label, "Root", sizeof(partition->label) - 1);
+            break;
+        default:
+            strncpy(partition->filesystem, "Unknown", sizeof(partition->filesystem) - 1);
+            strncpy(partition->label, "Partition", sizeof(partition->label) - 1);
+            break;
+    }
+    
+    return partition;
+}
+
+/* Print storage statistics */
+void storage_print_stats(void) {
+    kprintf("=== Storage Subsystem Statistics ===\n");
+    
+    kprintf("\nStorage Controllers:\n");
+    kprintf("  Active Controllers: %u\n", storage_subsystem.controller_count);
+    
+    storage_controller_t* ctrl = storage_subsystem.controllers;
+    while (ctrl) {
+        kprintf("    %s (%s): %u devices, %llu commands\n",
+                ctrl->name, interface_type_names[ctrl->type < 7 ? ctrl->type : 0],
+                ctrl->device_count, ctrl->total_commands);
+        ctrl = ctrl->next;
+    }
+    
+    kprintf("\nStorage Devices:\n");
+    kprintf("  Connected Devices: %u\n", storage_subsystem.device_count);
+    
+    storage_device_t* dev = storage_subsystem.devices;
+    while (dev) {
+        kprintf("    Device %u: %s (%s, %s)\n",
+                dev->id, dev->model,
+                interface_type_names[dev->interface_type < 7 ? dev->interface_type : 0],
+                device_type_names[dev->device_type < 6 ? dev->device_type : 0]);
+        kprintf("      Capacity: %llu GB, Sectors: %llu, Sector Size: %u\n",
+                dev->capacity / (1024*1024*1024), dev->sector_count, dev->sector_size);
+        kprintf("      Reads: %llu (%llu bytes), Writes: %llu (%llu bytes)\n",
+                dev->total_reads, dev->bytes_read, dev->total_writes, dev->bytes_written);
+        kprintf("      Avg Read Latency: %u μs, Avg Write Latency: %u μs\n",
+                dev->average_read_latency, dev->average_write_latency);
+        
+        if (dev->device_type == DEVICE_TYPE_HDD) {
+            kprintf("      RPM: %u, Temperature: %u°C\n", dev->rpm, dev->smart_data.temperature);
+        }
+        
+        if (dev->namespaces) {
+            nvme_namespace_t* ns = dev->namespaces;
+            while (ns) {
+                kprintf("      Namespace %u: %llu blocks (%u bytes/block)\n",
+                        ns->id, ns->block_count, ns->block_size);
+                ns = ns->next;
+            }
+        }
+        
+        dev = dev->next;
+    }
+    
+    kprintf("\nPartitions:\n");
+    kprintf("  Total Partitions: %u\n", storage_subsystem.partition_count);
+    
+    storage_partition_t* part = storage_subsystem.partitions;
+    while (part) {
+        kprintf("    Partition %u (Device %u): %s (%s)\n",
+                part->id, part->device_id, part->label, part->filesystem);
+        kprintf("      Range: LBA %llu - %llu (%llu sectors)\n",
+                part->start_lba, part->start_lba + part->size_lba - 1, part->size_lba);
+        if (part->mounted) {
+            kprintf("      Mount Point: %s\n", part->mount_point);
+        }
+        part = part->next;
+    }
+    
+    kprintf("\nGlobal Statistics:\n");
+    kprintf("  Total Read Operations: %llu\n", storage_subsystem.total_read_operations);
+    kprintf("  Total Write Operations: %llu\n", storage_subsystem.total_write_operations);
+    kprintf("  Total Bytes Read: %llu\n", storage_subsystem.total_bytes_read);
+    kprintf("  Total Bytes Written: %llu\n", storage_subsystem.total_bytes_written);
+    kprintf("  Total I/O Errors: %llu\n", storage_subsystem.total_io_errors);
+    kprintf("  Current IOPS: %u\n", storage_subsystem.current_iops);
+    kprintf("  Peak IOPS: %u\n", storage_subsystem.peak_iops);
+    
+    kprintf("\nConfiguration:\n");
+    kprintf("  I/O Scheduler: %s\n", storage_subsystem.io_scheduler_enabled ? "Enabled" : "Disabled");
+    kprintf("  Write Cache: %s\n", storage_subsystem.write_cache_enabled ? "Enabled" : "Disabled");
+    kprintf("  Read Ahead: %s\n", storage_subsystem.read_ahead_enabled ? "Enabled" : "Disabled");
+    kprintf("  I/O Timeout: %u ms\n", storage_subsystem.io_timeout_ms);
+    
+    kprintf("=== End Storage Statistics ===\n");
+}
+
+/* Initialize storage subsystem */
+status_t storage_subsystem_init(void) {
+    KLOG_INFO("STORAGE", "Initializing storage subsystem");
+    
+    memset(&storage_subsystem, 0, sizeof(storage_subsystem));
+    storage_subsystem.free_io_requests = MAX_IO_QUEUE_SIZE;
+    storage_subsystem.io_scheduler_enabled = true;
+    storage_subsystem.write_cache_enabled = true;
+    storage_subsystem.read_ahead_enabled = true;
+    storage_subsystem.io_timeout_ms = 30000; /* 30 second timeout */
+    
+    /* Initialize SATA controller */
+    storage_controller_t* sata = storage_init_controller(STORAGE_TYPE_SATA, "SATA Controller 0");
+    if (sata) {
+        sata->next = storage_subsystem.controllers;
+        storage_subsystem.controllers = sata;
+        storage_subsystem.controller_count++;
+        
+        KLOG_INFO("STORAGE", "SATA controller initialized with %u devices", sata->device_count);
+    }
+    
+    /* Initialize NVMe controller */
+    storage_controller_t* nvme = storage_init_controller(STORAGE_TYPE_NVME, "NVMe Controller 0");
+    if (nvme) {
+        nvme->next = storage_subsystem.controllers;
+        storage_subsystem.controllers = nvme;
+        storage_subsystem.controller_count++;
+        
+        KLOG_INFO("STORAGE", "NVMe controller initialized with %u devices", nvme->device_count);
+    }
+    
+    /* Create some example partitions */
+    if (storage_subsystem.device_count > 0) {
+        storage_device_t* first_device = storage_subsystem.devices;
+        
+        /* Create system partition (first 100GB) */
+        storage_partition_t* sys_part = storage_create_partition(first_device->id, 2048, 
+                                                               (100ULL * 1024 * 1024 * 1024) / SECTOR_SIZE, 
+                                                               0x07); /* NTFS */
+        if (sys_part) {
+            strncpy(sys_part->mount_point, "/", sizeof(sys_part->mount_point) - 1);
+            sys_part->mounted = true;
+            
+            sys_part->next = storage_subsystem.partitions;
+            storage_subsystem.partitions = sys_part;
+            storage_subsystem.partition_count++;
+        }
+        
+        /* Create data partition (rest of the drive) */
+        uint64_t remaining_sectors = first_device->sector_count - 2048 - ((100ULL * 1024 * 1024 * 1024) / SECTOR_SIZE);
+        if (remaining_sectors > 0) {
+            storage_partition_t* data_part = storage_create_partition(first_device->id, 
+                                                                    2048 + ((100ULL * 1024 * 1024 * 1024) / SECTOR_SIZE),
+                                                                    remaining_sectors, 0x83); /* Linux */
+            if (data_part) {
+                strncpy(data_part->label, "Data", sizeof(data_part->label) - 1);
+                strncpy(data_part->mount_point, "/data", sizeof(data_part->mount_point) - 1);
+                data_part->mounted = true;
+                
+                data_part->next = storage_subsystem.partitions;
+                storage_subsystem.partitions = data_part;
+                storage_subsystem.partition_count++;
+            }
+        }
+    }
+    
+    KLOG_INFO("STORAGE", "Storage subsystem initialization complete");
+    KLOG_INFO("STORAGE", "  Controllers: %u", storage_subsystem.controller_count);
+    KLOG_INFO("STORAGE", "  Devices: %u", storage_subsystem.device_count);
+    KLOG_INFO("STORAGE", "  Partitions: %u", storage_subsystem.partition_count);
+    
+    return STATUS_OK;
+}

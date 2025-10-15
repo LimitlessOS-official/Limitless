@@ -1,0 +1,535 @@
+/**
+ * Intrusion Detection System (IDS) for LimitlessOS
+ * Real-time security monitoring and threat detection
+ */
+
+#include "kernel.h"
+#include "security.h"
+#include "process.h"
+#include "net.h"
+#include "timer.h"
+
+/* IDS state */
+typedef struct {
+    bool enabled;
+    uint32_t threat_level;
+    uint64_t last_scan_time;
+    uint32_t alerts_generated;
+    uint32_t threats_blocked;
+    
+    /* Detection rules */
+    ids_rule_t rules[MAX_IDS_RULES];
+    uint32_t rule_count;
+    
+    /* Anomaly detection state */
+    struct {
+        uint32_t process_spawn_rate;
+        uint32_t network_connection_rate;
+        uint32_t file_access_rate;
+        uint32_t privilege_escalation_attempts;
+        uint64_t last_update_time;
+    } baseline;
+    
+    /* Threat patterns */
+    struct {
+        char signature[64];
+        uint32_t severity;
+        uint32_t detection_count;
+    } patterns[MAX_THREAT_PATTERNS];
+    uint32_t pattern_count;
+    
+    spinlock_t lock;
+} ids_system_t;
+
+static ids_system_t g_ids = {0};
+
+/* Initialize IDS */
+status_t ids_init(void) {
+    if (g_ids.enabled) {
+        return STATUS_EXISTS;
+    }
+    
+    k_memset(&g_ids, 0, sizeof(ids_system_t));
+    spinlock_init(&g_ids.lock);
+    
+    /* Initialize baseline metrics */
+    g_ids.baseline.last_update_time = timer_get_ticks();
+    
+    /* Add default detection rules */
+    ids_add_rule("SUSPICIOUS_PROCESS_SPAWN", IDS_RULE_PROCESS_ANOMALY, 
+                 "Process spawn rate exceeds baseline", THREAT_LEVEL_MEDIUM);
+    
+    ids_add_rule("PRIVILEGE_ESCALATION", IDS_RULE_PRIVILEGE_ESCALATION,
+                 "Unauthorized privilege escalation attempt", THREAT_LEVEL_HIGH);
+    
+    ids_add_rule("NETWORK_SCAN", IDS_RULE_NETWORK_ANOMALY,
+                 "Network port scanning detected", THREAT_LEVEL_MEDIUM);
+    
+    ids_add_rule("FILE_ACCESS_FLOOD", IDS_RULE_FILE_ANOMALY,
+                 "Excessive file access rate", THREAT_LEVEL_LOW);
+    
+    /* Add threat signatures */
+    ids_add_threat_pattern("BUFFER_OVERFLOW", THREAT_LEVEL_CRITICAL, 
+                          "Buffer overflow attack pattern");
+    
+    ids_add_threat_pattern("SQL_INJECTION", THREAT_LEVEL_HIGH,
+                          "SQL injection attempt");
+    
+    ids_add_threat_pattern("BRUTE_FORCE", THREAT_LEVEL_MEDIUM,
+                          "Brute force login attempt");
+    
+    g_ids.enabled = true;
+    
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "IDS initialized", "ids_system", 1);
+    
+    return STATUS_OK;
+}
+
+/* Add detection rule */
+status_t ids_add_rule(const char* name, ids_rule_type_t type, const char* description, uint32_t severity) {
+    if (!g_ids.enabled || !name || !description) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_ids.lock);
+    
+    if (g_ids.rule_count >= MAX_IDS_RULES) {
+        spin_unlock(&g_ids.lock);
+        return STATUS_FULL;
+    }
+    
+    ids_rule_t* rule = &g_ids.rules[g_ids.rule_count++];
+    
+    strncpy(rule->name, name, sizeof(rule->name) - 1);
+    rule->name[sizeof(rule->name) - 1] = 0;
+    
+    strncpy(rule->description, description, sizeof(rule->description) - 1);
+    rule->description[sizeof(rule->description) - 1] = 0;
+    
+    rule->rule_type = type;
+    rule->severity = severity;
+    rule->enabled = true;
+    rule->trigger_count = 0;
+    rule->last_triggered = 0;
+    
+    /* Set default thresholds based on rule type */
+    switch (type) {
+        case IDS_RULE_PROCESS_ANOMALY:
+            rule->threshold = 10;  /* Max 10 process spawns per second */
+            break;
+        case IDS_RULE_NETWORK_ANOMALY:
+            rule->threshold = 20;  /* Max 20 connections per second */
+            break;
+        case IDS_RULE_FILE_ANOMALY:
+            rule->threshold = 100; /* Max 100 file accesses per second */
+            break;
+        case IDS_RULE_PRIVILEGE_ESCALATION:
+            rule->threshold = 1;   /* Any privilege escalation is suspicious */
+            break;
+        default:
+            rule->threshold = 5;
+            break;
+    }
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Add threat pattern */
+status_t ids_add_threat_pattern(const char* signature, uint32_t severity, const char* description) {
+    if (!g_ids.enabled || !signature) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_ids.lock);
+    
+    if (g_ids.pattern_count >= MAX_THREAT_PATTERNS) {
+        spin_unlock(&g_ids.lock);
+        return STATUS_FULL;
+    }
+    
+    strncpy(g_ids.patterns[g_ids.pattern_count].signature, signature, 
+            sizeof(g_ids.patterns[g_ids.pattern_count].signature) - 1);
+    g_ids.patterns[g_ids.pattern_count].signature[sizeof(g_ids.patterns[g_ids.pattern_count].signature) - 1] = 0;
+    
+    g_ids.patterns[g_ids.pattern_count].severity = severity;
+    g_ids.patterns[g_ids.pattern_count].detection_count = 0;
+    g_ids.pattern_count++;
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Monitor process creation */
+status_t ids_monitor_process_spawn(pid_t pid, const char* name, uid_t uid) {
+    if (!g_ids.enabled) {
+        return STATUS_OK;
+    }
+    
+    uint64_t current_time = timer_get_ticks();
+    
+    spin_lock(&g_ids.lock);
+    
+    /* Update process spawn rate */
+    if (current_time - g_ids.baseline.last_update_time < TIMER_HZ) {
+        g_ids.baseline.process_spawn_rate++;
+    } else {
+        g_ids.baseline.process_spawn_rate = 1;
+        g_ids.baseline.last_update_time = current_time;
+    }
+    
+    /* Check for anomalies */
+    for (uint32_t i = 0; i < g_ids.rule_count; i++) {
+        ids_rule_t* rule = &g_ids.rules[i];
+        
+        if (!rule->enabled || rule->rule_type != IDS_RULE_PROCESS_ANOMALY) {
+            continue;
+        }
+        
+        if (g_ids.baseline.process_spawn_rate > rule->threshold) {
+            rule->trigger_count++;
+            rule->last_triggered = current_time;
+            
+            /* Generate security alert */
+            ids_generate_alert(rule->name, rule->severity, pid, uid, 
+                              "Suspicious process spawn rate detected", name);
+            
+            /* Increase threat level */
+            if (g_ids.threat_level < rule->severity) {
+                g_ids.threat_level = rule->severity;
+            }
+        }
+    }
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Monitor network activity */
+status_t ids_monitor_network_activity(uint32_t src_ip, uint16_t src_port, 
+                                     uint32_t dst_ip, uint16_t dst_port, 
+                                     network_protocol_t protocol) {
+    if (!g_ids.enabled) {
+        return STATUS_OK;
+    }
+    
+    uint64_t current_time = timer_get_ticks();
+    
+    spin_lock(&g_ids.lock);
+    
+    /* Update network connection rate */
+    if (current_time - g_ids.baseline.last_update_time < TIMER_HZ) {
+        g_ids.baseline.network_connection_rate++;
+    } else {
+        g_ids.baseline.network_connection_rate = 1;
+    }
+    
+    /* Check for port scanning (many connections to different ports) */
+    bool port_scan_detected = false;
+    if (g_ids.baseline.network_connection_rate > 20 && dst_port < 1024) {
+        port_scan_detected = true;
+    }
+    
+    /* Check network anomaly rules */
+    for (uint32_t i = 0; i < g_ids.rule_count; i++) {
+        ids_rule_t* rule = &g_ids.rules[i];
+        
+        if (!rule->enabled || rule->rule_type != IDS_RULE_NETWORK_ANOMALY) {
+            continue;
+        }
+        
+        if (g_ids.baseline.network_connection_rate > rule->threshold || port_scan_detected) {
+            rule->trigger_count++;
+            rule->last_triggered = current_time;
+            
+            /* Generate security alert */
+            char alert_msg[256];
+            snprintf(alert_msg, sizeof(alert_msg), 
+                    "Network anomaly: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+                    (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, 
+                    (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                    (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, 
+                    (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port);
+            
+            ids_generate_alert(rule->name, rule->severity, 0, 0, alert_msg, "network");
+            
+            if (g_ids.threat_level < rule->severity) {
+                g_ids.threat_level = rule->severity;
+            }
+        }
+    }
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Monitor file access */
+status_t ids_monitor_file_access(pid_t pid, uid_t uid, const char* filename, uint32_t access_flags) {
+    if (!g_ids.enabled || !filename) {
+        return STATUS_OK;
+    }
+    
+    uint64_t current_time = timer_get_ticks();
+    
+    spin_lock(&g_ids.lock);
+    
+    /* Update file access rate */
+    if (current_time - g_ids.baseline.last_update_time < TIMER_HZ) {
+        g_ids.baseline.file_access_rate++;
+    } else {
+        g_ids.baseline.file_access_rate = 1;
+    }
+    
+    /* Check for suspicious file access patterns */
+    bool suspicious_access = false;
+    
+    /* Check for access to sensitive files */
+    if (strstr(filename, "/etc/passwd") || strstr(filename, "/etc/shadow") ||
+        strstr(filename, "config") || strstr(filename, ".key") ||
+        strstr(filename, ".pem")) {
+        suspicious_access = true;
+    }
+    
+    /* Check file anomaly rules */
+    for (uint32_t i = 0; i < g_ids.rule_count; i++) {
+        ids_rule_t* rule = &g_ids.rules[i];
+        
+        if (!rule->enabled || rule->rule_type != IDS_RULE_FILE_ANOMALY) {
+            continue;
+        }
+        
+        if (g_ids.baseline.file_access_rate > rule->threshold || suspicious_access) {
+            rule->trigger_count++;
+            rule->last_triggered = current_time;
+            
+            /* Generate security alert */
+            char alert_msg[256];
+            snprintf(alert_msg, sizeof(alert_msg), 
+                    "File access anomaly: PID %u accessing %s (flags: 0x%x)",
+                    pid, filename, access_flags);
+            
+            ids_generate_alert(rule->name, suspicious_access ? THREAT_LEVEL_HIGH : rule->severity, 
+                              pid, uid, alert_msg, filename);
+            
+            if (g_ids.threat_level < rule->severity) {
+                g_ids.threat_level = rule->severity;
+            }
+        }
+    }
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Monitor privilege escalation */
+status_t ids_monitor_privilege_escalation(pid_t pid, uid_t old_uid, uid_t new_uid) {
+    if (!g_ids.enabled) {
+        return STATUS_OK;
+    }
+    
+    uint64_t current_time = timer_get_ticks();
+    
+    spin_lock(&g_ids.lock);
+    
+    g_ids.baseline.privilege_escalation_attempts++;
+    
+    /* Any privilege escalation to root is highly suspicious */
+    bool unauthorized_escalation = (new_uid == UID_ROOT && old_uid != UID_ROOT);
+    
+    /* Check privilege escalation rules */
+    for (uint32_t i = 0; i < g_ids.rule_count; i++) {
+        ids_rule_t* rule = &g_ids.rules[i];
+        
+        if (!rule->enabled || rule->rule_type != IDS_RULE_PRIVILEGE_ESCALATION) {
+            continue;
+        }
+        
+        if (unauthorized_escalation || g_ids.baseline.privilege_escalation_attempts > rule->threshold) {
+            rule->trigger_count++;
+            rule->last_triggered = current_time;
+            
+            /* Generate critical security alert */
+            char alert_msg[256];
+            snprintf(alert_msg, sizeof(alert_msg), 
+                    "Privilege escalation: PID %u escalated from UID %u to UID %u",
+                    pid, old_uid, new_uid);
+            
+            ids_generate_alert(rule->name, THREAT_LEVEL_CRITICAL, pid, old_uid, alert_msg, "privilege");
+            
+            g_ids.threat_level = THREAT_LEVEL_CRITICAL;
+            g_ids.threats_blocked++;
+            
+            /* In a real system, would block the escalation */
+        }
+    }
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Generate security alert */
+status_t ids_generate_alert(const char* rule_name, uint32_t severity, pid_t pid, uid_t uid,
+                           const char* description, const char* object_name) {
+    if (!g_ids.enabled || !rule_name || !description) {
+        return STATUS_ERROR;
+    }
+    
+    g_ids.alerts_generated++;
+    
+    /* Log to security audit system */
+    security_audit_event(SECURITY_EVENT_INTRUSION_DETECTED, pid, uid, 
+                        description, object_name, severity);
+    
+    /* In a production system, would also:
+     * - Send alerts to security operations center
+     * - Update threat intelligence feeds
+     * - Trigger automated response actions
+     * - Notify system administrators
+     */
+    
+    return STATUS_OK;
+}
+
+/* Scan for threats */
+status_t ids_perform_threat_scan(void) {
+    if (!g_ids.enabled) {
+        return STATUS_OK;
+    }
+    
+    uint64_t current_time = timer_get_ticks();
+    
+    spin_lock(&g_ids.lock);
+    
+    g_ids.last_scan_time = current_time;
+    
+    /* Reset threat level for new scan */
+    uint32_t old_threat_level = g_ids.threat_level;
+    g_ids.threat_level = THREAT_LEVEL_LOW;
+    
+    /* Analyze recent activity patterns */
+    uint32_t total_suspicious_activity = 0;
+    
+    for (uint32_t i = 0; i < g_ids.rule_count; i++) {
+        ids_rule_t* rule = &g_ids.rules[i];
+        
+        if (!rule->enabled) {
+            continue;
+        }
+        
+        /* Check if rule has been triggered recently */
+        if (current_time - rule->last_triggered < (5 * TIMER_HZ)) {
+            total_suspicious_activity++;
+            
+            if (g_ids.threat_level < rule->severity) {
+                g_ids.threat_level = rule->severity;
+            }
+        }
+    }
+    
+    /* Update baseline metrics for next evaluation cycle */
+    if (current_time - g_ids.baseline.last_update_time >= TIMER_HZ) {
+        g_ids.baseline.process_spawn_rate = 0;
+        g_ids.baseline.network_connection_rate = 0;
+        g_ids.baseline.file_access_rate = 0;
+        g_ids.baseline.last_update_time = current_time;
+    }
+    
+    /* Generate summary alert if threat level changed */
+    if (g_ids.threat_level != old_threat_level) {
+        char alert_msg[256];
+        snprintf(alert_msg, sizeof(alert_msg), 
+                "Threat level changed from %u to %u (%u suspicious activities)",
+                old_threat_level, g_ids.threat_level, total_suspicious_activity);
+        
+        ids_generate_alert("THREAT_LEVEL_CHANGE", g_ids.threat_level, 0, 0, 
+                          alert_msg, "ids_system");
+    }
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Get IDS statistics */
+status_t ids_get_statistics(ids_statistics_t* stats) {
+    if (!g_ids.enabled || !stats) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_ids.lock);
+    
+    k_memset(stats, 0, sizeof(ids_statistics_t));
+    
+    stats->enabled = g_ids.enabled;
+    stats->current_threat_level = g_ids.threat_level;
+    stats->alerts_generated = g_ids.alerts_generated;
+    stats->threats_blocked = g_ids.threats_blocked;
+    stats->last_scan_time = g_ids.last_scan_time;
+    
+    /* Copy active rules */
+    stats->active_rules = 0;
+    for (uint32_t i = 0; i < g_ids.rule_count && i < MAX_IDS_RULES; i++) {
+        if (g_ids.rules[i].enabled) {
+            stats->rules[stats->active_rules] = g_ids.rules[i];
+            stats->active_rules++;
+        }
+    }
+    
+    /* Copy current baseline metrics */
+    stats->process_spawn_rate = g_ids.baseline.process_spawn_rate;
+    stats->network_connection_rate = g_ids.baseline.network_connection_rate;
+    stats->file_access_rate = g_ids.baseline.file_access_rate;
+    stats->privilege_escalation_attempts = g_ids.baseline.privilege_escalation_attempts;
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Enable/disable IDS */
+status_t ids_set_enabled(bool enabled) {
+    spin_lock(&g_ids.lock);
+    
+    bool was_enabled = g_ids.enabled;
+    g_ids.enabled = enabled;
+    
+    if (enabled && !was_enabled) {
+        /* Reset statistics when re-enabling */
+        g_ids.alerts_generated = 0;
+        g_ids.threats_blocked = 0;
+        g_ids.threat_level = THREAT_LEVEL_LOW;
+        
+        security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                            "IDS enabled", "ids_system", 1);
+    } else if (!enabled && was_enabled) {
+        security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                            "IDS disabled", "ids_system", 1);
+    }
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}
+
+/* Shutdown IDS */
+status_t ids_shutdown(void) {
+    if (!g_ids.enabled) {
+        return STATUS_OK;
+    }
+    
+    spin_lock(&g_ids.lock);
+    
+    /* Clear all data */
+    k_memset(&g_ids, 0, sizeof(ids_system_t));
+    
+    spin_unlock(&g_ids.lock);
+    
+    return STATUS_OK;
+}

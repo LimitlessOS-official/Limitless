@@ -1,0 +1,49 @@
+#include "interrupt.h"
+#include "scheduler.h"
+#include "kernel.h"
+
+/* HAL */
+extern void hal_idt_init(void);
+extern void hal_apic_init(void);
+extern void hal_ioapic_init(void);
+extern void hal_enable_irq(u8 vec);
+extern void hal_eoi(void);
+extern void hal_register_trap_stub(u8 vec, void (*stub)(void));
+
+/* ISR table */
+static isr_handler_t g_isr[256];
+static __thread u8 g_need_resched_flag = 0; /* per-CPU/TLS if available; Phase 1 simple */
+
+void interrupts_init(void) {
+    for (int i = 0; i < 256; ++i) g_isr[i] = NULL;
+    hal_idt_init();
+    hal_apic_init();
+    hal_ioapic_init();
+}
+
+int interrupt_register(u8 vector, isr_handler_t handler) {
+    g_isr[vector] = handler;
+    hal_enable_irq(vector);
+    return 0;
+}
+
+/* Called by assembly stubs (installed by HAL) */
+void interrupt_dispatch(u64 vec, u64 err_code, void* ctx) {
+    (void)ctx;
+    if (g_isr[vec]) {
+        g_isr[vec](vec, err_code, ctx);
+    }
+    if (g_need_resched_flag) {
+        g_need_resched_flag = 0;
+        scheduler_schedule();
+    }
+    hal_eoi();
+}
+
+void interrupt_timer_tick(void) {
+    scheduler_tick();
+}
+
+void interrupt_request_reschedule(void) {
+    g_need_resched_flag = 1;
+}

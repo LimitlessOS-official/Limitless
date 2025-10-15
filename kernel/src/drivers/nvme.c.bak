@@ -1,0 +1,209 @@
+/**
+ * NVMe (Non-Volatile Memory Express) Driver for LimitlessOS
+ * Implements PCIe-based SSD interface with command queues
+ */
+
+#include "kernel.h"
+#include "pci.h"
+#include "storage.h"
+#include "vmm.h"
+#include "string.h"
+#include "log.h"
+#include "timer.h"
+
+/* NVMe register offsets */
+#define NVME_REG_CAP     0x00  /* Controller Capabilities */
+#define NVME_REG_VS      0x08  /* Version */
+#define NVME_REG_INTMS   0x0C  /* Interrupt Mask Set */
+#define NVME_REG_INTMC   0x10  /* Interrupt Mask Clear */
+#define NVME_REG_CC      0x14  /* Controller Configuration */
+#define NVME_REG_CSTS    0x1C  /* Controller Status */
+#define NVME_REG_NSSR    0x20  /* NVM Subsystem Reset */
+#define NVME_REG_AQA     0x24  /* Admin Queue Attributes */
+#define NVME_REG_ASQ     0x28  /* Admin Submission Queue Base Address */
+#define NVME_REG_ACQ     0x30  /* Admin Completion Queue Base Address */
+
+/* NVMe queue sizes */
+#define NVME_ADMIN_QUEUE_SIZE  64
+#define NVME_IO_QUEUE_SIZE     1024
+#define MAX_NVME_CONTROLLERS   8
+
+/* NVMe command opcodes */
+#define NVME_ADMIN_DELETE_SQ     0x00
+#define NVME_ADMIN_CREATE_SQ     0x01  
+#define NVME_ADMIN_DELETE_CQ     0x04
+#define NVME_ADMIN_CREATE_CQ     0x05
+#define NVME_ADMIN_IDENTIFY      0x06
+#define NVME_ADMIN_SET_FEATURES  0x09
+#define NVME_ADMIN_GET_FEATURES  0x0A
+
+#define NVME_CMD_READ            0x02
+#define NVME_CMD_WRITE           0x01
+
+/* NVMe command structure */
+typedef struct {
+    uint8_t  opcode;
+    uint8_t  flags;
+    uint16_t command_id;
+    uint32_t namespace_id;
+    uint64_t reserved1;
+    uint64_t metadata_ptr;
+    uint64_t prp1;
+    uint64_t prp2;
+    uint32_t cdw10;
+    uint32_t cdw11;
+    uint32_t cdw12;
+    uint32_t cdw13;
+    uint32_t cdw14;
+    uint32_t cdw15;
+} __attribute__((packed)) nvme_command_t;
+
+/* NVMe completion entry */
+typedef struct {
+    uint32_t result;
+    uint32_t reserved;
+    uint16_t sq_head;
+    uint16_t sq_id;
+    uint16_t command_id;
+    uint16_t status;
+} __attribute__((packed)) nvme_completion_t;
+
+/* NVMe queue pair */
+typedef struct {
+    nvme_command_t* sq_base;      /* Submission queue */
+    nvme_completion_t* cq_base;   /* Completion queue */
+    uint32_t sq_size;
+    uint32_t cq_size; 
+    uint32_t sq_tail;
+    uint32_t cq_head;
+    uint16_t sq_id;
+    uint16_t cq_id;
+    bool phase_tag;
+} nvme_queue_t;
+
+/* NVMe controller */
+typedef struct {
+    bool in_use;
+    pci_device_t pci_dev;
+    void* mmio_base;
+    size_t mmio_size;
+    
+    /* Controller capabilities */
+    uint64_t capabilities;
+    uint32_t version;
+    uint32_t max_queue_entries;
+    uint32_t doorbell_stride;
+    
+    /* Queues */
+    nvme_queue_t admin_queue;
+    nvme_queue_t io_queues[4];  /* Support up to 4 I/O queues */
+    uint32_t num_io_queues;
+    
+    /* Namespace information */
+    uint32_t namespace_count;
+    uint64_t namespace_size[256];  /* LBA count per namespace */
+    uint32_t namespace_block_size[256];
+    
+    /* Command tracking */
+    uint16_t next_command_id;
+} nvme_controller_t;
+
+static nvme_controller_t g_nvme_controllers[MAX_NVME_CONTROLLERS];
+static uint32_t g_nvme_controller_count = 0;
+
+/* MMIO register access */
+static inline uint32_t nvme_read32(nvme_controller_t* ctrl, uint32_t offset) {
+    return *(volatile uint32_t*)((uint8_t*)ctrl->mmio_base + offset);
+}
+
+static inline void nvme_write32(nvme_controller_t* ctrl, uint32_t offset, uint32_t value) {
+    *(volatile uint32_t*)((uint8_t*)ctrl->mmio_base + offset) = value;
+}
+
+static inline uint64_t nvme_read64(nvme_controller_t* ctrl, uint32_t offset) {
+    return *(volatile uint64_t*)((uint8_t*)ctrl->mmio_base + offset);
+}
+
+static inline void nvme_write64(nvme_controller_t* ctrl, uint32_t offset, uint64_t value) {
+    *(volatile uint64_t*)((uint8_t*)ctrl->mmio_base + offset) = value;
+}
+
+/* Ring doorbell to notify controller */
+static void nvme_ring_doorbell(nvme_controller_t* ctrl, uint16_t queue_id, bool is_cq, uint32_t value) {
+    uint32_t offset = 0x1000 + (2 * queue_id + (is_cq ? 1 : 0)) * (4 << ctrl->doorbell_stride);
+    nvme_write32(ctrl, offset, value);
+}
+
+/* Submit command to queue */
+static status_t nvme_submit_command(nvme_controller_t* ctrl, nvme_queue_t* queue, nvme_command_t* cmd) {
+    if (!ctrl || !queue || !cmd) {
+        return STATUS_ERROR;
+    }
+    
+    /* Copy command to submission queue */
+    queue->sq_base[queue->sq_tail] = *cmd;
+    
+    /* Update tail pointer */
+    queue->sq_tail = (queue->sq_tail + 1) % queue->sq_size;
+    
+    /* Ring doorbell */
+    nvme_ring_doorbell(ctrl, queue->sq_id, false, queue->sq_tail);
+    
+    return STATUS_OK;
+}
+
+/* Process completion queue */
+static bool nvme_process_completions(nvme_controller_t* ctrl, nvme_queue_t* queue) {
+    if (!ctrl || !queue) {
+        return false;
+    }
+    
+    bool processed = false;
+    
+    while (true) {
+        nvme_completion_t* cqe = &queue->cq_base[queue->cq_head];
+        
+        /* Check phase tag */
+        bool phase = (cqe->status & 0x0001) != 0;
+        if (phase != queue->phase_tag) {
+            break;  /* No more completions */
+        }
+        
+        /* Process completion */
+        uint16_t status = (cqe->status >> 1) & 0x7FF;
+        if (status != 0) {
+            KLOG_WARN(\"nvme\", \"Command %u completed with error: 0x%x\", cqe->command_id, status);
+        }
+        
+        /* Update head pointer */
+        queue->cq_head = (queue->cq_head + 1) % queue->cq_size;
+        if (queue->cq_head == 0) {
+            queue->phase_tag = !queue->phase_tag;
+        }
+        
+        processed = true;
+    }
+    
+    if (processed) {
+        /* Ring completion doorbell */
+        nvme_ring_doorbell(ctrl, queue->cq_id, true, queue->cq_head);
+    }
+    
+    return processed;
+}
+
+/* Initialize NVMe queue */
+static status_t nvme_init_queue(nvme_queue_t* queue, uint16_t sq_id, uint16_t cq_id, uint32_t size) {
+    if (!queue || size == 0 || size > 4096) {
+        return STATUS_ERROR;
+    }
+    
+    /* Allocate submission queue */\n    queue->sq_base = (nvme_command_t*)vmm_kmalloc(size * sizeof(nvme_command_t), PAGE_SIZE);\n    if (!queue->sq_base) {\n        return STATUS_NOMEM;\n    }\n    \n    /* Allocate completion queue */\n    queue->cq_base = (nvme_completion_t*)vmm_kmalloc(size * sizeof(nvme_completion_t), PAGE_SIZE);\n    if (!queue->cq_base) {\n        vmm_kfree(queue->sq_base, size * sizeof(nvme_command_t));\n        return STATUS_NOMEM;\n    }\n    \n    /* Initialize queue state */\n    k_memset(queue->sq_base, 0, size * sizeof(nvme_command_t));\n    k_memset(queue->cq_base, 0, size * sizeof(nvme_completion_t));\n    \n    queue->sq_size = size;\n    queue->cq_size = size;\n    queue->sq_tail = 0;\n    queue->cq_head = 0;\n    queue->sq_id = sq_id;\n    queue->cq_id = cq_id;\n    queue->phase_tag = true;\n    \n    return STATUS_OK;\n}\n\n/* Send Identify command */\nstatic status_t nvme_identify(nvme_controller_t* ctrl, uint8_t cns, uint32_t nsid, void* buffer) {\n    if (!ctrl || !buffer) {\n        return STATUS_ERROR;\n    }\n    \n    nvme_command_t cmd = {0};\n    cmd.opcode = NVME_ADMIN_IDENTIFY;\n    cmd.command_id = ctrl->next_command_id++;\n    cmd.namespace_id = nsid;\n    cmd.prp1 = (uint64_t)(uintptr_t)buffer;  /* Physical address */\n    cmd.cdw10 = cns;\n    \n    return nvme_submit_command(ctrl, &ctrl->admin_queue, &cmd);\n}\n\n/* Read/Write data */\nstatic status_t nvme_rw_data(nvme_controller_t* ctrl, bool is_write, uint32_t nsid, \n                           uint64_t start_lba, uint32_t block_count, void* buffer) {\n    if (!ctrl || !buffer || nsid == 0 || nsid > ctrl->namespace_count) {\n        return STATUS_ERROR;\n    }\n    \n    /* Use first I/O queue */\n    nvme_queue_t* io_queue = &ctrl->io_queues[0];\n    \n    nvme_command_t cmd = {0};\n    cmd.opcode = is_write ? NVME_CMD_WRITE : NVME_CMD_READ;\n    cmd.command_id = ctrl->next_command_id++;\n    cmd.namespace_id = nsid;\n    cmd.prp1 = (uint64_t)(uintptr_t)buffer;  /* Physical address */\n    cmd.cdw10 = start_lba & 0xFFFFFFFF;\n    cmd.cdw11 = (start_lba >> 32) & 0xFFFFFFFF;\n    cmd.cdw12 = (block_count - 1) & 0xFFFF;  /* 0-based */\n    \n    return nvme_submit_command(ctrl, io_queue, &cmd);\n}\n\n/* Reset controller */\nstatic status_t nvme_reset_controller(nvme_controller_t* ctrl) {\n    if (!ctrl) {\n        return STATUS_ERROR;\n    }\n    \n    /* Disable controller */\n    uint32_t cc = nvme_read32(ctrl, NVME_REG_CC);\n    cc &= ~0x01;  /* Clear enable bit */\n    nvme_write32(ctrl, NVME_REG_CC, cc);\n    \n    /* Wait for controller to be disabled */\n    uint64_t timeout = timer_get_ticks() + timer_get_freq_hz();  /* 1 second */\n    while (timer_get_ticks() < timeout) {\n        uint32_t csts = nvme_read32(ctrl, NVME_REG_CSTS);\n        if ((csts & 0x01) == 0) {  /* Ready bit clear */\n            break;\n        }\n    }\n    \n    return STATUS_OK;\n}\n\n/* Initialize NVMe controller */\nstatic status_t nvme_init_controller(nvme_controller_t* ctrl) {\n    if (!ctrl) {\n        return STATUS_ERROR;\n    }\n    \n    /* Read capabilities */\n    ctrl->capabilities = nvme_read64(ctrl, NVME_REG_CAP);\n    ctrl->version = nvme_read32(ctrl, NVME_REG_VS);\n    \n    ctrl->max_queue_entries = ((ctrl->capabilities & 0xFFFF) + 1);\n    ctrl->doorbell_stride = (ctrl->capabilities >> 32) & 0x0F;\n    \n    KLOG_INFO(\"nvme\", \"Controller version: %u.%u.%u, max queue entries: %u\",\n              (ctrl->version >> 16) & 0xFFFF, (ctrl->version >> 8) & 0xFF, ctrl->version & 0xFF,\n              ctrl->max_queue_entries);\n    \n    /* Reset controller */\n    status_t result = nvme_reset_controller(ctrl);\n    if (result != STATUS_OK) {\n        return result;\n    }\n    \n    /* Initialize admin queue */\n    uint32_t admin_queue_size = (ctrl->max_queue_entries < NVME_ADMIN_QUEUE_SIZE) ? \n                               ctrl->max_queue_entries : NVME_ADMIN_QUEUE_SIZE;\n    \n    result = nvme_init_queue(&ctrl->admin_queue, 0, 0, admin_queue_size);\n    if (result != STATUS_OK) {\n        return result;\n    }\n    \n    /* Configure admin queues */\n    uint32_t aqa = ((admin_queue_size - 1) << 16) | (admin_queue_size - 1);\n    nvme_write32(ctrl, NVME_REG_AQA, aqa);\n    nvme_write64(ctrl, NVME_REG_ASQ, (uint64_t)(uintptr_t)ctrl->admin_queue.sq_base);\n    nvme_write64(ctrl, NVME_REG_ACQ, (uint64_t)(uintptr_t)ctrl->admin_queue.cq_base);\n    \n    /* Enable controller */\n    uint32_t cc = 0;\n    cc |= 0x01;       /* Enable */\n    cc |= (6 << 16);  /* I/O completion queue entry size (2^6 = 64 bytes) */\n    cc |= (6 << 20);  /* I/O submission queue entry size (2^6 = 64 bytes) */\n    nvme_write32(ctrl, NVME_REG_CC, cc);\n    \n    /* Wait for controller to be ready */\n    uint64_t timeout = timer_get_ticks() + timer_get_freq_hz();  /* 1 second */\n    while (timer_get_ticks() < timeout) {\n        uint32_t csts = nvme_read32(ctrl, NVME_REG_CSTS);\n        if (csts & 0x01) {  /* Ready bit set */\n            break;\n        }\n    }\n    \n    uint32_t csts = nvme_read32(ctrl, NVME_REG_CSTS);\n    if ((csts & 0x01) == 0) {\n        KLOG_ERROR(\"nvme\", \"Controller failed to become ready\");\n        return STATUS_ERROR;\n    }\n    \n    KLOG_INFO(\"nvme\", \"Controller ready, status: 0x%x\", csts);\n    \n    /* Create I/O queues (simplified - just one pair) */\n    result = nvme_init_queue(&ctrl->io_queues[0], 1, 1, NVME_IO_QUEUE_SIZE);\n    if (result == STATUS_OK) {\n        ctrl->num_io_queues = 1;\n    }\n    \n    /* Create I/O queues and identify namespaces via admin commands */\n    ctrl->namespace_count = 1;  /* Assume one namespace for now */\n    ctrl->namespace_size[1] = 1000000;  /* 1M LBAs */\n    ctrl->namespace_block_size[1] = 512;  /* 512 bytes per LBA */\n    \n    return STATUS_OK;\n}\n\n/* PCI device enumeration callback */\nstatic void nvme_on_pci(const pci_device_t* dev, void* user) {\n    (void)user;\n    \n    /* Check for NVMe controller (class 01h, subclass 08h, prog-if 02h) */\n    if (dev->class_code == 0x01 && dev->subclass == 0x08 && dev->prog_if == 0x02) {\n        if (g_nvme_controller_count >= MAX_NVME_CONTROLLERS) {\n            KLOG_WARN(\"nvme\", \"Too many NVMe controllers, skipping %02x:%02x.%x\",\n                      dev->bus, dev->slot, dev->func);\n            return;\n        }\n        \n        KLOG_INFO(\"nvme\", \"Found NVMe controller: %02x:%02x.%x vid=%04x did=%04x\",\n                  dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);\n        \n        nvme_controller_t* ctrl = &g_nvme_controllers[g_nvme_controller_count];\n        ctrl->pci_dev = *dev;\n        \n        /* Map BAR0 (NVMe registers) */\n        if (dev->bar[0] == 0) {\n            KLOG_ERROR(\"nvme\", \"BAR0 not configured\");\n            return;\n        }\n        \n        uint64_t bar0_addr = dev->bar[0] & ~0x0F;  /* Clear flags */\n        ctrl->mmio_size = 0x1000;  /* Minimum 4KB */\n        \n        /* Map MMIO using virtual memory manager */\n        void* mapped_mmio = vmm_map_mmio(bar0_addr, ctrl->mmio_size);
+        if (mapped_mmio) {
+            ctrl->mmio_base = mapped_mmio;
+            KLOG_INFO("nvme", "Mapped MMIO at virtual address %p", mapped_mmio);
+        } else {
+            /* Fallback to direct mapping if VMM mapping fails */
+            ctrl->mmio_base = (void*)bar0_addr;
+            KLOG_WARN("nvme", "VMM mapping failed, using direct mapping at %p", (void*)bar0_addr);
+        }\n        \n        /* Initialize controller */\n        status_t result = nvme_init_controller(ctrl);\n        if (result == STATUS_OK) {\n            ctrl->in_use = true;\n            g_nvme_controller_count++;\n            KLOG_INFO(\"nvme\", \"Successfully initialized NVMe controller %u\", g_nvme_controller_count - 1);\n        } else {\n            KLOG_ERROR(\"nvme\", \"Failed to initialize NVMe controller\");\n        }\n    }\n}\n\n/* Probe for NVMe devices */\nvoid nvme_probe(void) {\n    KLOG_INFO(\"nvme\", \"Scanning for NVMe controllers...\");\n    g_nvme_controller_count = 0;\n    k_memset(g_nvme_controllers, 0, sizeof(g_nvme_controllers));\n    \n    pci_enumerate(nvme_on_pci, NULL);\n    \n    KLOG_INFO(\"nvme\", \"Found %u NVMe controller(s)\", g_nvme_controller_count);\n}\n\n/* NVMe block device interface */\nstatus_t nvme_read_blocks(uint32_t controller_id, uint32_t namespace_id, \n                         uint64_t start_lba, uint32_t block_count, void* buffer) {\n    if (controller_id >= g_nvme_controller_count || !buffer) {\n        return STATUS_ERROR;\n    }\n    \n    nvme_controller_t* ctrl = &g_nvme_controllers[controller_id];\n    if (!ctrl->in_use) {\n        return STATUS_ERROR;\n    }\n    \n    return nvme_rw_data(ctrl, false, namespace_id, start_lba, block_count, buffer);\n}\n\nstatus_t nvme_write_blocks(uint32_t controller_id, uint32_t namespace_id,\n                          uint64_t start_lba, uint32_t block_count, const void* buffer) {\n    if (controller_id >= g_nvme_controller_count || !buffer) {\n        return STATUS_ERROR;\n    }\n    \n    nvme_controller_t* ctrl = &g_nvme_controllers[controller_id];\n    if (!ctrl->in_use) {\n        return STATUS_ERROR;\n    }\n    \n    return nvme_rw_data(ctrl, true, namespace_id, start_lba, block_count, (void*)buffer);\n}"

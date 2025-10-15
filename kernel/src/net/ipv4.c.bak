@@ -1,0 +1,60 @@
+#include "net/ipv4.h"
+#include "net/icmp.h"
+#include "net/udp.h"
+#include "net/tcp.h"
+#include "kernel.h"
+#include "net/net.h"
+#include "net/filter.h"
+
+static u16 csum16(const u8* p, u32 len) {
+    u32 sum = 0;
+    while (len > 1) { sum += ((u16)p[0] << 8) | p[1]; p+=2; len-=2; }
+    if (len) sum += ((u16)p[0] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (u16)(~sum);
+}
+
+u16 ipv4_checksum(const void* data, u32 len) {
+    return csum16((const u8*)data, len);
+}
+
+u16 ipv4_pseudo_checksum(in_addr_t src, in_addr_t dst, u8 proto, u16 len) {
+    u32 sum = 0;
+    sum += (src.s_addr >> 16) & 0xFFFF;
+    sum += (src.s_addr) & 0xFFFF;
+    sum += (dst.s_addr >> 16) & 0xFFFF;
+    sum += (dst.s_addr) & 0xFFFF;
+    sum += (u16)proto;
+    sum += (u16)len;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (u16)(~sum);
+}
+
+void ipv4_init(void) {
+    /* nothing yet */
+}
+
+int ipv4_output(net_if_t* nif, in_addr_t src, in_addr_t dst, u8 proto, net_buf_t* payload) {
+    nf_packet_t fp = { .src_ip_be=src.s_addr, .dst_ip_be=dst.s_addr, .proto=proto, .src_port_be=0, .dst_port_be=0, .direction=1 };
+    if (nf_check(&fp) == NF_DROP) return K_EPERM;
+    net_buf_reserve_head(payload, sizeof(ipv4_hdr_t));
+    ipv4_hdr_t* ih = (ipv4_hdr_t*)(payload->data);
+    ih->ver_ihl = (4 << 4) | (sizeof(ipv4_hdr_t) / 4);
+    ih->tos = 0;
+    ih->total_len = __builtin_bswap16((u16)payload->len);
+    ih->id = 0;
+    ih->frag_off = 0;
+    ih->ttl = 64;
+    ih->proto = proto;
+    ih->src = src.s_addr;
+    ih->dst = dst.s_addr;
+    ih->hdr_checksum = 0;
+    ih->hdr_checksum = ipv4_checksum(ih, sizeof(*ih));
+
+    /* loopback direct xmit */
+    return nif->ops.xmit ? nif->ops.xmit(nif, payload, 0, NULL) : K_ENOTSUP;
+}
+
+
+/* IPv4 packet input handler */
+void ipv4_input(net_if_t* nif, net_buf_t* buf) {\n    if (!nif || !buf || buf->len < sizeof(ipv4_hdr_t)) {\n        if (buf) net_buf_free(buf);\n        return;\n    }\n    \n    ipv4_hdr_t* hdr = (ipv4_hdr_t*)buf->data;\n    \n    /* Basic validation */\n    if ((hdr->ver_ihl >> 4) != 4) {\n        net_buf_free(buf);\n        return;\n    }\n    \n    uint8_t ihl = (hdr->ver_ihl & 0x0F) * 4;\n    if (ihl < sizeof(ipv4_hdr_t) || buf->len < ihl) {\n        net_buf_free(buf);\n        return;\n    }\n    \n    uint16_t total_len = __builtin_bswap16(hdr->total_len);\n    if (total_len < ihl || total_len > buf->len) {\n        net_buf_free(buf);\n        return;\n    }\n    \n    /* Verify checksum */\n    uint16_t saved_checksum = hdr->hdr_checksum;\n    hdr->hdr_checksum = 0;\n    uint16_t calculated_checksum = ipv4_checksum(hdr, ihl);\n    if (saved_checksum != calculated_checksum) {\n        net_buf_free(buf);\n        return;\n    }\n    hdr->hdr_checksum = saved_checksum;\n    \n    /* Convert addresses for processing */\n    ipv4_addr_t src_ip, dst_ip;\n    k_memcpy(&src_ip, &hdr->src, sizeof(ipv4_addr_t));\n    k_memcpy(&dst_ip, &hdr->dst, sizeof(ipv4_addr_t));\n    \n    /* Check if packet is for us */\n    bool for_us = false;\n    \n    /* Check against interface IP */\n    if (k_memcmp(&dst_ip, &nif->ipv4_addr, sizeof(ipv4_addr_t)) == 0) {\n        for_us = true;\n    }\n    \n    /* Check loopback */\n    ipv4_addr_t loopback = {{127, 0, 0, 1}};\n    if (k_memcmp(&dst_ip, &loopback, sizeof(ipv4_addr_t)) == 0) {\n        for_us = true;\n    }\n    \n    if (!for_us) {\n        /* TODO: Implement forwarding if enabled */\n        net_buf_free(buf);\n        return;\n    }\n    \n    /* Remove IP header */\n    net_buf_trim_head(buf, ihl);\n    \n    /* Dispatch to protocol handlers */\n    switch (hdr->proto) {\n        case IP_PROTO_ICMP:\n            icmp_input(nif, src_ip, dst_ip, buf->data, buf->len);\n            break;\n            \n        case IP_PROTO_UDP:\n            udp_input(nif, buf->data, buf->len);\n            break;\n            \n        case IP_PROTO_TCP:\n            tcp_input(NULL, src_ip, dst_ip, buf->data, buf->len);\n            break;\n            \n        default:\n            /* Unknown protocol */\n            break;\n    }\n    \n    net_buf_free(buf);\n}\n\n/* Send IPv4 packet */\nint ipv4_send_packet(net_if_t* nif, u8 proto, u32 dst_ip_be, const void* payload, u16 payload_len) {\n    if (!nif || !payload || payload_len == 0) {\n        return K_EINVAL;\n    }\n    \n    /* Create network buffer */\n    net_buf_t* buf = net_buf_alloc(payload_len + sizeof(ipv4_hdr_t), sizeof(ipv4_hdr_t));\n    if (!buf) {\n        return K_ENOMEM;\n    }\n    \n    /* Add payload */\n    net_buf_push(buf, payload, payload_len);\n    \n    /* Add IP header */\n    net_buf_reserve_head(buf, sizeof(ipv4_hdr_t));\n    ipv4_hdr_t* hdr = (ipv4_hdr_t*)buf->data;\n    \n    hdr->ver_ihl = (4 << 4) | (sizeof(ipv4_hdr_t) / 4);\n    hdr->tos = 0;\n    hdr->total_len = __builtin_bswap16(sizeof(ipv4_hdr_t) + payload_len);\n    hdr->id = 0;\n    hdr->frag_off = 0;\n    hdr->ttl = 64;\n    hdr->proto = proto;\n    hdr->src = nif->ipv4_addr.s_addr;\n    hdr->dst = dst_ip_be;\n    hdr->hdr_checksum = 0;\n    hdr->hdr_checksum = ipv4_checksum(hdr, sizeof(ipv4_hdr_t));\n    \n    /* Send via interface */\n    int result = nif->ops.xmit ? nif->ops.xmit(nif, buf, 0, NULL) : K_ENOTSUP;\n    \n    /* Buffer is consumed by xmit or we free it on error */\n    if (result != 0) {\n        net_buf_free(buf);\n    }\n    \n    return result;\n}

@@ -1,0 +1,29 @@
+#include "net_ipc_hooks.h"
+#include "log.h"
+
+static net_packet_hook_t g_pkt_hooks[NET_IPC_HOOK_MAX];
+static ipc_msg_hook_t g_ipc_hooks[NET_IPC_HOOK_MAX];
+static net_ipc_hook_stats_t g_stats;
+
+static int add_hook(void** arr, void* fn){
+    for(int i=0;i<NET_IPC_HOOK_MAX;i++){ if(!arr[i]){ arr[i]=fn; return 0;} if(arr[i]==fn) return 0; }
+    return K_ENOSPC;
+}
+
+int net_register_packet_hook(net_packet_hook_t fn){ int r=add_hook((void**)g_pkt_hooks,(void*)fn); if(r==0) g_stats.pkt_hooks++; return r; }
+int ipc_register_msg_hook(ipc_msg_hook_t fn){ int r=add_hook((void**)g_ipc_hooks,(void*)fn); if(r==0) g_stats.ipc_hooks++; return r; }
+
+const net_ipc_hook_stats_t* net_ipc_get_stats(void){ return &g_stats; }
+void net_ipc_reset_stats(void){ k_memset(&g_stats,0,sizeof(g_stats)); /* preserve registration counts via re-count */ g_stats.pkt_hooks=0; g_stats.ipc_hooks=0; for(int i=0;i<NET_IPC_HOOK_MAX;i++){ if(g_pkt_hooks[i]) g_stats.pkt_hooks++; if(g_ipc_hooks[i]) g_stats.ipc_hooks++; } }
+
+static void invoke_packet(hook_direction_t dir,u32 src,u32 dst,u16 proto,u16 sport,u16 dport,const void* data,u32 len){
+    net_packet_meta_t meta; meta.dir=dir; meta.src_ip_be=src; meta.dst_ip_be=dst; meta.proto=proto; meta.src_port_be=sport; meta.dst_port_be=dport; meta.length=len; meta.data=data; meta.allow_mutation=0; meta.verdict=0;
+    for(int i=0;i<NET_IPC_HOOK_MAX;i++){ if(g_pkt_hooks[i]){ g_pkt_hooks[i](&meta); if(meta.verdict<0){ g_stats.pkt_dropped++; break; }}}
+    if(dir==HOOK_DIR_RX){ g_stats.pkt_rx_invoked++; } else { g_stats.pkt_tx_invoked++; }
+}
+
+void __net_emit_packet_rx(u32 src,u32 dst,u16 proto,u16 sport,u16 dport,const void* data,u32 len){ invoke_packet(HOOK_DIR_RX,src,dst,proto,sport,dport,data,len); }
+void __net_emit_packet_tx(u32 src,u32 dst,u16 proto,u16 sport,u16 dport,const void* data,u32 len){ invoke_packet(HOOK_DIR_TX,src,dst,proto,sport,dport,data,len); }
+
+int  __ipc_emit_send(const kipc_msg_t* m){ ipc_msg_meta_t meta; meta.stage=IPC_STAGE_SEND; meta.msg=m; meta.verdict=0; for(int i=0;i<NET_IPC_HOOK_MAX;i++){ if(g_ipc_hooks[i]){ g_ipc_hooks[i](&meta); if(meta.verdict<0){ g_stats.ipc_send_blocked++; return meta.verdict; }}} g_stats.ipc_send_invoked++; return 0; }
+void __ipc_emit_recv(const kipc_msg_t* m){ ipc_msg_meta_t meta; meta.stage=IPC_STAGE_RECV; meta.msg=m; meta.verdict=0; for(int i=0;i<NET_IPC_HOOK_MAX;i++){ if(g_ipc_hooks[i]) g_ipc_hooks[i](&meta); } g_stats.ipc_recv_invoked++; }

@@ -1,0 +1,997 @@
+/*
+ * LimitlessOS Advanced Device Driver Framework
+ * Universal device interface, hot-plug support, power management, driver lifecycle,
+ * automatic driver loading with AI-optimized resource allocation for production laptops
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+// Device types
+#define DEVICE_TYPE_UNKNOWN      0
+#define DEVICE_TYPE_PCI          1
+#define DEVICE_TYPE_USB          2
+#define DEVICE_TYPE_ACPI         3
+#define DEVICE_TYPE_PLATFORM     4
+#define DEVICE_TYPE_BLOCK        5
+#define DEVICE_TYPE_NETWORK      6
+#define DEVICE_TYPE_GRAPHICS     7
+#define DEVICE_TYPE_AUDIO        8
+#define DEVICE_TYPE_INPUT        9
+#define DEVICE_TYPE_THERMAL      10
+
+// Device states
+#define DEVICE_STATE_UNKNOWN     0
+#define DEVICE_STATE_INITIALIZED 1
+#define DEVICE_STATE_CONFIGURED  2
+#define DEVICE_STATE_ACTIVE      3
+#define DEVICE_STATE_SUSPENDED   4
+#define DEVICE_STATE_ERROR       5
+#define DEVICE_STATE_REMOVED     6
+
+// Power states (ACPI D-states)
+#define DEVICE_POWER_D0          0  // Fully on
+#define DEVICE_POWER_D1          1  // Intermediate state
+#define DEVICE_POWER_D2          2  // Intermediate state
+#define DEVICE_POWER_D3_HOT      3  // Off, but quick wake
+#define DEVICE_POWER_D3_COLD     4  // Off, full initialization needed
+
+// Driver flags
+#define DRIVER_FLAG_EXCLUSIVE    (1 << 0)  // Exclusive device access
+#define DRIVER_FLAG_HOTPLUG      (1 << 1)  // Supports hot-plug
+#define DRIVER_FLAG_PM_AWARE     (1 << 2)  // Power management aware
+#define DRIVER_FLAG_DMA_CAPABLE  (1 << 3)  // Can perform DMA
+#define DRIVER_FLAG_IRQ_SHARED   (1 << 4)  // Can share interrupts
+#define DRIVER_FLAG_REALTIME     (1 << 5)  // Real-time requirements
+
+// Device resource types
+#define RESOURCE_TYPE_NONE       0
+#define RESOURCE_TYPE_IO         1
+#define RESOURCE_TYPE_MEMORY     2
+#define RESOURCE_TYPE_IRQ        3
+#define RESOURCE_TYPE_DMA        4
+
+// AI resource optimization types
+#define AI_RESOURCE_CPU          0
+#define AI_RESOURCE_MEMORY       1
+#define AI_RESOURCE_IO           2
+#define AI_RESOURCE_INTERRUPT    3
+#define AI_RESOURCE_BANDWIDTH    4
+
+// Forward declarations
+struct device;
+struct driver;
+struct device_bus;
+
+// Device resource descriptor
+struct device_resource {
+    uint8_t type;               // RESOURCE_TYPE_*
+    uint64_t start;             // Start address/number
+    uint64_t end;               // End address/number
+    uint64_t flags;             // Resource flags
+    char name[32];              // Resource name
+    
+    struct device_resource *parent; // Parent resource
+    struct device_resource *child;  // Child resources
+    struct device_resource *sibling; // Sibling resources
+};
+
+// Device capabilities
+struct device_capabilities {
+    bool dma_coherent;          // DMA coherent capability
+    uint32_t dma_mask;          // DMA addressing capability
+    bool msi_capable;           // MSI interrupt capability
+    bool msix_capable;          // MSI-X interrupt capability
+    uint32_t max_link_speed;    // Maximum link speed (for buses)
+    uint32_t max_link_width;    // Maximum link width
+    
+    // Power management capabilities
+    bool d1_support;            // D1 power state support
+    bool d2_support;            // D2 power state support
+    bool d3hot_support;         // D3hot support
+    bool d3cold_support;        // D3cold support
+    bool wake_capable;          // Wake-on-event capability
+    
+    // Advanced capabilities
+    bool iommu_capable;         // IOMMU support
+    bool numa_aware;            // NUMA topology aware
+    bool hotplug_capable;       // Hot-plug support
+    bool virtualization_capable; // Virtualization support
+};
+
+// Driver operations structure
+struct driver_ops {
+    int (*probe)(struct device *dev);
+    int (*remove)(struct device *dev);
+    int (*suspend)(struct device *dev, uint32_t state);
+    int (*resume)(struct device *dev);
+    int (*shutdown)(struct device *dev);
+    
+    // Hot-plug operations
+    int (*hot_add)(struct device *dev);
+    int (*hot_remove)(struct device *dev);
+    
+    // Power management
+    int (*set_power_state)(struct device *dev, uint32_t state);
+    int (*get_power_state)(struct device *dev);
+    
+    // Runtime power management
+    int (*runtime_suspend)(struct device *dev);
+    int (*runtime_resume)(struct device *dev);
+    int (*runtime_idle)(struct device *dev);
+    
+    // Device-specific I/O operations
+    ssize_t (*read)(struct device *dev, void *buf, size_t count, off_t offset);
+    ssize_t (*write)(struct device *dev, const void *buf, size_t count, off_t offset);
+    int (*ioctl)(struct device *dev, uint32_t cmd, void *arg);
+    
+    // Interrupt handling
+    void (*irq_handler)(struct device *dev, uint32_t irq);
+    int (*request_irq)(struct device *dev, uint32_t irq, uint32_t flags);
+    void (*free_irq)(struct device *dev, uint32_t irq);
+};
+
+// Device match data for driver binding
+struct device_id {
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t subvendor_id;
+    uint32_t subdevice_id;
+    uint32_t class_code;
+    uint32_t class_mask;
+    void *driver_data;          // Driver-specific data
+};
+
+// AI resource optimization context
+struct ai_resource_context {
+    uint32_t usage_pattern;     // Historical usage pattern
+    uint32_t performance_score; // Performance score (0-100)
+    uint32_t power_efficiency;  // Power efficiency score (0-100)
+    uint64_t bandwidth_usage;   // Bandwidth utilization
+    uint64_t latency_average;   // Average latency
+    
+    // Neural network weights for resource prediction
+    float prediction_weights[16];
+    float prediction_bias[4];
+    
+    // Statistics
+    uint64_t operations_count;
+    uint64_t total_processing_time;
+    uint64_t power_consumption;
+    
+    // Resource allocation predictions
+    uint32_t predicted_cpu_usage;
+    uint32_t predicted_memory_usage;
+    uint32_t predicted_io_bandwidth;
+};
+
+// Device structure
+struct device {
+    char name[64];              // Device name
+    uint32_t device_id;         // Unique device ID
+    uint8_t type;               // Device type
+    uint8_t state;              // Current state
+    uint8_t power_state;        // Current power state
+    
+    // Device hierarchy
+    struct device *parent;      // Parent device
+    struct list_head children;  // Child devices
+    struct list_head siblings;  // Sibling devices
+    
+    // Bus connection
+    struct device_bus *bus;     // Bus this device is on
+    
+    // Driver binding
+    struct driver *driver;      // Bound driver
+    void *driver_data;          // Driver-specific data
+    
+    // Device resources
+    struct device_resource *resources; // Device resources
+    uint32_t num_resources;     // Number of resources
+    
+    // Capabilities
+    struct device_capabilities caps;
+    
+    // Configuration
+    void *config_space;         // Configuration space (PCI, etc.)
+    size_t config_size;         // Configuration space size
+    
+    // Memory mappings
+    struct {
+        void *virtual_addr;
+        uint64_t physical_addr;
+        size_t size;
+        uint32_t flags;
+    } memory_regions[8];
+    uint32_t num_memory_regions;
+    
+    // Interrupt handling
+    uint32_t irq_line;          // Primary interrupt line
+    uint32_t msi_vector;        // MSI vector (if MSI enabled)
+    struct msi_desc *msi_desc;  // MSI descriptor
+    
+    // Power management
+    struct {
+        bool runtime_pm_enabled;
+        uint64_t last_busy;     // Last activity timestamp
+        uint32_t autosuspend_delay; // Auto-suspend delay (ms)
+        uint32_t usage_count;   // Usage reference count
+        
+        // Power statistics
+        uint64_t active_time;
+        uint64_t suspended_time;
+        uint32_t suspend_count;
+        uint32_t resume_count;
+        
+    } pm;
+    
+    // Hot-plug support
+    struct {
+        bool hotplug_capable;
+        bool removal_pending;
+        struct work_item hotplug_work;
+        
+    } hotplug;
+    
+    // AI resource optimization
+    struct ai_resource_context ai_context;
+    
+    // Device statistics
+    struct {
+        uint64_t operations_count;
+        uint64_t bytes_transferred;
+        uint64_t error_count;
+        uint64_t last_error_time;
+        uint32_t performance_score; // 0-100
+        
+    } stats;
+    
+    // Synchronization
+    spinlock_t lock;
+    struct completion removal_completion;
+    
+    // Device tree/list linkage
+    struct list_head global_list;
+    struct list_head bus_list;
+    struct list_head driver_list;
+    
+} __attribute__((aligned(64)));
+
+// Driver structure
+struct driver {
+    char name[64];              // Driver name
+    char version[16];           // Driver version
+    char description[128];      // Driver description
+    
+    // Driver matching
+    struct device_id *id_table; // Supported device IDs
+    uint32_t flags;             // Driver flags
+    
+    // Operations
+    struct driver_ops *ops;     // Driver operations
+    
+    // Driver module information
+    struct module *owner;       // Owning module
+    char *module_path;          // Module file path
+    
+    // Device management
+    struct list_head devices;   // Bound devices
+    uint32_t device_count;      // Number of bound devices
+    
+    // Power management policy
+    struct {
+        uint32_t default_autosuspend_delay;
+        bool supports_runtime_pm;
+        bool always_on;         // Never suspend
+        
+    } pm_policy;
+    
+    // AI optimization
+    struct {
+        bool ai_enabled;
+        uint32_t optimization_level; // 0-3
+        float performance_weight;    // Performance vs power trade-off
+        
+        // Resource usage prediction model
+        float cpu_model_weights[8];
+        float memory_model_weights[8];
+        float io_model_weights[8];
+        
+    } ai_config;
+    
+    // Statistics
+    struct {
+        uint64_t probe_count;
+        uint64_t probe_failures;
+        uint64_t remove_count;
+        uint64_t suspend_count;
+        uint64_t resume_count;
+        uint64_t error_count;
+        
+    } stats;
+    
+    struct list_head global_list;
+    spinlock_t lock;
+};
+
+// Device bus structure
+struct device_bus {
+    char name[32];              // Bus name
+    uint8_t type;               // Bus type
+    
+    // Bus operations
+    struct {
+        int (*match)(struct device *dev, struct driver *drv);
+        int (*probe)(struct device *dev);
+        int (*remove)(struct device *dev);
+        int (*suspend)(struct device *dev, uint32_t state);
+        int (*resume)(struct device *dev);
+        
+        // Hot-plug operations
+        int (*hot_add)(struct device *dev);
+        int (*hot_remove)(struct device *dev);
+        
+        // Power management
+        int (*set_power)(struct device *dev, uint32_t state);
+        
+    } ops;
+    
+    // Devices and drivers on this bus
+    struct list_head devices;   // Devices on this bus
+    struct list_head drivers;   // Drivers for this bus
+    
+    // Bus-specific configuration
+    void *bus_data;             // Bus-specific data
+    
+    // Power management
+    bool pm_enabled;
+    uint32_t pm_ops_mask;       // Supported PM operations
+    
+    struct list_head global_list;
+    rwlock_t lock;
+};
+
+// Global device management
+struct device_manager {
+    // Device and driver lists
+    struct list_head devices;   // All devices
+    struct list_head drivers;   // All drivers
+    struct list_head buses;     // All buses
+    
+    // Device matching and binding
+    struct workqueue *probe_workqueue;    // Asynchronous probing
+    struct workqueue *hotplug_workqueue;  // Hot-plug events
+    
+    // Device enumeration
+    uint32_t next_device_id;    // Next device ID to assign
+    
+    // AI resource optimization
+    struct {
+        bool enabled;
+        uint32_t model_version;
+        float optimization_score;
+        
+        // Global neural network for resource allocation
+        float global_weights[64][32];
+        float global_hidden[32][16];
+        float global_output[16][8];
+        
+        // Resource allocation statistics
+        uint64_t optimization_attempts;
+        uint64_t optimization_successes;
+        uint64_t resource_conflicts_resolved;
+        
+    } ai_manager;
+    
+    // Power management coordination
+    struct {
+        bool system_suspend_active;
+        uint32_t suspended_device_count;
+        struct list_head suspend_order; // Device suspend order
+        
+    } pm_coordinator;
+    
+    // Hot-plug management
+    struct {
+        bool enabled;
+        uint32_t pending_additions;
+        uint32_t pending_removals;
+        
+    } hotplug_manager;
+    
+    // Statistics
+    struct {
+        uint32_t total_devices;
+        uint32_t active_devices;
+        uint32_t suspended_devices;
+        uint32_t failed_devices;
+        
+        uint32_t total_drivers;
+        uint32_t active_drivers;
+        
+        uint64_t total_bindings;
+        uint64_t binding_failures;
+        uint64_t hotplug_events;
+        
+    } stats;
+    
+    rwlock_t device_lock;
+    rwlock_t driver_lock;
+    rwlock_t bus_lock;
+    
+} dev_mgr;
+
+// AI resource optimization functions
+static float ai_predict_resource_usage(struct device *device, uint8_t resource_type) {
+    struct ai_resource_context *ai = &device->ai_context;
+    
+    // Prepare input features based on device type and history
+    float inputs[8] = {
+        (float)device->type / 16.0f,
+        (float)ai->operations_count / 10000.0f,
+        (float)ai->bandwidth_usage / 1000000.0f,
+        (float)ai->latency_average / 1000.0f,
+        (float)ai->performance_score / 100.0f,
+        (float)ai->power_efficiency / 100.0f,
+        0.0f, 0.0f
+    };
+    
+    // Simple neural network prediction
+    float hidden[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 8; j++) {
+            hidden[i] += inputs[j] * ai->prediction_weights[j * 2 + (i % 2)];
+        }
+        hidden[i] += ai->prediction_bias[i];
+        
+        // ReLU activation
+        if (hidden[i] < 0) hidden[i] = 0;
+    }
+    
+    // Output prediction based on resource type
+    float output = 0;
+    for (int i = 0; i < 4; i++) {
+        output += hidden[i] * ai->prediction_weights[8 + resource_type + i];
+    }
+    
+    // Sigmoid activation to normalize to [0,1]
+    output = 1.0f / (1.0f + expf(-output));
+    
+    return output;
+}
+
+static int ai_optimize_device_resources(struct device *device) {
+    if (!dev_mgr.ai_manager.enabled) return 0;
+    
+    // Predict resource usage for different resource types
+    float cpu_prediction = ai_predict_resource_usage(device, AI_RESOURCE_CPU);
+    float memory_prediction = ai_predict_resource_usage(device, AI_RESOURCE_MEMORY);
+    float io_prediction = ai_predict_resource_usage(device, AI_RESOURCE_IO);
+    
+    // Update AI context with predictions
+    device->ai_context.predicted_cpu_usage = (uint32_t)(cpu_prediction * 100);
+    device->ai_context.predicted_memory_usage = (uint32_t)(memory_prediction * 1000000); // MB
+    device->ai_context.predicted_io_bandwidth = (uint32_t)(io_prediction * 1000000000); // MB/s
+    
+    dev_mgr.ai_manager.optimization_attempts++;
+    
+    kprintf("DEV: AI predicted resources for %s - CPU: %u%%, Memory: %uMB, I/O: %uMB/s\n",
+            device->name, device->ai_context.predicted_cpu_usage,
+            device->ai_context.predicted_memory_usage / 1000000,
+            device->ai_context.predicted_io_bandwidth / 1000000);
+    
+    return 0;
+}
+
+// Device resource management
+static int allocate_device_resources(struct device *device) {
+    for (uint32_t i = 0; i < device->num_resources; i++) {
+        struct device_resource *res = &device->resources[i];
+        
+        switch (res->type) {
+            case RESOURCE_TYPE_MEMORY:
+                // Map memory region
+                if (i < 8) {  // Max 8 memory regions
+                    device->memory_regions[i].physical_addr = res->start;
+                    device->memory_regions[i].size = res->end - res->start + 1;
+                    device->memory_regions[i].virtual_addr = 
+                        map_device_memory(res->start, device->memory_regions[i].size);
+                    
+                    if (!device->memory_regions[i].virtual_addr) {
+                        kprintf("DEV: Failed to map memory region %u for %s\n", i, device->name);
+                        return -1;
+                    }
+                    
+                    device->num_memory_regions++;
+                    kprintf("DEV: Mapped memory region 0x%llx-0x%llx for %s\n",
+                            res->start, res->end, device->name);
+                }
+                break;
+                
+            case RESOURCE_TYPE_IRQ:
+                device->irq_line = res->start;
+                kprintf("DEV: Assigned IRQ %llu to %s\n", res->start, device->name);
+                break;
+                
+            case RESOURCE_TYPE_IO:
+                kprintf("DEV: Assigned I/O ports 0x%llx-0x%llx to %s\n",
+                        res->start, res->end, device->name);
+                break;
+        }
+    }
+    
+    return 0;
+}
+
+static void free_device_resources(struct device *device) {
+    // Unmap memory regions
+    for (uint32_t i = 0; i < device->num_memory_regions; i++) {
+        if (device->memory_regions[i].virtual_addr) {
+            unmap_device_memory(device->memory_regions[i].virtual_addr,
+                              device->memory_regions[i].size);
+            device->memory_regions[i].virtual_addr = NULL;
+        }
+    }
+    device->num_memory_regions = 0;
+    
+    // Free interrupt
+    if (device->irq_line != 0) {
+        free_irq(device->irq_line, device);
+        device->irq_line = 0;
+    }
+    
+    // Free MSI vectors
+    if (device->msi_desc) {
+        free_msi_vector(device->msi_desc);
+        device->msi_desc = NULL;
+    }
+}
+
+// Device power management
+static int device_set_power_state(struct device *device, uint32_t new_state) {
+    if (device->power_state == new_state) {
+        return 0; // Already in requested state
+    }
+    
+    uint32_t old_state = device->power_state;
+    
+    // Call driver power management if available
+    if (device->driver && device->driver->ops->set_power_state) {
+        int ret = device->driver->ops->set_power_state(device, new_state);
+        if (ret != 0) {
+            kprintf("DEV: Failed to set power state %u for %s\n", new_state, device->name);
+            return ret;
+        }
+    }
+    
+    device->power_state = new_state;
+    
+    // Update power management statistics
+    uint64_t now = get_timestamp();
+    if (old_state == DEVICE_POWER_D0 && new_state > DEVICE_POWER_D0) {
+        // Going to sleep
+        device->pm.suspended_time = now;
+        device->pm.suspend_count++;
+    } else if (old_state > DEVICE_POWER_D0 && new_state == DEVICE_POWER_D0) {
+        // Waking up
+        if (device->pm.suspended_time > 0) {
+            uint64_t sleep_time = now - device->pm.suspended_time;
+            // Update average sleep time or other statistics
+        }
+        device->pm.resume_count++;
+    }
+    
+    kprintf("DEV: %s power state changed from D%u to D%u\n", 
+            device->name, old_state, new_state);
+    
+    return 0;
+}
+
+static int device_runtime_suspend(struct device *device) {
+    if (!device->pm.runtime_pm_enabled) {
+        return -1;
+    }
+    
+    // Check if device is busy
+    if (device->pm.usage_count > 0) {
+        return -1; // Device is busy
+    }
+    
+    // Call driver runtime suspend
+    if (device->driver && device->driver->ops->runtime_suspend) {
+        int ret = device->driver->ops->runtime_suspend(device);
+        if (ret != 0) {
+            return ret;
+        }
+    }
+    
+    return device_set_power_state(device, DEVICE_POWER_D3_HOT);
+}
+
+static int device_runtime_resume(struct device *device) {
+    if (device->power_state == DEVICE_POWER_D0) {
+        return 0; // Already active
+    }
+    
+    // Set device to active power state
+    int ret = device_set_power_state(device, DEVICE_POWER_D0);
+    if (ret != 0) {
+        return ret;
+    }
+    
+    // Call driver runtime resume
+    if (device->driver && device->driver->ops->runtime_resume) {
+        ret = device->driver->ops->runtime_resume(device);
+        if (ret != 0) {
+            device_set_power_state(device, DEVICE_POWER_D3_HOT);
+            return ret;
+        }
+    }
+    
+    return 0;
+}
+
+// Device registration and binding
+static int device_match_driver(struct device *device, struct driver *driver) {
+    if (!driver->id_table) return 0;
+    
+    // Check device ID table for match
+    struct device_id *id = driver->id_table;
+    
+    while (id->vendor_id || id->device_id || id->class_code) {
+        bool match = false;
+        
+        // For PCI devices, check vendor/device ID
+        if (device->type == DEVICE_TYPE_PCI) {
+            struct pci_device *pci_dev = (struct pci_device *)device->bus->bus_data;
+            
+            if ((id->vendor_id == 0 || id->vendor_id == pci_dev->vendor_id) &&
+                (id->device_id == 0 || id->device_id == pci_dev->device_id) &&
+                (id->class_code == 0 || (id->class_code & id->class_mask) == 
+                 (pci_dev->class_code & id->class_mask))) {
+                match = true;
+            }
+        }
+        
+        if (match) {
+            kprintf("DEV: Driver %s matches device %s\n", driver->name, device->name);
+            return 1;
+        }
+        
+        id++;
+    }
+    
+    return 0;
+}
+
+static int bind_device_driver(struct device *device, struct driver *driver) {
+    if (device->driver) {
+        return -1; // Device already has a driver
+    }
+    
+    spin_lock(&device->lock);
+    device->driver = driver;
+    device->state = DEVICE_STATE_INITIALIZED;
+    spin_unlock(&device->lock);
+    
+    spin_lock(&driver->lock);
+    list_add_tail(&device->driver_list, &driver->devices);
+    driver->device_count++;
+    spin_unlock(&driver->lock);
+    
+    // Call driver probe function
+    if (driver->ops->probe) {
+        int ret = driver->ops->probe(device);
+        if (ret != 0) {
+            kprintf("DEV: Driver %s probe failed for %s\n", driver->name, device->name);
+            
+            // Unbind driver
+            spin_lock(&device->lock);
+            device->driver = NULL;
+            device->state = DEVICE_STATE_UNKNOWN;
+            spin_unlock(&device->lock);
+            
+            spin_lock(&driver->lock);
+            list_del(&device->driver_list);
+            driver->device_count--;
+            driver->stats.probe_failures++;
+            spin_unlock(&driver->lock);
+            
+            return ret;
+        }
+    }
+    
+    device->state = DEVICE_STATE_CONFIGURED;
+    driver->stats.probe_count++;
+    dev_mgr.stats.total_bindings++;
+    
+    // Optimize device resources with AI
+    ai_optimize_device_resources(device);
+    
+    kprintf("DEV: Successfully bound driver %s to device %s\n", driver->name, device->name);
+    return 0;
+}
+
+// Hot-plug support
+static void hotplug_add_device_work(struct work_item *work) {
+    struct device *device = container_of(work, struct device, hotplug.hotplug_work);
+    
+    kprintf("DEV: Hot-plug add device %s\n", device->name);
+    
+    // Allocate resources
+    if (allocate_device_resources(device) != 0) {
+        kprintf("DEV: Failed to allocate resources for hot-plugged device %s\n", device->name);
+        return;
+    }
+    
+    // Try to find and bind a driver
+    read_lock(&dev_mgr.driver_lock);
+    
+    struct driver *driver;
+    list_for_each_entry(driver, &dev_mgr.drivers, global_list) {
+        if (device_match_driver(device, driver)) {
+            if (bind_device_driver(device, driver) == 0) {
+                break;
+            }
+        }
+    }
+    
+    read_unlock(&dev_mgr.driver_lock);
+    
+    device->state = DEVICE_STATE_ACTIVE;
+    dev_mgr.hotplug_manager.pending_additions--;
+    dev_mgr.stats.hotplug_events++;
+}
+
+static void hotplug_remove_device_work(struct work_item *work) {
+    struct device *device = container_of(work, struct device, hotplug.hotplug_work);
+    
+    kprintf("DEV: Hot-plug remove device %s\n", device->name);
+    
+    // Call driver remove function
+    if (device->driver && device->driver->ops->hot_remove) {
+        device->driver->ops->hot_remove(device);
+    }
+    
+    // Free resources
+    free_device_resources(device);
+    
+    device->state = DEVICE_STATE_REMOVED;
+    dev_mgr.hotplug_manager.pending_removals--;
+    dev_mgr.stats.hotplug_events++;
+    
+    // Signal completion for any waiting threads
+    complete(&device->removal_completion);
+}
+
+int device_add_hotplug(struct device *device) {
+    if (!device->hotplug.hotplug_capable) {
+        return -1;
+    }
+    
+    dev_mgr.hotplug_manager.pending_additions++;
+    
+    // Initialize work item and queue it
+    INIT_WORK(&device->hotplug.hotplug_work, hotplug_add_device_work);
+    queue_work(dev_mgr.hotplug_workqueue, &device->hotplug.hotplug_work);
+    
+    return 0;
+}
+
+int device_remove_hotplug(struct device *device) {
+    if (!device->hotplug.hotplug_capable) {
+        return -1;
+    }
+    
+    device->hotplug.removal_pending = true;
+    dev_mgr.hotplug_manager.pending_removals++;
+    
+    // Initialize completion and work item
+    init_completion(&device->removal_completion);
+    INIT_WORK(&device->hotplug.hotplug_work, hotplug_remove_device_work);
+    queue_work(dev_mgr.hotplug_workqueue, &device->hotplug.hotplug_work);
+    
+    return 0;
+}
+
+// Device registration
+int register_device(struct device *device) {
+    if (!device) return -1;
+    
+    // Assign unique device ID
+    device->device_id = __atomic_fetch_add(&dev_mgr.next_device_id, 1, __ATOMIC_SEQ_CST);
+    
+    // Initialize device structure
+    spin_lock_init(&device->lock);
+    INIT_LIST_HEAD(&device->children);
+    INIT_LIST_HEAD(&device->siblings);
+    device->state = DEVICE_STATE_UNKNOWN;
+    device->power_state = DEVICE_POWER_D0;
+    
+    // Initialize power management
+    device->pm.runtime_pm_enabled = false;
+    device->pm.autosuspend_delay = 2000; // 2 seconds default
+    device->pm.usage_count = 1; // Initially active
+    
+    // Initialize AI context
+    device->ai_context.performance_score = 50; // Default
+    device->ai_context.power_efficiency = 50;  // Default
+    
+    // Add to global device list
+    write_lock(&dev_mgr.device_lock);
+    list_add_tail(&device->global_list, &dev_mgr.devices);
+    dev_mgr.stats.total_devices++;
+    dev_mgr.stats.active_devices++;
+    write_unlock(&dev_mgr.device_lock);
+    
+    // Allocate device resources
+    if (allocate_device_resources(device) != 0) {
+        kprintf("DEV: Failed to allocate resources for device %s\n", device->name);
+        return -1;
+    }
+    
+    // Try to bind a driver
+    read_lock(&dev_mgr.driver_lock);
+    
+    struct driver *driver;
+    list_for_each_entry(driver, &dev_mgr.drivers, global_list) {
+        if (device_match_driver(device, driver)) {
+            if (bind_device_driver(device, driver) == 0) {
+                break;
+            }
+        }
+    }
+    
+    read_unlock(&dev_mgr.driver_lock);
+    
+    if (!device->driver) {
+        kprintf("DEV: No driver found for device %s (type %u)\n", device->name, device->type);
+    } else {
+        device->state = DEVICE_STATE_ACTIVE;
+    }
+    
+    kprintf("DEV: Registered device %s (ID %u)\n", device->name, device->device_id);
+    return 0;
+}
+
+// Driver registration
+int register_driver(struct driver *driver) {
+    if (!driver || !driver->name[0]) return -1;
+    
+    // Initialize driver structure
+    spin_lock_init(&driver->lock);
+    INIT_LIST_HEAD(&driver->devices);
+    driver->device_count = 0;
+    
+    // Set default power management policy
+    if (driver->pm_policy.default_autosuspend_delay == 0) {
+        driver->pm_policy.default_autosuspend_delay = 2000; // 2 seconds
+    }
+    
+    // Initialize AI configuration
+    if (driver->ai_config.performance_weight == 0.0f) {
+        driver->ai_config.performance_weight = 0.7f; // Favor performance by default
+    }
+    
+    // Add to global driver list
+    write_lock(&dev_mgr.driver_lock);
+    list_add_tail(&driver->global_list, &dev_mgr.drivers);
+    dev_mgr.stats.total_drivers++;
+    dev_mgr.stats.active_drivers++;
+    write_unlock(&dev_mgr.driver_lock);
+    
+    // Try to bind to existing devices
+    read_lock(&dev_mgr.device_lock);
+    
+    struct device *device;
+    list_for_each_entry(device, &dev_mgr.devices, global_list) {
+        if (!device->driver && device_match_driver(device, driver)) {
+            bind_device_driver(device, driver);
+        }
+    }
+    
+    read_unlock(&dev_mgr.device_lock);
+    
+    kprintf("DEV: Registered driver %s (version %s)\n", driver->name, driver->version);
+    return 0;
+}
+
+// System power management coordination
+int system_suspend_devices(void) {
+    dev_mgr.pm_coordinator.system_suspend_active = true;
+    
+    write_lock(&dev_mgr.device_lock);
+    
+    struct device *device;
+    list_for_each_entry_reverse(device, &dev_mgr.devices, global_list) {
+        if (device->state == DEVICE_STATE_ACTIVE) {
+            // Suspend device
+            if (device->driver && device->driver->ops->suspend) {
+                device->driver->ops->suspend(device, DEVICE_POWER_D3_HOT);
+            }
+            
+            device_set_power_state(device, DEVICE_POWER_D3_HOT);
+            dev_mgr.pm_coordinator.suspended_device_count++;
+        }
+    }
+    
+    write_unlock(&dev_mgr.device_lock);
+    
+    kprintf("DEV: Suspended %u devices for system suspend\n", 
+            dev_mgr.pm_coordinator.suspended_device_count);
+    
+    return 0;
+}
+
+int system_resume_devices(void) {
+    write_lock(&dev_mgr.device_lock);
+    
+    struct device *device;
+    list_for_each_entry(device, &dev_mgr.devices, global_list) {
+        if (device->power_state > DEVICE_POWER_D0) {
+            // Resume device
+            device_set_power_state(device, DEVICE_POWER_D0);
+            
+            if (device->driver && device->driver->ops->resume) {
+                device->driver->ops->resume(device);
+            }
+            
+            dev_mgr.pm_coordinator.suspended_device_count--;
+        }
+    }
+    
+    write_unlock(&dev_mgr.device_lock);
+    
+    dev_mgr.pm_coordinator.system_suspend_active = false;
+    
+    kprintf("DEV: Resumed devices from system suspend\n");
+    return 0;
+}
+
+// Device manager initialization
+int device_manager_init(void) {
+    kprintf("DEV: Initializing advanced device driver framework\n");
+    
+    memset(&dev_mgr, 0, sizeof(dev_mgr));
+    dev_mgr.next_device_id = 1;
+    
+    // Initialize lists
+    INIT_LIST_HEAD(&dev_mgr.devices);
+    INIT_LIST_HEAD(&dev_mgr.drivers);
+    INIT_LIST_HEAD(&dev_mgr.buses);
+    
+    // Initialize locks
+    rwlock_init(&dev_mgr.device_lock);
+    rwlock_init(&dev_mgr.driver_lock);
+    rwlock_init(&dev_mgr.bus_lock);
+    
+    // Create work queues
+    dev_mgr.probe_workqueue = create_workqueue("device_probe");
+    dev_mgr.hotplug_workqueue = create_workqueue("device_hotplug");
+    
+    if (!dev_mgr.probe_workqueue || !dev_mgr.hotplug_workqueue) {
+        kprintf("DEV: Failed to create work queues\n");
+        return -1;
+    }
+    
+    // Initialize AI manager
+    dev_mgr.ai_manager.enabled = true;
+    dev_mgr.ai_manager.model_version = 1;
+    dev_mgr.ai_manager.optimization_score = 0.5f;
+    
+    // Initialize neural network weights (simplified)
+    for (int i = 0; i < 32; i++) {
+        for (int j = 0; j < 16; j++) {
+            dev_mgr.ai_manager.global_weights[i][j] = ((float)(i - j) / 50.0f);
+        }
+    }
+    
+    // Enable hot-plug manager
+    dev_mgr.hotplug_manager.enabled = true;
+    
+    kprintf("DEV: Device driver framework initialized\n");
+    kprintf("DEV: AI resource optimization enabled, hot-plug support enabled\n");
+    
+    return 0;
+}

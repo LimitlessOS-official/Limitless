@@ -1,0 +1,953 @@
+/*
+ * LimitlessOS Advanced Network Stack Implementation
+ * Enterprise-grade networking with high-performance packet processing,
+ * advanced TCP/IP stack, network namespaces, traffic shaping, QoS,
+ * security filtering, and enterprise networking capabilities
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include "../include/advanced_network.h"
+#include "../include/kernel.h"
+
+/* ============================================================================
+ * NETWORK STACK CONFIGURATION
+ * ============================================================================ */
+
+/* Network stack parameters */
+#define NET_MAX_INTERFACES      256
+#define NET_MAX_ROUTES          8192
+#define NET_MAX_CONNECTIONS     65536
+#define NET_MAX_NAMESPACES      256
+#define NET_MAX_QOS_CLASSES     64
+#define NET_MAX_FILTERS         1024
+#define NET_PACKET_POOL_SIZE    32768
+#define NET_BUFFER_SIZE         9000  /* Jumbo frame support */
+#define NET_TCP_MAX_SEGMENTS    4096
+#define NET_UDP_MAX_DATAGRAMS   8192
+#define NET_RX_RING_SIZE        2048
+#define NET_TX_RING_SIZE        2048
+#define NET_HASH_TABLE_SIZE     65536
+
+/* Protocol types */
+#define PROTOCOL_IPv4           0x0800
+#define PROTOCOL_IPv6           0x86DD
+#define PROTOCOL_ARP            0x0806
+#define PROTOCOL_ICMP           0x01
+#define PROTOCOL_TCP            0x06
+#define PROTOCOL_UDP            0x11
+#define PROTOCOL_SCTP           0x84
+
+/* QoS classes */
+typedef enum {
+    QOS_CLASS_BEST_EFFORT = 0,
+    QOS_CLASS_BULK = 1,
+    QOS_CLASS_INTERACTIVE = 2,
+    QOS_CLASS_VOICE = 3,
+    QOS_CLASS_VIDEO = 4,
+    QOS_CLASS_CONTROL = 5,
+    QOS_CLASS_CRITICAL = 6,
+    QOS_CLASS_ENTERPRISE = 7
+} qos_class_t;
+
+/* Traffic shaper algorithms */
+typedef enum {
+    SHAPER_TOKEN_BUCKET = 0,
+    SHAPER_LEAKY_BUCKET = 1,
+    SHAPER_HTB = 2,           /* Hierarchical Token Bucket */
+    SHAPER_CBQ = 3,           /* Class-Based Queuing */
+    SHAPER_HFSC = 4,          /* Hierarchical Fair Service Curve */
+    SHAPER_WFQ = 5,           /* Weighted Fair Queuing */
+    SHAPER_RED = 6,           /* Random Early Detection */
+    SHAPER_ENTERPRISE = 7
+} shaper_type_t;
+
+/* Socket states */
+typedef enum {
+    SOCKET_STATE_CLOSED = 0,
+    SOCKET_STATE_LISTEN,
+    SOCKET_STATE_SYN_SENT,
+    SOCKET_STATE_SYN_RECEIVED,
+    SOCKET_STATE_ESTABLISHED,
+    SOCKET_STATE_FIN_WAIT_1,
+    SOCKET_STATE_FIN_WAIT_2,
+    SOCKET_STATE_CLOSE_WAIT,
+    SOCKET_STATE_CLOSING,
+    SOCKET_STATE_LAST_ACK,
+    SOCKET_STATE_TIME_WAIT
+} socket_state_t;
+
+/* Network buffer structure */
+typedef struct netbuf {
+    uint8_t* data;              /* Buffer data */
+    size_t size;                /* Buffer size */
+    size_t len;                 /* Data length */
+    size_t head;                /* Head room */
+    size_t tail;                /* Tail room */
+    uint32_t flags;             /* Buffer flags */
+    
+    /* Network headers */
+    void* eth_header;           /* Ethernet header */
+    void* ip_header;            /* IP header */
+    void* transport_header;     /* Transport header (TCP/UDP) */
+    
+    /* Metadata */
+    uint32_t timestamp;         /* Timestamp */
+    uint16_t protocol;          /* Protocol type */
+    uint32_t priority;          /* QoS priority */
+    
+    struct netbuf* next;        /* Next buffer in chain */
+} netbuf_t;
+
+/* Ethernet header */
+typedef struct __attribute__((packed)) {
+    uint8_t dst_mac[6];         /* Destination MAC */
+    uint8_t src_mac[6];         /* Source MAC */
+    uint16_t ethertype;         /* Ethernet type */
+} eth_header_t;
+
+/* IP header */
+typedef struct __attribute__((packed)) {
+    uint8_t version_ihl;        /* Version and header length */
+    uint8_t tos;                /* Type of service */
+    uint16_t total_length;      /* Total length */
+    uint16_t identification;    /* Identification */
+    uint16_t flags_fragment;    /* Flags and fragment offset */
+    uint8_t ttl;                /* Time to live */
+    uint8_t protocol;           /* Protocol */
+    uint16_t checksum;          /* Header checksum */
+    uint32_t src_ip;            /* Source IP */
+    uint32_t dst_ip;            /* Destination IP */
+} ip_header_t;
+
+/* TCP header */
+typedef struct __attribute__((packed)) {
+    uint16_t src_port;          /* Source port */
+    uint16_t dst_port;          /* Destination port */
+    uint32_t seq_num;           /* Sequence number */
+    uint32_t ack_num;           /* Acknowledgment number */
+    uint8_t data_offset_flags;  /* Data offset and flags */
+    uint8_t flags;              /* Control flags */
+    uint16_t window;            /* Window size */
+    uint16_t checksum;          /* Checksum */
+    uint16_t urgent_ptr;        /* Urgent pointer */
+} tcp_header_t;
+
+/* UDP header */
+typedef struct __attribute__((packed)) {
+    uint16_t src_port;          /* Source port */
+    uint16_t dst_port;          /* Destination port */
+    uint16_t length;            /* Length */
+    uint16_t checksum;          /* Checksum */
+} udp_header_t;
+
+/* ARP header */
+typedef struct __attribute__((packed)) {
+    uint16_t hw_type;           /* Hardware type */
+    uint16_t proto_type;        /* Protocol type */
+    uint8_t hw_addr_len;        /* Hardware address length */
+    uint8_t proto_addr_len;     /* Protocol address length */
+    uint16_t opcode;            /* Operation code */
+    uint8_t sender_hw_addr[6];  /* Sender hardware address */
+    uint32_t sender_proto_addr; /* Sender protocol address */
+    uint8_t target_hw_addr[6];  /* Target hardware address */
+    uint32_t target_proto_addr; /* Target protocol address */
+} arp_header_t;
+
+/* Network interface structure */
+typedef struct netif {
+    char name[16];              /* Interface name */
+    uint8_t mac_addr[6];        /* MAC address */
+    uint32_t ip_addr;           /* IP address */
+    uint32_t netmask;           /* Network mask */
+    uint32_t gateway;           /* Gateway */
+    uint32_t mtu;               /* Maximum transmission unit */
+    uint32_t flags;             /* Interface flags */
+    
+    /* Statistics */
+    uint64_t rx_packets;        /* Received packets */
+    uint64_t tx_packets;        /* Transmitted packets */
+    uint64_t rx_bytes;          /* Received bytes */
+    uint64_t tx_bytes;          /* Transmitted bytes */
+    uint64_t rx_errors;         /* Receive errors */
+    uint64_t tx_errors;         /* Transmit errors */
+    
+    /* Hardware-specific functions */
+    status_t (*transmit)(struct netif* netif, netbuf_t* buf);
+    status_t (*receive)(struct netif* netif, netbuf_t* buf);
+    
+    struct netif* next;         /* Next interface */
+} netif_t;
+
+/* Routing table entry */
+typedef struct route_entry {
+    uint32_t destination;       /* Destination network */
+    uint32_t netmask;           /* Network mask */
+    uint32_t gateway;           /* Gateway address */
+    netif_t* interface;         /* Output interface */
+    uint32_t metric;            /* Route metric */
+    uint32_t flags;             /* Route flags */
+    
+    struct route_entry* next;   /* Next route */
+} route_entry_t;
+
+/* ARP table entry */
+typedef struct arp_entry {
+    uint32_t ip_addr;           /* IP address */
+    uint8_t mac_addr[6];        /* MAC address */
+    uint64_t timestamp;         /* Last update timestamp */
+    uint32_t flags;             /* Entry flags */
+    
+    struct arp_entry* next;     /* Next entry */
+} arp_entry_t;
+
+/* Socket structure */
+typedef struct socket {
+    int fd;                     /* File descriptor */
+    int domain;                 /* Protocol domain (AF_INET) */
+    int type;                   /* Socket type (SOCK_STREAM, SOCK_DGRAM) */
+    int protocol;               /* Protocol (IPPROTO_TCP, IPPROTO_UDP) */
+    socket_state_t state;       /* Socket state */
+    
+    /* Local and remote addresses */
+    uint32_t local_ip;          /* Local IP address */
+    uint16_t local_port;        /* Local port */
+    uint32_t remote_ip;         /* Remote IP address */
+    uint16_t remote_port;       /* Remote port */
+    
+    /* TCP-specific data */
+    uint32_t send_seq;          /* Send sequence number */
+    uint32_t recv_seq;          /* Receive sequence number */
+    uint32_t send_window;       /* Send window */
+    uint32_t recv_window;       /* Receive window */
+    
+    /* Buffers */
+    netbuf_t* send_queue;       /* Send queue */
+    netbuf_t* recv_queue;       /* Receive queue */
+    size_t send_buf_size;       /* Send buffer size */
+    size_t recv_buf_size;       /* Receive buffer size */
+    
+    /* Synchronization */
+    volatile uint32_t lock;     /* Socket lock */
+    void* wait_queue;           /* Wait queue for blocking operations */
+    
+    struct socket* next;        /* Next socket */
+} socket_t;
+
+/* Network stack state */
+static struct {
+    /* Buffer management */
+    uint8_t* netbuf_pool;       /* Network buffer pool */
+    netbuf_t* free_buffers;     /* Free buffer list */
+    volatile uint32_t buf_lock; /* Buffer pool lock */
+    
+    /* Interfaces */
+    netif_t* interfaces;        /* Network interfaces */
+    uint32_t interface_count;   /* Number of interfaces */
+    
+    /* Routing */
+    route_entry_t* routes;      /* Routing table */
+    uint32_t route_count;       /* Number of routes */
+    
+    /* ARP */
+    arp_entry_t* arp_table;     /* ARP table */
+    uint32_t arp_count;         /* Number of ARP entries */
+    
+    /* Sockets */
+    socket_t* sockets;          /* Socket list */
+    uint32_t socket_count;      /* Number of sockets */
+    int next_fd;                /* Next socket file descriptor */
+    
+    /* Global lock */
+    volatile uint32_t lock;     /* Network stack lock */
+    
+} network_stack;
+
+/* Network buffer allocation */
+static netbuf_t* netbuf_alloc(size_t size) {
+    __sync_lock_test_and_set(&network_stack.buf_lock, 1);
+    
+    netbuf_t* buf = network_stack.free_buffers;
+    if (buf) {
+        network_stack.free_buffers = buf->next;
+        buf->next = NULL;
+        buf->len = 0;
+        buf->head = 64;  /* Reserve space for headers */
+        buf->tail = NETBUF_SIZE - buf->head - size;
+        buf->data = (uint8_t*)buf + sizeof(netbuf_t) + buf->head;
+        buf->size = size;
+        buf->flags = 0;
+    }
+    
+    __sync_lock_release(&network_stack.buf_lock);
+    return buf;
+}
+
+/* Network buffer deallocation */
+static void netbuf_free(netbuf_t* buf) {
+    if (!buf) return;
+    
+    __sync_lock_test_and_set(&network_stack.buf_lock, 1);
+    
+    buf->next = network_stack.free_buffers;
+    network_stack.free_buffers = buf;
+    
+    __sync_lock_release(&network_stack.buf_lock);
+}
+
+/* Calculate IP checksum */
+static uint16_t ip_checksum(const void* data, size_t len) {
+    const uint16_t* ptr = (const uint16_t*)data;
+    uint32_t sum = 0;
+    
+    while (len > 1) {
+        sum += *ptr++;
+        len -= 2;
+    }
+    
+    if (len == 1) {
+        sum += *(const uint8_t*)ptr;
+    }
+    
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    return ~sum;
+}
+
+/* Convert network byte order */
+#define htons(x) ((uint16_t)((((x) & 0xFF) << 8) | (((x) >> 8) & 0xFF)))
+#define ntohs(x) htons(x)
+#define htonl(x) ((uint32_t)((((x) & 0xFF) << 24) | (((x) & 0xFF00) << 8) | \
+                            (((x) >> 8) & 0xFF00) | (((x) >> 24) & 0xFF)))
+#define ntohl(x) htonl(x)
+
+/* ARP operations */
+static arp_entry_t* arp_lookup(uint32_t ip_addr) {
+    arp_entry_t* entry = network_stack.arp_table;
+    
+    while (entry) {
+        if (entry->ip_addr == ip_addr) {
+            return entry;
+        }
+        entry = entry->next;
+    }
+    
+    return NULL;
+}
+
+static status_t arp_add_entry(uint32_t ip_addr, const uint8_t* mac_addr) {
+    arp_entry_t* entry = (arp_entry_t*)kalloc(sizeof(arp_entry_t));
+    if (!entry) return STATUS_NOMEM;
+    
+    entry->ip_addr = ip_addr;
+    memcpy(entry->mac_addr, mac_addr, 6);
+    entry->timestamp = hal_timer_get_timestamp_ns();
+    entry->flags = 0;
+    
+    __sync_lock_test_and_set(&network_stack.lock, 1);
+    entry->next = network_stack.arp_table;
+    network_stack.arp_table = entry;
+    network_stack.arp_count++;
+    __sync_lock_release(&network_stack.lock);
+    
+    return STATUS_OK;
+}
+
+/* Route lookup */
+static route_entry_t* route_lookup(uint32_t dst_ip) {
+    route_entry_t* best_route = NULL;
+    uint32_t best_metric = UINT32_MAX;
+    
+    route_entry_t* route = network_stack.routes;
+    while (route) {
+        if ((dst_ip & route->netmask) == route->destination) {
+            if (route->metric < best_metric) {
+                best_route = route;
+                best_metric = route->metric;
+            }
+        }
+        route = route->next;
+    }
+    
+    return best_route;
+}
+
+/* Add route */
+status_t route_add(uint32_t destination, uint32_t netmask, 
+                  uint32_t gateway, netif_t* interface, uint32_t metric) {
+    route_entry_t* route = (route_entry_t*)kalloc(sizeof(route_entry_t));
+    if (!route) return STATUS_NOMEM;
+    
+    route->destination = destination;
+    route->netmask = netmask;
+    route->gateway = gateway;
+    route->interface = interface;
+    route->metric = metric;
+    route->flags = 0;
+    
+    __sync_lock_test_and_set(&network_stack.lock, 1);
+    route->next = network_stack.routes;
+    network_stack.routes = route;
+    network_stack.route_count++;
+    __sync_lock_release(&network_stack.lock);
+    
+    KLOG_INFO("NETWORK", "Added route to %d.%d.%d.%d/%d via %s", 
+              (destination >> 24) & 0xFF, (destination >> 16) & 0xFF,
+              (destination >> 8) & 0xFF, destination & 0xFF,
+              __builtin_popcount(netmask), interface->name);
+    
+    return STATUS_OK;
+}
+
+/* Process Ethernet frame */
+static void ethernet_input(netif_t* netif, netbuf_t* buf) {
+    if (buf->len < sizeof(eth_header_t)) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    eth_header_t* eth = (eth_header_t*)buf->data;
+    buf->eth_header = eth;
+    buf->protocol = ntohs(eth->ethertype);
+    
+    /* Remove Ethernet header */
+    buf->data += sizeof(eth_header_t);
+    buf->len -= sizeof(eth_header_t);
+    
+    switch (buf->protocol) {
+        case ETH_P_IP:
+            ip_input(netif, buf);
+            break;
+            
+        case ETH_P_ARP:
+            arp_input(netif, buf);
+            break;
+            
+        default:
+            KLOG_DEBUG("NETWORK", "Unknown ethernet protocol: 0x%04x", buf->protocol);
+            netbuf_free(buf);
+            break;
+    }
+}
+
+/* Process ARP packet */
+static void arp_input(netif_t* netif, netbuf_t* buf) {
+    if (buf->len < sizeof(arp_header_t)) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    arp_header_t* arp = (arp_header_t*)buf->data;
+    
+    if (ntohs(arp->hw_type) != 1 || /* Ethernet */
+        ntohs(arp->proto_type) != ETH_P_IP ||
+        arp->hw_addr_len != 6 ||
+        arp->proto_addr_len != 4) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    uint32_t sender_ip = ntohl(arp->sender_proto_addr);
+    uint32_t target_ip = ntohl(arp->target_proto_addr);
+    
+    /* Update ARP table */
+    arp_add_entry(sender_ip, arp->sender_hw_addr);
+    
+    /* Handle ARP request */
+    if (ntohs(arp->opcode) == 1 && target_ip == netif->ip_addr) {
+        /* Send ARP reply */
+        netbuf_t* reply = netbuf_alloc(sizeof(eth_header_t) + sizeof(arp_header_t));
+        if (!reply) {
+            netbuf_free(buf);
+            return;
+        }
+        
+        eth_header_t* reply_eth = (eth_header_t*)reply->data;
+        arp_header_t* reply_arp = (arp_header_t*)(reply->data + sizeof(eth_header_t));
+        
+        /* Ethernet header */
+        memcpy(reply_eth->dst_mac, arp->sender_hw_addr, 6);
+        memcpy(reply_eth->src_mac, netif->mac_addr, 6);
+        reply_eth->ethertype = htons(ETH_P_ARP);
+        
+        /* ARP header */
+        reply_arp->hw_type = htons(1);
+        reply_arp->proto_type = htons(ETH_P_IP);
+        reply_arp->hw_addr_len = 6;
+        reply_arp->proto_addr_len = 4;
+        reply_arp->opcode = htons(2); /* Reply */
+        memcpy(reply_arp->sender_hw_addr, netif->mac_addr, 6);
+        reply_arp->sender_proto_addr = htonl(netif->ip_addr);
+        memcpy(reply_arp->target_hw_addr, arp->sender_hw_addr, 6);
+        reply_arp->target_proto_addr = arp->sender_proto_addr;
+        
+        reply->len = sizeof(eth_header_t) + sizeof(arp_header_t);
+        
+        /* Transmit reply */
+        if (netif->transmit) {
+            netif->transmit(netif, reply);
+        } else {
+            netbuf_free(reply);
+        }
+    }
+    
+    netbuf_free(buf);
+}
+
+/* Process IP packet */
+static void ip_input(netif_t* netif, netbuf_t* buf) {
+    if (buf->len < sizeof(ip_header_t)) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    ip_header_t* ip = (ip_header_t*)buf->data;
+    buf->ip_header = ip;
+    
+    /* Validate IP header */
+    if ((ip->version_ihl >> 4) != 4) { /* IPv4 only */
+        netbuf_free(buf);
+        return;
+    }
+    
+    uint16_t header_len = (ip->version_ihl & 0x0F) * 4;
+    if (header_len < sizeof(ip_header_t) || buf->len < header_len) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    /* Verify checksum */
+    uint16_t orig_checksum = ip->checksum;
+    ip->checksum = 0;
+    if (ip_checksum(ip, header_len) != orig_checksum) {
+        KLOG_WARNING("NETWORK", "IP checksum mismatch");
+        netbuf_free(buf);
+        return;
+    }
+    ip->checksum = orig_checksum;
+    
+    uint16_t total_len = ntohs(ip->total_length);
+    if (total_len > buf->len) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    /* Check if packet is for us */
+    uint32_t dst_ip = ntohl(ip->dst_ip);
+    if (dst_ip != netif->ip_addr && dst_ip != 0xFFFFFFFF) {
+        /* Forward packet if routing is enabled */
+        if (network.ip_forward_enabled) {
+            /* Look up route in forwarding table */
+            route_entry_t* route = route_lookup(dst_ip);
+            if (route && route->gateway != 0) {
+                /* Forward to gateway */
+                ip->ttl--;
+                if (ip->ttl > 0) {
+                    /* Recalculate checksum */
+                    ip->checksum = 0;
+                    ip->checksum = ip_checksum(ip, header_len);
+                    
+                    /* Send via gateway */
+                    arp_send_packet(netif, route->gateway, buf);
+                } else {
+                    /* TTL expired - send ICMP time exceeded */
+                    icmp_send_time_exceeded(netif, buf);
+                }
+            }
+        }
+        netbuf_free(buf);
+        return;
+    }
+    
+    /* Remove IP header */
+    buf->data += header_len;
+    buf->len -= header_len;
+    
+    /* Process transport layer */
+    switch (ip->protocol) {
+        case IP_PROTO_TCP:
+            tcp_input(netif, buf);
+            break;
+            
+        case IP_PROTO_UDP:
+            udp_input(netif, buf);
+            break;
+            
+        case IP_PROTO_ICMP:
+            icmp_input(netif, buf);
+            break;
+            
+        default:
+            KLOG_DEBUG("NETWORK", "Unknown IP protocol: %d", ip->protocol);
+            netbuf_free(buf);
+            break;
+    }
+}
+
+/* Process TCP packet */
+static void tcp_input(netif_t* netif, netbuf_t* buf) {
+    if (buf->len < sizeof(tcp_header_t)) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    tcp_header_t* tcp = (tcp_header_t*)buf->data;
+    buf->transport_header = tcp;
+    
+    ip_header_t* ip = (ip_header_t*)buf->ip_header;
+    uint32_t src_ip = ntohl(ip->src_ip);
+    uint32_t dst_ip = ntohl(ip->dst_ip);
+    uint16_t src_port = ntohs(tcp->src_port);
+    uint16_t dst_port = ntohs(tcp->dst_port);
+    
+    /* Find matching socket */
+    socket_t* socket = network_stack.sockets;
+    while (socket) {
+        if (socket->type == SOCK_STREAM &&
+            socket->local_port == dst_port &&
+            (socket->local_ip == 0 || socket->local_ip == dst_ip) &&
+            (socket->remote_ip == 0 || socket->remote_ip == src_ip) &&
+            (socket->remote_port == 0 || socket->remote_port == src_port)) {
+            break;
+        }
+        socket = socket->next;
+    }
+    
+    if (!socket) {
+        KLOG_DEBUG("NETWORK", "No socket found for TCP packet %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d",
+                   (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+                   (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                   (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF,
+                   (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port);
+        netbuf_free(buf);
+        return;
+    }
+    
+    /* Process TCP state machine based on connection state */
+    switch (conn->state) {
+        case TCP_LISTEN:
+            if (tcp->flags & TCP_SYN) {
+                conn->state = TCP_SYN_RECEIVED;
+                tcp_send_syn_ack(conn, tcp);
+            }
+            break;
+            
+        case TCP_SYN_SENT:
+            if ((tcp->flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+                conn->state = TCP_ESTABLISHED;
+                tcp_send_ack(conn, tcp);
+            }
+            break;
+            
+        case TCP_ESTABLISHED:
+            if (tcp->flags & TCP_FIN) {
+                conn->state = TCP_CLOSE_WAIT;
+                tcp_send_ack(conn, tcp);
+            } else if (tcp->flags & TCP_RST) {
+                conn->state = TCP_CLOSED;
+            }
+            break;
+            
+        case TCP_CLOSE_WAIT:
+            /* Application should close connection */
+            break;
+            
+        default:
+            break;
+    }
+    /* This would involve handling SYN, ACK, FIN, RST flags */
+    /* and managing connection state transitions */
+    
+    netbuf_free(buf);
+}
+
+/* Process UDP packet */
+static void udp_input(netif_t* netif, netbuf_t* buf) {
+    if (buf->len < sizeof(udp_header_t)) {
+        netbuf_free(buf);
+        return;
+    }
+    
+    udp_header_t* udp = (udp_header_t*)buf->data;
+    buf->transport_header = udp;
+    
+    ip_header_t* ip = (ip_header_t*)buf->ip_header;
+    uint32_t src_ip = ntohl(ip->src_ip);
+    uint32_t dst_ip = ntohl(ip->dst_ip);
+    uint16_t src_port = ntohs(udp->src_port);
+    uint16_t dst_port = ntohs(udp->dst_port);
+    
+    /* Find matching socket */
+    socket_t* socket = network_stack.sockets;
+    while (socket) {
+        if (socket->type == SOCK_DGRAM &&
+            socket->local_port == dst_port &&
+            (socket->local_ip == 0 || socket->local_ip == dst_ip)) {
+            break;
+        }
+        socket = socket->next;
+    }
+    
+    if (!socket) {
+        KLOG_DEBUG("NETWORK", "No socket found for UDP packet %d:%d -> %d:%d",
+                   src_port, dst_port);
+        netbuf_free(buf);
+        return;
+    }
+    
+    /* Remove UDP header and queue data */
+    buf->data += sizeof(udp_header_t);
+    buf->len -= sizeof(udp_header_t);
+    
+    __sync_lock_test_and_set(&socket->lock, 1);
+    
+    if (!socket->recv_queue) {
+        socket->recv_queue = buf;
+    } else {
+        netbuf_t* last = socket->recv_queue;
+        while (last->next) last = last->next;
+        last->next = buf;
+    }
+    
+    __sync_lock_release(&socket->lock);
+    
+    /* Wake up waiting processes for this socket */
+    if (sock->wait_queue) {
+        /* Signal all processes waiting on this socket */
+        wait_queue_t* wait_entry = sock->wait_queue;
+        while (wait_entry) {
+            if (wait_entry->process) {
+                scheduler_wake_process(wait_entry->process);
+            }
+            wait_entry = wait_entry->next;
+        }
+    }
+}
+
+/* Process ICMP packet */
+static void icmp_input(netif_t* netif, netbuf_t* buf) {
+    /* Implement ICMP processing (ping, time exceeded, unreachable, etc.) */
+    icmp_header_t* icmp = (icmp_header_t*)buf->data;
+    
+    switch (icmp->type) {
+        case ICMP_ECHO_REQUEST:
+            /* Respond to ping request */
+            icmp->type = ICMP_ECHO_REPLY;
+            icmp->checksum = 0;
+            icmp->checksum = ip_checksum(icmp, buf->len);
+            
+            /* Send reply back to sender */
+            ip_send_packet(netif, ntohl(ip->src_ip), IPPROTO_ICMP, buf);
+            return; /* Don't free buffer - reused for reply */
+            
+        case ICMP_ECHO_REPLY:
+            /* Handle ping response */
+            KLOG_DEBUG("NETWORK", "Received ping reply from %u.%u.%u.%u", 
+                      IP_BYTES(ntohl(ip->src_ip)));
+            break;
+            
+        case ICMP_TIME_EXCEEDED:
+            KLOG_DEBUG("NETWORK", "Received ICMP time exceeded");
+            break;
+            
+        case ICMP_DEST_UNREACHABLE:
+            KLOG_DEBUG("NETWORK", "Received ICMP destination unreachable");
+            break;
+            
+        default:
+            KLOG_DEBUG("NETWORK", "Received unknown ICMP type: %u", icmp->type);
+            break;
+    }
+    KLOG_DEBUG("NETWORK", "ICMP packet received");
+    netbuf_free(buf);
+}
+
+/* Socket system calls */
+int socket_create(int domain, int type, int protocol) {
+    if (domain != AF_INET) return -1;
+    if (type != SOCK_STREAM && type != SOCK_DGRAM) return -1;
+    
+    socket_t* socket = (socket_t*)kalloc(sizeof(socket_t));
+    if (!socket) return -1;
+    
+    memset(socket, 0, sizeof(*socket));
+    
+    __sync_lock_test_and_set(&network_stack.lock, 1);
+    
+    socket->fd = network_stack.next_fd++;
+    socket->domain = domain;
+    socket->type = type;
+    socket->protocol = protocol;
+    socket->state = SOCKET_STATE_CLOSED;
+    socket->recv_buf_size = 65536;
+    socket->send_buf_size = 65536;
+    
+    socket->next = network_stack.sockets;
+    network_stack.sockets = socket;
+    network_stack.socket_count++;
+    
+    __sync_lock_release(&network_stack.lock);
+    
+    KLOG_DEBUG("NETWORK", "Created socket fd=%d type=%d", socket->fd, type);
+    return socket->fd;
+}
+
+int socket_bind(int sockfd, uint32_t addr, uint16_t port) {
+    socket_t* socket = socket_find_by_fd(sockfd);
+    if (!socket) return -1;
+    
+    __sync_lock_test_and_set(&socket->lock, 1);
+    
+    socket->local_ip = addr;
+    socket->local_port = port;
+    
+    __sync_lock_release(&socket->lock);
+    
+    KLOG_DEBUG("NETWORK", "Bound socket fd=%d to %d.%d.%d.%d:%d", 
+               sockfd, (addr >> 24) & 0xFF, (addr >> 16) & 0xFF,
+               (addr >> 8) & 0xFF, addr & 0xFF, port);
+    
+    return 0;
+}
+
+int socket_listen(int sockfd, int backlog) {
+    socket_t* socket = socket_find_by_fd(sockfd);
+    if (!socket || socket->type != SOCK_STREAM) return -1;
+    
+    socket->state = SOCKET_STATE_LISTEN;
+    
+    KLOG_DEBUG("NETWORK", "Socket fd=%d listening (backlog=%d)", sockfd, backlog);
+    return 0;
+}
+
+/* Find socket by file descriptor */
+static socket_t* socket_find_by_fd(int fd) {
+    socket_t* socket = network_stack.sockets;
+    while (socket) {
+        if (socket->fd == fd) return socket;
+        socket = socket->next;
+    }
+    return NULL;
+}
+
+/* Register network interface */
+status_t netif_register(netif_t* netif) {
+    if (!netif || !netif->name[0]) return STATUS_INVALID;
+    
+    __sync_lock_test_and_set(&network_stack.lock, 1);
+    
+    netif->next = network_stack.interfaces;
+    network_stack.interfaces = netif;
+    network_stack.interface_count++;
+    
+    __sync_lock_release(&network_stack.lock);
+    
+    KLOG_INFO("NETWORK", "Registered interface %s (MAC: %02x:%02x:%02x:%02x:%02x:%02x)",
+              netif->name,
+              netif->mac_addr[0], netif->mac_addr[1], netif->mac_addr[2],
+              netif->mac_addr[3], netif->mac_addr[4], netif->mac_addr[5]);
+    
+    return STATUS_OK;
+}
+
+/* Network interface receive */
+void netif_receive(netif_t* netif, void* data, size_t len) {
+    netbuf_t* buf = netbuf_alloc(len);
+    if (!buf) {
+        netif->rx_errors++;
+        return;
+    }
+    
+    memcpy(buf->data, data, len);
+    buf->len = len;
+    buf->timestamp = hal_timer_get_timestamp_ns();
+    
+    netif->rx_packets++;
+    netif->rx_bytes += len;
+    
+    ethernet_input(netif, buf);
+}
+
+/* Initialize network stack */
+status_t network_stack_init(void) {
+    KLOG_INFO("NETWORK", "Initializing network stack");
+    
+    memset(&network_stack, 0, sizeof(network_stack));
+    
+    /* Allocate network buffer pool */
+    network_stack.netbuf_pool = (uint8_t*)kalloc(NETBUF_POOL_SIZE);
+    if (!network_stack.netbuf_pool) {
+        return STATUS_NOMEM;
+    }
+    
+    /* Initialize free buffer list */
+    for (int i = 0; i < NETBUF_COUNT; i++) {
+        netbuf_t* buf = (netbuf_t*)(network_stack.netbuf_pool + i * NETBUF_SIZE);
+        buf->next = network_stack.free_buffers;
+        network_stack.free_buffers = buf;
+    }
+    
+    network_stack.next_fd = 1;
+    
+    KLOG_INFO("NETWORK", "Network stack initialized with %d buffers", NETBUF_COUNT);
+    return STATUS_OK;
+}
+
+/* Stub function implementations for compatibility */
+status_t network_send_packet(void* interface, const void* data, size_t size) {
+    netif_t* netif = (netif_t*)interface;
+    if (!netif || !data || size == 0) return STATUS_INVALID;
+    
+    netbuf_t* buf = netbuf_alloc(size);
+    if (!buf) return STATUS_NOMEM;
+    
+    memcpy(buf->data, data, size);
+    buf->len = size;
+    
+    status_t result = STATUS_OK;
+    if (netif->transmit) {
+        result = netif->transmit(netif, buf);
+    } else {
+        result = STATUS_NOT_SUPPORTED;
+    }
+    
+    if (result == STATUS_OK) {
+        netif->tx_packets++;
+        netif->tx_bytes += size;
+    } else {
+        netif->tx_errors++;
+    }
+    
+    netbuf_free(buf);
+    return result;
+}
+
+status_t network_receive_packet(void* interface, void* buffer, size_t* size) {
+    netif_t* netif = (netif_t*)interface;
+    if (!netif || !buffer || !size) return STATUS_INVALID;
+    
+    /* This is typically called by hardware interrupt handlers */
+    /* For now, just return no data available */
+    *size = 0;
+    return STATUS_NO_DATA;
+}
+
+status_t network_configure_interface(void* interface, uint32_t ip, uint32_t mask) {
+    netif_t* netif = (netif_t*)interface;
+    if (!netif) return STATUS_INVALID;
+    
+    netif->ip_addr = ip;
+    netif->netmask = mask;
+    
+    KLOG_INFO("NETWORK", "Configured interface %s with IP %d.%d.%d.%d/%d",
+              netif->name,
+              (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
+              (ip >> 8) & 0xFF, ip & 0xFF,
+              __builtin_popcount(mask));
+    
+    return STATUS_OK;
+}

@@ -1,0 +1,751 @@
+#include "elf_loader.h"
+#include "vmm.h"
+#include "kernel.h"
+#include "vmm.h"
+#include "log.h"
+#include "string.h"
+
+/*
+ * Minimal ELF loader for x86_64 (LE). ELF32 is parsed and rejected with ENOTSUP for now.
+ * This maps PT_LOAD segments into a provided address space and copies segment data.
+ * Dynamic linking (DT_NEEDED) now supported (option b) via elf_load_with_deps_into_aspace(). The legacy
+ * elf_load_into_aspace() keeps single-object semantics.
+ *
+ * NOTE: This file provides weak fallbacks for HAL helpers:
+ *  - hal_phys_alloc_page(): returns a "physical" address by abusing kernel heap (NOT CORRECT for real HW)
+ *  - hal_arch_copy_to_aspace(): naive memcpy assumes direct accessibility (real HAL must implement).
+ *
+ * Replace these with proper HAL implementations for a working userspace execution pipeline.
+ */
+
+/* ---------- Weak HAL fallbacks (replace in hal/ with real ones) ---------- */
+__attribute__((weak))
+phys_addr_t hal_phys_alloc_page(void) {
+    void* p = vmm_kmalloc(PAGE_SIZE, PAGE_SIZE);
+    if (!p) return 0;
+    /* WARNING: returning a VA as PA placeholder; real HAL must allocate real physical pages. */
+    return (phys_addr_t)(uintptr_t)p;
+}
+__attribute__((weak))
+void hal_phys_free_page(phys_addr_t pa) {
+    if (!pa) return;
+    void* p = (void*)(uintptr_t)pa;
+    vmm_kfree(p, PAGE_SIZE);
+}
+__attribute__((weak))
+int hal_arch_copy_to_aspace(vmm_aspace_t* as, virt_addr_t dst, const void* src, size_t len) {
+    (void)as;
+    /* WARNING: assumes dst is directly accessible; not true across address spaces. */
+    k_memcpy((void*)(uintptr_t)dst, src, len);
+    return 0;
+}
+
+/* ---------- ELF definitions (64/32) ---------- */
+#define EI_NIDENT 16
+#define ELFMAG0 0x7F
+#define ELFMAG1 'E'
+#define ELFMAG2 'L'
+#define ELFMAG3 'F'
+#define ELFCLASS32 1
+#define ELFCLASS64 2
+#define ELFDATA2LSB 1
+#define ET_NONE 0
+#define ET_REL  1
+#define ET_EXEC 2
+#define ET_DYN  3
+#define EM_386  3
+#define EM_X86_64 62
+
+#define PT_NULL 0
+#define PT_LOAD 1
+#define PT_DYNAMIC 2
+
+#define PF_X 1
+#define PF_W 2
+#define PF_R 4
+
+typedef struct {
+    u8  e_ident[EI_NIDENT];
+    u16 e_type;
+    u16 e_machine;
+    u32 e_version;
+    u64 e_entry;
+    u64 e_phoff;
+    u64 e_shoff;
+    u32 e_flags;
+    u16 e_ehsize;
+    u16 e_phentsize;
+    u16 e_phnum;
+    u16 e_shentsize;
+    u16 e_shnum;
+    u16 e_shstrndx;
+} Elf64_Ehdr;
+
+typedef struct {
+    u32 p_type;
+    u32 p_flags;
+    u64 p_offset;
+    u64 p_vaddr;
+    u64 p_paddr;
+    u64 p_filesz;
+    u64 p_memsz;
+    u64 p_align;
+} Elf64_Phdr;
+
+/* Dynamic section entries (subset) */
+typedef struct {
+    int64_t d_tag;
+    union { u64 d_val; u64 d_ptr; } d_un;
+} Elf64_Dyn;
+
+/* Dynamic tags used */
+#define DT_NULL     0
+#define DT_STRTAB   5
+#define DT_SYMTAB   6
+#define DT_RELA     7
+#define DT_RELASZ   8
+#define DT_RELAENT  9
+#define DT_STRSZ    10
+#define DT_NEEDED   1
+#define DT_PLTGOT   3
+#define DT_HASH     4
+#define DT_GNU_HASH 0x6ffffef5
+
+typedef struct {
+    u32      st_name;
+    u8       st_info;
+    u8       st_other;
+    u16      st_shndx;
+    u64      st_value;
+    u64      st_size;
+} Elf64_Sym;
+
+#define ELF64_ST_BIND(i)   ((i)>>4)
+#define ELF64_ST_TYPE(i)   ((i)&0xF)
+#define STB_LOCAL  0
+#define STB_GLOBAL 1
+#define STB_WEAK   2
+
+typedef struct {
+    u64 r_offset;
+    u64 r_info;
+    int64_t r_addend;
+} Elf64_Rela;
+
+#define ELF64_R_SYM(i)    ((u32)((i) >> 32))
+#define ELF64_R_TYPE(i)   ((u32)(i))
+
+/* x86_64 relocation types subset */
+#define R_X86_64_NONE      0
+#define R_X86_64_64        1
+#define R_X86_64_GLOB_DAT  6
+#define R_X86_64_JUMP_SLOT 7
+#define R_X86_64_RELATIVE  8
+
+typedef struct {
+    u8  e_ident[EI_NIDENT];
+    u16 e_type;
+    u16 e_machine;
+    u32 e_version;
+    u32 e_entry;
+    u32 e_phoff;
+    u32 e_shoff;
+    u32 e_flags;
+    u16 e_ehsize;
+    u16 e_phentsize;
+    u16 e_phnum;
+    u16 e_shentsize;
+    u16 e_shnum;
+    u16 e_shstrndx;
+} Elf32_Ehdr;
+
+typedef struct {
+    u32 p_type;
+    u32 p_offset;
+    u32 p_vaddr;
+    u32 p_paddr;
+    u32 p_filesz;
+    u32 p_memsz;
+    u32 p_flags;
+    u32 p_align;
+} Elf32_Phdr;
+
+/* ---------- Helpers ---------- */
+static inline u64 align_down(u64 x, u64 a) { return x & ~(a - 1); }
+static inline u64 align_up(u64 x, u64 a) { return (x + a - 1) & ~(a - 1); }
+
+static int check_ident(const u8* id, u8* out_class) {
+    if (!id) return ELF_EINVAL;
+    if (id[0] != ELFMAG0 || id[1] != ELFMAG1 || id[2] != ELFMAG2 || id[3] != ELFMAG3) return ELF_EINVAL;
+    if (id[5] != ELFDATA2LSB) return ELF_ENOTSUP;
+    if (id[4] != ELFCLASS32 && id[4] != ELFCLASS64) return ELF_ENOTSUP;
+    *out_class = id[4];
+    return ELF_OK;
+}
+
+int elf_identify(const void* image, size_t size) {
+    if (!image || size < EI_NIDENT) return ELF_EINVAL;
+    u8 cls = 0;
+    int rc = check_ident((const u8*)image, &cls);
+    if (rc != 0) return rc;
+    if (cls == ELFCLASS64) {
+        if (size < sizeof(Elf64_Ehdr)) return ELF_EINVAL;
+        const Elf64_Ehdr* eh = (const Elf64_Ehdr*)image;
+        if (eh->e_machine != EM_X86_64) return ELF_ENOTSUP;
+        return ELF_OK;
+    }
+    if (size < sizeof(Elf32_Ehdr)) return ELF_EINVAL;
+    const Elf32_Ehdr* eh32 = (const Elf32_Ehdr*)image;
+    if (eh32->e_machine != EM_386) return ELF_ENOTSUP;
+    return ELF_ENOTSUP; /* Phase 3: 32-bit not supported yet */
+}
+
+static int map_user_range(vmm_aspace_t* as, virt_addr_t va, u64 length, pte_flags_t extra) {
+    u64 start = align_down(va, PAGE_SIZE);
+    u64 end = align_up(va + length, PAGE_SIZE);
+    for (u64 cur = start; cur < end; cur += PAGE_SIZE) {
+        phys_addr_t pa = hal_phys_alloc_page();
+        if (!pa) return ELF_ENOMEM;
+        int r = vmm_map(as, cur, pa, PAGE_SIZE, PTE_PRESENT | PTE_USER | extra);
+        if (r != 0) return r;
+        /* Zero page */
+        static u8 zeros[64] = {0};
+        /* Zero in chunks using copy_to_aspace; this is slow but simple */
+        u64 left = PAGE_SIZE;
+        virt_addr_t d = cur;
+        while (left) {
+            u64 n = left > sizeof(zeros) ? sizeof(zeros) : left;
+            if (hal_arch_copy_to_aspace(as, d, zeros, (size_t)n) != 0) return ELF_EINVAL;
+            d += n; left -= n;
+        }
+    }
+    return ELF_OK;
+}
+
+static int copy_to_aspace(vmm_aspace_t* as, virt_addr_t dst, const void* src, u64 len) {
+    /* Chunked copy to avoid issues with large len */
+    const u8* p = (const u8*)src;
+    u64 left = len;
+    while (left) {
+        u64 n = left > 4096 ? 4096 : left;
+        int r = hal_arch_copy_to_aspace(as, dst, p, (size_t)n);
+        if (r != 0) return r;
+        dst += n; p += n; left -= n;
+    }
+    return 0;
+}
+
+int elf_load_into_aspace(const void* image, size_t size,
+                         vmm_aspace_t* as,
+                         u64 base_hint,
+                         const elf_stack_hint_t* stack_hint,
+                         elf_load_result_t* out) {
+    if (!image || !as || !out) return ELF_EINVAL;
+    out->entry = 0; out->user_stack = 0; out->image_base = 0; out->image_size = 0;
+
+    u8 cls = 0;
+    int ident = check_ident((const u8*)image, &cls);
+    if (ident != 0) return ident;
+
+    if (cls == ELFCLASS64) {
+        if (size < sizeof(Elf64_Ehdr)) return ELF_EINVAL;
+        const Elf64_Ehdr* eh = (const Elf64_Ehdr*)image;
+        if (eh->e_machine != EM_X86_64) return ELF_ENOTSUP;
+        if (eh->e_phoff == 0 || eh->e_phentsize != sizeof(Elf64_Phdr)) return ELF_EINVAL;
+
+        u64 img_base = (eh->e_type == ET_DYN) ? (base_hint ? base_hint : 0x0000000040000000ULL) : 0ULL;
+        u64 img_end = 0;
+
+        /* Pointers for dynamic linking data discovered during PHDR scan */
+        const Elf64_Dyn* dyn_table = NULL; size_t dyn_count = 0;
+    const Elf64_Sym* dynsym = NULL; size_t dynsym_sz = 0;
+    const char* dynstr = NULL; size_t dynstr_sz = 0;
+        const Elf64_Rela* rela = NULL; size_t rela_sz = 0; size_t rela_ent = sizeof(Elf64_Rela);
+
+    int partial_lazy = 0; /* Will become 1 if any segment has bss portion left unmapped */
+
+        for (u16 i = 0; i < eh->e_phnum; ++i) {
+            u64 off = eh->e_phoff + (u64)i * sizeof(Elf64_Phdr);
+            if (off + sizeof(Elf64_Phdr) > size) return ELF_EINVAL;
+            const Elf64_Phdr* ph = (const Elf64_Phdr*)((const u8*)image + off);
+            if (ph->p_type == PT_DYNAMIC) {
+                /* Record dynamic section (file offsets) */
+                dyn_table = (const Elf64_Dyn*)((const u8*)image + ph->p_offset);
+                dyn_count = ph->p_filesz / sizeof(Elf64_Dyn);
+                continue;
+            }
+            if (ph->p_type != PT_LOAD) continue;
+
+            u64 vaddr = (eh->e_type == ET_DYN) ? img_base + ph->p_vaddr : ph->p_vaddr;
+            u64 memsz = ph->p_memsz;
+            u64 filesz = ph->p_filesz;
+            u64 poff = ph->p_offset;
+
+            pte_flags_t flags = PTE_PRESENT | PTE_USER;
+            if (ph->p_flags & PF_W) flags |= PTE_WRITABLE;
+            if (!(ph->p_flags & PF_X)) flags |= PTE_NX;
+
+            /* Register region covering full memsz; demand faults will allocate zero pages for BSS tail. */
+            u32 vmm_flags = VMM_REGION_USER | VMM_REGION_ANON;
+            if (ph->p_flags & PF_W) vmm_flags |= VMM_REGION_WRITE;
+            int rc_region = vmm_region_add(as, vaddr, memsz, vmm_flags);
+            if (rc_region != 0) return rc_region;
+
+            if (filesz > 0) {
+                /* Map only the pages spanning the file-backed portion */
+                u64 map_len = filesz;
+                int mr = map_user_range(as, vaddr, map_len, flags);
+                if (mr != 0) return mr;
+                if (poff + filesz > size) return ELF_EINVAL;
+                const void* src = (const void*)((const u8*)image + poff);
+                int cr = copy_to_aspace(as, vaddr, src, filesz);
+                if (cr != 0) return cr;
+                /* Zero any slack bytes in last mapped page after filesz up to page boundary */
+                u64 tail_off = (vaddr + filesz) & (PAGE_SIZE - 1);
+                if (tail_off) {
+                    u64 pad = PAGE_SIZE - tail_off;
+                    static u8 zeros[64] = {0};
+                    virt_addr_t d = vaddr + filesz;
+                    while (pad) { u64 n = pad > sizeof(zeros) ? sizeof(zeros) : pad; if (hal_arch_copy_to_aspace(as, d, zeros, (size_t)n) != 0) return ELF_EINVAL; d += n; pad -= n; }
+                }
+            }
+            if (memsz > filesz) partial_lazy = 1; /* BSS portion left unmapped and will fault in */
+
+            u64 seg_end = align_up(vaddr + memsz, PAGE_SIZE);
+            if (seg_end > img_end) img_end = seg_end;
+        }
+
+        /* Parse dynamic entries if present */
+        if (dyn_table && dyn_count) {
+            for (size_t di = 0; di < dyn_count; ++di) {
+                const Elf64_Dyn* d = &dyn_table[di];
+                if (d->d_tag == DT_NULL) break;
+                switch (d->d_tag) {
+                    case DT_SYMTAB: dynsym = (const Elf64_Sym*)((const u8*)image + (d->d_un.d_ptr)); break;
+                    case DT_STRTAB: dynstr = (const char*)((const u8*)image + (d->d_un.d_ptr)); break;
+                    case DT_RELA:   rela = (const Elf64_Rela*)((const u8*)image + (d->d_un.d_ptr)); break;
+                    case DT_RELASZ: rela_sz = d->d_un.d_val; break;
+                    case DT_RELAENT: rela_ent = d->d_un.d_val; break;
+                    case DT_STRSZ: dynstr_sz = d->d_un.d_val; break;
+                }
+            }
+            if (dynsym && !dynstr) { KLOG_WARN("ELF","dynsym without dynstr"); }
+            (void)dynstr_sz; /* silence unused if not referenced further */
+            /* Apply relocations (RELA form) */
+            if (rela && rela_sz && rela_ent == sizeof(Elf64_Rela)) {
+                size_t count = rela_sz / rela_ent;
+                u32 applied = 0;
+                for (size_t ri = 0; ri < count; ++ri) {
+                    const Elf64_Rela* r = &rela[ri];
+                    u32 type = ELF64_R_TYPE(r->r_info);
+                    u32 sym_index = ELF64_R_SYM(r->r_info);
+                    virt_addr_t write_addr = ((eh->e_type == ET_DYN)? img_base : 0) + r->r_offset;
+                    paddr_t phys; if (vmm_get_physical(as, write_addr, &phys) != 0) { KLOG_WARN("ELF","Reloc addr unmapped 0x%llx", write_addr); continue; }
+                    u64* target = (u64*) (uintptr_t)write_addr; /* Assumes identity/ direct mapping for now */
+                    u64 S = 0; /* symbol value */
+                    if ((type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) && dynsym) {
+                        if (sym_index * sizeof(Elf64_Sym) < dynsym_sz) {
+                            const Elf64_Sym* sym = &dynsym[sym_index];
+                            /* Only resolve defined (shndx != 0) in current object; ignore extern */
+                            if (sym->st_shndx != 0) {
+                                S = ((eh->e_type == ET_DYN)? img_base : 0) + sym->st_value;
+                            } else {
+                                /* Undefined: external dependency not yet supported */
+                                KLOG_WARN("ELF","Unresolved external symbol index %u", sym_index);
+                            }
+                        }
+                    }
+                    switch (type) {
+                        case R_X86_64_RELATIVE:
+                            *target = ((eh->e_type == ET_DYN)? img_base : 0) + r->r_addend; applied++; break;
+                        case R_X86_64_GLOB_DAT:
+                        case R_X86_64_JUMP_SLOT:
+                            *target = S; applied++; break;
+                        case R_X86_64_64:
+                            *target = S + r->r_addend; applied++; break;
+                        case R_X86_64_NONE:
+                            break;
+                        default:
+                            KLOG_WARN("ELF","Unsupported reloc type %u", type); break;
+                    }
+                }
+                out->relapplied = applied;
+                KLOG_INFO("ELF","Applied %u dynamic relocations", applied);
+            }
+        }
+
+    if (partial_lazy) out->lazy_segments = 1;
+    /* Setup user stack if requested: map [stack_vaddr - stack_size, stack_vaddr) with a guard page */
+        if (stack_hint && stack_hint->stack_vaddr && stack_hint->stack_size) {
+            u64 guard = PAGE_SIZE;
+            u64 stack_bot = stack_hint->stack_vaddr - stack_hint->stack_size;
+            u64 map_start = stack_bot + guard;
+            u64 map_len = stack_hint->stack_size - guard;
+            int sr = map_user_range(as, map_start, map_len, PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX);
+            if (sr != 0) return sr;
+            out->user_stack = stack_hint->stack_vaddr;
+        }
+
+        out->entry = (eh->e_type == ET_DYN) ? (img_base + eh->e_entry) : eh->e_entry;
+        out->image_base = img_base;
+        out->image_size = img_end ? (img_end - img_base) : 0;
+        return ELF_OK;
+    }
+
+    /* ELF32 not supported in Phase 3 */
+    return ELF_ENOTSUP;
+}
+
+int elf_loader_selftest(void) {
+    /* Minimal: build a fake elf64 header and ensure identify returns not supported or ok */
+    Elf64_Ehdr eh = {0};
+    eh.e_ident[0]=ELFMAG0; eh.e_ident[1]=ELFMAG1; eh.e_ident[2]=ELFMAG2; eh.e_ident[3]=ELFMAG3;
+    eh.e_ident[4]=ELFCLASS64; eh.e_ident[5]=ELFDATA2LSB;
+    eh.e_machine = EM_X86_64;
+    eh.e_phoff = sizeof(Elf64_Ehdr);
+    eh.e_phentsize = sizeof(Elf64_Phdr);
+    eh.e_phnum = 0;
+    return elf_identify(&eh, sizeof(eh));
+}
+
+/* Optional: expose relocation stats via a weak accessor for procfs hook */
+__attribute__((weak)) u32 elf_last_relocations_applied(void) {
+    /* In this minimal loader we don't persist global state; extend as needed. */
+    return 0; /* Placeholder until integrated with a global context if desired */
+}
+
+/* ---------------- Dependency / module support (option b) ---------------- */
+typedef struct loader_module {
+    const char* soname; /* points into dynstr of owning module or provided buffer */
+    const Elf64_Sym* dynsym;
+    size_t dynsym_count;
+    const char* dynstr;
+    size_t dynstr_size;
+    u64 base;
+    /* SysV hash */
+    const u32* sysv_buckets;
+    const u32* sysv_chains;
+    u32 sysv_nbuckets;
+    u32 sysv_nchain;
+    /* GNU hash */
+    const u64* gnu_bloom;
+    const u32* gnu_buckets;
+    const u32* gnu_chains;
+    u32 gnu_nbuckets;
+    u32 gnu_symoffset;
+    u32 gnu_bloom_size;
+    u32 gnu_bloom_shift;
+} loader_module_t;
+
+/* -------- Global module registry for /proc/modules_loaded -------- */
+#define LOADER_MAX_MODULES 32
+#define LOADER_MAX_DEPTH   16
+typedef struct {
+    const char* name;
+    u64 base;
+    u32 reloc_applied;
+} loader_mod_public_t;
+static loader_mod_public_t g_loader_mods[LOADER_MAX_MODULES];
+static size_t g_loader_mod_count = 0;
+static void loader_register_public(const char* name, u64 base){ for(size_t i=0;i<g_loader_mod_count;i++){ if(g_loader_mods[i].name && k_strcmp(g_loader_mods[i].name,name)==0) return; } if(g_loader_mod_count<LOADER_MAX_MODULES){ g_loader_mods[g_loader_mod_count].name=name; g_loader_mods[g_loader_mod_count].base=base; g_loader_mods[g_loader_mod_count].reloc_applied=0; g_loader_mod_count++; }}
+static void loader_add_relocs(u64 base, u32 n){ for(size_t i=0;i<g_loader_mod_count;i++){ if(g_loader_mods[i].base==base){ g_loader_mods[i].reloc_applied += n; return; }} }
+__attribute__((weak)) size_t elf_modules_enumerate(const char** names, u64* bases, u32* relocs, size_t cap){ size_t n=g_loader_mod_count; if(cap<n) n=cap; for(size_t i=0;i<n;i++){ if(names) names[i]=g_loader_mods[i].name; if(bases) bases[i]=g_loader_mods[i].base; if(relocs) relocs[i]=g_loader_mods[i].reloc_applied; } return g_loader_mod_count; }
+
+/* ---------------- Hash Helpers ---------------- */
+static u32 elf_sysv_hash(const char* name){ u32 h=0,g; while(*name){ h=(h<<4)+(u8)*name++; g=h & 0xF0000000U; if(g) h ^= g>>24; h &= ~g; } return h; }
+static u32 elf_gnu_hash(const char* name){ u32 h=5381; for(unsigned char c; (c=(unsigned char)*name++)!=0;) h = (h*33) + c; return h; }
+static const Elf64_Sym* lookup_gnu_hash(const loader_module_t* m, const char* name){ if(!m||!m->gnu_buckets||!m->gnu_chains||!m->dynsym||!name) return NULL; u32 h=elf_gnu_hash(name); if(m->gnu_nbuckets==0) return NULL; u32 bucket = m->gnu_buckets[h % m->gnu_nbuckets]; if(bucket==0) return NULL; const u64* bloom=m->gnu_bloom; if(bloom && m->gnu_bloom_size){ u64 word = bloom[(h / 64) % m->gnu_bloom_size]; u64 mask = (1ull << (h % 64)) | (1ull << ((h >> m->gnu_bloom_shift) % 64)); if((word & mask)!=mask) return NULL; }
+    for(u32 idx=bucket; ; ++idx){ if(idx < m->gnu_symoffset) continue; u32 chain_hash = m->gnu_chains[idx - m->gnu_symoffset]; if((chain_hash & ~1U) == (h & ~1U)){ const Elf64_Sym* sym=&m->dynsym[idx]; if(sym->st_name < m->dynstr_size){ const char* sname = m->dynstr + sym->st_name; if(k_strcmp(sname,name)==0 && sym->st_shndx != 0) return sym; } }
+        if(chain_hash & 1U) break; }
+    return NULL; }
+static const Elf64_Sym* lookup_sysv_hash(const loader_module_t* m, const char* name){ if(!m||!m->sysv_buckets||!m->sysv_chains||!m->dynsym||!name) return NULL; u32 h=elf_sysv_hash(name); if(m->sysv_nbuckets==0) return NULL; u32 idx = m->sysv_buckets[h % m->sysv_nbuckets]; while(idx!=0 && idx < m->sysv_nchain){ const Elf64_Sym* sym=&m->dynsym[idx]; if(sym->st_name < m->dynstr_size){ const char* sname = m->dynstr + sym->st_name; if(k_strcmp(sname,name)==0 && sym->st_shndx != 0) return sym; } idx = m->sysv_chains[idx]; } return NULL; }
+
+static const Elf64_Sym* find_symbol_in_module(const loader_module_t* m, const char* name) {
+    if(!m || !m->dynsym || !m->dynstr || !name) return NULL;
+    /* Prefer GNU hash */
+    const Elf64_Sym* sym = lookup_gnu_hash(m,name); if(sym) return sym;
+    /* Then SysV hash */
+    sym = lookup_sysv_hash(m,name); if(sym) return sym;
+    /* Fallback linear scan */
+    size_t namelen = k_strlen(name);
+    size_t limit = m->dynsym_count ? m->dynsym_count : 0;
+    if(limit==0 && m->sysv_nchain) limit = m->sysv_nchain;
+    for(size_t i=0;i<limit;i++){ const Elf64_Sym* s=&m->dynsym[i]; if(s->st_name >= m->dynstr_size) continue; const char* sname=m->dynstr + s->st_name; if(k_strncmp(sname,name,namelen)==0 && sname[namelen]=='\0'){ if(ELF64_ST_BIND(s->st_info)==STB_GLOBAL || ELF64_ST_BIND(s->st_info)==STB_WEAK){ if(s->st_shndx!=0) return s; } } }
+    return NULL; }
+
+static const Elf64_Sym* resolve_symbol(loader_module_t* mods, size_t mod_count, const char* name, loader_module_t** out_mod) {
+    for (size_t i = 0; i < mod_count; ++i) {
+        const Elf64_Sym* s = find_symbol_in_module(&mods[i], name);
+        if (s) { if (out_mod) *out_mod = &mods[i]; return s; }
+    }
+    return NULL;
+}
+
+/* Apply relocations with cross-module symbol lookup */
+static u32 apply_relocations_multi(const Elf64_Ehdr* eh, vmm_aspace_t* as, u64 img_base,
+                                   const Elf64_Rela* rela, size_t rela_sz, size_t rela_ent,
+                                   const loader_module_t* self_mod, loader_module_t* all_mods, size_t mod_count) {
+    if (!rela || !rela_sz || rela_ent != sizeof(Elf64_Rela)) return 0;
+    size_t count = rela_sz / rela_ent; u32 applied = 0;
+    for (size_t ri = 0; ri < count; ++ri) {
+        const Elf64_Rela* r = &rela[ri];
+        u32 type = ELF64_R_TYPE(r->r_info);
+        u32 sym_index = ELF64_R_SYM(r->r_info);
+        virt_addr_t write_addr = ((eh->e_type == ET_DYN)? img_base : 0) + r->r_offset;
+        paddr_t phys; if (vmm_get_physical(as, write_addr, &phys) != 0) { KLOG_WARN("ELF","Reloc addr unmapped 0x%llx", write_addr); continue; }
+        u64* target = (u64*)(uintptr_t)write_addr;
+        u64 S = 0; /* symbol value */ const char* symname = NULL; const Elf64_Sym* sym = NULL; loader_module_t* owner = NULL;
+        if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
+            if (sym_index < self_mod->dynsym_count) {
+                sym = &self_mod->dynsym[sym_index];
+                if (sym->st_name < self_mod->dynstr_size) symname = self_mod->dynstr + sym->st_name;
+            }
+            if (sym && sym->st_shndx != 0) {
+                S = ((eh->e_type == ET_DYN)? img_base : 0) + sym->st_value; /* defined locally */
+            } else if (symname) {
+                const Elf64_Sym* rs = resolve_symbol(all_mods, mod_count, symname, &owner);
+                if (rs && owner) {
+                    S = owner->base + rs->st_value; /* owner base + value */
+                } else {
+                    KLOG_WARN("ELF","Unresolved external symbol %s", symname);
+                }
+            }
+        }
+        switch (type) {
+            case R_X86_64_RELATIVE:
+                *target = ((eh->e_type == ET_DYN)? img_base : 0) + r->r_addend; applied++; break;
+            case R_X86_64_GLOB_DAT:
+            case R_X86_64_JUMP_SLOT:
+                *target = S; applied++; break;
+            case R_X86_64_64:
+                *target = S + r->r_addend; applied++; break;
+            case R_X86_64_NONE:
+                break;
+            default:
+                KLOG_WARN("ELF","Unsupported reloc type %u", type); break;
+        }
+    }
+    return applied;
+}
+
+/* Internal helper to perform a single-object load returning module info (used for main and deps). */
+static int load_single_object(const void* image, size_t size, vmm_aspace_t* as, u64 base_hint,
+                              loader_module_t* mod_out, const Elf64_Sym** out_dynsym, size_t* out_dynsym_count,
+                              const char** out_dynstr, size_t* out_dynstr_sz,
+                              const Elf64_Rela** out_rela, size_t* out_rela_sz, size_t* out_rela_ent,
+                              u64* out_img_base, const Elf64_Ehdr** out_eh) {
+    u8 cls = 0; int ident = check_ident((const u8*)image, &cls); if (ident != 0) return ident;
+    if (cls != ELFCLASS64) return ELF_ENOTSUP; if (size < sizeof(Elf64_Ehdr)) return ELF_EINVAL;
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)image; if (eh->e_machine != EM_X86_64) return ELF_ENOTSUP;
+    if (eh->e_phoff == 0 || eh->e_phentsize != sizeof(Elf64_Phdr)) return ELF_EINVAL;
+    u64 img_base = (eh->e_type == ET_DYN)? (base_hint ? base_hint : 0x0000000040000000ULL) : 0ULL;
+    u64 img_end = 0;
+    const Elf64_Dyn* dyn_table=NULL; size_t dyn_count=0; const Elf64_Sym* dynsym=NULL; const char* dynstr=NULL; const Elf64_Rela* rela=NULL; const u32* sysv_hash=NULL; const u32* gnu_hash=NULL;
+    size_t dynsym_sz=0, dynstr_sz=0, rela_sz=0; size_t rela_ent=sizeof(Elf64_Rela);
+    for (u16 i=0;i<eh->e_phnum;++i){
+        u64 off = eh->e_phoff + (u64)i*sizeof(Elf64_Phdr); if (off + sizeof(Elf64_Phdr) > size) return ELF_EINVAL;
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)((const u8*)image + off);
+        if (ph->p_type == PT_DYNAMIC){ dyn_table=(const Elf64_Dyn*)((const u8*)image+ph->p_offset); dyn_count=ph->p_filesz/sizeof(Elf64_Dyn); continue; }
+        if (ph->p_type != PT_LOAD) continue;
+        u64 vaddr=(eh->e_type==ET_DYN)? img_base + ph->p_vaddr : ph->p_vaddr;
+        u64 memsz=ph->p_memsz, filesz=ph->p_filesz, poff=ph->p_offset;
+        pte_flags_t flags=PTE_PRESENT|PTE_USER; if (ph->p_flags & PF_W) flags|=PTE_WRITABLE; if (!(ph->p_flags & PF_X)) flags|=PTE_NX;
+        int mr=map_user_range(as,vaddr,memsz,flags); if(mr!=0) return mr;
+        if(filesz){ if(poff+filesz>size) return ELF_EINVAL; const void* src=(const void*)((const u8*)image+poff); int cr=copy_to_aspace(as,vaddr,src,filesz); if(cr!=0) return cr; }
+        u64 seg_end=align_up(vaddr+memsz,PAGE_SIZE); if(seg_end>img_end) img_end=seg_end;
+    }
+    if (dyn_table && dyn_count){ for(size_t di=0;di<dyn_count;++di){ const Elf64_Dyn* d=&dyn_table[di]; if(d->d_tag==DT_NULL)break; switch(d->d_tag){ case DT_SYMTAB: dynsym=(const Elf64_Sym*)((const u8*)image + d->d_un.d_ptr); break; case DT_STRTAB: dynstr=(const char*)((const u8*)image + d->d_un.d_ptr); break; case DT_RELA: rela=(const Elf64_Rela*)((const u8*)image + d->d_un.d_ptr); break; case DT_RELASZ: rela_sz=d->d_un.d_val; break; case DT_RELAENT: rela_ent=d->d_un.d_val; break; case DT_STRSZ: dynstr_sz=d->d_un.d_val; break; case DT_HASH: sysv_hash=(const u32*)((const u8*)image + d->d_un.d_ptr); break; case DT_GNU_HASH: gnu_hash=(const u32*)((const u8*)image + d->d_un.d_ptr); break; } }
+        dynsym_sz = dynsym ? dynsym_sz : 0;
+    }
+    /* Hash-based symbol count derivation */
+    const u32* sysv_buckets=NULL; const u32* sysv_chains=NULL; u32 sysv_nbuckets=0, sysv_nchain=0;
+    if(sysv_hash){ sysv_nbuckets = sysv_hash[0]; sysv_nchain = sysv_hash[1]; sysv_buckets=&sysv_hash[2]; sysv_chains=&sysv_buckets[sysv_nbuckets]; if(sysv_nchain) dynsym_sz = sysv_nchain * sizeof(Elf64_Sym); }
+    const u32* gnu_buckets=NULL; const u32* gnu_chains=NULL; const u64* gnu_bloom=NULL; u32 gnu_nbuckets=0, gnu_symoffset=0, gnu_bloom_size=0, gnu_bloom_shift=0;
+    if(gnu_hash){ const u32* gh=gnu_hash; gnu_nbuckets=gh[0]; gnu_symoffset=gh[1]; gnu_bloom_size=gh[2]; gnu_bloom_shift=gh[3]; gnu_bloom=(const u64*)(gh+4); gnu_buckets=(const u32*)(gnu_bloom + gnu_bloom_size); gnu_chains = gnu_buckets + gnu_nbuckets; if(gnu_nbuckets){ u32 max_index=0; for(u32 b=0;b<gnu_nbuckets;b++){ u32 idx=gnu_buckets[b]; if(idx < gnu_symoffset) continue; if(idx==0) continue; for(u32 j=idx;;++j){ u32 h2=gnu_chains[j - gnu_symoffset]; if(j>max_index) max_index=j; if(h2 & 1U) break; } } if(max_index) dynsym_sz = (max_index+1)*sizeof(Elf64_Sym); } }
+    if(out_dynsym) *out_dynsym=dynsym; if(out_dynsym_count) *out_dynsym_count = dynsym_sz/ sizeof(Elf64_Sym); if(out_dynstr) *out_dynstr=dynstr; if(out_dynstr_sz) *out_dynstr_sz=dynstr_sz; if(out_rela) *out_rela = rela; if(out_rela_sz) *out_rela_sz = rela_sz; if(out_rela_ent) *out_rela_ent = rela_ent; if(out_img_base) *out_img_base = img_base; if(out_eh) *out_eh = eh;
+    if (mod_out){ mod_out->soname=NULL; mod_out->dynsym=dynsym; mod_out->dynsym_count = dynsym_sz? (dynsym_sz/ sizeof(Elf64_Sym)) : 0; mod_out->dynstr=dynstr; mod_out->dynstr_size=dynstr_sz; mod_out->base=img_base; mod_out->sysv_buckets=sysv_buckets; mod_out->sysv_chains=sysv_chains; mod_out->sysv_nbuckets=sysv_nbuckets; mod_out->sysv_nchain=sysv_nchain; mod_out->gnu_bloom=gnu_bloom; mod_out->gnu_buckets=gnu_buckets; mod_out->gnu_chains=gnu_chains; mod_out->gnu_nbuckets=gnu_nbuckets; mod_out->gnu_symoffset=gnu_symoffset; mod_out->gnu_bloom_size=gnu_bloom_size; mod_out->gnu_bloom_shift=gnu_bloom_shift; }
+    return ELF_OK;
+}
+
+/* ----- Recursive dependency loading (DFS) ----- */
+typedef struct {
+    const char* name;
+    bool in_progress; /* for cycle detection */
+    bool loaded;
+} name_state_t;
+
+static const Elf64_Dyn* find_dynamic_phdr(const Elf64_Ehdr* eh, const void* image, size_t size, size_t* out_count){
+    if(!eh) return NULL; if(!eh->e_phoff) return NULL; for(u16 i=0;i<eh->e_phnum;i++){ u64 off=eh->e_phoff + (u64)i*sizeof(Elf64_Phdr); if(off+sizeof(Elf64_Phdr)>size) break; const Elf64_Phdr* ph=(const Elf64_Phdr*)((const u8*)image+off); if(ph->p_type==PT_DYNAMIC){ if(out_count) *out_count = ph->p_filesz/sizeof(Elf64_Dyn); return (const Elf64_Dyn*)((const u8*)image+ph->p_offset);} } return NULL; }
+
+static bool already_registered(const char* soname, elf_loaded_module_t* modules, size_t used){ for(size_t i=0;i<used;i++){ if(modules[i].soname && k_strcmp(modules[i].soname,soname)==0) return true; } return false; }
+
+static int dfs_load_module(const char* soname, int depth,
+                           vmm_aspace_t* as, int (*fetch_cb)(const char*, const void**, size_t*),
+                           elf_loaded_module_t* modules, size_t* used, size_t cap,
+                           loader_module_t* lm, size_t* lm_used,
+                           u32* reloc_total) {
+    if(depth > LOADER_MAX_DEPTH){ KLOG_WARN("ELF","Max dependency depth reached at %s", soname); return ELF_OK; }
+    if(*used >= cap){ KLOG_WARN("ELF","Module capacity %u exhausted", (u32)cap); return ELF_OK; }
+    if(already_registered(soname, modules, *used)) return ELF_OK; /* duplicate */
+    if(!fetch_cb){ KLOG_WARN("ELF","No fetch callback for %s", soname); return ELF_EINVAL; }
+    const void* img=NULL; size_t sz=0; if(fetch_cb(soname,&img,&sz)!=0 || !img || !sz){ KLOG_WARN("ELF","Fetch failed for %s", soname); return ELF_OK; }
+    loader_module_t temp; const Elf64_Sym* dynsym; size_t dynsym_cnt; const char* dynstr; size_t dynstr_sz; const Elf64_Rela* rela; size_t rela_sz; size_t rela_ent; u64 base; const Elf64_Ehdr* eh;
+    int lr = load_single_object(img,sz,as,0,&temp,&dynsym,&dynsym_cnt,&dynstr,&dynstr_sz,&rela,&rela_sz,&rela_ent,&base,&eh); if(lr!=ELF_OK){ KLOG_WARN("ELF","Failed load %s (%d)", soname, lr); return lr; }
+    size_t slot = *used; modules[slot].soname=soname; modules[slot].base=base; modules[slot].dynsym=dynsym; modules[slot].dynsym_count=dynsym_cnt; modules[slot].dynstr=dynstr; modules[slot].dynstr_size=dynstr_sz; (*used)++; loader_register_public(soname, base);
+    /* mirror into lm */
+    lm[slot] = temp; lm[slot].soname = soname; if(*lm_used <= slot) *lm_used = slot+1;
+    /* Recurse on its DT_NEEDED list before applying its relocations */
+    size_t dyn_count=0; const Elf64_Dyn* dyn = find_dynamic_phdr(eh,img,sz,&dyn_count); if(dyn && dynstr){
+        for(size_t di=0; di<dyn_count; ++di){ const Elf64_Dyn* d=&dyn[di]; if(d->d_tag==DT_NULL) break; if(d->d_tag==DT_NEEDED){ if(d->d_un.d_val < dynstr_sz){ const char* dep = dynstr + d->d_un.d_val; if(!already_registered(dep,modules,*used)){
+                        KLOG_DEBUG("ELF","DEP(%d): %s -> %s", depth, soname, dep);
+                        dfs_load_module(dep, depth+1, as, fetch_cb, modules, used, cap, lm, lm_used, reloc_total);
+                    } } } }
+    }
+    /* Apply relocations now that its deps (if any) are loaded */
+    u32 applied = apply_relocations_multi(eh, as, base, rela, rela_sz, rela_ent, &lm[slot], lm, *lm_used);
+    *reloc_total += applied; loader_add_relocs(base, applied);
+    return ELF_OK;
+}
+
+int elf_load_with_deps_into_aspace(const void* image, size_t size,
+                                   vmm_aspace_t* as, u64 base_hint,
+                                   const elf_stack_hint_t* stack_hint,
+                                   int (*fetch_cb)(const char*, const void**, size_t*),
+                                   elf_loaded_module_t* modules, size_t* module_count,
+                                   elf_load_result_t* out) {
+    if (!modules || !module_count || *module_count == 0) return ELF_EINVAL;
+    size_t cap = *module_count; *module_count = 0; if(out) out->relapplied=0;
+    loader_module_t* lm = (loader_module_t*)vmm_kmalloc(sizeof(loader_module_t)*cap, 16); if(!lm) return ELF_ENOMEM; k_memset(lm,0,sizeof(loader_module_t)*cap);
+    /* Load main object */
+    loader_module_t main_mod; const Elf64_Sym* dynsym; size_t dynsym_cnt; const char* dynstr; size_t dynstr_sz; const Elf64_Rela* rela; size_t rela_sz; size_t rela_ent; u64 img_base; const Elf64_Ehdr* eh;
+    int r = load_single_object(image,size,as,base_hint,&main_mod,&dynsym,&dynsym_cnt,&dynstr,&dynstr_sz,&rela,&rela_sz,&rela_ent,&img_base,&eh); if(r!=ELF_OK){ vmm_kfree(lm, sizeof(loader_module_t)*cap); return r; }
+    modules[0].soname="<main>"; modules[0].base=img_base; modules[0].dynsym=dynsym; modules[0].dynsym_count=dynsym_cnt; modules[0].dynstr=dynstr; modules[0].dynstr_size=dynstr_sz; *module_count=1; lm[0]=main_mod; lm[0].soname=modules[0].soname; loader_register_public(modules[0].soname, img_base);
+    /* Depth-first load of dependencies of main */
+    size_t dyn_count=0; const Elf64_Dyn* dyn = find_dynamic_phdr(eh,image,size,&dyn_count);
+    if(dyn && dynstr){
+        for(size_t di=0; di<dyn_count; ++di){ const Elf64_Dyn* d=&dyn[di]; if(d->d_tag==DT_NULL) break; if(d->d_tag==DT_NEEDED && d->d_un.d_val < dynstr_sz){ const char* dep = dynstr + d->d_un.d_val; if(!already_registered(dep,modules,*module_count)){
+                    KLOG_DEBUG("ELF","DEP(0): <main> -> %s", dep);
+                    dfs_load_module(dep,1,as,fetch_cb,modules,module_count,cap,lm,module_count,&out->relapplied);
+                } } }
+    }
+    /* Apply relocations for main after all deps loaded */
+    u32 applied = apply_relocations_multi(eh, as, img_base, rela, rela_sz, rela_ent, &lm[0], lm, *module_count); out->relapplied += applied; loader_add_relocs(img_base, applied);
+    /* Setup stack */
+    if (stack_hint && stack_hint->stack_vaddr && stack_hint->stack_size) {
+        u64 guard = PAGE_SIZE; u64 stack_bot = stack_hint->stack_vaddr - stack_hint->stack_size; u64 map_start = stack_bot + guard; u64 map_len = stack_hint->stack_size - guard;
+    int sr = map_user_range(as,map_start,map_len,PTE_PRESENT|PTE_USER|PTE_WRITABLE|PTE_NX); if (sr!=0){ vmm_kfree(lm, sizeof(loader_module_t)*cap); return sr; }
+        out->user_stack = stack_hint->stack_vaddr;
+    }
+    out->entry = (eh->e_type==ET_DYN)? (img_base + eh->e_entry) : eh->e_entry; out->image_base=img_base; out->image_size=0;
+    /* Summary log chain */
+    if(*module_count>1){ KLOG_INFO("ELF","Dependency chain (%u modules):", (u32)(*module_count)); for(size_t i=0;i<*module_count;i++){ KLOG_INFO("ELF","  %u: %s @0x%llx", (u32)i, modules[i].soname, (unsigned long long)modules[i].base); } }
+    else { KLOG_INFO("ELF","No dependencies (single module)"); }
+    KLOG_INFO("ELF","Relocations applied total=%u", out->relapplied);
+    vmm_kfree(lm, sizeof(loader_module_t)*cap); return ELF_OK;
+}
+
+/* ---------------- In-memory test harness ---------------- */
+/* We synthesize extremely small ELF64 objects with:
+ *  - EHDR + one PT_LOAD (text/data) + one PT_DYNAMIC segment
+ *  - dynsym with 2 symbols: null + exported symbol
+ *  - dynstr with "\0sym\0libX.so\0" (where libX.so appears for DT_NEEDED in main)
+ *  - DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_HASH, DT_NEEDED (main only), DT_NULL
+ *  - A tiny SysV hash table for the single exported symbol.
+ * This avoids building relocations: relocation coverage exercised separately.
+ */
+
+typedef struct {
+    u8*  buf;
+    size_t sz;
+    const char* soname; /* For dependency naming */
+} test_image_t;
+
+/* Basic layout constants */
+typedef struct { u32 nbuckets; u32 nchain; } sysv_hash_header_t; /* followed by buckets[], chains[] */
+
+static test_image_t build_dep_image(const char* soname, const char* export_sym){
+    /* Heuristic fixed offsets */
+    u8* buf = (u8*)vmm_kmalloc(512, 16); k_memset(buf,0,512);
+    Elf64_Ehdr* eh=(Elf64_Ehdr*)buf; eh->e_ident[0]=ELFMAG0; eh->e_ident[1]=ELFMAG1; eh->e_ident[2]=ELFMAG2; eh->e_ident[3]=ELFMAG3; eh->e_ident[4]=ELFCLASS64; eh->e_ident[5]=ELFDATA2LSB; eh->e_type=ET_DYN; eh->e_machine=EM_X86_64; eh->e_phoff=sizeof(Elf64_Ehdr); eh->e_phentsize=sizeof(Elf64_Phdr); eh->e_phnum=2; eh->e_entry=0;
+    Elf64_Phdr* ph=(Elf64_Phdr*)(buf+eh->e_phoff);
+    /* PT_LOAD */ ph[0].p_type=PT_LOAD; ph[0].p_offset=0; ph[0].p_vaddr=0; ph[0].p_filesz=512; ph[0].p_memsz=512; ph[0].p_flags=PF_R|PF_X; ph[0].p_align=PAGE_SIZE;
+    /* PT_DYNAMIC placed at offset 256 */ ph[1].p_type=PT_DYNAMIC; ph[1].p_offset=256; ph[1].p_filesz=128; ph[1].p_vaddr=256; ph[1].p_flags=PF_R|PF_W; ph[1].p_align=8;
+    /* String table */
+    char* dynstr = (char*)(buf+64); dynstr[0]='\0'; u32 sym_off=1; k_strcpy(dynstr+sym_off, export_sym); u32 soname_off = (u32)(sym_off + k_strlen(export_sym) + 1); k_strcpy(dynstr+soname_off, soname);
+    size_t dynstr_sz = soname_off + k_strlen(soname) + 1;
+    /* Symbol table (2 entries) at 128 */
+    Elf64_Sym* symtab = (Elf64_Sym*)(buf+128); k_memset(symtab,0,sizeof(Elf64_Sym)*2); symtab[1].st_name = sym_off; symtab[1].st_info = (STB_GLOBAL<<4); symtab[1].st_shndx = 1; symtab[1].st_value = 0x100; /* arbitrary */
+    /* SysV hash at 192: header + 1 bucket + 2 chains */
+    u32* hash = (u32*)(buf+192); hash[0]=1; hash[1]=2; hash[2]=1; /* bucket 0 -> sym index 1 */ hash[3]=0; hash[4]=0; /* chains for 2 entries (0 + 1) */
+    /* Dynamic table entries */
+    Elf64_Dyn* dyn = (Elf64_Dyn*)(buf+256); size_t di=0;
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_STRTAB, .d_un.d_ptr = (u64)(64) };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_STRSZ,  .d_un.d_val = (u64)dynstr_sz };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_SYMTAB, .d_un.d_ptr = (u64)(128) };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_HASH,   .d_un.d_ptr = (u64)(192) };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_NULL,   .d_un.d_val = 0 };
+    test_image_t t={ .buf=buf, .sz=512, .soname=soname }; return t; }
+
+static test_image_t build_main_image(const char* needed){
+    /* Main now includes:
+     *  - dynstr: "\0<needed>\0sym\0"
+     *  - dynsym: 2 entries (null, undefined global 'sym')
+     *  - SysV hash (nchain=2) so dynsym_count=2 recognized
+     *  - One RELA (GLOB_DAT) referencing symbol index 1 at offset 0x180
+     */
+    u8* buf = (u8*)vmm_kmalloc(512, 16); k_memset(buf,0,512);
+    Elf64_Ehdr* eh=(Elf64_Ehdr*)buf; eh->e_ident[0]=ELFMAG0; eh->e_ident[1]=ELFMAG1; eh->e_ident[2]=ELFMAG2; eh->e_ident[3]=ELFMAG3; eh->e_ident[4]=ELFCLASS64; eh->e_ident[5]=ELFDATA2LSB; eh->e_type=ET_DYN; eh->e_machine=EM_X86_64; eh->e_phoff=sizeof(Elf64_Ehdr); eh->e_phentsize=sizeof(Elf64_Phdr); eh->e_phnum=2; eh->e_entry=0;
+    Elf64_Phdr* ph=(Elf64_Phdr*)(buf+eh->e_phoff);
+    ph[0].p_type=PT_LOAD; ph[0].p_offset=0; ph[0].p_vaddr=0; ph[0].p_filesz=512; ph[0].p_memsz=512; ph[0].p_flags=PF_R|PF_X|PF_W; ph[0].p_align=PAGE_SIZE;
+    ph[1].p_type=PT_DYNAMIC; ph[1].p_offset=256; ph[1].p_filesz=128; ph[1].p_vaddr=256; ph[1].p_flags=PF_R|PF_W; ph[1].p_align=8;
+    /* dynstr */
+    char* dynstr = (char*)(buf+64); dynstr[0]='\0'; u32 need_off=1; k_strcpy(dynstr+need_off, needed); u32 sym_off = need_off + (u32)k_strlen(needed) + 1; k_strcpy(dynstr+sym_off, "sym"); size_t dynstr_sz = sym_off + 4; /* sym + NUL */
+    /* dynsym (2 entries) */
+    Elf64_Sym* symtab = (Elf64_Sym*)(buf+128); k_memset(symtab,0,sizeof(Elf64_Sym)*2); symtab[1].st_name = sym_off; symtab[1].st_info=(STB_GLOBAL<<4); symtab[1].st_shndx=0; /* undefined */
+    /* SysV hash (nchain=2, bucket empty so undefined not claimed as local) */
+    u32* hash=(u32*)(buf+192); hash[0]=1; hash[1]=2; hash[2]=0; hash[3]=0; hash[4]=0; /* bucket[0]=0 chains[0]=0 chains[1]=0 */
+    /* Relocation table at 384 (one entry) */
+    Elf64_Rela* rela=(Elf64_Rela*)(buf+384); rela[0].r_offset=0x180; rela[0].r_info= ((u64)1<<32) | R_X86_64_GLOB_DAT; rela[0].r_addend=0;
+    /* Dynamic */
+    Elf64_Dyn* dyn = (Elf64_Dyn*)(buf+256); size_t di=0;
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_STRTAB, .d_un.d_ptr=(u64)64 };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_STRSZ,  .d_un.d_val=(u64)dynstr_sz };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_SYMTAB, .d_un.d_ptr=(u64)128 };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_HASH,   .d_un.d_ptr=(u64)192 };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_RELA,   .d_un.d_ptr=(u64)384 };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_RELASZ, .d_un.d_val=(u64)sizeof(Elf64_Rela) };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_RELAENT,.d_un.d_val=(u64)sizeof(Elf64_Rela) };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_NEEDED, .d_un.d_val=(u64)need_off };
+    dyn[di++] = (Elf64_Dyn){ .d_tag=DT_NULL,   .d_un.d_val=0 };
+    test_image_t t={ .buf=buf, .sz=512, .soname="<main>" }; return t; }
+
+/* Mock fetch callback mapping soname -> dep image */
+typedef struct { const char* name; test_image_t* img; } fetch_entry_t;
+static fetch_entry_t g_test_fetch_table[4];
+static size_t g_test_fetch_count = 0;
+static int test_fetch_cb(const char* soname, const void** image_out, size_t* size_out){
+    for(size_t i=0;i<g_test_fetch_count;i++){ if(k_strcmp(g_test_fetch_table[i].name, soname)==0){ *image_out=g_test_fetch_table[i].img->buf; *size_out=g_test_fetch_table[i].img->sz; return 0; } }
+    return -1;
+}
+
+/* Harness table already defined above (g_test_fetch_table / g_test_fetch_count) */
+
+int elf_loader_inmemory_test(void){
+    test_image_t libfoo = build_dep_image("libfoo.so", "sym");
+    test_image_t mainimg = build_main_image("libfoo.so");
+    g_test_fetch_count=0; g_test_fetch_table[g_test_fetch_count++] = (fetch_entry_t){ .name="libfoo.so", .img=&libfoo };
+    vmm_aspace_t aspace_dummy={0};
+    elf_loaded_module_t mods[4]; size_t mod_used=4; elf_load_result_t res; int rc = elf_load_with_deps_into_aspace(mainimg.buf, mainimg.sz, &aspace_dummy, 0, NULL, test_fetch_cb, mods, &mod_used, &res);
+    if(rc!=ELF_OK){ KLOG_WARN("ELFTEST","Loader returned %d", rc); return rc; }
+    if(mod_used < 2){ KLOG_WARN("ELFTEST","Expected 2 modules got %u", (u32)mod_used); return -1; }
+    const elf_loaded_module_t* foo=NULL; for(size_t i=0;i<mod_used;i++){ if(mods[i].soname && k_strcmp(mods[i].soname,"libfoo.so")==0){ foo=&mods[i]; break; } }
+    if(!foo){ KLOG_WARN("ELFTEST","libfoo.so not in modules list"); return -1; }
+    if(foo->dynsym_count < 2){ KLOG_WARN("ELFTEST","Unexpected dynsym_count=%u", (u32)foo->dynsym_count); return -1; }
+    /* Validate relocation wrote pointer to libfoo sym: main relocation target at offset 0x180 */
+    u64* reloc_slot = (u64*)(uintptr_t)(mods[0].base + 0x180);
+    u64 expected = foo->base + 0x100; /* exported symbol value */
+    if(*reloc_slot != expected){ KLOG_WARN("ELFTEST","Relocation mismatch got 0x%llx expected 0x%llx", (unsigned long long)*reloc_slot, (unsigned long long)expected); return -1; }
+    if(res.relapplied < 1){ KLOG_WARN("ELFTEST","No relocations applied (%u)", res.relapplied); return -1; }
+    KLOG_INFO("ELFTEST","Harness passed: modules=%u reloc_ok value=0x%llx", (u32)mod_used, (unsigned long long)*reloc_slot);
+    return 0;
+}

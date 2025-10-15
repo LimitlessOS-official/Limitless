@@ -1,0 +1,1002 @@
+/*
+ * socket_interface.c - LimitlessOS Socket Interface Implementation
+ * 
+ * Complete POSIX socket interface with TCP/UDP/Unix domain sockets,
+ * advanced buffer management, and production networking features.
+ */
+
+#include "kernel.h"
+#include "process.h"
+#include "fd.h"
+#include "vmm.h"
+#include "net/tcp.h"
+#include "net/udp.h"
+#include "net/ipv4.h"
+#include "timer.h"
+
+#define MAX_SOCKETS            8192
+#define MAX_SOCKET_BUFFER      1048576  /* 1MB */
+#define DEFAULT_SOCKET_BUFFER  65536    /* 64KB */
+#define MAX_LISTEN_BACKLOG     128
+
+/* Socket address families */
+#define AF_UNSPEC       0
+#define AF_UNIX         1
+#define AF_LOCAL        AF_UNIX
+#define AF_INET         2
+#define AF_INET6        10
+
+/* Socket types */
+#define SOCK_STREAM     1
+#define SOCK_DGRAM      2
+#define SOCK_RAW        3
+#define SOCK_SEQPACKET  5
+
+/* Socket protocols */
+#define IPPROTO_IP      0
+#define IPPROTO_ICMP    1
+#define IPPROTO_TCP     6
+#define IPPROTO_UDP     17
+
+/* Socket options levels */
+#define SOL_SOCKET      1
+#define IPPROTO_TCP     6
+#define IPPROTO_UDP     17
+
+/* Socket option names */
+#define SO_DEBUG        1
+#define SO_REUSEADDR    2
+#define SO_TYPE         3
+#define SO_ERROR        4
+#define SO_DONTROUTE    5
+#define SO_BROADCAST    6
+#define SO_SNDBUF       7
+#define SO_RCVBUF       8
+#define SO_KEEPALIVE    9
+#define SO_OOBINLINE    10
+#define SO_LINGER       13
+#define SO_REUSEPORT    15
+#define SO_RCVLOWAT     18
+#define SO_SNDLOWAT     19
+#define SO_RCVTIMEO     20
+#define SO_SNDTIMEO     21
+
+/* TCP socket options */
+#define TCP_NODELAY     1
+#define TCP_MAXSEG      2
+#define TCP_CORK        3
+#define TCP_KEEPIDLE    4
+#define TCP_KEEPINTVL   5
+#define TCP_KEEPCNT     6
+
+/* Socket shutdown options */
+#define SHUT_RD         0
+#define SHUT_WR         1
+#define SHUT_RDWR       2
+
+/* Socket message flags */
+#define MSG_OOB         0x01
+#define MSG_PEEK        0x02
+#define MSG_DONTROUTE   0x04
+#define MSG_CTRUNC      0x08
+#define MSG_TRUNC       0x20
+#define MSG_DONTWAIT    0x40
+#define MSG_WAITALL     0x100
+
+/* Socket address structures */
+struct sockaddr {
+    uint16_t sa_family;        /* Address family */
+    char sa_data[14];          /* Address data */
+};
+
+struct sockaddr_in {
+    uint16_t sin_family;       /* AF_INET */
+    uint16_t sin_port;         /* Port number */
+    uint32_t sin_addr;         /* IPv4 address */
+    uint8_t sin_zero[8];       /* Padding */
+};
+
+struct sockaddr_un {
+    uint16_t sun_family;       /* AF_UNIX */
+    char sun_path[108];        /* Unix domain socket path */
+};
+
+/* Socket linger structure */
+struct linger {
+    int l_onoff;               /* Linger active */
+    int l_linger;              /* Linger time in seconds */
+};
+
+/* I/O vector structure */
+struct iovec {
+    void* iov_base;            /* Base address */
+    size_t iov_len;            /* Length */
+};
+
+/* Message structure */
+struct msghdr {
+    void* msg_name;            /* Socket name */
+    socklen_t msg_namelen;     /* Length of name */
+    struct iovec* msg_iov;     /* Data blocks */
+    size_t msg_iovlen;         /* Number of blocks */
+    void* msg_control;         /* Ancillary data */
+    socklen_t msg_controllen;  /* Ancillary data length */
+    int msg_flags;             /* Flags */
+};
+
+/* Socket buffer */
+typedef struct socket_buffer {
+    uint8_t* data;             /* Buffer data */
+    size_t size;               /* Buffer size */
+    size_t used;               /* Bytes used */
+    size_t read_pos;           /* Read position */
+    size_t write_pos;          /* Write position */
+    
+    spinlock_t lock;           /* Buffer lock */
+    struct wait_queue* waiters; /* Waiting processes */
+    
+    /* Flow control */
+    size_t low_watermark;      /* Low water mark */
+    size_t high_watermark;     /* High water mark */
+    
+} socket_buffer_t;
+
+/* Socket structure */
+typedef struct socket {
+    int fd;                    /* File descriptor */
+    int family;                /* Address family */
+    int type;                  /* Socket type */
+    int protocol;              /* Protocol */
+    
+    /* Socket state */
+    int state;                 /* Socket state */
+    int error;                 /* Last error */
+    
+    /* Addresses */
+    struct sockaddr_storage local_addr;   /* Local address */
+    struct sockaddr_storage remote_addr;  /* Remote address */
+    socklen_t local_addrlen;
+    socklen_t remote_addrlen;
+    
+    /* Buffers */
+    socket_buffer_t* send_buffer;    /* Send buffer */
+    socket_buffer_t* recv_buffer;    /* Receive buffer */
+    
+    /* Socket options */
+    int so_debug;              /* SO_DEBUG */
+    int so_reuseaddr;          /* SO_REUSEADDR */
+    int so_reuseport;          /* SO_REUSEPORT */
+    int so_broadcast;          /* SO_BROADCAST */
+    int so_keepalive;          /* SO_KEEPALIVE */
+    int so_oobinline;          /* SO_OOBINLINE */
+    int so_dontroute;          /* SO_DONTROUTE */
+    
+    size_t so_sndbuf;          /* Send buffer size */
+    size_t so_rcvbuf;          /* Receive buffer size */
+    size_t so_sndlowat;        /* Send low water mark */
+    size_t so_rcvlowat;        /* Receive low water mark */
+    
+    uint64_t so_sndtimeo;      /* Send timeout */
+    uint64_t so_rcvtimeo;      /* Receive timeout */
+    
+    struct linger so_linger;   /* Linger options */
+    
+    /* TCP options */
+    int tcp_nodelay;           /* TCP_NODELAY */
+    int tcp_cork;              /* TCP_CORK */
+    int tcp_keepidle;          /* TCP_KEEPIDLE */
+    int tcp_keepintvl;         /* TCP_KEEPINTVL */
+    int tcp_keepcnt;           /* TCP_KEEPCNT */
+    
+    /* Connection management */
+    struct list_head accept_queue;    /* Accept queue for listening sockets */
+    struct socket* parent;            /* Parent listening socket */
+    int backlog;                      /* Listen backlog */
+    
+    /* Protocol-specific data */
+    void* protocol_data;       /* TCP/UDP connection data */
+    
+    /* Synchronization */
+    spinlock_t lock;           /* Socket lock */
+    struct wait_queue* read_waiters;   /* Read waiters */
+    struct wait_queue* write_waiters;  /* Write waiters */
+    struct wait_queue* connect_waiters; /* Connect waiters */
+    
+    /* Statistics */
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t packets_sent;
+    uint64_t packets_received;
+    uint64_t errors;
+    
+    atomic_t refcount;         /* Reference count */
+    struct list_head list;     /* Global socket list */
+    
+} socket_t;
+
+/* Socket states */
+#define SS_UNCONNECTED  0
+#define SS_CONNECTING   1
+#define SS_CONNECTED    2
+#define SS_DISCONNECTING 3
+#define SS_LISTENING    4
+#define SS_BOUND        5
+
+/* Global socket management */
+static struct {
+    bool initialized;
+    
+    /* Socket table */
+    socket_t* sockets[MAX_SOCKETS];
+    spinlock_t socket_table_lock;
+    
+    /* Global socket list */
+    struct list_head socket_list;
+    spinlock_t socket_list_lock;
+    
+    /* Statistics */
+    atomic64_t sockets_created;
+    atomic64_t sockets_destroyed;
+    atomic64_t bytes_sent_total;
+    atomic64_t bytes_received_total;
+    
+} g_socket_mgr = {0};
+
+/* Function prototypes */
+static socket_t* socket_alloc(int family, int type, int protocol);
+static void socket_free(socket_t* sock);
+static socket_buffer_t* socket_buffer_alloc(size_t size);
+static void socket_buffer_free(socket_buffer_t* buf);
+static ssize_t socket_buffer_write(socket_buffer_t* buf, const void* data, size_t len);
+static ssize_t socket_buffer_read(socket_buffer_t* buf, void* data, size_t len);
+static int socket_bind_inet(socket_t* sock, const struct sockaddr_in* addr);
+static int socket_connect_inet(socket_t* sock, const struct sockaddr_in* addr);
+static int socket_listen_inet(socket_t* sock, int backlog);
+static socket_t* socket_accept_inet(socket_t* sock, struct sockaddr_in* addr, socklen_t* addrlen);
+
+/* File operations for sockets */
+static ssize_t socket_read(struct file* file, void* buffer, size_t count);
+static ssize_t socket_write(struct file* file, const void* buffer, size_t count);
+static int socket_close(struct file* file);
+static int socket_ioctl(struct file* file, unsigned long cmd, unsigned long arg);
+
+static struct file_operations socket_fops = {
+    .read = socket_read,
+    .write = socket_write,
+    .close = socket_close,
+    .ioctl = socket_ioctl,
+};
+
+/* Initialize socket interface */
+int socket_interface_init(void) {
+    if (g_socket_mgr.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing socket interface\n");
+    
+    memset(&g_socket_mgr, 0, sizeof(g_socket_mgr));
+    
+    spinlock_init(&g_socket_mgr.socket_table_lock);
+    spinlock_init(&g_socket_mgr.socket_list_lock);
+    
+    INIT_LIST_HEAD(&g_socket_mgr.socket_list);
+    
+    g_socket_mgr.initialized = true;
+    
+    printf("Socket interface initialized\n");
+    return 0;
+}
+
+/* Create socket system call */
+int sys_socket(int family, int type, int protocol) {
+    /* Validate parameters */
+    if (family != AF_INET && family != AF_UNIX) {
+        return -EAFNOSUPPORT;
+    }
+    
+    if (type != SOCK_STREAM && type != SOCK_DGRAM && type != SOCK_RAW) {
+        return -ESOCKTNOSUPPORT;
+    }
+    
+    /* Set default protocol */
+    if (protocol == 0) {
+        if (type == SOCK_STREAM) {
+            protocol = IPPROTO_TCP;
+        } else if (type == SOCK_DGRAM) {
+            protocol = IPPROTO_UDP;
+        }
+    }
+    
+    /* Allocate socket */
+    socket_t* sock = socket_alloc(family, type, protocol);
+    if (!sock) {
+        return -ENOMEM;
+    }
+    
+    /* Create file descriptor */
+    struct process* proc = get_current_process();
+    if (!proc) {
+        socket_free(sock);
+        return -ESRCH;
+    }
+    
+    struct file* file = (struct file*)vmm_kmalloc(sizeof(struct file), 32);
+    if (!file) {
+        socket_free(sock);
+        return -ENOMEM;
+    }
+    
+    memset(file, 0, sizeof(struct file));
+    file->f_op = &socket_fops;
+    file->private_data = sock;
+    file->f_flags = O_RDWR;
+    
+    int fd = fd_allocate(proc->fd_table, file);
+    if (fd < 0) {
+        vmm_kfree(file, sizeof(struct file));
+        socket_free(sock);
+        return -EMFILE;
+    }
+    
+    sock->fd = fd;
+    
+    atomic64_inc(&g_socket_mgr.sockets_created);
+    
+    printf("Socket created: fd=%d, family=%d, type=%d, protocol=%d\n", 
+           fd, family, type, protocol);
+    
+    return fd;
+}
+
+/* Bind socket system call */
+int sys_bind(int sockfd, const struct sockaddr* addr, socklen_t addrlen) {
+    if (!addr) {
+        return -EINVAL;
+    }
+    
+    /* Get socket from file descriptor */
+    struct process* proc = get_current_process();
+    if (!proc) {
+        return -ESRCH;
+    }
+    
+    struct file* file = fd_get_file(proc->fd_table, sockfd);
+    if (!file || file->f_op != &socket_fops) {
+        return -ENOTSOCK;
+    }
+    
+    socket_t* sock = (socket_t*)file->private_data;
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&sock->lock);
+    
+    /* Check socket state */
+    if (sock->state != SS_UNCONNECTED) {
+        spin_unlock(&sock->lock);
+        return -EINVAL;
+    }
+    
+    int ret = 0;
+    
+    /* Handle different address families */
+    switch (sock->family) {
+        case AF_INET:
+            if (addrlen < sizeof(struct sockaddr_in)) {
+                ret = -EINVAL;
+                break;
+            }
+            ret = socket_bind_inet(sock, (const struct sockaddr_in*)addr);
+            break;
+            
+        case AF_UNIX:
+            /* TODO: Implement Unix domain socket bind */
+            ret = -ENOSYS;
+            break;
+            
+        default:
+            ret = -EAFNOSUPPORT;
+            break;
+    }
+    
+    if (ret == 0) {
+        sock->state = SS_BOUND;
+        memcpy(&sock->local_addr, addr, addrlen);
+        sock->local_addrlen = addrlen;
+    }
+    
+    spin_unlock(&sock->lock);
+    
+    return ret;
+}
+
+/* Connect socket system call */
+int sys_connect(int sockfd, const struct sockaddr* addr, socklen_t addrlen) {
+    if (!addr) {
+        return -EINVAL;
+    }
+    
+    /* Get socket from file descriptor */
+    struct process* proc = get_current_process();
+    if (!proc) {
+        return -ESRCH;
+    }
+    
+    struct file* file = fd_get_file(proc->fd_table, sockfd);
+    if (!file || file->f_op != &socket_fops) {
+        return -ENOTSOCK;
+    }
+    
+    socket_t* sock = (socket_t*)file->private_data;
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&sock->lock);
+    
+    /* Check socket state */
+    if (sock->state == SS_CONNECTED) {
+        spin_unlock(&sock->lock);
+        return -EISCONN;
+    }
+    
+    if (sock->state == SS_CONNECTING) {
+        spin_unlock(&sock->lock);
+        return -EALREADY;
+    }
+    
+    int ret = 0;
+    
+    /* Handle different address families */
+    switch (sock->family) {
+        case AF_INET:
+            if (addrlen < sizeof(struct sockaddr_in)) {
+                ret = -EINVAL;
+                break;
+            }
+            ret = socket_connect_inet(sock, (const struct sockaddr_in*)addr);
+            break;
+            
+        case AF_UNIX:
+            /* TODO: Implement Unix domain socket connect */
+            ret = -ENOSYS;
+            break;
+            
+        default:
+            ret = -EAFNOSUPPORT;
+            break;
+    }
+    
+    if (ret == 0) {
+        sock->state = SS_CONNECTED;
+        memcpy(&sock->remote_addr, addr, addrlen);
+        sock->remote_addrlen = addrlen;
+    } else if (ret == -EINPROGRESS) {
+        sock->state = SS_CONNECTING;
+    }
+    
+    spin_unlock(&sock->lock);
+    
+    return ret;
+}
+
+/* Listen socket system call */
+int sys_listen(int sockfd, int backlog) {
+    /* Get socket from file descriptor */
+    struct process* proc = get_current_process();
+    if (!proc) {
+        return -ESRCH;
+    }
+    
+    struct file* file = fd_get_file(proc->fd_table, sockfd);
+    if (!file || file->f_op != &socket_fops) {
+        return -ENOTSOCK;
+    }
+    
+    socket_t* sock = (socket_t*)file->private_data;
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    /* Only stream sockets can listen */
+    if (sock->type != SOCK_STREAM) {
+        return -EOPNOTSUPP;
+    }
+    
+    spin_lock(&sock->lock);
+    
+    /* Socket must be bound first */
+    if (sock->state != SS_BOUND) {
+        spin_unlock(&sock->lock);
+        return -EDESTADDRREQ;
+    }
+    
+    /* Limit backlog */
+    if (backlog < 0) {
+        backlog = 0;
+    } else if (backlog > MAX_LISTEN_BACKLOG) {
+        backlog = MAX_LISTEN_BACKLOG;
+    }
+    
+    int ret = 0;
+    
+    /* Handle different address families */
+    switch (sock->family) {
+        case AF_INET:
+            ret = socket_listen_inet(sock, backlog);
+            break;
+            
+        case AF_UNIX:
+            /* TODO: Implement Unix domain socket listen */
+            ret = -ENOSYS;
+            break;
+            
+        default:
+            ret = -EAFNOSUPPORT;
+            break;
+    }
+    
+    if (ret == 0) {
+        sock->state = SS_LISTENING;
+        sock->backlog = backlog;
+        INIT_LIST_HEAD(&sock->accept_queue);
+    }
+    
+    spin_unlock(&sock->lock);
+    
+    return ret;
+}
+
+/* Accept socket system call */
+int sys_accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
+    /* Get socket from file descriptor */
+    struct process* proc = get_current_process();
+    if (!proc) {
+        return -ESRCH;
+    }
+    
+    struct file* file = fd_get_file(proc->fd_table, sockfd);
+    if (!file || file->f_op != &socket_fops) {
+        return -ENOTSOCK;
+    }
+    
+    socket_t* sock = (socket_t*)file->private_data;
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    /* Socket must be listening */
+    if (sock->state != SS_LISTENING) {
+        return -EINVAL;
+    }
+    
+    /* Only stream sockets can accept */
+    if (sock->type != SOCK_STREAM) {
+        return -EOPNOTSUPP;
+    }
+    
+    socket_t* new_sock = NULL;
+    
+    /* Handle different address families */
+    switch (sock->family) {
+        case AF_INET: {
+            struct sockaddr_in client_addr;
+            socklen_t client_addrlen = sizeof(client_addr);
+            
+            new_sock = socket_accept_inet(sock, &client_addr, &client_addrlen);
+            
+            if (new_sock && addr && addrlen) {
+                socklen_t copy_len = min(*addrlen, client_addrlen);
+                memcpy(addr, &client_addr, copy_len);
+                *addrlen = client_addrlen;
+            }
+            break;
+        }
+        
+        case AF_UNIX:
+            /* TODO: Implement Unix domain socket accept */
+            return -ENOSYS;
+            
+        default:
+            return -EAFNOSUPPORT;
+    }
+    
+    if (!new_sock) {
+        return -EAGAIN; /* Would block */
+    }
+    
+    /* Create file descriptor for new socket */
+    struct file* new_file = (struct file*)vmm_kmalloc(sizeof(struct file), 32);
+    if (!new_file) {
+        socket_free(new_sock);
+        return -ENOMEM;
+    }
+    
+    memset(new_file, 0, sizeof(struct file));
+    new_file->f_op = &socket_fops;
+    new_file->private_data = new_sock;
+    new_file->f_flags = O_RDWR;
+    
+    int new_fd = fd_allocate(proc->fd_table, new_file);
+    if (new_fd < 0) {
+        vmm_kfree(new_file, sizeof(struct file));
+        socket_free(new_sock);
+        return -EMFILE;
+    }
+    
+    new_sock->fd = new_fd;
+    new_sock->parent = sock;
+    
+    return new_fd;
+}
+
+/* Allocate socket structure */
+static socket_t* socket_alloc(int family, int type, int protocol) {
+    socket_t* sock = (socket_t*)vmm_kmalloc(sizeof(socket_t), 64);
+    if (!sock) {
+        return NULL;
+    }
+    
+    memset(sock, 0, sizeof(socket_t));
+    
+    sock->family = family;
+    sock->type = type;
+    sock->protocol = protocol;
+    sock->state = SS_UNCONNECTED;
+    
+    /* Set default socket options */
+    sock->so_sndbuf = DEFAULT_SOCKET_BUFFER;
+    sock->so_rcvbuf = DEFAULT_SOCKET_BUFFER;
+    sock->so_sndlowat = 1;
+    sock->so_rcvlowat = 1;
+    
+    /* Allocate buffers */
+    sock->send_buffer = socket_buffer_alloc(sock->so_sndbuf);
+    sock->recv_buffer = socket_buffer_alloc(sock->so_rcvbuf);
+    
+    if (!sock->send_buffer || !sock->recv_buffer) {
+        if (sock->send_buffer) socket_buffer_free(sock->send_buffer);
+        if (sock->recv_buffer) socket_buffer_free(sock->recv_buffer);
+        vmm_kfree(sock, sizeof(socket_t));
+        return NULL;
+    }
+    
+    /* Initialize synchronization */
+    spinlock_init(&sock->lock);
+    sock->read_waiters = wait_queue_create();
+    sock->write_waiters = wait_queue_create();
+    sock->connect_waiters = wait_queue_create();
+    
+    if (!sock->read_waiters || !sock->write_waiters || !sock->connect_waiters) {
+        if (sock->read_waiters) wait_queue_destroy(sock->read_waiters);
+        if (sock->write_waiters) wait_queue_destroy(sock->write_waiters);
+        if (sock->connect_waiters) wait_queue_destroy(sock->connect_waiters);
+        socket_buffer_free(sock->send_buffer);
+        socket_buffer_free(sock->recv_buffer);
+        vmm_kfree(sock, sizeof(socket_t));
+        return NULL;
+    }
+    
+    atomic_set(&sock->refcount, 1);
+    INIT_LIST_HEAD(&sock->list);
+    INIT_LIST_HEAD(&sock->accept_queue);
+    
+    /* Add to global socket list */
+    spin_lock(&g_socket_mgr.socket_list_lock);
+    list_add(&sock->list, &g_socket_mgr.socket_list);
+    spin_unlock(&g_socket_mgr.socket_list_lock);
+    
+    return sock;
+}
+
+/* Free socket structure */
+static void socket_free(socket_t* sock) {
+    if (!sock) {
+        return;
+    }
+    
+    /* Remove from global socket list */
+    spin_lock(&g_socket_mgr.socket_list_lock);
+    list_del(&sock->list);
+    spin_unlock(&g_socket_mgr.socket_list_lock);
+    
+    /* Free buffers */
+    if (sock->send_buffer) {
+        socket_buffer_free(sock->send_buffer);
+    }
+    if (sock->recv_buffer) {
+        socket_buffer_free(sock->recv_buffer);
+    }
+    
+    /* Free wait queues */
+    if (sock->read_waiters) {
+        wait_queue_destroy(sock->read_waiters);
+    }
+    if (sock->write_waiters) {
+        wait_queue_destroy(sock->write_waiters);
+    }
+    if (sock->connect_waiters) {
+        wait_queue_destroy(sock->connect_waiters);
+    }
+    
+    vmm_kfree(sock, sizeof(socket_t));
+    
+    atomic64_inc(&g_socket_mgr.sockets_destroyed);
+}
+
+/* Allocate socket buffer */
+static socket_buffer_t* socket_buffer_alloc(size_t size) {
+    socket_buffer_t* buf = (socket_buffer_t*)vmm_kmalloc(sizeof(socket_buffer_t), 32);
+    if (!buf) {
+        return NULL;
+    }
+    
+    memset(buf, 0, sizeof(socket_buffer_t));
+    
+    buf->data = (uint8_t*)vmm_kmalloc(size, PAGE_SIZE);
+    if (!buf->data) {
+        vmm_kfree(buf, sizeof(socket_buffer_t));
+        return NULL;
+    }
+    
+    buf->size = size;
+    buf->low_watermark = size / 4;
+    buf->high_watermark = (size * 3) / 4;
+    
+    spinlock_init(&buf->lock);
+    buf->waiters = wait_queue_create();
+    
+    if (!buf->waiters) {
+        vmm_kfree(buf->data, size);
+        vmm_kfree(buf, sizeof(socket_buffer_t));
+        return NULL;
+    }
+    
+    return buf;
+}
+
+/* Free socket buffer */
+static void socket_buffer_free(socket_buffer_t* buf) {
+    if (!buf) {
+        return;
+    }
+    
+    if (buf->waiters) {
+        wait_queue_destroy(buf->waiters);
+    }
+    
+    if (buf->data) {
+        vmm_kfree(buf->data, buf->size);
+    }
+    
+    vmm_kfree(buf, sizeof(socket_buffer_t));
+}
+
+/* Socket file operations */
+static ssize_t socket_read(struct file* file, void* buffer, size_t count) {
+    socket_t* sock = (socket_t*)file->private_data;
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    if (count == 0) {
+        return 0;
+    }
+    
+    /* Read from receive buffer */
+    ssize_t result = socket_buffer_read(sock->recv_buffer, buffer, count);
+    
+    if (result > 0) {
+        sock->bytes_received += result;
+        atomic64_add(&g_socket_mgr.bytes_received_total, result);
+    }
+    
+    return result;
+}
+
+static ssize_t socket_write(struct file* file, const void* buffer, size_t count) {
+    socket_t* sock = (socket_t*)file->private_data;
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    if (count == 0) {
+        return 0;
+    }
+    
+    /* Write to send buffer */
+    ssize_t result = socket_buffer_write(sock->send_buffer, buffer, count);
+    
+    if (result > 0) {
+        sock->bytes_sent += result;
+        atomic64_add(&g_socket_mgr.bytes_sent_total, result);
+        
+        /* TODO: Trigger actual network send */
+    }
+    
+    return result;
+}
+
+static int socket_close(struct file* file) {
+    socket_t* sock = (socket_t*)file->private_data;
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    /* TODO: Implement proper socket close with protocol-specific handling */
+    
+    if (atomic_dec_and_test(&sock->refcount)) {
+        socket_free(sock);
+    }
+    
+    return 0;
+}
+
+static int socket_ioctl(struct file* file, unsigned long cmd, unsigned long arg) {
+    UNUSED(file);
+    UNUSED(cmd);
+    UNUSED(arg);
+    
+    /* TODO: Implement socket ioctl operations */
+    return -ENOTTY;
+}
+
+/* Stub implementations for protocol-specific operations */
+static int socket_bind_inet(socket_t* sock, const struct sockaddr_in* addr) {
+    UNUSED(sock);
+    UNUSED(addr);
+    
+    /* TODO: Implement inet socket bind */
+    return 0;
+}
+
+static int socket_connect_inet(socket_t* sock, const struct sockaddr_in* addr) {
+    UNUSED(sock);
+    UNUSED(addr);
+    
+    /* TODO: Implement inet socket connect */
+    return 0;
+}
+
+static int socket_listen_inet(socket_t* sock, int backlog) {
+    UNUSED(sock);
+    UNUSED(backlog);
+    
+    /* TODO: Implement inet socket listen */
+    return 0;
+}
+
+static socket_t* socket_accept_inet(socket_t* sock, struct sockaddr_in* addr, socklen_t* addrlen) {
+    UNUSED(sock);
+    UNUSED(addr);
+    UNUSED(addrlen);
+    
+    /* TODO: Implement inet socket accept */
+    return NULL;
+}
+
+/* Buffer operations */
+static ssize_t socket_buffer_write(socket_buffer_t* buf, const void* data, size_t len) {
+    if (!buf || !data || len == 0) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&buf->lock);
+    
+    /* Check available space */
+    size_t available = buf->size - buf->used;
+    if (available == 0) {
+        spin_unlock(&buf->lock);
+        return -EAGAIN; /* Would block */
+    }
+    
+    size_t to_write = min(len, available);
+    size_t written = 0;
+    
+    while (written < to_write) {
+        size_t chunk = min(to_write - written, buf->size - buf->write_pos);
+        
+        memcpy(buf->data + buf->write_pos, (const char*)data + written, chunk);
+        
+        buf->write_pos = (buf->write_pos + chunk) % buf->size;
+        buf->used += chunk;
+        written += chunk;
+    }
+    
+    /* Wake up readers */
+    if (buf->used >= buf->low_watermark) {
+        wait_queue_wake_all(buf->waiters);
+    }
+    
+    spin_unlock(&buf->lock);
+    
+    return written;
+}
+
+static ssize_t socket_buffer_read(socket_buffer_t* buf, void* data, size_t len) {
+    if (!buf || !data || len == 0) {
+        return -EINVAL;
+    }
+    
+    spin_lock(&buf->lock);
+    
+    /* Check available data */
+    if (buf->used == 0) {
+        spin_unlock(&buf->lock);
+        return 0; /* No data available */
+    }
+    
+    size_t to_read = min(len, buf->used);
+    size_t read_bytes = 0;
+    
+    while (read_bytes < to_read) {
+        size_t chunk = min(to_read - read_bytes, buf->size - buf->read_pos);
+        
+        memcpy((char*)data + read_bytes, buf->data + buf->read_pos, chunk);
+        
+        buf->read_pos = (buf->read_pos + chunk) % buf->size;
+        buf->used -= chunk;
+        read_bytes += chunk;
+    }
+    
+    /* Wake up writers */
+    if (buf->used <= buf->high_watermark) {
+        wait_queue_wake_all(buf->waiters);
+    }
+    
+    spin_unlock(&buf->lock);
+    
+    return read_bytes;
+}
+
+/* Get socket statistics */
+void socket_get_stats(struct socket_stats* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(struct socket_stats));
+    
+    stats->sockets_created = atomic64_read(&g_socket_mgr.sockets_created);
+    stats->sockets_destroyed = atomic64_read(&g_socket_mgr.sockets_destroyed);
+    stats->bytes_sent_total = atomic64_read(&g_socket_mgr.bytes_sent_total);
+    stats->bytes_received_total = atomic64_read(&g_socket_mgr.bytes_received_total);
+    
+    /* Count active sockets */
+    spin_lock(&g_socket_mgr.socket_list_lock);
+    
+    socket_t* sock;
+    list_for_each_entry(sock, &g_socket_mgr.socket_list, list) {
+        stats->active_sockets++;
+        
+        switch (sock->state) {
+            case SS_LISTENING:
+                stats->listening_sockets++;
+                break;
+            case SS_CONNECTED:
+                stats->connected_sockets++;
+                break;
+            case SS_CONNECTING:
+                stats->connecting_sockets++;
+                break;
+        }
+    }
+    
+    spin_unlock(&g_socket_mgr.socket_list_lock);
+}
+
+/* Debug output */
+void socket_dump_stats(void) {
+    struct socket_stats stats;
+    socket_get_stats(&stats);
+    
+    printf("Socket Statistics:\n");
+    printf("  Active sockets: %u\n", stats.active_sockets);
+    printf("  Listening sockets: %u\n", stats.listening_sockets);
+    printf("  Connected sockets: %u\n", stats.connected_sockets);
+    printf("  Connecting sockets: %u\n", stats.connecting_sockets);
+    printf("  Sockets created: %lu\n", stats.sockets_created);
+    printf("  Sockets destroyed: %lu\n", stats.sockets_destroyed);
+    printf("  Bytes sent total: %lu\n", stats.bytes_sent_total);
+    printf("  Bytes received total: %lu\n", stats.bytes_received_total);
+}

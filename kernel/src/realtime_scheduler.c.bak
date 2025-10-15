@@ -1,0 +1,856 @@
+/**
+ * Advanced Real-Time Scheduler Implementation for LimitlessOS
+ * Enterprise-grade real-time scheduling with deadline guarantees
+ */
+
+#include "kernel.h"
+#include "realtime_scheduler.h"
+#include "scheduler.h"
+#include "timer.h"
+#include "security.h"
+
+/* Global real-time scheduler instance */
+static realtime_scheduler_t g_rt_scheduler = {0};
+
+/* Task priority comparison for EDF scheduling */
+static inline bool rt_task_has_earlier_deadline(const rt_task_t* a, const rt_task_t* b) {
+    return a->current_deadline_ns < b->current_deadline_ns;
+}
+
+/* Rate monotonic priority comparison */
+static inline bool rt_task_has_higher_rm_priority(const rt_task_t* a, const rt_task_t* b) {
+    return a->params.period_ns < b->params.period_ns;  /* Shorter period = higher priority */
+}
+
+/* Initialize real-time scheduler */
+status_t realtime_scheduler_init(void) {
+    k_memset(&g_rt_scheduler, 0, sizeof(realtime_scheduler_t));
+    
+    /* Initialize global lock */
+    spinlock_init(&g_rt_scheduler.global_lock);
+    
+    /* Set default configuration */
+    g_rt_scheduler.enabled = false;
+    g_rt_scheduler.cpu_count = get_cpu_count();
+    g_rt_scheduler.task_count = 0;
+    g_rt_scheduler.next_task_id = 1;
+    g_rt_scheduler.task_list = NULL;
+    
+    /* Configure global parameters */
+    g_rt_scheduler.global_period_ns = DEFAULT_RT_PERIOD_NS;
+    g_rt_scheduler.rt_bandwidth_percent = DEFAULT_RT_BANDWIDTH_PERCENT;
+    g_rt_scheduler.admission_control = true;
+    g_rt_scheduler.priority_inheritance = true;
+    g_rt_scheduler.edf_enabled = true;
+    g_rt_scheduler.edf_threshold_ns = 1000000;  /* 1ms */
+    
+    /* Initialize per-CPU data */
+    for (uint32_t i = 0; i < g_rt_scheduler.cpu_count; i++) {
+        rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[i];
+        
+        cpu_data->cpu_id = i;
+        cpu_data->current_task = NULL;
+        cpu_data->isolation_level = CPU_ISOLATION_NONE;
+        cpu_data->rt_enabled = true;
+        cpu_data->rt_bandwidth_ns = (g_rt_scheduler.global_period_ns * g_rt_scheduler.rt_bandwidth_percent) / 100;
+        cpu_data->rt_period_ns = g_rt_scheduler.global_period_ns;
+        cpu_data->rt_used_bandwidth_ns = 0;
+        
+        /* Initialize per-class ready queues */
+        for (uint32_t j = 0; j < RT_CLASS_COUNT; j++) {
+            cpu_data->ready_queue[j] = NULL;
+        }
+        
+        spinlock_init(&cpu_data->lock);
+    }
+    
+    g_rt_scheduler.initialized = true;
+    
+    console_printf("Real-time scheduler initialized (%u CPUs, %u%% RT bandwidth)\n",
+                  g_rt_scheduler.cpu_count, g_rt_scheduler.rt_bandwidth_percent);
+    
+    return STATUS_OK;
+}
+
+/* Enable/disable real-time scheduling */
+status_t rt_scheduler_enable(bool enable) {
+    if (!g_rt_scheduler.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    g_rt_scheduler.enabled = enable;
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    console_printf("Real-time scheduler %s\n", enable ? "enabled" : "disabled");
+    
+    return STATUS_OK;
+}
+
+/* Configure real-time scheduler parameters */
+status_t rt_scheduler_configure(uint32_t rt_bandwidth_percent, uint64_t global_period_ns) {
+    if (!g_rt_scheduler.initialized || rt_bandwidth_percent > 100 || 
+        global_period_ns < MIN_TASK_PERIOD_NS || global_period_ns > MAX_TASK_PERIOD_NS) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    g_rt_scheduler.rt_bandwidth_percent = rt_bandwidth_percent;
+    g_rt_scheduler.global_period_ns = global_period_ns;
+    
+    /* Update per-CPU bandwidth */
+    for (uint32_t i = 0; i < g_rt_scheduler.cpu_count; i++) {
+        rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[i];
+        cpu_data->rt_bandwidth_ns = (global_period_ns * rt_bandwidth_percent) / 100;
+        cpu_data->rt_period_ns = global_period_ns;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    console_printf("RT scheduler configured: %u%% bandwidth, %llu ns period\n",
+                  rt_bandwidth_percent, global_period_ns);
+    
+    return STATUS_OK;
+}
+
+/* Set CPU isolation level */
+status_t rt_cpu_set_isolation(uint32_t cpu_id, cpu_isolation_level_t level) {
+    if (!g_rt_scheduler.initialized || cpu_id >= g_rt_scheduler.cpu_count) {
+        return STATUS_ERROR;
+    }
+    
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[cpu_id];
+    
+    spin_lock(&cpu_data->lock);
+    cpu_data->isolation_level = level;
+    spin_unlock(&cpu_data->lock);
+    
+    const char* level_names[] = {"None", "Soft", "Hard", "NoHZ-Full"};
+    const char* level_name = (level < 4) ? level_names[level] : "Unknown";
+    
+    console_printf("CPU %u isolation level set to: %s\n", cpu_id, level_name);
+    
+    return STATUS_OK;
+}
+
+/* Enable NO_HZ_FULL for a CPU */
+status_t rt_cpu_enable_nohz_full(uint32_t cpu_id) {
+    if (!g_rt_scheduler.initialized || cpu_id >= g_rt_scheduler.cpu_count) {
+        return STATUS_ERROR;
+    }
+    
+    /* Set maximum isolation */
+    rt_cpu_set_isolation(cpu_id, CPU_ISOLATION_NOHZ_FULL);
+    
+    /* Disable timer interrupts on this CPU when running RT tasks */
+    /* In real implementation, would configure NO_HZ_FULL kernel feature */
+    
+    console_printf("CPU %u configured for NO_HZ_FULL operation\n", cpu_id);
+    
+    return STATUS_OK;
+}
+
+/* Admission control test for new RT task */
+admission_result_t rt_admission_control_test(const rt_task_params_t* params, uint32_t cpu_id) {
+    if (!params || cpu_id >= g_rt_scheduler.cpu_count) {
+        return ADMISSION_REJECTED_RESOURCES;
+    }
+    
+    if (!g_rt_scheduler.admission_control) {
+        return ADMISSION_ACCEPTED;  /* Admission control disabled */
+    }
+    
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[cpu_id];
+    
+    /* Check CPU utilization - Liu & Layland bound for RM: U <= n(2^(1/n) - 1) */
+    uint64_t new_utilization_ns = (params->runtime_ns * 1000000) / params->period_ns;
+    
+    spin_lock(&cpu_data->lock);
+    
+    uint64_t current_utilization_ns = cpu_data->rt_used_bandwidth_ns;
+    uint64_t total_utilization_ns = current_utilization_ns + new_utilization_ns;
+    
+    /* Check against available RT bandwidth */
+    if (total_utilization_ns > cpu_data->rt_bandwidth_ns) {
+        spin_unlock(&cpu_data->lock);
+        return ADMISSION_REJECTED_CPU;
+    }
+    
+    spin_unlock(&cpu_data->lock);
+    
+    /* Check deadline constraint */
+    if (params->deadline_ns > params->period_ns) {
+        return ADMISSION_REJECTED_DEADLINE;
+    }
+    
+    /* Check WCET constraint */
+    if (params->runtime_ns > params->wcet_ns) {
+        return ADMISSION_REJECTED_DEADLINE;
+    }
+    
+    /* Check CPU affinity conflicts with isolation */
+    if (cpu_data->isolation_level >= CPU_ISOLATION_HARD) {
+        /* Hard isolated CPU - check if task is specifically assigned */
+        if (!(params->cpu_affinity_mask & (1U << cpu_id))) {
+            return ADMISSION_REJECTED_ISOLATION;
+        }
+    }
+    
+    /* Check memory bandwidth requirements */
+    if (params->memory_bandwidth_mbps > 0) {
+        /* In real implementation, would check against available memory bandwidth */
+        uint32_t total_memory_bandwidth = 0;
+        
+        /* Sum up current memory bandwidth usage */
+        rt_task_t* task = g_rt_scheduler.task_list;
+        while (task) {
+            if (task->assigned_cpu == cpu_id && task->state != RT_STATE_INACTIVE) {
+                total_memory_bandwidth += task->params.memory_bandwidth_mbps;
+            }
+            task = task->next;
+        }
+        
+        /* Check against system memory bandwidth (assume 10GB/s) */
+        if (total_memory_bandwidth + params->memory_bandwidth_mbps > 10000) {
+            return ADMISSION_REJECTED_MEMORY;
+        }
+    }
+    
+    return ADMISSION_ACCEPTED;
+}
+
+/* Create new real-time task */
+status_t rt_task_create(pid_t pid, rt_class_t class, const rt_task_params_t* params, uint32_t* task_id) {
+    if (!params || !task_id || class >= RT_CLASS_COUNT) {
+        return STATUS_ERROR;
+    }
+    
+    if (!g_rt_scheduler.initialized || !g_rt_scheduler.enabled) {
+        return STATUS_ERROR;
+    }
+    
+    /* Validate task parameters */
+    if (params->period_ns < MIN_TASK_PERIOD_NS || params->period_ns > MAX_TASK_PERIOD_NS) {
+        return STATUS_ERROR;
+    }
+    
+    if (params->runtime_ns > params->period_ns || params->deadline_ns > params->period_ns) {
+        return STATUS_ERROR;
+    }
+    
+    /* Select target CPU based on affinity */
+    uint32_t target_cpu = 0;
+    if (params->cpu_affinity_mask != 0) {
+        /* Find first CPU in affinity mask */
+        for (uint32_t i = 0; i < g_rt_scheduler.cpu_count; i++) {
+            if (params->cpu_affinity_mask & (1U << i)) {
+                target_cpu = i;
+                break;
+            }
+        }
+    }
+    
+    /* Perform admission control */
+    admission_result_t admission = rt_admission_control_test(params, target_cpu);
+    if (admission != ADMISSION_ACCEPTED) {
+        console_printf("RT task admission rejected: reason %u\n", admission);
+        return STATUS_ERROR;
+    }
+    
+    /* Allocate task structure */
+    rt_task_t* task = k_malloc(sizeof(rt_task_t));
+    if (!task) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(task, 0, sizeof(rt_task_t));
+    
+    /* Initialize task */
+    spin_lock(&g_rt_scheduler.global_lock);
+    task->task_id = g_rt_scheduler.next_task_id++;
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    task->pid = pid;
+    task->class = class;
+    task->state = RT_STATE_INACTIVE;
+    k_memcpy(&task->params, params, sizeof(rt_task_params_t));
+    
+    /* Initialize timing */
+    uint64_t current_time = timer_get_ticks_ns();
+    task->next_period_start_ns = current_time + params->period_ns;
+    task->current_deadline_ns = task->next_period_start_ns + params->deadline_ns;
+    task->remaining_runtime_ns = params->runtime_ns;
+    task->assigned_cpu = target_cpu;
+    task->deadline_enforced = false;
+    
+    spinlock_init(&task->lock);
+    
+    /* Add to global task list */
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    task->next = g_rt_scheduler.task_list;
+    if (g_rt_scheduler.task_list) {
+        g_rt_scheduler.task_list->prev = task;
+    }
+    g_rt_scheduler.task_list = task;
+    g_rt_scheduler.task_count++;
+    
+    /* Update CPU bandwidth usage */
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[target_cpu];
+    spin_lock(&cpu_data->lock);
+    cpu_data->rt_used_bandwidth_ns += (params->runtime_ns * 1000000) / params->period_ns;
+    spin_unlock(&cpu_data->lock);
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    *task_id = task->task_id;
+    
+    console_printf("RT task %u created: PID %u, class %u, period %llu ns, deadline %llu ns\n",
+                  task->task_id, pid, class, params->period_ns, params->deadline_ns);
+    
+    return STATUS_OK;
+}
+
+/* Activate real-time task */
+status_t rt_task_activate(uint32_t task_id) {
+    if (!g_rt_scheduler.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    /* Find task */
+    rt_task_t* task = NULL;
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    rt_task_t* current = g_rt_scheduler.task_list;
+    while (current) {
+        if (current->task_id == task_id) {
+            task = current;
+            break;
+        }
+        current = current->next;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    if (!task) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&task->lock);
+    
+    if (task->state != RT_STATE_INACTIVE && task->state != RT_STATE_SUSPENDED) {
+        spin_unlock(&task->lock);
+        return STATUS_ERROR;  /* Task already active */
+    }
+    
+    /* Activate task */
+    task->state = RT_STATE_READY;
+    task->activation_time_ns = timer_get_ticks_ns();
+    task->remaining_runtime_ns = task->params.runtime_ns;
+    
+    /* Update next period and deadline */
+    task->next_period_start_ns = task->activation_time_ns + task->params.period_ns;
+    task->current_deadline_ns = task->activation_time_ns + task->params.deadline_ns;
+    
+    /* Update statistics */
+    task->stats.activations++;
+    
+    spin_unlock(&task->lock);
+    
+    /* Add to appropriate ready queue */
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[task->assigned_cpu];
+    
+    spin_lock(&cpu_data->lock);
+    
+    /* Insert into ready queue based on scheduling class */
+    rt_task_t** queue = &cpu_data->ready_queue[task->class];
+    
+    if (task->class == RT_CLASS_DEADLINE) {
+        /* EDF - insert by deadline */
+        rt_task_t** pos = queue;
+        while (*pos && rt_task_has_earlier_deadline(*pos, task)) {
+            pos = &((*pos)->next);
+        }
+        task->next = *pos;
+        if (*pos) {
+            (*pos)->prev = task;
+        }
+        *pos = task;
+        task->prev = NULL;
+    } else {
+        /* Fixed priority - insert by priority */
+        rt_task_t** pos = queue;
+        while (*pos && rt_task_has_higher_rm_priority(*pos, task)) {
+            pos = &((*pos)->next);
+        }
+        task->next = *pos;
+        if (*pos) {
+            (*pos)->prev = task;
+        }
+        *pos = task;
+        task->prev = NULL;
+    }
+    
+    spin_unlock(&cpu_data->lock);
+    
+    console_printf("RT task %u activated on CPU %u\n", task_id, task->assigned_cpu);
+    
+    /* Trigger scheduling on target CPU */
+    /* In real implementation, would send IPI to target CPU */
+    rt_schedule(task->assigned_cpu);
+    
+    return STATUS_OK;
+}
+
+/* Real-time scheduler - select next task to run */
+status_t rt_schedule(uint32_t cpu_id) {
+    if (!g_rt_scheduler.initialized || !g_rt_scheduler.enabled || 
+        cpu_id >= g_rt_scheduler.cpu_count) {
+        return STATUS_ERROR;
+    }
+    
+    uint64_t schedule_start = timer_get_ticks_ns();
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[cpu_id];
+    
+    spin_lock(&cpu_data->lock);
+    
+    rt_task_t* next_task = NULL;
+    rt_task_t* highest_priority_task = NULL;
+    
+    /* Find highest priority ready task across all classes */
+    for (int class = 0; class < RT_CLASS_COUNT; class++) {
+        rt_task_t* task = cpu_data->ready_queue[class];
+        
+        if (task && task->state == RT_STATE_READY) {
+            if (class == RT_CLASS_DEADLINE) {
+                /* EDF - task with earliest deadline */
+                if (!next_task || rt_task_has_earlier_deadline(task, next_task)) {
+                    next_task = task;
+                }
+            } else {
+                /* Fixed priority classes */
+                if (!highest_priority_task) {
+                    highest_priority_task = task;
+                }
+            }
+        }
+    }
+    
+    /* Choose between EDF and fixed priority */
+    if (next_task && highest_priority_task) {
+        /* Use EDF if deadline is within threshold */
+        uint64_t current_time = timer_get_ticks_ns();
+        if (next_task->current_deadline_ns - current_time <= g_rt_scheduler.edf_threshold_ns) {
+            /* Deadline critical - use EDF */
+        } else {
+            /* Use highest priority fixed priority task */
+            next_task = highest_priority_task;
+        }
+    } else if (highest_priority_task) {
+        next_task = highest_priority_task;
+    }
+    
+    /* Context switch if needed */
+    rt_task_t* current_task = cpu_data->current_task;
+    
+    if (next_task != current_task) {
+        /* Preempt current task if needed */
+        if (current_task && current_task->state == RT_STATE_RUNNING) {
+            current_task->state = RT_STATE_READY;
+            current_task->stats.preemptions++;
+            cpu_data->preemptions++;
+        }
+        
+        /* Switch to next task */
+        if (next_task) {
+            next_task->state = RT_STATE_RUNNING;
+            next_task->start_time_ns = timer_get_ticks_ns();
+            cpu_data->current_task = next_task;
+            
+            /* Update statistics */
+            cpu_data->context_switches++;
+            g_rt_scheduler.scheduler_invocations++;
+            
+            console_printf("RT task %u scheduled on CPU %u (deadline in %llu ns)\n",
+                          next_task->task_id, cpu_id, 
+                          next_task->current_deadline_ns - next_task->start_time_ns);
+        } else {
+            cpu_data->current_task = NULL;
+        }
+    }
+    
+    spin_unlock(&cpu_data->lock);
+    
+    /* Update scheduler timing statistics */
+    uint64_t schedule_time = timer_get_ticks_ns() - schedule_start;
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    g_rt_scheduler.scheduler_time_ns += schedule_time;
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    return STATUS_OK;
+}
+
+/* Handle deadline miss */
+status_t rt_handle_deadline_miss(rt_task_t* task) {
+    if (!task) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&task->lock);
+    
+    task->stats.deadline_misses++;
+    task->state = RT_STATE_DEADLINE_MISSED;
+    
+    spin_unlock(&task->lock);
+    
+    /* Update global statistics */
+    spin_lock(&g_rt_scheduler.global_lock);
+    g_rt_scheduler.global_deadline_misses++;
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    /* Update CPU statistics */
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[task->assigned_cpu];
+    spin_lock(&cpu_data->lock);
+    cpu_data->deadline_misses++;
+    spin_unlock(&cpu_data->lock);
+    
+    console_printf("DEADLINE MISS: RT task %u missed deadline by %llu ns\n",
+                  task->task_id, 
+                  timer_get_ticks_ns() - task->current_deadline_ns);
+    
+    /* Apply deadline enforcement policy */
+    if (task->deadline_enforced) {
+        console_printf("Terminating RT task %u due to deadline enforcement\n", task->task_id);
+        /* In real implementation, would terminate the task */
+        return rt_task_destroy(task->task_id);
+    }
+    
+    /* Reset task for next period */
+    task->state = RT_STATE_READY;
+    task->remaining_runtime_ns = task->params.runtime_ns;
+    task->next_period_start_ns += task->params.period_ns;
+    task->current_deadline_ns += task->params.period_ns;
+    
+    return STATUS_OK;
+}
+
+/* RT scheduler tick handler */
+status_t rt_scheduler_tick(uint32_t cpu_id) {
+    if (!g_rt_scheduler.initialized || !g_rt_scheduler.enabled || 
+        cpu_id >= g_rt_scheduler.cpu_count) {
+        return STATUS_OK;
+    }
+    
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[cpu_id];
+    rt_task_t* current_task = cpu_data->current_task;
+    
+    if (!current_task || current_task->state != RT_STATE_RUNNING) {
+        return STATUS_OK;
+    }
+    
+    uint64_t current_time = timer_get_ticks_ns();
+    
+    spin_lock(&current_task->lock);
+    
+    /* Check for deadline miss */
+    if (current_time > current_task->current_deadline_ns) {
+        spin_unlock(&current_task->lock);
+        return rt_handle_deadline_miss(current_task);
+    }
+    
+    /* Update remaining runtime */
+    uint64_t elapsed = current_time - current_task->start_time_ns;
+    if (elapsed >= current_task->remaining_runtime_ns) {
+        /* Task completed its execution for this period */
+        current_task->remaining_runtime_ns = 0;
+        current_task->state = RT_STATE_READY;  /* Wait for next period */
+        current_task->stats.completions++;
+        
+        /* Calculate response time */
+        uint64_t response_time = current_time - current_task->activation_time_ns;
+        current_task->stats.total_response_time_ns += response_time;
+        
+        if (current_task->stats.min_response_time_ns == 0 || 
+            response_time < current_task->stats.min_response_time_ns) {
+            current_task->stats.min_response_time_ns = response_time;
+        }
+        
+        if (response_time > current_task->stats.max_response_time_ns) {
+            current_task->stats.max_response_time_ns = response_time;
+        }
+        
+        current_task->stats.avg_response_time_ns = 
+            current_task->stats.total_response_time_ns / current_task->stats.completions;
+        
+        console_printf("RT task %u completed period (response time: %llu ns)\n",
+                      current_task->task_id, response_time);
+    } else {
+        current_task->remaining_runtime_ns -= elapsed;
+    }
+    
+    current_task->start_time_ns = current_time;
+    
+    spin_unlock(&current_task->lock);
+    
+    /* Trigger rescheduling */
+    return rt_schedule(cpu_id);
+}
+
+/* Get real-time scheduler statistics */
+status_t rt_get_scheduler_stats(rt_scheduler_stats_t* stats) {
+    if (!stats || !g_rt_scheduler.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    k_memset(stats, 0, sizeof(rt_scheduler_stats_t));
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    stats->enabled = g_rt_scheduler.enabled;
+    stats->total_rt_tasks = g_rt_scheduler.task_count;
+    
+    /* Count active tasks and calculate totals */
+    uint32_t active_tasks = 0;
+    uint64_t total_activations = 0;
+    uint64_t total_completions = 0;
+    uint64_t total_deadline_misses = 0;
+    
+    uint64_t total_response_time = 0;
+    uint64_t total_execution_time = 0;
+    uint64_t min_response_time = UINT64_MAX;
+    uint64_t max_response_time = 0;
+    uint64_t min_execution_time = UINT64_MAX;
+    uint64_t max_execution_time = 0;
+    
+    rt_task_t* task = g_rt_scheduler.task_list;
+    while (task) {
+        if (task->state != RT_STATE_INACTIVE) {
+            active_tasks++;
+        }
+        
+        total_activations += task->stats.activations;
+        total_completions += task->stats.completions;
+        total_deadline_misses += task->stats.deadline_misses;
+        
+        if (task->stats.completions > 0) {
+            total_response_time += task->stats.total_response_time_ns;
+            total_execution_time += task->stats.total_execution_time_ns;
+            
+            if (task->stats.min_response_time_ns < min_response_time) {
+                min_response_time = task->stats.min_response_time_ns;
+            }
+            if (task->stats.max_response_time_ns > max_response_time) {
+                max_response_time = task->stats.max_response_time_ns;
+            }
+            if (task->stats.min_execution_time_ns < min_execution_time) {
+                min_execution_time = task->stats.min_execution_time_ns;
+            }
+            if (task->stats.max_execution_time_ns > max_execution_time) {
+                max_execution_time = task->stats.max_execution_time_ns;
+            }
+        }
+        
+        task = task->next;
+    }
+    
+    stats->active_rt_tasks = active_tasks;
+    stats->total_activations = total_activations;
+    stats->total_completions = total_completions;
+    stats->total_deadline_misses = total_deadline_misses;
+    
+    /* Calculate deadline miss rate in parts per million */
+    if (total_activations > 0) {
+        stats->deadline_miss_rate_ppm = (uint32_t)((total_deadline_misses * 1000000) / total_activations);
+    }
+    
+    /* Calculate timing averages */
+    if (total_completions > 0) {
+        stats->avg_response_time_ns = total_response_time / total_completions;
+        stats->avg_execution_time_ns = total_execution_time / total_completions;
+    }
+    
+    stats->min_response_time_ns = (min_response_time == UINT64_MAX) ? 0 : min_response_time;
+    stats->max_response_time_ns = max_response_time;
+    stats->min_execution_time_ns = (min_execution_time == UINT64_MAX) ? 0 : min_execution_time;
+    stats->max_execution_time_ns = max_execution_time;
+    
+    /* Per-CPU statistics */
+    for (uint32_t i = 0; i < g_rt_scheduler.cpu_count; i++) {
+        rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[i];
+        
+        spin_lock(&cpu_data->lock);
+        
+        stats->per_cpu[i].isolation_level = cpu_data->isolation_level;
+        stats->per_cpu[i].context_switches = cpu_data->context_switches;
+        stats->per_cpu[i].deadline_misses = cpu_data->deadline_misses;
+        
+        /* Calculate RT utilization */
+        if (cpu_data->rt_period_ns > 0) {
+            stats->per_cpu[i].rt_utilization_percent = 
+                (uint32_t)((cpu_data->rt_used_bandwidth_ns * 100) / cpu_data->rt_bandwidth_ns);
+        }
+        
+        /* Count active tasks on this CPU */
+        uint32_t cpu_active_tasks = 0;
+        rt_task_t* cpu_task = g_rt_scheduler.task_list;
+        while (cpu_task) {
+            if (cpu_task->assigned_cpu == i && cpu_task->state != RT_STATE_INACTIVE) {
+                cpu_active_tasks++;
+            }
+            cpu_task = cpu_task->next;
+        }
+        stats->per_cpu[i].active_tasks = cpu_active_tasks;
+        
+        spin_unlock(&cpu_data->lock);
+    }
+    
+    /* Scheduler overhead statistics */
+    stats->scheduler_invocations = g_rt_scheduler.scheduler_invocations;
+    if (g_rt_scheduler.scheduler_invocations > 0) {
+        stats->avg_scheduler_time_ns = g_rt_scheduler.scheduler_time_ns / g_rt_scheduler.scheduler_invocations;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    return STATUS_OK;
+}
+
+/* Dump comprehensive RT scheduler statistics */
+status_t rt_dump_all_stats(void) {
+    if (!g_rt_scheduler.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    rt_scheduler_stats_t stats;
+    if (rt_get_scheduler_stats(&stats) != STATUS_OK) {
+        return STATUS_ERROR;
+    }
+    
+    console_printf("=== Real-Time Scheduler Statistics ===\n");
+    console_printf("Status: %s\n", stats.enabled ? "Enabled" : "Disabled");
+    console_printf("Active RT Tasks: %u / %u\n", stats.active_rt_tasks, stats.total_rt_tasks);
+    console_printf("Total Activations: %llu\n", stats.total_activations);
+    console_printf("Total Completions: %llu\n", stats.total_completions);
+    console_printf("Total Deadline Misses: %llu\n", stats.total_deadline_misses);
+    console_printf("Deadline Miss Rate: %u ppm\n", stats.deadline_miss_rate_ppm);
+    
+    console_printf("\nTiming Performance:\n");
+    console_printf("  Response Time: min=%llu ns, max=%llu ns, avg=%llu ns\n",
+                  stats.min_response_time_ns, stats.max_response_time_ns, stats.avg_response_time_ns);
+    console_printf("  Execution Time: min=%llu ns, max=%llu ns, avg=%llu ns\n",
+                  stats.min_execution_time_ns, stats.max_execution_time_ns, stats.avg_execution_time_ns);
+    
+    console_printf("\nScheduler Overhead:\n");
+    console_printf("  Invocations: %llu\n", stats.scheduler_invocations);
+    console_printf("  Average Time: %llu ns\n", stats.avg_scheduler_time_ns);
+    console_printf("  Max Time: %llu ns\n", stats.max_scheduler_time_ns);
+    
+    /* Per-CPU statistics */
+    console_printf("\nPer-CPU Statistics:\n");
+    const char* isolation_names[] = {"None", "Soft", "Hard", "NoHZ-Full"};
+    
+    for (uint32_t i = 0; i < g_rt_scheduler.cpu_count; i++) {
+        const char* isolation_name = (stats.per_cpu[i].isolation_level < 4) ? 
+                                   isolation_names[stats.per_cpu[i].isolation_level] : "Unknown";
+        
+        console_printf("  CPU %u:\n", i);
+        console_printf("    Active Tasks: %u\n", stats.per_cpu[i].active_tasks);
+        console_printf("    RT Utilization: %u%%\n", stats.per_cpu[i].rt_utilization_percent);
+        console_printf("    Isolation: %s\n", isolation_name);
+        console_printf("    Context Switches: %llu\n", stats.per_cpu[i].context_switches);
+        console_printf("    Deadline Misses: %llu\n", stats.per_cpu[i].deadline_misses);
+    }
+    
+    console_printf("=== End RT Scheduler Statistics ===\n");
+    
+    return STATUS_OK;
+}
+
+/* Destroy real-time task */
+status_t rt_task_destroy(uint32_t task_id) {
+    if (!g_rt_scheduler.initialized) {
+        return STATUS_ERROR;
+    }
+    
+    rt_task_t* task = NULL;
+    
+    spin_lock(&g_rt_scheduler.global_lock);
+    
+    /* Find and remove task from global list */
+    rt_task_t* current = g_rt_scheduler.task_list;
+    while (current) {
+        if (current->task_id == task_id) {
+            task = current;
+            
+            /* Remove from list */
+            if (task->prev) {
+                task->prev->next = task->next;
+            } else {
+                g_rt_scheduler.task_list = task->next;
+            }
+            
+            if (task->next) {
+                task->next->prev = task->prev;
+            }
+            
+            g_rt_scheduler.task_count--;
+            break;
+        }
+        current = current->next;
+    }
+    
+    spin_unlock(&g_rt_scheduler.global_lock);
+    
+    if (!task) {
+        return STATUS_ERROR;
+    }
+    
+    /* Remove from CPU ready queue */
+    rt_cpu_data_t* cpu_data = &g_rt_scheduler.cpu_data[task->assigned_cpu];
+    
+    spin_lock(&cpu_data->lock);
+    
+    /* Update bandwidth */
+    uint64_t task_bandwidth = (task->params.runtime_ns * 1000000) / task->params.period_ns;
+    cpu_data->rt_used_bandwidth_ns -= task_bandwidth;
+    
+    /* Remove from ready queue */
+    rt_task_t** queue = &cpu_data->ready_queue[task->class];
+    rt_task_t* queue_task = *queue;
+    
+    while (queue_task) {
+        if (queue_task->task_id == task_id) {
+            if (queue_task->prev) {
+                queue_task->prev->next = queue_task->next;
+            } else {
+                *queue = queue_task->next;
+            }
+            
+            if (queue_task->next) {
+                queue_task->next->prev = queue_task->prev;
+            }
+            break;
+        }
+        queue_task = queue_task->next;
+    }
+    
+    /* Clear current task if this task is running */
+    if (cpu_data->current_task == task) {
+        cpu_data->current_task = NULL;
+    }
+    
+    spin_unlock(&cpu_data->lock);
+    
+    /* Free task structure */
+    k_free(task);
+    
+    console_printf("RT task %u destroyed\n", task_id);
+    
+    /* Trigger rescheduling */
+    rt_schedule(task->assigned_cpu);
+    
+    return STATUS_OK;
+}

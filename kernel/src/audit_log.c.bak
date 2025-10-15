@@ -1,0 +1,545 @@
+#include "audit_log.h"
+#include "log.h"
+#include "kernel.h"
+#include "vfs.h"
+#include "timer.h"
+#include "process.h"
+
+/* Global audit context */
+static audit_ring_buffer_t g_audit_buffer;
+static audit_config_t g_audit_config;
+static audit_statistics_t g_audit_stats;
+static bool g_audit_initialized = false;
+
+/* File handle for persistent logging */
+static int g_log_file_fd = -1;
+
+/* Helper functions */
+static uint32_t calculate_checksum(const void* data, size_t length) {
+    const uint8_t* bytes = (const uint8_t*)data;
+    uint32_t checksum = 0;
+    
+    for (size_t i = 0; i < length; i++) {
+        checksum = checksum * 31 + bytes[i];
+    }
+    
+    return checksum;
+}
+
+static bool is_event_type_enabled(audit_event_type_t type) {
+    if (!g_audit_config.enabled) return false;
+    
+    switch (type) {
+        case AUDIT_EVENT_FILE_ACCESS: return g_audit_config.log_file_access;
+        case AUDIT_EVENT_PROCESS_CREATE:
+        case AUDIT_EVENT_PROCESS_EXIT: return g_audit_config.log_process_events;
+        case AUDIT_EVENT_NETWORK_CONNECT: return g_audit_config.log_network_events;
+        case AUDIT_EVENT_SYSCALL: return g_audit_config.log_syscalls;
+        case AUDIT_EVENT_LOGIN:
+        case AUDIT_EVENT_LOGOUT:
+        case AUDIT_EVENT_AUTHENTICATION: return g_audit_config.log_authentication;
+        case AUDIT_EVENT_AUTHORIZATION: return g_audit_config.log_authorization;
+        case AUDIT_EVENT_CRYPTO_OPERATION: return g_audit_config.log_crypto_ops;
+        default: return true; /* Log other events by default */
+    }
+}
+
+static status_t write_log_to_disk(const audit_log_entry_t* entry) {
+    if (g_log_file_fd < 0) return STATUS_ERROR;
+    
+    /* Write entry to file */
+    ssize_t written = vfs_write(g_log_file_fd, entry, sizeof(*entry));
+    if (written != sizeof(*entry)) {
+        return STATUS_ERROR;
+    }
+    
+    g_audit_stats.file_writes++;
+    g_audit_stats.current_file_size += sizeof(*entry);
+    
+    /* Check if rotation is needed */
+    if (g_audit_config.auto_rotate && 
+        g_audit_stats.current_file_size >= g_audit_config.max_file_size) {
+        audit_rotate_log();
+    }
+    
+    return STATUS_OK;
+}
+
+status_t audit_init(void) {
+    /* Initialize ring buffer */
+    k_memset(&g_audit_buffer, 0, sizeof(g_audit_buffer));
+    spinlock_init(&g_audit_buffer.lock);
+    g_audit_buffer.next_sequence = 1;
+    
+    /* Initialize default configuration */
+    k_memset(&g_audit_config, 0, sizeof(g_audit_config));
+    g_audit_config.enabled = true;
+    g_audit_config.log_file_access = true;
+    g_audit_config.log_process_events = true;
+    g_audit_config.log_network_events = true;
+    g_audit_config.log_syscalls = false; /* Too verbose by default */
+    g_audit_config.log_authentication = true;
+    g_audit_config.log_authorization = true;
+    g_audit_config.log_crypto_ops = true;
+    g_audit_config.auto_rotate = true;
+    g_audit_config.max_file_size = AUDIT_MAX_FILE_SIZE;
+    g_audit_config.min_severity = AUDIT_SEVERITY_INFO;
+    k_strlcpy(g_audit_config.log_file_path, "/var/log/audit.log", 
+              sizeof(g_audit_config.log_file_path));
+    
+    /* Initialize statistics */
+    k_memset(&g_audit_stats, 0, sizeof(g_audit_stats));
+    
+    /* Try to open log file */
+    g_log_file_fd = vfs_open(g_audit_config.log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0640);
+    if (g_log_file_fd < 0) {
+        log_warn("[AUDIT] Failed to open log file: %s", g_audit_config.log_file_path);
+    }
+    
+    g_audit_initialized = true;
+    
+    /* Log audit system initialization */
+    audit_log_event(AUDIT_EVENT_SECURITY_ALERT, AUDIT_SEVERITY_INFO, 0,
+                   "Audit logging subsystem initialized");
+    
+    log_info("[AUDIT] Audit logging subsystem initialized");
+    return STATUS_OK;
+}
+
+status_t audit_shutdown(void) {
+    if (!g_audit_initialized) return STATUS_OK;
+    
+    /* Flush any remaining entries */
+    audit_flush_to_disk();
+    
+    /* Close log file */
+    if (g_log_file_fd >= 0) {
+        vfs_close(g_log_file_fd);
+        g_log_file_fd = -1;
+    }
+    
+    /* Log shutdown */
+    audit_log_event(AUDIT_EVENT_SECURITY_ALERT, AUDIT_SEVERITY_INFO, 0,
+                   "Audit logging subsystem shutdown");
+    
+    g_audit_initialized = false;
+    log_info("[AUDIT] Audit logging subsystem shutdown");
+    return STATUS_OK;
+}
+
+status_t audit_configure(const audit_config_t* config) {
+    if (!config) return STATUS_INVALID;
+    
+    spin_lock(&g_audit_buffer.lock);
+    
+    /* Update configuration */
+    audit_config_t old_config = g_audit_config;
+    g_audit_config = *config;
+    
+    /* Handle log file path changes */
+    if (k_strcmp(old_config.log_file_path, config->log_file_path) != 0) {
+        if (g_log_file_fd >= 0) {
+            vfs_close(g_log_file_fd);
+        }
+        
+        g_log_file_fd = vfs_open(config->log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0640);
+        if (g_log_file_fd < 0) {
+            log_warn("[AUDIT] Failed to open new log file: %s", config->log_file_path);
+        }
+    }
+    
+    spin_unlock(&g_audit_buffer.lock);
+    
+    /* Log configuration change */
+    audit_log_event(AUDIT_EVENT_POLICY_CHANGE, AUDIT_SEVERITY_INFO, 0,
+                   "Audit configuration updated");
+    
+    return STATUS_OK;
+}
+
+status_t audit_get_config(audit_config_t* out_config) {
+    if (!out_config) return STATUS_INVALID;
+    
+    *out_config = g_audit_config;
+    return STATUS_OK;
+}
+
+static status_t add_entry_to_buffer(const audit_log_entry_t* entry) {
+    spin_lock(&g_audit_buffer.lock);
+    
+    /* Check if buffer is full */
+    if (g_audit_buffer.count >= AUDIT_LOG_MAX_ENTRIES) {
+        if (!g_audit_buffer.overflow) {
+            g_audit_buffer.overflow = true;
+            log_warn("[AUDIT] Audit buffer overflow - dropping events");
+        }
+        
+        /* Drop oldest entry */
+        g_audit_buffer.tail = (g_audit_buffer.tail + 1) % AUDIT_LOG_MAX_ENTRIES;
+        g_audit_buffer.dropped_events++;
+        g_audit_stats.events_dropped++;
+    } else {
+        g_audit_buffer.count++;
+    }
+    
+    /* Add new entry */
+    g_audit_buffer.entries[g_audit_buffer.head] = *entry;
+    g_audit_buffer.head = (g_audit_buffer.head + 1) % AUDIT_LOG_MAX_ENTRIES;
+    g_audit_buffer.total_events++;
+    g_audit_stats.events_logged++;
+    
+    spin_unlock(&g_audit_buffer.lock);
+    
+    /* Write to disk if enabled */
+    if (g_log_file_fd >= 0) {
+        write_log_to_disk(entry);
+    }
+    
+    return STATUS_OK;
+}
+
+status_t audit_log_event(audit_event_type_t type, audit_severity_t severity,
+                        pid_t pid, const char* format, ...) {
+    if (!g_audit_initialized || !is_event_type_enabled(type)) {
+        return STATUS_OK;
+    }
+    
+    if (severity < g_audit_config.min_severity) {
+        return STATUS_OK;
+    }
+    
+    /* Create audit entry */
+    audit_log_entry_t entry;
+    k_memset(&entry, 0, sizeof(entry));
+    
+    entry.timestamp = timer_get_ticks();
+    entry.sequence_number = g_audit_buffer.next_sequence++;
+    entry.type = type;
+    entry.severity = severity;
+    entry.process_id = pid;
+    
+    /* Get process information */
+    if (pid > 0) {
+        process_t* process = process_get(pid);
+        if (process) {
+            entry.user_id = process->uid;
+            entry.group_id = process->gid;
+            entry.session_id = process->session_id;
+            k_strlcpy(entry.process_name, process->name, sizeof(entry.process_name));
+        }
+    }
+    
+    /* Format event data */
+    if (format) {
+        va_list args;
+        va_start(args, format);
+        int len = k_vsnprintf(entry.event_data, sizeof(entry.event_data), format, args);
+        va_end(args);
+        
+        entry.data_length = (len > 0) ? len : 0;
+    }
+    
+    /* Calculate checksum */
+    entry.checksum = calculate_checksum(&entry, sizeof(entry) - sizeof(entry.checksum));
+    
+    return add_entry_to_buffer(&entry);
+}
+
+status_t audit_log_file_access(pid_t pid, const char* path, uint32_t access_type, bool granted) {
+    if (!path) return STATUS_INVALID;
+    
+    return audit_log_event(AUDIT_EVENT_FILE_ACCESS,
+                          granted ? AUDIT_SEVERITY_INFO : AUDIT_SEVERITY_WARNING,
+                          pid, "file=%s access=0x%x result=%s", 
+                          path, access_type, granted ? "ALLOWED" : "DENIED");
+}
+
+status_t audit_log_process_create(pid_t parent_pid, pid_t child_pid, const char* program) {
+    if (!program) return STATUS_INVALID;
+    
+    return audit_log_event(AUDIT_EVENT_PROCESS_CREATE, AUDIT_SEVERITY_INFO, parent_pid,
+                          "child_pid=%d program=%s", child_pid, program);
+}
+
+status_t audit_log_process_exit(pid_t pid, int exit_code) {
+    return audit_log_event(AUDIT_EVENT_PROCESS_EXIT, AUDIT_SEVERITY_INFO, pid,
+                          "exit_code=%d", exit_code);
+}
+
+status_t audit_log_network_connect(pid_t pid, uint32_t remote_addr, uint16_t port, bool success) {
+    return audit_log_event(AUDIT_EVENT_NETWORK_CONNECT,
+                          success ? AUDIT_SEVERITY_INFO : AUDIT_SEVERITY_WARNING,
+                          pid, "remote=%u.%u.%u.%u:%d result=%s",
+                          (remote_addr >> 24) & 0xFF, (remote_addr >> 16) & 0xFF,
+                          (remote_addr >> 8) & 0xFF, remote_addr & 0xFF,
+                          port, success ? "SUCCESS" : "FAILED");
+}
+
+status_t audit_log_authentication(const char* username, bool success, const char* method) {
+    if (!username || !method) return STATUS_INVALID;
+    
+    return audit_log_event(AUDIT_EVENT_AUTHENTICATION,
+                          success ? AUDIT_SEVERITY_INFO : AUDIT_SEVERITY_ERROR,
+                          0, "user=%s method=%s result=%s",
+                          username, method, success ? "SUCCESS" : "FAILED");
+}
+
+status_t audit_log_authorization(pid_t pid, const char* resource, bool granted) {
+    if (!resource) return STATUS_INVALID;
+    
+    return audit_log_event(AUDIT_EVENT_AUTHORIZATION,
+                          granted ? AUDIT_SEVERITY_INFO : AUDIT_SEVERITY_WARNING,
+                          pid, "resource=%s result=%s",
+                          resource, granted ? "GRANTED" : "DENIED");
+}
+
+status_t audit_log_syscall(pid_t pid, uint32_t syscall_number, const char* syscall_name) {
+    if (!syscall_name) return STATUS_INVALID;
+    
+    return audit_log_event(AUDIT_EVENT_SYSCALL, AUDIT_SEVERITY_INFO, pid,
+                          "syscall=%s number=%u", syscall_name, syscall_number);
+}
+
+status_t audit_log_policy_change(const char* policy_type, const char* description) {
+    if (!policy_type || !description) return STATUS_INVALID;
+    
+    return audit_log_event(AUDIT_EVENT_POLICY_CHANGE, AUDIT_SEVERITY_WARNING, 0,
+                          "policy=%s description=%s", policy_type, description);
+}
+
+status_t audit_log_crypto_operation(pid_t pid, const char* operation, bool success) {
+    if (!operation) return STATUS_INVALID;
+    
+    return audit_log_event(AUDIT_EVENT_CRYPTO_OPERATION,
+                          success ? AUDIT_SEVERITY_INFO : AUDIT_SEVERITY_ERROR,
+                          pid, "operation=%s result=%s",
+                          operation, success ? "SUCCESS" : "FAILED");
+}
+
+status_t audit_get_entries(audit_log_entry_t* out_entries, uint32_t* in_out_count) {
+    if (!out_entries || !in_out_count) return STATUS_INVALID;
+    
+    spin_lock(&g_audit_buffer.lock);
+    
+    uint32_t available = g_audit_buffer.count;
+    uint32_t to_copy = (*in_out_count < available) ? *in_out_count : available;
+    
+    /* Copy entries from tail (oldest) to head (newest) */
+    uint32_t tail = g_audit_buffer.tail;
+    for (uint32_t i = 0; i < to_copy; i++) {
+        out_entries[i] = g_audit_buffer.entries[tail];
+        tail = (tail + 1) % AUDIT_LOG_MAX_ENTRIES;
+    }
+    
+    *in_out_count = to_copy;
+    
+    spin_unlock(&g_audit_buffer.lock);
+    return STATUS_OK;
+}
+
+static bool entry_matches_criteria(const audit_log_entry_t* entry, 
+                                  const audit_search_criteria_t* criteria) {
+    /* Time range check */
+    if (criteria->start_time > 0 && entry->timestamp < criteria->start_time) {
+        return false;
+    }
+    if (criteria->end_time > 0 && entry->timestamp > criteria->end_time) {
+        return false;
+    }
+    
+    /* Event type check */
+    if (criteria->event_type > 0 && entry->type != criteria->event_type) {
+        return false;
+    }
+    
+    /* Severity check */
+    if (entry->severity < criteria->min_severity) {
+        return false;
+    }
+    
+    /* Process ID check */
+    if (criteria->process_id > 0 && entry->process_id != criteria->process_id) {
+        return false;
+    }
+    
+    /* User ID check */
+    if (criteria->user_id != 0xFFFFFFFF && entry->user_id != criteria->user_id) {
+        return false;
+    }
+    
+    /* Process name pattern */
+    if (criteria->process_name[0] != '\0' && 
+        !k_strstr(entry->process_name, criteria->process_name)) {
+        return false;
+    }
+    
+    /* Event data pattern */
+    if (criteria->event_data_pattern[0] != '\0' &&
+        !k_strstr(entry->event_data, criteria->event_data_pattern)) {
+        return false;
+    }
+    
+    return true;
+}
+
+status_t audit_search_entries(const audit_search_criteria_t* criteria,
+                             audit_log_entry_t* out_entries, uint32_t* in_out_count) {
+    if (!criteria || !out_entries || !in_out_count) return STATUS_INVALID;
+    
+    spin_lock(&g_audit_buffer.lock);
+    
+    uint32_t found = 0;
+    uint32_t max_results = *in_out_count;
+    
+    /* Search through all entries */
+    uint32_t pos = g_audit_buffer.tail;
+    for (uint32_t i = 0; i < g_audit_buffer.count && found < max_results; i++) {
+        if (entry_matches_criteria(&g_audit_buffer.entries[pos], criteria)) {
+            out_entries[found++] = g_audit_buffer.entries[pos];
+        }
+        pos = (pos + 1) % AUDIT_LOG_MAX_ENTRIES;
+    }
+    
+    *in_out_count = found;
+    
+    spin_unlock(&g_audit_buffer.lock);
+    return STATUS_OK;
+}
+
+status_t audit_get_recent_entries(uint32_t count, audit_log_entry_t* out_entries, uint32_t* out_actual_count) {
+    if (!out_entries || !out_actual_count) return STATUS_INVALID;
+    
+    spin_lock(&g_audit_buffer.lock);
+    
+    uint32_t available = g_audit_buffer.count;
+    uint32_t to_copy = (count < available) ? count : available;
+    
+    /* Copy most recent entries (backwards from head) */
+    uint32_t head = (g_audit_buffer.head + AUDIT_LOG_MAX_ENTRIES - 1) % AUDIT_LOG_MAX_ENTRIES;
+    for (uint32_t i = 0; i < to_copy; i++) {
+        out_entries[i] = g_audit_buffer.entries[head];
+        head = (head + AUDIT_LOG_MAX_ENTRIES - 1) % AUDIT_LOG_MAX_ENTRIES;
+    }
+    
+    *out_actual_count = to_copy;
+    
+    spin_unlock(&g_audit_buffer.lock);
+    return STATUS_OK;
+}
+
+status_t audit_flush_to_disk(void) {
+    if (g_log_file_fd < 0) return STATUS_ERROR;
+    
+    /* Sync file to disk */
+    return vfs_fsync(g_log_file_fd);
+}
+
+status_t audit_rotate_log(void) {
+    if (g_log_file_fd < 0) return STATUS_ERROR;
+    
+    /* Close current log */
+    vfs_close(g_log_file_fd);
+    
+    /* Rename current log to .old */
+    char old_path[512];
+    k_snprintf(old_path, sizeof(old_path), "%s.old", g_audit_config.log_file_path);
+    vfs_rename(g_audit_config.log_file_path, old_path);
+    
+    /* Open new log file */
+    g_log_file_fd = vfs_open(g_audit_config.log_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    if (g_log_file_fd < 0) {
+        return STATUS_ERROR;
+    }
+    
+    g_audit_stats.file_rotations++;
+    g_audit_stats.last_rotation_time = timer_get_ticks();
+    g_audit_stats.current_file_size = 0;
+    
+    /* Log rotation event */
+    audit_log_event(AUDIT_EVENT_SECURITY_ALERT, AUDIT_SEVERITY_INFO, 0,
+                   "Log file rotated to %s", old_path);
+    
+    return STATUS_OK;
+}
+
+status_t audit_clear_log(void) {
+    spin_lock(&g_audit_buffer.lock);
+    
+    /* Clear ring buffer */
+    g_audit_buffer.head = 0;
+    g_audit_buffer.tail = 0;
+    g_audit_buffer.count = 0;
+    g_audit_buffer.overflow = false;
+    
+    spin_unlock(&g_audit_buffer.lock);
+    
+    /* Truncate log file */
+    if (g_log_file_fd >= 0) {
+        vfs_ftruncate(g_log_file_fd, 0);
+        g_audit_stats.current_file_size = 0;
+    }
+    
+    audit_log_event(AUDIT_EVENT_SECURITY_ALERT, AUDIT_SEVERITY_WARNING, 0,
+                   "Audit log cleared");
+    
+    return STATUS_OK;
+}
+
+status_t audit_get_statistics(audit_statistics_t* out_stats) {
+    if (!out_stats) return STATUS_INVALID;
+    
+    *out_stats = g_audit_stats;
+    out_stats->events_logged = g_audit_buffer.total_events;
+    out_stats->events_dropped = g_audit_buffer.dropped_events;
+    
+    return STATUS_OK;
+}
+
+status_t audit_reset_statistics(void) {
+    k_memset(&g_audit_stats, 0, sizeof(g_audit_stats));
+    
+    spin_lock(&g_audit_buffer.lock);
+    g_audit_buffer.total_events = 0;
+    g_audit_buffer.dropped_events = 0;
+    spin_unlock(&g_audit_buffer.lock);
+    
+    return STATUS_OK;
+}
+
+bool audit_is_buffer_full(void) {
+    return g_audit_buffer.count >= AUDIT_LOG_MAX_ENTRIES;
+}
+
+float audit_get_buffer_usage(void) {
+    return (float)g_audit_buffer.count / (float)AUDIT_LOG_MAX_ENTRIES;
+}
+
+status_t audit_verify_integrity(bool* out_valid) {
+    if (!out_valid) return STATUS_INVALID;
+    
+    *out_valid = true;
+    
+    spin_lock(&g_audit_buffer.lock);
+    
+    /* Verify checksums of all entries */
+    uint32_t pos = g_audit_buffer.tail;
+    for (uint32_t i = 0; i < g_audit_buffer.count; i++) {
+        audit_log_entry_t* entry = &g_audit_buffer.entries[pos];
+        uint32_t stored_checksum = entry->checksum;
+        entry->checksum = 0;
+        
+        uint32_t calculated = calculate_checksum(entry, sizeof(*entry) - sizeof(entry->checksum));
+        entry->checksum = stored_checksum;
+        
+        if (calculated != stored_checksum) {
+            *out_valid = false;
+            g_audit_stats.integrity_failures++;
+            break;
+        }
+        
+        pos = (pos + 1) % AUDIT_LOG_MAX_ENTRIES;
+    }
+    
+    spin_unlock(&g_audit_buffer.lock);
+    return STATUS_OK;
+}

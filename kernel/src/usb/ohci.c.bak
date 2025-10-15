@@ -1,0 +1,132 @@
+#include "usb.h"
+#include "kernel.h"
+
+/*
+ * OHCI (USB 1.1) Host Controller Driver
+ * Open Host Controller Interface for USB 1.1
+ */
+
+#include "../../../hal/include/pci.h"
+#include "../../../hal/include/hal.h"
+#include "../../include/kernel.h"
+
+/* OHCI register offsets */
+#define OHCI_REVISION       0x00
+#define OHCI_CONTROL        0x04
+#define OHCI_COMMAND_STATUS 0x08
+#define OHCI_INTERRUPT_STATUS 0x0C
+#define OHCI_INTERRUPT_ENABLE 0x10
+#define OHCI_INTERRUPT_DISABLE 0x14
+#define OHCI_HCCA           0x18
+#define OHCI_PERIODIC_ED    0x1C
+#define OHCI_CONTROL_HEAD_ED 0x20
+#define OHCI_BULK_HEAD_ED   0x24
+#define OHCI_DONE_HEAD      0x30
+#define OHCI_FM_INTERVAL    0x34
+#define OHCI_RH_DESCRIPTOR_A 0x48
+#define OHCI_RH_STATUS      0x50
+#define OHCI_RH_PORT_STATUS 0x54
+
+/* OHCI controller structure */
+typedef struct {
+    pci_device_t pci_dev;
+    void* regs;
+    uint32_t revision;
+    uint32_t n_ports;
+    bool in_use;
+} ohci_controller_t;
+
+#define MAX_OHCI_CONTROLLERS 8
+static ohci_controller_t g_ohci_controllers[MAX_OHCI_CONTROLLERS];
+static uint32_t g_ohci_controller_count = 0;
+
+/* Read OHCI register */
+static uint32_t ohci_read32(void* base, uint32_t offset) {
+    return *(volatile uint32_t*)((uintptr_t)base + offset);
+}
+
+/* Write OHCI register */
+static void ohci_write32(void* base, uint32_t offset, uint32_t value) {
+    *(volatile uint32_t*)((uintptr_t)base + offset) = value;
+}
+
+/* Initialize OHCI controller */
+static status_t ohci_init_controller(ohci_controller_t* ctrl) {
+    if (!ctrl) return STATUS_ERROR;
+    
+    /* Read revision */
+    ctrl->revision = ohci_read32(ctrl->regs, OHCI_REVISION) & 0xFF;
+    
+    /* Read root hub descriptor to get port count */
+    uint32_t rh_desc_a = ohci_read32(ctrl->regs, OHCI_RH_DESCRIPTOR_A);
+    ctrl->n_ports = rh_desc_a & 0xFF;
+    
+    KLOG_INFO("ohci", "Revision %u.%u, %u ports",
+              (ctrl->revision >> 4) & 0xF, ctrl->revision & 0xF, ctrl->n_ports);
+    
+    /* Reset controller */
+    ohci_write32(ctrl->regs, OHCI_COMMAND_STATUS, 1); /* Host Controller Reset */
+    
+    /* Wait for reset to complete */
+    uint64_t timeout = timer_get_ticks() + timer_get_freq_hz();
+    while (timer_get_ticks() < timeout) {
+        uint32_t status = ohci_read32(ctrl->regs, OHCI_COMMAND_STATUS);
+        if ((status & 1) == 0) break;
+    }
+    
+    uint32_t status = ohci_read32(ctrl->regs, OHCI_COMMAND_STATUS);
+    if (status & 1) {
+        KLOG_ERROR("ohci", "Controller reset timeout");
+        return STATUS_ERROR;
+    }
+    
+    /* Set operational state */
+    uint32_t control = ohci_read32(ctrl->regs, OHCI_CONTROL);
+    control = (control & ~0x03) | 0x02; /* USB Operational */
+    ohci_write32(ctrl->regs, OHCI_CONTROL, control);
+    
+    KLOG_INFO("ohci", "Controller initialized successfully");
+    return STATUS_OK;
+}
+
+/* PCI enumeration callback for OHCI */
+static void ohci_on_pci(const pci_device_t* dev, void* user) {
+    (void)user;
+    
+    /* Check for OHCI controller (class 0x0C, subclass 0x03, prog-if 0x10) */
+    if (dev->class_code == 0x0C && dev->subclass == 0x03 && dev->prog_if == 0x10) {
+        if (g_ohci_controller_count >= MAX_OHCI_CONTROLLERS) {
+            KLOG_WARN("ohci", "Too many OHCI controllers");
+            return;
+        }
+        
+        KLOG_INFO("ohci", "Found OHCI controller: %02x:%02x.%x vid=%04x did=%04x",
+                  dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);
+        
+        ohci_controller_t* ctrl = &g_ohci_controllers[g_ohci_controller_count];
+        ctrl->pci_dev = *dev;
+        
+        /* Map BAR0 */
+        if (dev->bar[0] == 0) {
+            KLOG_ERROR("ohci", "BAR0 not configured");
+            return;
+        }
+        
+        ctrl->regs = (void*)(dev->bar[0] & ~0x0F);
+        
+        if (ohci_init_controller(ctrl) == STATUS_OK) {
+            ctrl->in_use = true;
+            g_ohci_controller_count++;
+        }
+    }
+}
+
+void ohci_probe(void) {
+    KLOG_INFO("ohci", "Scanning for OHCI (USB 1.1) controllers...");
+    g_ohci_controller_count = 0;
+    k_memset(g_ohci_controllers, 0, sizeof(g_ohci_controllers));
+    
+    pci_enumerate(ohci_on_pci, NULL);
+    
+    KLOG_INFO("ohci", "Found %u OHCI controller(s)", g_ohci_controller_count);
+}

@@ -1,0 +1,31 @@
+#include "kernel.h"
+#include "interrupt.h"
+
+/* HAL timer interfaces */
+extern void hal_timer_init(u64* out_freq_hz);
+extern void hal_timer_set_periodic(u64 hz);
+extern u64  hal_timer_ticks(void);
+
+static u64 g_timer_hz = 1000;
+
+static void timer_isr(u64 vec, u64 err, void* ctx) {
+    (void)vec; (void)err; (void)ctx;
+    interrupt_timer_tick();
+}
+
+void timer_init(void) {
+    hal_timer_init(&g_timer_hz);
+    if (g_timer_hz == 0) g_timer_hz = 1000;
+    /* Assume HAL wires timer IRQ vector 32 (typical PIT/APIC) */
+    extern int interrupt_register(u8 vector, void (*handler)(u64,u64,void*));
+    interrupt_register(32, timer_isr);
+    hal_timer_set_periodic(g_timer_hz);
+}
+
+u64 timer_get_ticks(void) {
+    return hal_timer_ticks();
+}
+
+u64 timer_get_freq_hz(void) {
+    return g_timer_hz;
+}

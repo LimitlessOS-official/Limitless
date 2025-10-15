@@ -1,0 +1,16 @@
+#include "kernel.h"
+#include "pci.h"
+
+/* Realtek RTL8169/8168 stub */
+
+static void rtl8169_probe_cb(const pci_device_t* dev, void* user) {
+    (void)user;
+    if (dev->class_code == 0x02 && dev->subclass == 0x00) {
+        kprintf("RTL81xx NIC candidate at %02x:%02x.%x (vid=%04x did=%04x)\n",
+                dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);
+    }
+}
+
+void rtl8169_init(void) {
+    pci_enumerate(rtl8169_probe_cb, NULL);
+}

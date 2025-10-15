@@ -1,0 +1,18 @@
+#include "kernel.h"
+#include "pci.h"
+#include "net/net.h"
+
+/* Intel e1000 legacy stub (Phase 2): Discover and log only */
+
+static void e1000_probe_cb(const pci_device_t* dev, void* user) {
+    (void)user;
+    if (dev->class_code == 0x02 && dev->subclass == 0x00 && dev->prog_if == 0x00) {
+        kprintf("e1000 NIC found at %02x:%02x.%x (vid=%04x did=%04x)\n",
+                dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);
+        /* TODO: Map BARs, init RX/TX rings, register net_if_t */
+    }
+}
+
+void e1000_init(void) {
+    pci_enumerate(e1000_probe_cb, NULL);
+}

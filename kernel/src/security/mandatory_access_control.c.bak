@@ -1,0 +1,701 @@
+/*
+ * mandatory_access_control.c - LimitlessOS Mandatory Access Control (MAC)
+ * 
+ * SELinux-style mandatory access control system providing type enforcement,
+ * role-based access control, and multi-level security.
+ */
+
+#include "kernel.h"
+#include "security.h"
+#include "process.h"
+#include "vfs.h"
+#include "syscall.h"
+#include "vmm.h"
+
+#define MAC_MAX_CONTEXT_LEN     256
+#define MAC_MAX_TYPES           8192
+#define MAC_MAX_RULES           65536
+#define MAC_MAX_ROLES           256
+#define MAC_MAX_USERS           1024
+#define MAC_MAX_CATEGORIES      1024
+
+/* Security context structure */
+typedef struct security_context {
+    char user[64];                  /* SELinux user */
+    char role[64];                  /* SELinux role */
+    char type[64];                  /* SELinux type */
+    char level[128];                /* MLS level (s0-s15:c0.c1023) */
+    
+    /* Cached IDs for performance */
+    uint32_t user_id;
+    uint32_t role_id;
+    uint32_t type_id;
+    uint32_t level_id;
+    
+} security_context_t;
+
+/* Access vector permissions */
+#define MAC_PERM_READ           0x00000001
+#define MAC_PERM_WRITE          0x00000002
+#define MAC_PERM_EXECUTE        0x00000004
+#define MAC_PERM_DELETE         0x00000008
+#define MAC_PERM_APPEND         0x00000010
+#define MAC_PERM_CREATE         0x00000020
+#define MAC_PERM_RENAME         0x00000040
+#define MAC_PERM_SETATTR        0x00000080
+#define MAC_PERM_GETATTR        0x00000100
+#define MAC_PERM_SEARCH         0x00000200
+#define MAC_PERM_LINK           0x00000400
+#define MAC_PERM_UNLINK         0x00000800
+#define MAC_PERM_IOCTL          0x00001000
+#define MAC_PERM_LOCK           0x00002000
+#define MAC_PERM_SEND           0x00004000
+#define MAC_PERM_RECV           0x00008000
+#define MAC_PERM_BIND           0x00010000
+#define MAC_PERM_CONNECT        0x00020000
+#define MAC_PERM_LISTEN         0x00040000
+#define MAC_PERM_ACCEPT         0x00080000
+#define MAC_PERM_SIGNAL         0x00100000
+#define MAC_PERM_TRANSITION     0x00200000
+#define MAC_PERM_ENTRYPOINT     0x00400000
+
+/* Object classes */
+#define MAC_CLASS_FILE          1
+#define MAC_CLASS_DIR           2
+#define MAC_CLASS_PROCESS       3
+#define MAC_CLASS_SOCKET        4
+#define MAC_CLASS_CAPABILITY    5
+#define MAC_CLASS_SYSTEM        6
+#define MAC_CLASS_DEVICE        7
+
+/* Access vector */
+typedef struct access_vector {
+    uint32_t source_type;           /* Source type ID */
+    uint32_t target_type;           /* Target type ID */
+    uint32_t object_class;          /* Object class */
+    uint32_t permissions;           /* Allowed permissions */
+    
+} access_vector_t;
+
+/* Type enforcement rule */
+typedef struct te_rule {
+    uint32_t source_type;           /* Source type */
+    uint32_t target_type;           /* Target type */
+    uint32_t object_class;          /* Object class */
+    uint32_t permissions;           /* Permissions */
+    uint32_t flags;                 /* Rule flags */
+    
+    struct list_head list;
+    
+} te_rule_t;
+
+/* Role transition rule */
+typedef struct role_transition {
+    uint32_t source_role;           /* Source role */
+    uint32_t target_type;           /* Target type */
+    uint32_t object_class;          /* Object class */
+    uint32_t default_role;          /* Default role */
+    
+    struct list_head list;
+    
+} role_transition_t;
+
+/* MLS level */
+typedef struct mls_level {
+    uint32_t sensitivity;           /* Sensitivity level (s0-s15) */
+    uint32_t categories[32];        /* Category bitmap (c0-c1023) */
+    
+} mls_level_t;
+
+/* Security identifier (SID) */
+typedef struct security_id {
+    uint32_t id;                    /* Unique SID */
+    security_context_t context;     /* Security context */
+    mls_level_t level;              /* MLS level */
+    
+    atomic_t refcount;
+    struct list_head list;
+    
+} security_id_t;
+
+/* MAC policy database */
+typedef struct mac_policy {
+    bool enforcing;                 /* Enforcement mode */
+    bool mls_enabled;               /* MLS enabled */
+    
+    /* Type enforcement */
+    te_rule_t* te_rules;            /* TE rules array */
+    uint32_t num_te_rules;
+    struct list_head te_rule_list;
+    
+    /* Role transitions */
+    struct list_head role_transitions;
+    uint32_t num_role_transitions;
+    
+    /* Security identifiers */
+    struct list_head sids;          /* All SIDs */
+    spinlock_t sid_lock;
+    uint32_t next_sid;
+    
+    /* Type/role/user mappings */
+    char* type_names[MAC_MAX_TYPES];
+    char* role_names[MAC_MAX_ROLES];
+    char* user_names[MAC_MAX_USERS];
+    
+    /* Statistics */
+    atomic64_t access_checks;       /* Total access checks */
+    atomic64_t access_grants;       /* Granted accesses */
+    atomic64_t access_denials;      /* Denied accesses */
+    atomic64_t avc_misses;          /* AVC cache misses */
+    
+    spinlock_t lock;
+    
+} mac_policy_t;
+
+/* Access Vector Cache (AVC) */
+#define AVC_CACHE_SIZE          1024
+
+typedef struct avc_entry {
+    uint32_t source_sid;            /* Source SID */
+    uint32_t target_sid;            /* Target SID */
+    uint32_t object_class;          /* Object class */
+    uint32_t permissions;           /* Cached permissions */
+    uint64_t timestamp;             /* Cache timestamp */
+    
+    struct list_head hash_list;
+    
+} avc_entry_t;
+
+typedef struct avc_cache {
+    struct list_head buckets[AVC_CACHE_SIZE];
+    spinlock_t locks[AVC_CACHE_SIZE];
+    atomic64_t hits;
+    atomic64_t misses;
+    
+} avc_cache_t;
+
+/* Global MAC state */
+static struct {
+    bool initialized;
+    mac_policy_t policy;
+    avc_cache_t avc;
+    
+    /* Default SIDs */
+    security_id_t* kernel_sid;      /* Kernel SID */
+    security_id_t* init_sid;        /* Init process SID */
+    security_id_t* unlabeled_sid;   /* Unlabeled objects */
+    
+} g_mac_system = {0};
+
+/* Function prototypes */
+static security_id_t* mac_get_sid(const security_context_t* context);
+static int mac_check_access(uint32_t source_sid, uint32_t target_sid, 
+                           uint32_t object_class, uint32_t permissions);
+static uint32_t mac_compute_av(uint32_t source_sid, uint32_t target_sid, uint32_t object_class);
+static int mac_parse_context(const char* context_str, security_context_t* context);
+static int mac_validate_transition(uint32_t old_sid, uint32_t new_sid, uint32_t object_class);
+
+/* Initialize MAC system */
+int mac_init(void) {
+    if (g_mac_system.initialized) {
+        return 0;
+    }
+    
+    printf("Initializing Mandatory Access Control (MAC) system\n");
+    
+    memset(&g_mac_system, 0, sizeof(g_mac_system));
+    
+    mac_policy_t* policy = &g_mac_system.policy;
+    
+    /* Initialize policy */
+    policy->enforcing = false;      /* Start in permissive mode */
+    policy->mls_enabled = true;
+    
+    INIT_LIST_HEAD(&policy->te_rule_list);
+    INIT_LIST_HEAD(&policy->role_transitions);
+    INIT_LIST_HEAD(&policy->sids);
+    spinlock_init(&policy->sid_lock);
+    spinlock_init(&policy->lock);
+    policy->next_sid = 1;
+    
+    /* Initialize AVC cache */
+    avc_cache_t* avc = &g_mac_system.avc;
+    for (int i = 0; i < AVC_CACHE_SIZE; i++) {
+        INIT_LIST_HEAD(&avc->buckets[i]);
+        spinlock_init(&avc->locks[i]);
+    }
+    
+    /* Create default SIDs */
+    security_context_t kernel_context = {
+        .user = "system_u",
+        .role = "system_r", 
+        .type = "kernel_t",
+        .level = "s15:c0.c1023"
+    };
+    g_mac_system.kernel_sid = mac_get_sid(&kernel_context);
+    
+    security_context_t init_context = {
+        .user = "system_u",
+        .role = "system_r",
+        .type = "init_t", 
+        .level = "s0"
+    };
+    g_mac_system.init_sid = mac_get_sid(&init_context);
+    
+    security_context_t unlabeled_context = {
+        .user = "system_u",
+        .role = "object_r",
+        .type = "unlabeled_t",
+        .level = "s0"
+    };
+    g_mac_system.unlabeled_sid = mac_get_sid(&unlabeled_context);
+    
+    /* Initialize default types */
+    policy->type_names[1] = "kernel_t";
+    policy->type_names[2] = "init_t";
+    policy->type_names[3] = "unlabeled_t";
+    policy->type_names[4] = "user_t";
+    policy->type_names[5] = "admin_t";
+    policy->type_names[6] = "file_t";
+    policy->type_names[7] = "device_t";
+    policy->type_names[8] = "tmp_t";
+    
+    /* Initialize default roles */
+    policy->role_names[1] = "system_r";
+    policy->role_names[2] = "object_r";
+    policy->role_names[3] = "user_r";
+    policy->role_names[4] = "admin_r";
+    
+    /* Initialize default users */
+    policy->user_names[1] = "system_u";
+    policy->user_names[2] = "user_u";
+    policy->user_names[3] = "admin_u";
+    
+    /* Load basic TE rules */
+    mac_load_default_policy();
+    
+    g_mac_system.initialized = true;
+    
+    printf("MAC system initialized (enforcing=%s, mls=%s)\n", 
+           policy->enforcing ? "true" : "false",
+           policy->mls_enabled ? "true" : "false");
+    
+    return 0;
+}
+
+/* Load default policy rules */
+void mac_load_default_policy(void) {
+    mac_policy_t* policy = &g_mac_system.policy;
+    
+    /* Allow kernel to do everything */
+    mac_add_te_rule(1, 0, 0, 0xFFFFFFFF); /* kernel_t -> all */
+    
+    /* Allow init basic permissions */
+    mac_add_te_rule(2, 6, MAC_CLASS_FILE, MAC_PERM_READ | MAC_PERM_WRITE | MAC_PERM_EXECUTE);
+    mac_add_te_rule(2, 2, MAC_CLASS_PROCESS, MAC_PERM_TRANSITION);
+    
+    /* Allow user processes basic file access */
+    mac_add_te_rule(4, 6, MAC_CLASS_FILE, MAC_PERM_READ | MAC_PERM_EXECUTE);
+    mac_add_te_rule(4, 8, MAC_CLASS_FILE, MAC_PERM_READ | MAC_PERM_WRITE | MAC_PERM_CREATE);
+    
+    /* Allow admin processes more permissions */
+    mac_add_te_rule(5, 0, 0, 0xFFFFFFF0); /* admin_t -> most things */
+    
+    printf("MAC: Loaded default policy with %u TE rules\n", policy->num_te_rules);
+}
+
+/* Add Type Enforcement rule */
+int mac_add_te_rule(uint32_t source_type, uint32_t target_type, 
+                    uint32_t object_class, uint32_t permissions) {
+    
+    mac_policy_t* policy = &g_mac_system.policy;
+    
+    if (policy->num_te_rules >= MAC_MAX_RULES) {
+        return -ENOSPC;
+    }
+    
+    te_rule_t* rule = (te_rule_t*)vmm_kmalloc(sizeof(te_rule_t), 32);
+    if (!rule) {
+        return -ENOMEM;
+    }
+    
+    rule->source_type = source_type;
+    rule->target_type = target_type;
+    rule->object_class = object_class;
+    rule->permissions = permissions;
+    rule->flags = 0;
+    
+    spin_lock(&policy->lock);
+    list_add(&rule->list, &policy->te_rule_list);
+    policy->num_te_rules++;
+    spin_unlock(&policy->lock);
+    
+    return 0;
+}
+
+/* Get or create SID */
+static security_id_t* mac_get_sid(const security_context_t* context) {
+    if (!context) {
+        return g_mac_system.unlabeled_sid;
+    }
+    
+    mac_policy_t* policy = &g_mac_system.policy;
+    
+    spin_lock(&policy->sid_lock);
+    
+    /* Search for existing SID */
+    security_id_t* sid;
+    list_for_each_entry(sid, &policy->sids, list) {
+        if (strcmp(sid->context.user, context->user) == 0 &&
+            strcmp(sid->context.role, context->role) == 0 &&
+            strcmp(sid->context.type, context->type) == 0 &&
+            strcmp(sid->context.level, context->level) == 0) {
+            
+            atomic_inc(&sid->refcount);
+            spin_unlock(&policy->sid_lock);
+            return sid;
+        }
+    }
+    
+    /* Create new SID */
+    sid = (security_id_t*)vmm_kmalloc(sizeof(security_id_t), 32);
+    if (!sid) {
+        spin_unlock(&policy->sid_lock);
+        return g_mac_system.unlabeled_sid;
+    }
+    
+    memset(sid, 0, sizeof(security_id_t));
+    
+    sid->id = policy->next_sid++;
+    memcpy(&sid->context, context, sizeof(security_context_t));
+    atomic_set(&sid->refcount, 1);
+    
+    /* Parse MLS level */
+    mac_parse_mls_level(context->level, &sid->level);
+    
+    /* Cache type/role/user IDs */
+    sid->context.type_id = mac_lookup_type_id(context->type);
+    sid->context.role_id = mac_lookup_role_id(context->role);
+    sid->context.user_id = mac_lookup_user_id(context->user);
+    
+    list_add(&sid->list, &policy->sids);
+    
+    spin_unlock(&policy->sid_lock);
+    
+    return sid;
+}
+
+/* Parse MLS level */
+int mac_parse_mls_level(const char* level_str, mls_level_t* level) {
+    if (!level_str || !level) {
+        return -EINVAL;
+    }
+    
+    memset(level, 0, sizeof(mls_level_t));
+    
+    /* Parse format: s0-s15[:c0.c1023] */
+    if (strncmp(level_str, "s", 1) != 0) {
+        return -EINVAL;
+    }
+    
+    /* Extract sensitivity level */
+    level->sensitivity = level_str[1] - '0';
+    if (level->sensitivity > 15) {
+        level->sensitivity = 0;
+    }
+    
+    /* Parse categories if present */
+    const char* colon = strchr(level_str, ':');
+    if (colon) {
+        colon++; /* Skip ':' */
+        
+        if (strncmp(colon, "c", 1) == 0) {
+            /* Parse category range: c0.c1023 */
+            int start_cat = 0, end_cat = 0;
+            
+            if (sscanf(colon, "c%d.c%d", &start_cat, &end_cat) == 2) {
+                for (int cat = start_cat; cat <= end_cat && cat < MAC_MAX_CATEGORIES; cat++) {
+                    int word = cat / 32;
+                    int bit = cat % 32;
+                    if (word < 32) {
+                        level->categories[word] |= (1U << bit);
+                    }
+                }
+            }
+        }
+    }
+    
+    return 0;
+}
+
+/* Check MLS constraints */
+bool mac_mls_check(const mls_level_t* source, const mls_level_t* target, uint32_t permissions) {
+    if (!g_mac_system.policy.mls_enabled) {
+        return true;
+    }
+    
+    /* Read operations: source dominates target */
+    if (permissions & (MAC_PERM_READ | MAC_PERM_GETATTR | MAC_PERM_SEARCH)) {
+        if (source->sensitivity < target->sensitivity) {
+            return false;
+        }
+        
+        /* Check categories: source must have all target categories */
+        for (int i = 0; i < 32; i++) {
+            if ((target->categories[i] & source->categories[i]) != target->categories[i]) {
+                return false;
+            }
+        }
+    }
+    
+    /* Write operations: target dominates source */
+    if (permissions & (MAC_PERM_WRITE | MAC_PERM_APPEND | MAC_PERM_CREATE)) {
+        if (target->sensitivity < source->sensitivity) {
+            return false;
+        }
+        
+        /* Check categories: target must have all source categories */
+        for (int i = 0; i < 32; i++) {
+            if ((source->categories[i] & target->categories[i]) != source->categories[i]) {
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+/* Compute access vector */
+static uint32_t mac_compute_av(uint32_t source_sid, uint32_t target_sid, uint32_t object_class) {
+    mac_policy_t* policy = &g_mac_system.policy;
+    uint32_t allowed = 0;
+    
+    /* Find source and target SIDs */
+    security_id_t *source = NULL, *target = NULL;
+    
+    list_for_each_entry(source, &policy->sids, list) {
+        if (source->id == source_sid) break;
+    }
+    
+    list_for_each_entry(target, &policy->sids, list) {
+        if (target->id == target_sid) break;
+    }
+    
+    if (!source || !target) {
+        return 0;
+    }
+    
+    /* Check TE rules */
+    te_rule_t* rule;
+    list_for_each_entry(rule, &policy->te_rule_list, list) {
+        if ((rule->source_type == 0 || rule->source_type == source->context.type_id) &&
+            (rule->target_type == 0 || rule->target_type == target->context.type_id) &&
+            (rule->object_class == 0 || rule->object_class == object_class)) {
+            
+            allowed |= rule->permissions;
+        }
+    }
+    
+    return allowed;
+}
+
+/* AVC cache operations */
+static uint32_t avc_hash(uint32_t source_sid, uint32_t target_sid, uint32_t object_class) {
+    return (source_sid ^ target_sid ^ object_class) % AVC_CACHE_SIZE;
+}
+
+static uint32_t avc_lookup(uint32_t source_sid, uint32_t target_sid, uint32_t object_class) {
+    avc_cache_t* avc = &g_mac_system.avc;
+    uint32_t hash = avc_hash(source_sid, target_sid, object_class);
+    uint64_t now = timer_get_ticks();
+    
+    spin_lock(&avc->locks[hash]);
+    
+    avc_entry_t* entry;
+    list_for_each_entry(entry, &avc->buckets[hash], hash_list) {
+        if (entry->source_sid == source_sid &&
+            entry->target_sid == target_sid &&
+            entry->object_class == object_class &&
+            (now - entry->timestamp) < 1000) { /* 1 second TTL */
+            
+            uint32_t permissions = entry->permissions;
+            spin_unlock(&avc->locks[hash]);
+            
+            atomic64_inc(&avc->hits);
+            return permissions;
+        }
+    }
+    
+    spin_unlock(&avc->locks[hash]);
+    
+    atomic64_inc(&avc->misses);
+    return 0xFFFFFFFF; /* Cache miss */
+}
+
+static void avc_insert(uint32_t source_sid, uint32_t target_sid, 
+                       uint32_t object_class, uint32_t permissions) {
+    
+    avc_cache_t* avc = &g_mac_system.avc;
+    uint32_t hash = avc_hash(source_sid, target_sid, object_class);
+    
+    avc_entry_t* entry = (avc_entry_t*)vmm_kmalloc(sizeof(avc_entry_t), 32);
+    if (!entry) {
+        return;
+    }
+    
+    entry->source_sid = source_sid;
+    entry->target_sid = target_sid;
+    entry->object_class = object_class;
+    entry->permissions = permissions;
+    entry->timestamp = timer_get_ticks();
+    
+    spin_lock(&avc->locks[hash]);
+    list_add(&entry->hash_list, &avc->buckets[hash]);
+    spin_unlock(&avc->locks[hash]);
+}
+
+/* Main access check function */
+static int mac_check_access(uint32_t source_sid, uint32_t target_sid, 
+                           uint32_t object_class, uint32_t permissions) {
+    
+    mac_policy_t* policy = &g_mac_system.policy;
+    
+    atomic64_inc(&policy->access_checks);
+    
+    /* Check AVC cache first */
+    uint32_t cached_perms = avc_lookup(source_sid, target_sid, object_class);
+    uint32_t allowed;
+    
+    if (cached_perms != 0xFFFFFFFF) {
+        allowed = cached_perms;
+    } else {
+        /* Compute permissions */
+        allowed = mac_compute_av(source_sid, target_sid, object_class);
+        
+        /* Cache result */
+        avc_insert(source_sid, target_sid, object_class, allowed);
+        
+        atomic64_inc(&policy->avc_misses);
+    }
+    
+    /* Check if requested permissions are allowed */
+    if ((permissions & allowed) != permissions) {
+        atomic64_inc(&policy->access_denials);
+        
+        if (policy->enforcing) {
+            return -EACCES;
+        } else {
+            /* Permissive mode - log but allow */
+            printf("MAC: Permissive denial: SID %u -> SID %u class %u perm 0x%x\n",
+                   source_sid, target_sid, object_class, permissions);
+        }
+    }
+    
+    atomic64_inc(&policy->access_grants);
+    return 0;
+}
+
+/* Public MAC interfaces */
+int mac_file_permission(struct inode* inode, int mask) {
+    if (!current_process || !current_process->security_context) {
+        return 0;
+    }
+    
+    uint32_t source_sid = ((security_id_t*)current_process->security_context)->id;
+    uint32_t target_sid = inode->security_id ? ((security_id_t*)inode->security_id)->id : 
+                         g_mac_system.unlabeled_sid->id;
+    
+    uint32_t permissions = 0;
+    if (mask & MAY_READ) permissions |= MAC_PERM_READ;
+    if (mask & MAY_WRITE) permissions |= MAC_PERM_WRITE;
+    if (mask & MAY_EXEC) permissions |= MAC_PERM_EXECUTE;
+    
+    uint32_t object_class = S_ISDIR(inode->i_mode) ? MAC_CLASS_DIR : MAC_CLASS_FILE;
+    
+    return mac_check_access(source_sid, target_sid, object_class, permissions);
+}
+
+int mac_process_signal(struct task_struct* target, int sig) {
+    if (!current_process || !current_process->security_context ||
+        !target || !target->security_context) {
+        return 0;
+    }
+    
+    uint32_t source_sid = ((security_id_t*)current_process->security_context)->id;
+    uint32_t target_sid = ((security_id_t*)target->security_context)->id;
+    
+    return mac_check_access(source_sid, target_sid, MAC_CLASS_PROCESS, MAC_PERM_SIGNAL);
+}
+
+int mac_socket_permission(struct socket* sock, int operation) {
+    if (!current_process || !current_process->security_context) {
+        return 0;
+    }
+    
+    uint32_t source_sid = ((security_id_t*)current_process->security_context)->id;
+    uint32_t target_sid = sock->security_id ? ((security_id_t*)sock->security_id)->id :
+                         g_mac_system.unlabeled_sid->id;
+    
+    uint32_t permissions = 0;
+    switch (operation) {
+        case 1: permissions = MAC_PERM_CREATE; break;
+        case 2: permissions = MAC_PERM_BIND; break;
+        case 3: permissions = MAC_PERM_CONNECT; break;
+        case 4: permissions = MAC_PERM_LISTEN; break;
+        case 5: permissions = MAC_PERM_ACCEPT; break;
+        case 6: permissions = MAC_PERM_SEND; break;
+        case 7: permissions = MAC_PERM_RECV; break;
+        default: return 0;
+    }
+    
+    return mac_check_access(source_sid, target_sid, MAC_CLASS_SOCKET, permissions);
+}
+
+/* Set enforcement mode */
+int mac_set_enforcing(bool enforcing) {
+    if (!capable(CAP_MAC_ADMIN)) {
+        return -EPERM;
+    }
+    
+    g_mac_system.policy.enforcing = enforcing;
+    
+    printf("MAC: Enforcement mode %s\n", enforcing ? "enabled" : "disabled");
+    return 0;
+}
+
+/* Get MAC statistics */
+void mac_get_stats(struct mac_stats* stats) {
+    if (!stats) return;
+    
+    mac_policy_t* policy = &g_mac_system.policy;
+    avc_cache_t* avc = &g_mac_system.avc;
+    
+    memset(stats, 0, sizeof(struct mac_stats));
+    
+    stats->access_checks = atomic64_read(&policy->access_checks);
+    stats->access_grants = atomic64_read(&policy->access_grants);
+    stats->access_denials = atomic64_read(&policy->access_denials);
+    stats->avc_hits = atomic64_read(&avc->hits);
+    stats->avc_misses = atomic64_read(&avc->misses);
+    stats->enforcing = policy->enforcing;
+    stats->mls_enabled = policy->mls_enabled;
+    stats->num_sids = 0; /* Count SIDs */
+    stats->num_te_rules = policy->num_te_rules;
+}
+
+/* Debug output */
+void mac_dump_stats(void) {
+    struct mac_stats stats;
+    mac_get_stats(&stats);
+    
+    printf("MAC Statistics:\n");
+    printf("  Access checks: %lu\n", stats.access_checks);
+    printf("  Access grants: %lu\n", stats.access_grants);
+    printf("  Access denials: %lu\n", stats.access_denials);
+    printf("  AVC hits: %lu\n", stats.avc_hits);
+    printf("  AVC misses: %lu\n", stats.avc_misses);
+    printf("  Enforcing: %s\n", stats.enforcing ? "yes" : "no");
+    printf("  MLS enabled: %s\n", stats.mls_enabled ? "yes" : "no");
+    printf("  SIDs: %u\n", stats.num_sids);
+    printf("  TE rules: %u\n", stats.num_te_rules);
+}

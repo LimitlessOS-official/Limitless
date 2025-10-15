@@ -1,0 +1,926 @@
+/*
+ * LimitlessOS Extended Kernel Core
+ * Comprehensive kernel subsystems with advanced IPC, module management, and device framework
+ */
+
+#include "kernel.h"
+#include "hal.h"
+
+/* Status codes and logging */
+#define KLOG_INFO(subsys, fmt, ...) kprintf("[INFO:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_DEBUG(subsys, fmt, ...) kprintf("[DEBUG:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_WARN(subsys, fmt, ...) kprintf("[WARN:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+#define KLOG_ERROR(subsys, fmt, ...) kprintf("[ERROR:%s] " fmt "\n", subsys, ##__VA_ARGS__)
+
+/* Use kernel memory functions */
+#define memcpy k_memcpy
+#define memset k_memset
+#define memcmp k_memcmp
+
+/* Advanced IPC Types */
+#define IPC_TYPE_PIPE           1
+#define IPC_TYPE_FIFO           2
+#define IPC_TYPE_SOCKET         3
+#define IPC_TYPE_SHMEM          4
+#define IPC_TYPE_SEMAPHORE      5
+#define IPC_TYPE_MUTEX          6
+#define IPC_TYPE_CONDVAR        7
+#define IPC_TYPE_EVENTFD        8
+#define IPC_TYPE_SIGNALFD       9
+#define IPC_TYPE_TIMERFD        10
+#define IPC_TYPE_EPOLL          11
+#define IPC_TYPE_KQUEUE         12
+
+/* Kernel Module Types */
+#define MODULE_TYPE_DRIVER      1
+#define MODULE_TYPE_FILESYSTEM  2
+#define MODULE_TYPE_NETWORK     3
+#define MODULE_TYPE_SECURITY    4
+#define MODULE_TYPE_CODEC       5
+#define MODULE_TYPE_CRYPTO      6
+#define MODULE_TYPE_VIRTUALIZATION 7
+
+/* Device Classes */
+#define DEVICE_CLASS_STORAGE    1
+#define DEVICE_CLASS_NETWORK    2
+#define DEVICE_CLASS_GRAPHICS   3
+#define DEVICE_CLASS_AUDIO      4
+#define DEVICE_CLASS_INPUT      5
+#define DEVICE_CLASS_USB        6
+#define DEVICE_CLASS_PCI        7
+#define DEVICE_CLASS_ACPI       8
+#define DEVICE_CLASS_THERMAL    9
+#define DEVICE_CLASS_POWER      10
+
+/* Maximum limits */
+#define MAX_IPC_OBJECTS         4096
+#define MAX_KERNEL_MODULES      512
+#define MAX_DEVICE_OBJECTS      2048
+#define MAX_INTERRUPT_HANDLERS  256
+#define MAX_MEMORY_POOLS        64
+#define MAX_SYSTEM_CALLS        512
+
+/* IPC Object */
+typedef struct ipc_object {
+    uint32_t id;                    /* IPC object ID */
+    uint32_t type;                  /* IPC type */
+    char name[64];                  /* Object name */
+    
+    /* Access control */
+    uint32_t owner_pid;             /* Owner process */
+    uint32_t permissions;           /* Access permissions */
+    uint32_t ref_count;             /* Reference count */
+    
+    /* Type-specific data */
+    union {
+        struct {
+            void* buffer;           /* Pipe buffer */
+            uint32_t size;          /* Buffer size */
+            uint32_t read_pos;      /* Read position */
+            uint32_t write_pos;     /* Write position */
+            bool blocking;          /* Blocking mode */
+        } pipe;
+        
+        struct {
+            void* base_addr;        /* Shared memory base */
+            uint32_t size;          /* Memory size */
+            uint32_t flags;         /* Mapping flags */
+            uint32_t attached_count; /* Attached processes */
+        } shmem;
+        
+        struct {
+            uint32_t value;         /* Semaphore value */
+            uint32_t max_value;     /* Maximum value */
+            uint32_t waiting_count; /* Waiting processes */
+        } semaphore;
+        
+        struct {
+            bool locked;            /* Mutex state */
+            uint32_t owner_tid;     /* Owner thread */
+            uint32_t recursion;     /* Recursion count */
+            uint32_t waiting_count; /* Waiting threads */
+        } mutex;
+        
+        struct {
+            uint64_t counter;       /* Event counter */
+            bool semaphore_mode;    /* Semaphore semantics */
+        } eventfd;
+        
+        struct {
+            uint32_t max_events;    /* Maximum events */
+            uint32_t event_count;   /* Current events */
+            void* event_list;       /* Event list */
+        } epoll;
+    } data;
+    
+    /* Statistics */
+    uint64_t operations;            /* Total operations */
+    uint64_t bytes_transferred;     /* Bytes transferred */
+    uint64_t creation_time;         /* Creation timestamp */
+    uint64_t last_access;           /* Last access time */
+    
+    /* Synchronization */
+    volatile uint32_t lock;         /* Object lock */
+    
+    struct ipc_object* next;        /* Next in list */
+} ipc_object_t;
+
+/* Kernel Module */
+typedef struct kernel_module {
+    uint32_t id;                    /* Module ID */
+    uint32_t type;                  /* Module type */
+    char name[64];                  /* Module name */
+    char version[16];               /* Module version */
+    char author[64];                /* Module author */
+    char description[256];          /* Module description */
+    
+    /* Module binary */
+    void* base_addr;                /* Module base address */
+    uint32_t size;                  /* Module size */
+    void* entry_point;              /* Entry point */
+    
+    /* Module interface */
+    status_t (*init_func)(void);    /* Initialization function */
+    void (*cleanup_func)(void);     /* Cleanup function */
+    void (*update_func)(void);      /* Update function */
+    
+    /* Dependencies */
+    char dependencies[16][32];      /* Required modules */
+    uint32_t dependency_count;      /* Dependency count */
+    
+    /* State */
+    uint32_t state;                 /* Module state */
+    uint32_t load_order;            /* Load order */
+    uint64_t load_time;             /* Load timestamp */
+    
+    /* Resources */
+    uint32_t memory_usage;          /* Memory usage */
+    uint32_t cpu_usage;             /* CPU usage percentage */
+    
+    /* Statistics */
+    uint64_t function_calls;        /* Function calls */
+    uint64_t interrupts_handled;    /* Interrupts handled */
+    uint64_t errors;                /* Error count */
+    
+    struct kernel_module* next;     /* Next module */
+} kernel_module_t;
+
+/* Device Object */
+typedef struct device_object {
+    uint32_t id;                    /* Device ID */
+    uint32_t class;                 /* Device class */
+    char name[64];                  /* Device name */
+    char vendor[32];                /* Vendor name */
+    char model[64];                 /* Device model */
+    
+    /* Hardware information */
+    uint32_t vendor_id;             /* Vendor ID */
+    uint32_t device_id;             /* Device ID */
+    uint32_t revision;              /* Device revision */
+    uint32_t subsystem_id;          /* Subsystem ID */
+    
+    /* Physical location */
+    uint32_t bus_type;              /* Bus type (PCI, USB, etc.) */
+    uint32_t bus_number;            /* Bus number */
+    uint32_t slot_number;           /* Slot number */
+    uint32_t function_number;       /* Function number */
+    
+    /* Resources */
+    struct {
+        uint64_t base;              /* Base address */
+        uint32_t size;              /* Resource size */
+        uint32_t type;              /* Resource type */
+        uint32_t flags;             /* Resource flags */
+    } resources[8];
+    uint32_t resource_count;        /* Number of resources */
+    
+    /* Interrupts */
+    uint32_t irq_line;              /* IRQ line */
+    uint32_t irq_vector;            /* IRQ vector */
+    void (*irq_handler)(void*);     /* IRQ handler */
+    void* irq_context;              /* Handler context */
+    
+    /* Driver interface */
+    kernel_module_t* driver;        /* Associated driver */
+    void* driver_context;           /* Driver private data */
+    
+    /* Device operations */
+    status_t (*probe)(struct device_object* dev);
+    status_t (*remove)(struct device_object* dev);
+    status_t (*suspend)(struct device_object* dev);
+    status_t (*resume)(struct device_object* dev);
+    status_t (*reset)(struct device_object* dev);
+    
+    /* Power management */
+    uint32_t power_state;           /* Current power state */
+    uint32_t supported_states;      /* Supported power states */
+    
+    /* Statistics */
+    uint64_t operations;            /* Device operations */
+    uint64_t errors;                /* Error count */
+    uint64_t interrupts;            /* Interrupt count */
+    uint64_t bytes_transferred;     /* Data transferred */
+    
+    /* Synchronization */
+    volatile uint32_t lock;         /* Device lock */
+    
+    struct device_object* next;     /* Next device */
+} device_object_t;
+
+/* Interrupt Handler */
+typedef struct interrupt_handler {
+    uint32_t vector;                /* Interrupt vector */
+    uint32_t priority;              /* Handler priority */
+    void (*handler)(uint32_t vector, void* context);
+    void* context;                  /* Handler context */
+    
+    /* Statistics */
+    uint64_t call_count;            /* Handler call count */
+    uint64_t total_time_ns;         /* Total handling time */
+    uint64_t max_time_ns;           /* Maximum handling time */
+    
+    struct interrupt_handler* next; /* Next handler */
+} interrupt_handler_t;
+
+/* Memory Pool */
+typedef struct memory_pool {
+    uint32_t id;                    /* Pool ID */
+    char name[32];                  /* Pool name */
+    
+    /* Pool configuration */
+    uint32_t block_size;            /* Block size */
+    uint32_t block_count;           /* Total blocks */
+    uint32_t free_blocks;           /* Free blocks */
+    
+    /* Memory layout */
+    void* base_addr;                /* Base address */
+    uint32_t total_size;            /* Total pool size */
+    uint8_t* free_bitmap;           /* Free block bitmap */
+    
+    /* Allocation tracking */
+    uint32_t allocated_blocks;      /* Allocated blocks */
+    uint32_t peak_usage;            /* Peak usage */
+    
+    /* Statistics */
+    uint64_t allocations;           /* Total allocations */
+    uint64_t deallocations;         /* Total deallocations */
+    uint64_t allocation_failures;   /* Failed allocations */
+    
+    /* Synchronization */
+    volatile uint32_t lock;         /* Pool lock */
+    
+    struct memory_pool* next;       /* Next pool */
+} memory_pool_t;
+
+/* System Call Entry */
+typedef struct syscall_entry {
+    uint32_t number;                /* System call number */
+    char name[32];                  /* System call name */
+    void* handler;                  /* Handler function */
+    uint32_t param_count;           /* Parameter count */
+    
+    /* Access control */
+    uint32_t required_capability;   /* Required capability */
+    bool privileged;                /* Privileged call */
+    
+    /* Statistics */
+    uint64_t call_count;            /* Call count */
+    uint64_t total_time_ns;         /* Total execution time */
+    uint64_t errors;                /* Error count */
+} syscall_entry_t;
+
+/* Kernel Debugging Support */
+typedef struct debug_context {
+    bool debugging_enabled;         /* Debugging enabled */
+    uint32_t debug_level;           /* Debug verbosity level */
+    
+    /* Breakpoints */
+    struct {
+        uint64_t address;           /* Breakpoint address */
+        bool enabled;               /* Breakpoint enabled */
+        uint32_t hit_count;         /* Hit count */
+    } breakpoints[64];
+    uint32_t breakpoint_count;      /* Active breakpoints */
+    
+    /* Kernel profiling */
+    struct {
+        uint64_t function_addr;     /* Function address */
+        char name[64];              /* Function name */
+        uint64_t call_count;        /* Call count */
+        uint64_t total_time_ns;     /* Total execution time */
+    } profile_data[256];
+    uint32_t profile_count;         /* Profiled functions */
+    
+    /* Memory tracking */
+    struct {
+        void* address;              /* Allocated address */
+        uint32_t size;              /* Allocation size */
+        const char* file;           /* Source file */
+        uint32_t line;              /* Source line */
+        uint64_t timestamp;         /* Allocation time */
+    } allocations[1024];
+    uint32_t allocation_count;      /* Tracked allocations */
+} debug_context_t;
+
+/* Global kernel state */
+static struct {
+    /* IPC subsystem */
+    ipc_object_t* ipc_objects;      /* IPC object list */
+    uint32_t ipc_count;             /* IPC object count */
+    
+    /* Module subsystem */
+    kernel_module_t* modules;       /* Module list */
+    uint32_t module_count;          /* Module count */
+    
+    /* Device subsystem */
+    device_object_t* devices;       /* Device list */
+    uint32_t device_count;          /* Device count */
+    
+    /* Interrupt subsystem */
+    interrupt_handler_t* interrupt_handlers[MAX_INTERRUPT_HANDLERS];
+    uint32_t handler_count;         /* Handler count */
+    
+    /* Memory subsystem */
+    memory_pool_t* memory_pools;    /* Memory pool list */
+    uint32_t pool_count;            /* Pool count */
+    
+    /* System call subsystem */
+    syscall_entry_t syscall_table[MAX_SYSTEM_CALLS];
+    uint32_t syscall_count;         /* System call count */
+    
+    /* Debugging subsystem */
+    debug_context_t debug_ctx;      /* Debug context */
+    
+    /* Performance monitoring */
+    struct {
+        uint64_t context_switches;  /* Context switches */
+        uint64_t system_calls;      /* System calls */
+        uint64_t interrupts;        /* Interrupts */
+        uint64_t page_faults;       /* Page faults */
+        uint64_t memory_allocations; /* Memory allocations */
+        
+        /* CPU usage */
+        uint32_t cpu_usage_percent; /* CPU usage */
+        uint64_t idle_time_ns;      /* Idle time */
+        uint64_t kernel_time_ns;    /* Kernel time */
+        uint64_t user_time_ns;      /* User time */
+        
+        /* Memory usage */
+        uint32_t total_memory_kb;   /* Total memory */
+        uint32_t used_memory_kb;    /* Used memory */
+        uint32_t free_memory_kb;    /* Free memory */
+        uint32_t cached_memory_kb;  /* Cached memory */
+    } performance_stats;
+    
+    /* Global synchronization */
+    volatile uint32_t global_lock;  /* Global kernel lock */
+    
+} kernel_extended_state;
+
+/* IPC Operations */
+
+/* Create IPC object */
+uint32_t ipc_create(uint32_t type, const char* name, uint32_t size) {
+    __sync_lock_test_and_set(&kernel_extended_state.global_lock, 1);
+    
+    ipc_object_t* obj = (ipc_object_t*)kalloc(sizeof(ipc_object_t));
+    if (!obj) {
+        __sync_lock_release(&kernel_extended_state.global_lock);
+        return 0;
+    }
+    
+    memset(obj, 0, sizeof(*obj));
+    obj->id = kernel_extended_state.ipc_count + 1;
+    obj->type = type;
+    if (name) {
+        strncpy(obj->name, name, sizeof(obj->name) - 1);
+    }
+    obj->owner_pid = 0; /* TODO: Get current process PID */
+    obj->permissions = 0666; /* Default permissions */
+    obj->ref_count = 1;
+    obj->creation_time = hal_timer_get_timestamp_ns();
+    
+    /* Initialize type-specific data */
+    switch (type) {
+        case IPC_TYPE_PIPE:
+            obj->data.pipe.buffer = kalloc(size);
+            obj->data.pipe.size = size;
+            obj->data.pipe.blocking = true;
+            break;
+            
+        case IPC_TYPE_SHMEM:
+            obj->data.shmem.base_addr = kalloc(size);
+            obj->data.shmem.size = size;
+            obj->data.shmem.flags = 0;
+            break;
+            
+        case IPC_TYPE_SEMAPHORE:
+            obj->data.semaphore.value = 1; /* Binary semaphore by default */
+            obj->data.semaphore.max_value = size; /* Use size as max value */
+            break;
+            
+        case IPC_TYPE_MUTEX:
+            obj->data.mutex.locked = false;
+            break;
+            
+        case IPC_TYPE_EVENTFD:
+            obj->data.eventfd.counter = 0;
+            obj->data.eventfd.semaphore_mode = false;
+            break;
+    }
+    
+    /* Add to list */
+    obj->next = kernel_extended_state.ipc_objects;
+    kernel_extended_state.ipc_objects = obj;
+    kernel_extended_state.ipc_count++;
+    
+    __sync_lock_release(&kernel_extended_state.global_lock);
+    
+    KLOG_DEBUG("IPC", "Created IPC object %u (%s) type %u", obj->id, name ? name : "unnamed", type);
+    return obj->id;
+}
+
+/* IPC read operation */
+status_t ipc_read(uint32_t ipc_id, void* buffer, uint32_t size, uint32_t* bytes_read) {
+    ipc_object_t* obj = kernel_extended_state.ipc_objects;
+    while (obj && obj->id != ipc_id) {
+        obj = obj->next;
+    }
+    
+    if (!obj || !buffer || !bytes_read) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&obj->lock, 1);
+    
+    *bytes_read = 0;
+    status_t result = STATUS_OK;
+    
+    switch (obj->type) {
+        case IPC_TYPE_PIPE: {
+            uint32_t available = 0;
+            if (obj->data.pipe.write_pos >= obj->data.pipe.read_pos) {
+                available = obj->data.pipe.write_pos - obj->data.pipe.read_pos;
+            } else {
+                available = obj->data.pipe.size - obj->data.pipe.read_pos + obj->data.pipe.write_pos;
+            }
+            
+            uint32_t to_read = (size < available) ? size : available;
+            if (to_read > 0) {
+                uint8_t* pipe_buf = (uint8_t*)obj->data.pipe.buffer;
+                uint8_t* dst = (uint8_t*)buffer;
+                
+                for (uint32_t i = 0; i < to_read; i++) {
+                    dst[i] = pipe_buf[obj->data.pipe.read_pos];
+                    obj->data.pipe.read_pos = (obj->data.pipe.read_pos + 1) % obj->data.pipe.size;
+                }
+                
+                *bytes_read = to_read;
+                obj->bytes_transferred += to_read;
+            }
+            break;
+        }
+        
+        case IPC_TYPE_SHMEM:
+            if (size <= obj->data.shmem.size) {
+                memcpy(buffer, obj->data.shmem.base_addr, size);
+                *bytes_read = size;
+            } else {
+                result = STATUS_INVALID;
+            }
+            break;
+            
+        default:
+            result = STATUS_NOT_SUPPORTED;
+            break;
+    }
+    
+    obj->operations++;
+    obj->last_access = hal_timer_get_timestamp_ns();
+    
+    __sync_lock_release(&obj->lock);
+    return result;
+}
+
+/* IPC write operation */
+status_t ipc_write(uint32_t ipc_id, const void* buffer, uint32_t size, uint32_t* bytes_written) {
+    ipc_object_t* obj = kernel_extended_state.ipc_objects;
+    while (obj && obj->id != ipc_id) {
+        obj = obj->next;
+    }
+    
+    if (!obj || !buffer || !bytes_written) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&obj->lock, 1);
+    
+    *bytes_written = 0;
+    status_t result = STATUS_OK;
+    
+    switch (obj->type) {
+        case IPC_TYPE_PIPE: {
+            uint32_t space_available = obj->data.pipe.size - 1; /* Leave one slot empty */
+            if (obj->data.pipe.write_pos >= obj->data.pipe.read_pos) {
+                space_available = obj->data.pipe.size - (obj->data.pipe.write_pos - obj->data.pipe.read_pos) - 1;
+            } else {
+                space_available = obj->data.pipe.read_pos - obj->data.pipe.write_pos - 1;
+            }
+            
+            uint32_t to_write = (size < space_available) ? size : space_available;
+            if (to_write > 0) {
+                uint8_t* pipe_buf = (uint8_t*)obj->data.pipe.buffer;
+                const uint8_t* src = (const uint8_t*)buffer;
+                
+                for (uint32_t i = 0; i < to_write; i++) {
+                    pipe_buf[obj->data.pipe.write_pos] = src[i];
+                    obj->data.pipe.write_pos = (obj->data.pipe.write_pos + 1) % obj->data.pipe.size;
+                }
+                
+                *bytes_written = to_write;
+                obj->bytes_transferred += to_write;
+            }
+            break;
+        }
+        
+        case IPC_TYPE_SHMEM:
+            if (size <= obj->data.shmem.size) {
+                memcpy(obj->data.shmem.base_addr, buffer, size);
+                *bytes_written = size;
+            } else {
+                result = STATUS_INVALID;
+            }
+            break;
+            
+        default:
+            result = STATUS_NOT_SUPPORTED;
+            break;
+    }
+    
+    obj->operations++;
+    obj->last_access = hal_timer_get_timestamp_ns();
+    
+    __sync_lock_release(&obj->lock);
+    return result;
+}
+
+/* Kernel Module Management */
+
+/* Load kernel module */
+status_t module_load(const char* name, void* module_data, uint32_t size) {
+    if (!name || !module_data || size == 0) {
+        return STATUS_INVALID;
+    }
+    
+    __sync_lock_test_and_set(&kernel_extended_state.global_lock, 1);
+    
+    kernel_module_t* module = (kernel_module_t*)kalloc(sizeof(kernel_module_t));
+    if (!module) {
+        __sync_lock_release(&kernel_extended_state.global_lock);
+        return STATUS_NOMEM;
+    }
+    
+    memset(module, 0, sizeof(*module));
+    module->id = kernel_extended_state.module_count + 1;
+    strncpy(module->name, name, sizeof(module->name) - 1);
+    strncpy(module->version, "1.0", sizeof(module->version) - 1);
+    strncpy(module->author, "LimitlessOS", sizeof(module->author) - 1);
+    
+    /* Allocate module memory */
+    module->base_addr = kalloc(size);
+    if (!module->base_addr) {
+        kfree(module);
+        __sync_lock_release(&kernel_extended_state.global_lock);
+        return STATUS_NOMEM;
+    }
+    
+    memcpy(module->base_addr, module_data, size);
+    module->size = size;
+    module->entry_point = module->base_addr; /* Simplified */
+    
+    module->state = 1; /* Loaded */
+    module->load_order = kernel_extended_state.module_count;
+    module->load_time = hal_timer_get_timestamp_ns();
+    
+    /* Add to list */
+    module->next = kernel_extended_state.modules;
+    kernel_extended_state.modules = module;
+    kernel_extended_state.module_count++;
+    
+    __sync_lock_release(&kernel_extended_state.global_lock);
+    
+    KLOG_INFO("MODULE", "Loaded kernel module %s (ID: %u, size: %u bytes)", name, module->id, size);
+    return STATUS_OK;
+}
+
+/* Initialize kernel module */
+status_t module_init(uint32_t module_id) {
+    kernel_module_t* module = kernel_extended_state.modules;
+    while (module && module->id != module_id) {
+        module = module->next;
+    }
+    
+    if (!module) {
+        return STATUS_NOT_FOUND;
+    }
+    
+    if (module->init_func) {
+        status_t result = module->init_func();
+        if (result == STATUS_OK) {
+            module->state = 2; /* Initialized */
+            KLOG_INFO("MODULE", "Initialized module %s", module->name);
+        } else {
+            KLOG_ERROR("MODULE", "Failed to initialize module %s: %d", module->name, result);
+        }
+        return result;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Device Management */
+
+/* Register device */
+uint32_t device_register(const char* name, uint32_t class, uint32_t vendor_id, uint32_t device_id) {
+    if (!name) {
+        return 0;
+    }
+    
+    __sync_lock_test_and_set(&kernel_extended_state.global_lock, 1);
+    
+    device_object_t* device = (device_object_t*)kalloc(sizeof(device_object_t));
+    if (!device) {
+        __sync_lock_release(&kernel_extended_state.global_lock);
+        return 0;
+    }
+    
+    memset(device, 0, sizeof(*device));
+    device->id = kernel_extended_state.device_count + 1;
+    device->class = class;
+    strncpy(device->name, name, sizeof(device->name) - 1);
+    device->vendor_id = vendor_id;
+    device->device_id = device_id;
+    
+    /* Add to list */
+    device->next = kernel_extended_state.devices;
+    kernel_extended_state.devices = device;
+    kernel_extended_state.device_count++;
+    
+    __sync_lock_release(&kernel_extended_state.global_lock);
+    
+    KLOG_INFO("DEVICE", "Registered device %s (ID: %u, class: %u)", name, device->id, class);
+    return device->id;
+}
+
+/* Attach device driver */
+status_t device_attach_driver(uint32_t device_id, uint32_t module_id) {
+    device_object_t* device = kernel_extended_state.devices;
+    while (device && device->id != device_id) {
+        device = device->next;
+    }
+    
+    kernel_module_t* module = kernel_extended_state.modules;
+    while (module && module->id != module_id) {
+        module = module->next;
+    }
+    
+    if (!device || !module) {
+        return STATUS_NOT_FOUND;
+    }
+    
+    device->driver = module;
+    
+    /* Call device probe if available */
+    if (device->probe) {
+        status_t result = device->probe(device);
+        if (result == STATUS_OK) {
+            KLOG_INFO("DEVICE", "Driver %s attached to device %s", module->name, device->name);
+        }
+        return result;
+    }
+    
+    return STATUS_OK;
+}
+
+/* Memory Pool Management */
+
+/* Create memory pool */
+uint32_t memory_pool_create(const char* name, uint32_t block_size, uint32_t block_count) {
+    if (!name || block_size == 0 || block_count == 0) {
+        return 0;
+    }
+    
+    __sync_lock_test_and_set(&kernel_extended_state.global_lock, 1);
+    
+    memory_pool_t* pool = (memory_pool_t*)kalloc(sizeof(memory_pool_t));
+    if (!pool) {
+        __sync_lock_release(&kernel_extended_state.global_lock);
+        return 0;
+    }
+    
+    memset(pool, 0, sizeof(*pool));
+    pool->id = kernel_extended_state.pool_count + 1;
+    strncpy(pool->name, name, sizeof(pool->name) - 1);
+    pool->block_size = block_size;
+    pool->block_count = block_count;
+    pool->free_blocks = block_count;
+    pool->total_size = block_size * block_count;
+    
+    /* Allocate pool memory */
+    pool->base_addr = kalloc(pool->total_size);
+    if (!pool->base_addr) {
+        kfree(pool);
+        __sync_lock_release(&kernel_extended_state.global_lock);
+        return 0;
+    }
+    
+    /* Allocate bitmap for tracking free blocks */
+    uint32_t bitmap_size = (block_count + 7) / 8;
+    pool->free_bitmap = (uint8_t*)kalloc(bitmap_size);
+    if (!pool->free_bitmap) {
+        kfree(pool->base_addr);
+        kfree(pool);
+        __sync_lock_release(&kernel_extended_state.global_lock);
+        return 0;
+    }
+    
+    /* Initialize bitmap (all blocks free) */
+    memset(pool->free_bitmap, 0, bitmap_size);
+    
+    /* Add to list */
+    pool->next = kernel_extended_state.memory_pools;
+    kernel_extended_state.memory_pools = pool;
+    kernel_extended_state.pool_count++;
+    
+    __sync_lock_release(&kernel_extended_state.global_lock);
+    
+    KLOG_INFO("MEMORY", "Created memory pool %s (ID: %u, %u blocks of %u bytes)", 
+              name, pool->id, block_count, block_size);
+    return pool->id;
+}
+
+/* Allocate from memory pool */
+void* memory_pool_alloc(uint32_t pool_id) {
+    memory_pool_t* pool = kernel_extended_state.memory_pools;
+    while (pool && pool->id != pool_id) {
+        pool = pool->next;
+    }
+    
+    if (!pool) {
+        return NULL;
+    }
+    
+    __sync_lock_test_and_set(&pool->lock, 1);
+    
+    if (pool->free_blocks == 0) {
+        pool->allocation_failures++;
+        __sync_lock_release(&pool->lock);
+        return NULL;
+    }
+    
+    /* Find free block */
+    for (uint32_t i = 0; i < pool->block_count; i++) {
+        uint32_t byte_index = i / 8;
+        uint32_t bit_index = i % 8;
+        
+        if (!(pool->free_bitmap[byte_index] & (1 << bit_index))) {
+            /* Mark block as allocated */
+            pool->free_bitmap[byte_index] |= (1 << bit_index);
+            
+            pool->free_blocks--;
+            pool->allocated_blocks++;
+            pool->allocations++;
+            
+            if (pool->allocated_blocks > pool->peak_usage) {
+                pool->peak_usage = pool->allocated_blocks;
+            }
+            
+            void* ptr = (uint8_t*)pool->base_addr + (i * pool->block_size);
+            __sync_lock_release(&pool->lock);
+            return ptr;
+        }
+    }
+    
+    pool->allocation_failures++;
+    __sync_lock_release(&pool->lock);
+    return NULL;
+}
+
+/* Performance monitoring */
+void kernel_update_performance_stats(void) {
+    /* Update CPU usage (simulated) */
+    kernel_extended_state.performance_stats.cpu_usage_percent = 
+        15 + (hal_timer_get_timestamp_ns() % 30); /* Simulated 15-45% */
+    
+    /* Update memory usage (simulated) */
+    uint32_t base_memory = 64 * 1024; /* 64MB base usage */
+    kernel_extended_state.performance_stats.used_memory_kb = 
+        base_memory + (kernel_extended_state.device_count * 256) + 
+        (kernel_extended_state.module_count * 512);
+    
+    kernel_extended_state.performance_stats.total_memory_kb = 1024 * 1024; /* 1GB */
+    kernel_extended_state.performance_stats.free_memory_kb = 
+        kernel_extended_state.performance_stats.total_memory_kb - 
+        kernel_extended_state.performance_stats.used_memory_kb;
+    
+    /* Update operation counts */
+    kernel_extended_state.performance_stats.system_calls += 10; /* Simulated activity */
+    kernel_extended_state.performance_stats.interrupts += 5;
+    kernel_extended_state.performance_stats.context_switches += 3;
+}
+
+/* Print kernel statistics */
+void kernel_extended_print_stats(void) {
+    kernel_update_performance_stats();
+    
+    kprintf("=== Extended Kernel Statistics ===\n");
+    
+    kprintf("\nIPC Subsystem:\n");
+    kprintf("  IPC Objects: %u\n", kernel_extended_state.ipc_count);
+    
+    ipc_object_t* ipc = kernel_extended_state.ipc_objects;
+    while (ipc) {
+        const char* type_names[] = {"", "Pipe", "FIFO", "Socket", "Shmem", "Semaphore", "Mutex", "CondVar", "EventFD", "SignalFD", "TimerFD", "Epoll", "Kqueue"};
+        kprintf("    %s (%u): %llu ops, %llu bytes\n", 
+                ipc->name[0] ? ipc->name : type_names[ipc->type], 
+                ipc->id, ipc->operations, ipc->bytes_transferred);
+        ipc = ipc->next;
+    }
+    
+    kprintf("\nModule Subsystem:\n");
+    kprintf("  Loaded Modules: %u\n", kernel_extended_state.module_count);
+    
+    kernel_module_t* mod = kernel_extended_state.modules;
+    while (mod) {
+        const char* states[] = {"Unloaded", "Loaded", "Initialized", "Running", "Error"};
+        kprintf("    %s v%s: %s (%u calls, %u errors)\n", 
+                mod->name, mod->version, 
+                states[mod->state < 5 ? mod->state : 4], 
+                (uint32_t)mod->function_calls, (uint32_t)mod->errors);
+        mod = mod->next;
+    }
+    
+    kprintf("\nDevice Subsystem:\n");
+    kprintf("  Registered Devices: %u\n", kernel_extended_state.device_count);
+    
+    device_object_t* dev = kernel_extended_state.devices;
+    while (dev) {
+        const char* class_names[] = {"", "Storage", "Network", "Graphics", "Audio", "Input", "USB", "PCI", "ACPI", "Thermal", "Power"};
+        kprintf("    %s (%s): %04X:%04X (%llu ops, %llu interrupts)\n",
+                dev->name, 
+                class_names[dev->class < 11 ? dev->class : 0],
+                dev->vendor_id, dev->device_id,
+                dev->operations, dev->interrupts);
+        dev = dev->next;
+    }
+    
+    kprintf("\nMemory Pools:\n");
+    kprintf("  Active Pools: %u\n", kernel_extended_state.pool_count);
+    
+    memory_pool_t* pool = kernel_extended_state.memory_pools;
+    while (pool) {
+        uint32_t usage_percent = (pool->allocated_blocks * 100) / pool->block_count;
+        kprintf("    %s: %u/%u blocks (%u%%), %llu allocs, %llu failures\n",
+                pool->name, pool->allocated_blocks, pool->block_count, usage_percent,
+                pool->allocations, pool->allocation_failures);
+        pool = pool->next;
+    }
+    
+    kprintf("\nPerformance Metrics:\n");
+    kprintf("  CPU Usage: %u%%\n", kernel_extended_state.performance_stats.cpu_usage_percent);
+    kprintf("  Memory: %u/%u KB (%u%% used)\n", 
+            kernel_extended_state.performance_stats.used_memory_kb,
+            kernel_extended_state.performance_stats.total_memory_kb,
+            (kernel_extended_state.performance_stats.used_memory_kb * 100) / 
+            kernel_extended_state.performance_stats.total_memory_kb);
+    kprintf("  System Calls: %llu\n", kernel_extended_state.performance_stats.system_calls);
+    kprintf("  Interrupts: %llu\n", kernel_extended_state.performance_stats.interrupts);
+    kprintf("  Context Switches: %llu\n", kernel_extended_state.performance_stats.context_switches);
+    
+    kprintf("=== End Extended Kernel Statistics ===\n");
+}
+
+/* Initialize extended kernel */
+status_t kernel_extended_init(void) {
+    KLOG_INFO("KERNEL_EXT", "Initializing extended kernel subsystems");
+    
+    memset(&kernel_extended_state, 0, sizeof(kernel_extended_state));
+    
+    /* Initialize performance stats */
+    kernel_extended_state.performance_stats.total_memory_kb = 1024 * 1024; /* 1GB */
+    
+    /* Create default memory pools */
+    memory_pool_create("small_objects", 64, 1024);      /* 64KB pool for small objects */
+    memory_pool_create("medium_objects", 1024, 512);    /* 512KB pool for medium objects */
+    memory_pool_create("large_objects", 4096, 128);     /* 512KB pool for large objects */
+    
+    /* Create default IPC objects */
+    ipc_create(IPC_TYPE_PIPE, "kernel_log", 4096);      /* Kernel log pipe */
+    ipc_create(IPC_TYPE_SHMEM, "kernel_stats", 8192);   /* Statistics shared memory */
+    
+    KLOG_INFO("KERNEL_EXT", "Extended kernel initialization complete");
+    KLOG_INFO("KERNEL_EXT", "  Memory pools: %u", kernel_extended_state.pool_count);
+    KLOG_INFO("KERNEL_EXT", "  IPC objects: %u", kernel_extended_state.ipc_count);
+    
+    return STATUS_OK;
+}

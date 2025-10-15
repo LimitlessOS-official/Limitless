@@ -1,0 +1,681 @@
+/*
+ * observability.c - LimitlessOS Observability Framework
+ * 
+ * Complete observability system with structured logging, tracing,
+ * crash dump analysis, performance monitoring, and metrics export.
+ */
+
+#include <kernel/observability.h>
+#include <kernel/klog.h>
+#include <kernel/timer.h>
+#include <kernel/vmm.h>
+#include <kernel/vfs.h>
+#include <kernel/string.h>
+#include <kernel/process.h>
+
+#define MAX_LOG_ENTRIES     10000
+#define MAX_TRACE_EVENTS    50000
+#define MAX_METRICS         1000
+#define MAX_CRASH_DUMPS     100
+#define LOG_BUFFER_SIZE     4096
+#define TRACE_BUFFER_SIZE   8192
+
+/* Log levels */
+typedef enum {
+    LOG_LEVEL_TRACE = 0,
+    LOG_LEVEL_DEBUG,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_WARN,
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_FATAL
+} log_level_t;
+
+/* Log entry structure */
+typedef struct log_entry {
+    uint64_t timestamp;
+    log_level_t level;
+    pid_t pid;
+    tid_t tid;
+    char subsystem[32];
+    char message[256];
+    char file[64];
+    uint32_t line;
+    void* context_data;
+    size_t context_size;
+} log_entry_t;
+
+/* Trace event types */
+typedef enum {
+    TRACE_EVENT_FUNCTION_ENTER,
+    TRACE_EVENT_FUNCTION_EXIT,
+    TRACE_EVENT_SYSCALL_ENTER,
+    TRACE_EVENT_SYSCALL_EXIT,
+    TRACE_EVENT_INTERRUPT,
+    TRACE_EVENT_CONTEXT_SWITCH,
+    TRACE_EVENT_PAGE_FAULT,
+    TRACE_EVENT_MEMORY_ALLOC,
+    TRACE_EVENT_MEMORY_FREE,
+    TRACE_EVENT_LOCK_ACQUIRE,
+    TRACE_EVENT_LOCK_RELEASE,
+    TRACE_EVENT_CUSTOM
+} trace_event_type_t;
+
+/* Trace event structure */
+typedef struct trace_event {
+    uint64_t timestamp;
+    trace_event_type_t type;
+    pid_t pid;
+    tid_t tid;
+    uint64_t data1;
+    uint64_t data2;
+    uint64_t data3;
+    char description[128];
+} trace_event_t;
+
+/* Performance counter */
+typedef struct perf_counter {
+    char name[64];
+    uint64_t value;
+    uint64_t min_value;
+    uint64_t max_value;
+    uint64_t total_samples;
+    uint64_t last_update;
+    bool enabled;
+} perf_counter_t;
+
+/* Metric types */
+typedef enum {
+    METRIC_TYPE_COUNTER,
+    METRIC_TYPE_GAUGE,
+    METRIC_TYPE_HISTOGRAM,
+    METRIC_TYPE_SUMMARY
+} metric_type_t;
+
+/* Metric structure */
+typedef struct metric {
+    char name[64];
+    metric_type_t type;
+    char labels[16][64];  /* key=value pairs */
+    uint32_t label_count;
+    union {
+        uint64_t counter_value;
+        int64_t gauge_value;
+        struct {
+            uint64_t buckets[32];
+            uint64_t bucket_bounds[32];
+            uint32_t bucket_count;
+            uint64_t sum;
+            uint64_t count;
+        } histogram;
+        struct {
+            uint64_t sum;
+            uint64_t count;
+            uint64_t quantiles[10];  /* P50, P90, P95, P99, etc. */
+        } summary;
+    } data;
+    uint64_t last_update;
+} metric_t;
+
+/* Crash dump structure */
+typedef struct crash_dump {
+    uint64_t timestamp;
+    pid_t pid;
+    char process_name[64];
+    uint32_t signal;
+    uint64_t crash_address;
+    
+    /* CPU state */
+    cpu_context_t cpu_context;
+    
+    /* Stack trace */
+    void* stack_trace[32];
+    uint32_t stack_trace_depth;
+    
+    /* Memory mappings */
+    struct {
+        void* start;
+        void* end;
+        uint32_t permissions;
+        char name[64];
+    } memory_maps[64];
+    uint32_t memory_map_count;
+    
+    /* Core dump data */
+    void* core_data;
+    size_t core_size;
+} crash_dump_t;
+
+/* Global observability state */
+static struct {
+    /* Logging subsystem */
+    log_entry_t log_buffer[MAX_LOG_ENTRIES];
+    uint32_t log_head;
+    uint32_t log_tail;
+    uint32_t log_count;
+    log_level_t log_level_filter;
+    bool log_to_console;
+    bool log_to_file;
+    file_t* log_file;
+    
+    /* Tracing subsystem */
+    trace_event_t trace_buffer[MAX_TRACE_EVENTS];
+    uint32_t trace_head;
+    uint32_t trace_tail;
+    uint32_t trace_count;
+    bool tracing_enabled;
+    uint32_t trace_filters;  /* Bitmask of enabled event types */
+    
+    /* Performance monitoring */
+    perf_counter_t perf_counters[MAX_METRICS];
+    uint32_t perf_counter_count;
+    
+    /* Metrics system */
+    metric_t metrics[MAX_METRICS];
+    uint32_t metric_count;
+    
+    /* Crash dumps */
+    crash_dump_t crash_dumps[MAX_CRASH_DUMPS];
+    uint32_t crash_dump_count;
+    
+    /* Configuration */
+    bool profiling_enabled;
+    uint32_t sample_rate_hz;
+    
+    spinlock_t log_lock;
+    spinlock_t trace_lock;
+    spinlock_t metrics_lock;
+    spinlock_t crash_lock;
+} obs_state;
+
+/* Function prototypes */
+static void write_log_entry(log_level_t level, const char* subsystem, 
+                           const char* file, uint32_t line, const char* format, va_list args);
+static void add_trace_event(trace_event_type_t type, uint64_t data1, 
+                           uint64_t data2, uint64_t data3, const char* desc);
+static perf_counter_t* find_or_create_counter(const char* name);
+static metric_t* find_or_create_metric(const char* name, metric_type_t type);
+static void export_metrics_prometheus(char* buffer, size_t buffer_size);
+
+/* Initialize observability framework */
+status_t observability_init(void) {
+    KLOG_INFO("OBSERVABILITY", "Initializing observability framework");
+    
+    memset(&obs_state, 0, sizeof(obs_state));
+    
+    spin_lock_init(&obs_state.log_lock);
+    spin_lock_init(&obs_state.trace_lock);
+    spin_lock_init(&obs_state.metrics_lock);
+    spin_lock_init(&obs_state.crash_lock);
+    
+    /* Initialize logging */
+    obs_state.log_level_filter = LOG_LEVEL_INFO;
+    obs_state.log_to_console = true;
+    obs_state.log_to_file = true;
+    
+    /* Open log file */
+    obs_state.log_file = vfs_open("/var/log/kernel.log", O_WRONLY | O_CREAT | O_APPEND);
+    if (!obs_state.log_file) {
+        obs_state.log_to_file = false;
+        KLOG_WARN("OBSERVABILITY", "Failed to open log file");
+    }
+    
+    /* Initialize tracing */
+    obs_state.tracing_enabled = false;  /* Disabled by default for performance */
+    obs_state.trace_filters = 0xFFFFFFFF;  /* All events enabled */
+    
+    /* Initialize performance monitoring */
+    obs_state.profiling_enabled = false;
+    obs_state.sample_rate_hz = 1000;  /* 1 KHz sampling */
+    
+    /* Create initial performance counters */
+    find_or_create_counter("cpu.context_switches");
+    find_or_create_counter("memory.page_faults");
+    find_or_create_counter("memory.allocations");
+    find_or_create_counter("syscalls.total");
+    find_or_create_counter("interrupts.total");
+    
+    /* Create initial metrics */
+    find_or_create_metric("cpu_usage_percent", METRIC_TYPE_GAUGE);
+    find_or_create_metric("memory_usage_bytes", METRIC_TYPE_GAUGE);
+    find_or_create_metric("disk_io_bytes_total", METRIC_TYPE_COUNTER);
+    find_or_create_metric("network_bytes_total", METRIC_TYPE_COUNTER);
+    
+    KLOG_INFO("OBSERVABILITY", "Observability framework initialized");
+    return STATUS_OK;
+}
+
+/* Structured logging interface */
+void obs_log(log_level_t level, const char* subsystem, const char* file, 
+            uint32_t line, const char* format, ...) {
+    if (level < obs_state.log_level_filter) {
+        return;
+    }
+    
+    va_list args;
+    va_start(args, format);
+    write_log_entry(level, subsystem, file, line, format, args);
+    va_end(args);
+}
+
+/* Write log entry */
+static void write_log_entry(log_level_t level, const char* subsystem,
+                           const char* file, uint32_t line, const char* format, va_list args) {
+    spin_lock(&obs_state.log_lock);
+    
+    /* Get next log entry slot */
+    log_entry_t* entry = &obs_state.log_buffer[obs_state.log_head];
+    obs_state.log_head = (obs_state.log_head + 1) % MAX_LOG_ENTRIES;
+    
+    if (obs_state.log_count < MAX_LOG_ENTRIES) {
+        obs_state.log_count++;
+    } else {
+        /* Buffer full, advance tail */
+        obs_state.log_tail = (obs_state.log_tail + 1) % MAX_LOG_ENTRIES;
+    }
+    
+    /* Fill in log entry */
+    entry->timestamp = timer_get_ticks_us();
+    entry->level = level;
+    entry->pid = get_current_process() ? get_current_process()->pid : 0;
+    entry->tid = syscall0(SYS_gettid);
+    strncpy(entry->subsystem, subsystem, sizeof(entry->subsystem) - 1);
+    entry->subsystem[sizeof(entry->subsystem) - 1] = '\0';
+    strncpy(entry->file, file, sizeof(entry->file) - 1);
+    entry->file[sizeof(entry->file) - 1] = '\0';
+    entry->line = line;
+    
+    vsnprintf(entry->message, sizeof(entry->message), format, args);
+    
+    spin_unlock(&obs_state.log_lock);
+    
+    /* Write to console if enabled */
+    if (obs_state.log_to_console) {
+        const char* level_names[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"};
+        printf("[%s] %s: %s\n", level_names[level], subsystem, entry->message);
+    }
+    
+    /* Write to log file if enabled */
+    if (obs_state.log_to_file && obs_state.log_file) {
+        char log_line[512];
+        snprintf(log_line, sizeof(log_line), "%lu [%s] %s:%u %s: %s\n",
+                entry->timestamp, level_names[level], entry->file, entry->line,
+                entry->subsystem, entry->message);
+        vfs_write(obs_state.log_file, log_line, strlen(log_line));
+    }
+}
+
+/* Tracing interface */
+void obs_trace(trace_event_type_t type, uint64_t data1, uint64_t data2, 
+              uint64_t data3, const char* description) {
+    if (!obs_state.tracing_enabled || !(obs_state.trace_filters & (1 << type))) {
+        return;
+    }
+    
+    add_trace_event(type, data1, data2, data3, description);
+}
+
+/* Add trace event */
+static void add_trace_event(trace_event_type_t type, uint64_t data1,
+                           uint64_t data2, uint64_t data3, const char* desc) {
+    spin_lock(&obs_state.trace_lock);
+    
+    trace_event_t* event = &obs_state.trace_buffer[obs_state.trace_head];
+    obs_state.trace_head = (obs_state.trace_head + 1) % MAX_TRACE_EVENTS;
+    
+    if (obs_state.trace_count < MAX_TRACE_EVENTS) {
+        obs_state.trace_count++;
+    } else {
+        obs_state.trace_tail = (obs_state.trace_tail + 1) % MAX_TRACE_EVENTS;
+    }
+    
+    /* Fill in trace event */
+    event->timestamp = timer_get_ticks_us();
+    event->type = type;
+    event->pid = get_current_process() ? get_current_process()->pid : 0;
+    event->tid = syscall0(SYS_gettid);
+    event->data1 = data1;
+    event->data2 = data2;
+    event->data3 = data3;
+    
+    if (desc) {
+        strncpy(event->description, desc, sizeof(event->description) - 1);
+        event->description[sizeof(event->description) - 1] = '\0';
+    } else {
+        event->description[0] = '\0';
+    }
+    
+    spin_unlock(&obs_state.trace_lock);
+}
+
+/* Performance counter management */
+void obs_counter_inc(const char* name, uint64_t value) {
+    perf_counter_t* counter = find_or_create_counter(name);
+    if (counter) {
+        __sync_fetch_and_add(&counter->value, value);
+        counter->last_update = timer_get_ticks_us();
+        counter->total_samples++;
+    }
+}
+
+void obs_counter_set(const char* name, uint64_t value) {
+    perf_counter_t* counter = find_or_create_counter(name);
+    if (counter) {
+        counter->value = value;
+        if (value < counter->min_value) counter->min_value = value;
+        if (value > counter->max_value) counter->max_value = value;
+        counter->last_update = timer_get_ticks_us();
+        counter->total_samples++;
+    }
+}
+
+/* Find or create performance counter */
+static perf_counter_t* find_or_create_counter(const char* name) {
+    spin_lock(&obs_state.metrics_lock);
+    
+    /* Search for existing counter */
+    for (uint32_t i = 0; i < obs_state.perf_counter_count; i++) {
+        if (strcmp(obs_state.perf_counters[i].name, name) == 0) {
+            spin_unlock(&obs_state.metrics_lock);
+            return &obs_state.perf_counters[i];
+        }
+    }
+    
+    /* Create new counter */
+    if (obs_state.perf_counter_count < MAX_METRICS) {
+        perf_counter_t* counter = &obs_state.perf_counters[obs_state.perf_counter_count++];
+        strncpy(counter->name, name, sizeof(counter->name) - 1);
+        counter->name[sizeof(counter->name) - 1] = '\0';
+        counter->value = 0;
+        counter->min_value = UINT64_MAX;
+        counter->max_value = 0;
+        counter->total_samples = 0;
+        counter->enabled = true;
+        
+        spin_unlock(&obs_state.metrics_lock);
+        return counter;
+    }
+    
+    spin_unlock(&obs_state.metrics_lock);
+    return NULL;
+}
+
+/* Metrics interface */
+void obs_metric_counter_inc(const char* name, const char* labels[], uint64_t value) {
+    metric_t* metric = find_or_create_metric(name, METRIC_TYPE_COUNTER);
+    if (metric) {
+        __sync_fetch_and_add(&metric->data.counter_value, value);
+        metric->last_update = timer_get_ticks_us();
+    }
+}
+
+void obs_metric_gauge_set(const char* name, const char* labels[], int64_t value) {
+    metric_t* metric = find_or_create_metric(name, METRIC_TYPE_GAUGE);
+    if (metric) {
+        metric->data.gauge_value = value;
+        metric->last_update = timer_get_ticks_us();
+    }
+}
+
+void obs_metric_histogram_observe(const char* name, const char* labels[], uint64_t value) {
+    metric_t* metric = find_or_create_metric(name, METRIC_TYPE_HISTOGRAM);
+    if (metric) {
+        /* Find appropriate bucket */
+        for (uint32_t i = 0; i < metric->data.histogram.bucket_count; i++) {
+            if (value <= metric->data.histogram.bucket_bounds[i]) {
+                __sync_fetch_and_add(&metric->data.histogram.buckets[i], 1);
+                break;
+            }
+        }
+        
+        __sync_fetch_and_add(&metric->data.histogram.sum, value);
+        __sync_fetch_and_add(&metric->data.histogram.count, 1);
+        metric->last_update = timer_get_ticks_us();
+    }
+}
+
+/* Find or create metric */
+static metric_t* find_or_create_metric(const char* name, metric_type_t type) {
+    spin_lock(&obs_state.metrics_lock);
+    
+    /* Search for existing metric */
+    for (uint32_t i = 0; i < obs_state.metric_count; i++) {
+        if (strcmp(obs_state.metrics[i].name, name) == 0 &&
+            obs_state.metrics[i].type == type) {
+            spin_unlock(&obs_state.metrics_lock);
+            return &obs_state.metrics[i];
+        }
+    }
+    
+    /* Create new metric */
+    if (obs_state.metric_count < MAX_METRICS) {
+        metric_t* metric = &obs_state.metrics[obs_state.metric_count++];
+        memset(metric, 0, sizeof(metric_t));
+        
+        strncpy(metric->name, name, sizeof(metric->name) - 1);
+        metric->name[sizeof(metric->name) - 1] = '\0';
+        metric->type = type;
+        
+        /* Initialize histogram buckets if needed */
+        if (type == METRIC_TYPE_HISTOGRAM) {
+            uint64_t bounds[] = {10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+            metric->data.histogram.bucket_count = sizeof(bounds) / sizeof(bounds[0]);
+            memcpy(metric->data.histogram.bucket_bounds, bounds, sizeof(bounds));
+        }
+        
+        spin_unlock(&obs_state.metrics_lock);
+        return metric;
+    }
+    
+    spin_unlock(&obs_state.metrics_lock);
+    return NULL;
+}
+
+/* Crash dump handling */
+void obs_create_crash_dump(process_t* process, uint32_t signal, void* crash_addr,
+                          cpu_context_t* context) {
+    spin_lock(&obs_state.crash_lock);
+    
+    if (obs_state.crash_dump_count >= MAX_CRASH_DUMPS) {
+        /* Remove oldest dump */
+        crash_dump_t* oldest = &obs_state.crash_dumps[0];
+        if (oldest->core_data) {
+            vmm_free_pages(oldest->core_data, PAGE_COUNT(oldest->core_size));
+        }
+        memmove(&obs_state.crash_dumps[0], &obs_state.crash_dumps[1],
+               (MAX_CRASH_DUMPS - 1) * sizeof(crash_dump_t));
+        obs_state.crash_dump_count--;
+    }
+    
+    crash_dump_t* dump = &obs_state.crash_dumps[obs_state.crash_dump_count++];
+    memset(dump, 0, sizeof(crash_dump_t));
+    
+    /* Fill in crash information */
+    dump->timestamp = timer_get_ticks_us();
+    dump->pid = process->pid;
+    strncpy(dump->process_name, process->name, sizeof(dump->process_name) - 1);
+    dump->signal = signal;
+    dump->crash_address = (uint64_t)crash_addr;
+    
+    /* Copy CPU context */
+    if (context) {
+        memcpy(&dump->cpu_context, context, sizeof(cpu_context_t));
+    }
+    
+    /* Generate stack trace */
+    dump->stack_trace_depth = generate_stack_trace(process, dump->stack_trace, 32);
+    
+    /* Copy memory mappings */
+    dump->memory_map_count = get_process_memory_maps(process, dump->memory_maps, 64);
+    
+    /* Create core dump */
+    dump->core_size = process->vmm_context.total_size;
+    if (dump->core_size > 0) {
+        dump->core_data = vmm_alloc_pages(PAGE_COUNT(dump->core_size), VMM_FLAG_KERNEL);
+        if (dump->core_data) {
+            create_core_dump(process, dump->core_data, dump->core_size);
+        } else {
+            dump->core_size = 0;
+        }
+    }
+    
+    spin_unlock(&obs_state.crash_lock);
+    
+    /* Write crash dump to disk */
+    char dump_path[256];
+    snprintf(dump_path, sizeof(dump_path), "/var/crash/core.%s.%lu", 
+            process->name, dump->timestamp);
+    
+    file_t* dump_file = vfs_open(dump_path, O_WRONLY | O_CREAT);
+    if (dump_file && dump->core_data) {
+        vfs_write(dump_file, dump->core_data, dump->core_size);
+        vfs_close(dump_file);
+    }
+    
+    obs_log(LOG_LEVEL_ERROR, "CRASH", __FILE__, __LINE__,
+           "Process %s (PID %d) crashed with signal %d at %p, core dump saved to %s",
+           process->name, process->pid, signal, crash_addr, dump_path);
+}
+
+/* Configuration interface */
+void obs_enable_tracing(bool enabled) {
+    obs_state.tracing_enabled = enabled;
+}
+
+void obs_set_trace_filter(uint32_t filter_mask) {
+    obs_state.trace_filters = filter_mask;
+}
+
+void obs_set_log_level(log_level_t level) {
+    obs_state.log_level_filter = level;
+}
+
+void obs_enable_profiling(bool enabled) {
+    obs_state.profiling_enabled = enabled;
+}
+
+/* Export metrics in Prometheus format */
+size_t obs_export_metrics_prometheus(char* buffer, size_t buffer_size) {
+    size_t offset = 0;
+    
+    spin_lock(&obs_state.metrics_lock);
+    
+    for (uint32_t i = 0; i < obs_state.metric_count && offset < buffer_size - 256; i++) {
+        metric_t* metric = &obs_state.metrics[i];
+        
+        switch (metric->type) {
+            case METRIC_TYPE_COUNTER:
+                offset += snprintf(buffer + offset, buffer_size - offset,
+                                 "# TYPE %s counter\n%s %lu\n",
+                                 metric->name, metric->name, metric->data.counter_value);
+                break;
+                
+            case METRIC_TYPE_GAUGE:
+                offset += snprintf(buffer + offset, buffer_size - offset,
+                                 "# TYPE %s gauge\n%s %ld\n",
+                                 metric->name, metric->name, metric->data.gauge_value);
+                break;
+                
+            case METRIC_TYPE_HISTOGRAM:
+                offset += snprintf(buffer + offset, buffer_size - offset,
+                                 "# TYPE %s histogram\n",
+                                 metric->name);
+                
+                for (uint32_t j = 0; j < metric->data.histogram.bucket_count; j++) {
+                    offset += snprintf(buffer + offset, buffer_size - offset,
+                                     "%s_bucket{le=\"%lu\"} %lu\n",
+                                     metric->name, metric->data.histogram.bucket_bounds[j],
+                                     metric->data.histogram.buckets[j]);
+                }
+                
+                offset += snprintf(buffer + offset, buffer_size - offset,
+                                 "%s_sum %lu\n%s_count %lu\n",
+                                 metric->name, metric->data.histogram.sum,
+                                 metric->name, metric->data.histogram.count);
+                break;
+                
+            default:
+                break;
+        }
+    }
+    
+    spin_unlock(&obs_state.metrics_lock);
+    
+    return offset;
+}
+
+/* Get system statistics */
+void obs_get_system_stats(system_stats_t* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(system_stats_t));
+    
+    stats->uptime_seconds = timer_get_ticks() / 1000;
+    stats->total_processes = process_get_count();
+    stats->log_entries = obs_state.log_count;
+    stats->trace_events = obs_state.trace_count;
+    stats->crash_dumps = obs_state.crash_dump_count;
+    
+    /* Get memory statistics */
+    stats->memory_total = pmm_get_total_memory();
+    stats->memory_used = pmm_get_used_memory();
+    stats->memory_free = stats->memory_total - stats->memory_used;
+    
+    /* Get CPU utilization */
+    perf_counter_t* cpu_counter = find_or_create_counter("cpu_usage_percent");
+    if (cpu_counter) {
+        stats->cpu_usage_percent = (uint32_t)cpu_counter->value;
+    }
+}
+
+/* Performance profiling */
+void obs_profile_function_enter(const char* function_name, void* caller_addr) {
+    if (obs_state.profiling_enabled) {
+        obs_trace(TRACE_EVENT_FUNCTION_ENTER, (uint64_t)caller_addr, 0, 0, function_name);
+    }
+}
+
+void obs_profile_function_exit(const char* function_name, void* caller_addr) {
+    if (obs_state.profiling_enabled) {
+        obs_trace(TRACE_EVENT_FUNCTION_EXIT, (uint64_t)caller_addr, 0, 0, function_name);
+    }
+}
+
+/* Macros for convenient logging */
+#define OBS_TRACE(subsystem, ...) obs_log(LOG_LEVEL_TRACE, subsystem, __FILE__, __LINE__, __VA_ARGS__)
+#define OBS_DEBUG(subsystem, ...) obs_log(LOG_LEVEL_DEBUG, subsystem, __FILE__, __LINE__, __VA_ARGS__)
+#define OBS_INFO(subsystem, ...)  obs_log(LOG_LEVEL_INFO, subsystem, __FILE__, __LINE__, __VA_ARGS__)
+#define OBS_WARN(subsystem, ...)  obs_log(LOG_LEVEL_WARN, subsystem, __FILE__, __LINE__, __VA_ARGS__)
+#define OBS_ERROR(subsystem, ...) obs_log(LOG_LEVEL_ERROR, subsystem, __FILE__, __LINE__, __VA_ARGS__)
+#define OBS_FATAL(subsystem, ...) obs_log(LOG_LEVEL_FATAL, subsystem, __FILE__, __LINE__, __VA_ARGS__)
+
+/* Function instrumentation macros */
+#define PROFILE_ENTER() obs_profile_function_enter(__func__, __builtin_return_address(0))
+#define PROFILE_EXIT()  obs_profile_function_exit(__func__, __builtin_return_address(0))
+
+/* Real-time monitoring */
+void obs_start_realtime_monitoring(uint32_t sample_rate_hz) {
+    obs_state.sample_rate_hz = sample_rate_hz;
+    obs_state.profiling_enabled = true;
+    
+    /* Start sampling timer */
+    timer_create_periodic(1000000 / sample_rate_hz, obs_sampling_callback, NULL);
+}
+
+void obs_sampling_callback(void* context) {
+    /* Update system metrics */
+    obs_metric_gauge_set("memory_usage_bytes", NULL, pmm_get_used_memory());
+    obs_metric_gauge_set("cpu_usage_percent", NULL, cpu_get_usage_percent());
+    
+    /* Sample current call stack */
+    if (obs_state.profiling_enabled) {
+        process_t* current = get_current_process();
+        if (current) {
+            void* stack_trace[16];
+            uint32_t depth = generate_stack_trace(current, stack_trace, 16);
+            
+            for (uint32_t i = 0; i < depth; i++) {
+                obs_trace(TRACE_EVENT_CUSTOM, (uint64_t)stack_trace[i], i, depth, "stack_sample");
+            }
+        }
+    }
+}

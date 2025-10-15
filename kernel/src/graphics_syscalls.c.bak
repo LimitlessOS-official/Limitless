@@ -1,0 +1,132 @@
+/**
+ * Graphics syscall implementations for LimitlessOS
+ */
+
+#include "syscall.h"
+#include "graphics.h"
+#include "kernel.h"
+#include "process.h"
+
+/* Graphics initialization syscall */
+long sys_graphics_init(void) {
+    status_t result = graphics_init();
+    return (result == STATUS_OK) ? 0 : -K_EIO;
+}
+
+/* Get screen information */
+long sys_graphics_get_screen_info(u32* width, u32* height, u32* bpp) {
+    if (!width || !height || !bpp) {
+        return -K_EINVAL;
+    }
+    
+    /* TODO: Validate user pointers */
+    
+    status_t result = graphics_get_screen_info(width, height, bpp);
+    return (result == STATUS_OK) ? 0 : -K_EIO;
+}
+
+/* Create window */
+long sys_graphics_create_window(u32 x, u32 y, u32 width, u32 height, u32 flags) {
+    if (width == 0 || height == 0 || width > 4096 || height > 4096) {
+        return -K_EINVAL;
+    }
+    
+    uint32_t window_id = graphics_create_window(x, y, width, height, flags);
+    return (window_id > 0) ? (long)window_id : -K_ENOMEM;
+}
+
+/* Create buffer */
+long sys_graphics_create_buffer(u32 width, u32 height, u32 format) {
+    if (width == 0 || height == 0 || width > 4096 || height > 4096) {
+        return -K_EINVAL;
+    }
+    
+    if (format > GFX_FORMAT_RGB565) {
+        return -K_EINVAL;
+    }
+    
+    uint32_t buffer_id = graphics_create_buffer(width, height, format);
+    return (buffer_id > 0) ? (long)buffer_id : -K_ENOMEM;
+}
+
+/* Fill rectangle */
+long sys_graphics_fill_rect(u32 buffer_id, u32 x, u32 y, u32 width, u32 height, u32 color) {
+    if (buffer_id == 0 || width == 0 || height == 0) {
+        return -K_EINVAL;
+    }
+    
+    status_t result = graphics_fill_rect(buffer_id, x, y, width, height, color);
+    
+    switch (result) {
+        case STATUS_OK:
+            return 0;
+        case STATUS_NOTFOUND:
+            return -K_EBADF;
+        default:
+            return -K_EIO;
+    }
+}
+
+/* Blit operation */
+long sys_graphics_blit(u32 src_id, u32 dst_id, u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height) {
+    if (width == 0 || height == 0) {
+        return -K_EINVAL;
+    }
+    
+    status_t result = graphics_blit(src_id, dst_id, src_x, src_y, dst_x, dst_y, width, height);
+    
+    switch (result) {
+        case STATUS_OK:
+            return 0;
+        case STATUS_NOTFOUND:
+            return -K_EBADF;
+        default:
+            return -K_EIO;
+    }
+}
+
+/* Present graphics to screen */
+long sys_graphics_present(void) {
+    status_t result = graphics_present();
+    return (result == STATUS_OK) ? 0 : -K_EIO;
+}
+
+/* Destroy window */
+long sys_graphics_destroy_window(u32 window_id) {
+    if (window_id == 0) {
+        return -K_EINVAL;
+    }
+    
+    status_t result = graphics_destroy_window(window_id);
+    
+    switch (result) {
+        case STATUS_OK:
+            return 0;
+        case STATUS_NOTFOUND:
+            return -K_EBADF;
+        case STATUS_DENIED:
+            return -K_EPERM;
+        default:
+            return -K_EIO;
+    }
+}
+
+/* Destroy buffer */
+long sys_graphics_destroy_buffer(u32 buffer_id) {
+    if (buffer_id == 0) {
+        return -K_EINVAL;
+    }
+    
+    status_t result = graphics_destroy_buffer(buffer_id);
+    
+    switch (result) {
+        case STATUS_OK:
+            return 0;
+        case STATUS_NOTFOUND:
+            return -K_EBADF;
+        case STATUS_DENIED:
+            return -K_EPERM;
+        default:
+            return -K_EIO;
+    }
+}

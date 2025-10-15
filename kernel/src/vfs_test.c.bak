@@ -1,0 +1,127 @@
+#include "kernel.h"
+#include "vfs.h"
+#include "log.h"
+
+/*
+ * VFS Self-Test Suite
+ * Tests virtual filesystem operations, tmpfs functionality, and file I/O
+ */
+
+int vfs_selftest(void) {
+    KLOG_INFO("vfs_test", "Starting VFS self-tests");
+
+    // Test 1: Basic filesystem operations
+    vnode_t* root = NULL;
+    int rc = vfs_lookup("/", &root);
+    if (rc != 0) {
+        KLOG_ERROR("vfs_test", "Root lookup failed rc=%d", rc);
+        return -1;
+    }
+
+    // Test 2: Create a test file
+    file_t* test_file = NULL;
+    rc = vfs_create_file("/test.txt", 0644, &test_file);
+    if (rc != 0) {
+        KLOG_ERROR("vfs_test", "File creation failed rc=%d", rc);
+        return -2;
+    }
+
+    // Test 3: Write data to file
+    const char* test_data = "Hello, LimitlessOS VFS!";
+    size_t test_len = k_strlen(test_data);
+    u64 bytes_written = 0;
+    
+    rc = vfs_write(test_file, test_data, test_len, &bytes_written);
+    if (rc != 0 || bytes_written != test_len) {
+        KLOG_ERROR("vfs_test", "Write failed rc=%d written=%llu expected=%zu", 
+                   rc, bytes_written, test_len);
+        return -3;
+    }
+
+    // Test 4: Read data back
+    char read_buffer[64];
+    u64 bytes_read = 0;
+    k_memset(read_buffer, 0, sizeof(read_buffer));
+    
+    // Seek to beginning first
+    vfs_seek(test_file, 0, SEEK_SET);
+    
+    rc = vfs_read(test_file, read_buffer, test_len, &bytes_read);
+    if (rc != 0 || bytes_read != test_len) {
+        KLOG_ERROR("vfs_test", "Read failed rc=%d read=%llu expected=%zu", 
+                   rc, bytes_read, test_len);
+        return -4;
+    }
+
+    // Test 5: Verify data integrity
+    if (k_memcmp(test_data, read_buffer, test_len) != 0) {
+        KLOG_ERROR("vfs_test", "Data integrity check failed");
+        return -5;
+    }
+
+    // Close the test file
+    vfs_close(test_file);
+
+    // Test 6: Create directory
+    rc = vfs_mkdir_path("/testdir", 0755);
+    if (rc != 0) {
+        KLOG_ERROR("vfs_test", "Directory creation failed rc=%d", rc);
+        return -6;
+    }
+
+    // Test 7: Create file in directory
+    file_t* nested_file = NULL;
+    rc = vfs_create_file("/testdir/nested.txt", 0644, &nested_file);
+    if (rc != 0) {
+        KLOG_ERROR("vfs_test", "Nested file creation failed rc=%d", rc);
+        return -7;
+    }
+    vfs_close(nested_file);
+
+    // Test 8: Directory listing (simplified test - just check if listdir works)
+    static int list_callback(const char* name, u8 type, void* ctx) {
+        int* count = (int*)ctx;
+        (*count)++;
+        KLOG_INFO("vfs_test", "Found entry: %s (type=%u)", name, type);
+        return 0; // Continue enumeration
+    }
+
+    int entry_count = 0;
+    rc = vfs_listdir("/", list_callback, &entry_count);
+    if (rc != 0) {
+        KLOG_ERROR("vfs_test", "Directory listing failed rc=%d", rc);
+        return -8;
+    }
+
+    if (entry_count == 0) {
+        KLOG_ERROR("vfs_test", "No entries found in root directory");
+        return -9;
+    }
+
+    // Test 9: File removal
+    rc = vfs_unlink_path("/test.txt");
+    if (rc != 0) {
+        KLOG_ERROR("vfs_test", "File removal failed rc=%d", rc);
+        return -10;
+    }
+
+    // Test 10: Remove nested file first
+    rc = vfs_unlink_path("/testdir/nested.txt");
+    if (rc != 0) {
+        KLOG_ERROR("vfs_test", "Nested file removal failed rc=%d", rc);
+        return -11;
+    }
+
+    // Test 11: Open and read an existing file (if any exists)
+    file_t* read_test = NULL;
+    rc = vfs_open("/", O_RDONLY, &read_test);
+    if (rc == 0 && read_test) {
+        vfs_close(read_test);
+        KLOG_INFO("vfs_test", "Successfully opened root directory");
+    }
+
+    // Note: Directory removal not tested as API may not be fully implemented yet
+
+    KLOG_INFO("vfs_test", "All VFS tests passed");
+    return 0;
+}

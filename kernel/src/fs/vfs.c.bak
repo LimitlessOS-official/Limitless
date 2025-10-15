@@ -1,0 +1,272 @@
+#if 0 /* legacy fs/vfs disabled; new kernel/src/vfs.c active */
+#include "kernel.h"
+#include "vfs.h"
+#include "block.h"
+#include "string.h"
+#include "log.h"
+
+/* Hook internals (weak if hooks not linked) */
+extern void __vfs_emit_open_event(const char* path,int flags,int rc) __attribute__((weak));
+extern void __vfs_emit_create_event(const char* path,u32 mode,int rc) __attribute__((weak));
+extern void __vfs_emit_unlink_event(const char* path,int rc) __attribute__((weak));
+extern int __security_open_check(const char* path,int flags) __attribute__((weak));
+
+/* Weak externs to integrate with existing kernel subsystems */
+extern block_dev_t* block_get_by_name(const char* name) __attribute__((weak));
+extern int proc_exec_init(const char* path) __attribute__((weak)); /* start PID1 */
+extern int start_init_process(const char* path) __attribute__((weak));
+
+/* Filesystem registry */
+#define MAX_FS_TYPES 8
+static const fs_type_t* g_fs_types[MAX_FS_TYPES];
+
+/* Mount table (single root and optional others) */
+#define MAX_MOUNTS 8
+static vfs_mount_t g_mounts[MAX_MOUNTS];
+static vfs_mount_t* g_root = NULL;
+
+static int streq(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == 0 && *b == 0;
+}
+
+const fs_type_t* vfs_find_fs(const char* name) {
+    for (int i=0;i<MAX_FS_TYPES;i++) {
+        if (g_fs_types[i] && streq(g_fs_types[i]->name, name)) return g_fs_types[i];
+    }
+    return NULL;
+}
+
+int vfs_register_fs(const fs_type_t* type) {
+    for (int i=0;i<MAX_FS_TYPES;i++) if (!g_fs_types[i]) { g_fs_types[i] = type; return 0; }
+    return K_ENOSPC;
+}
+
+static vfs_mount_t* mount_alloc(void) {
+    for (int i=0;i<MAX_MOUNTS;i++) if (g_mounts[i].sb == NULL) return &g_mounts[i];
+    return NULL;
+}
+
+vfs_mount_t* vfs_get_root_mount(void) { return g_root; }
+
+static int vfs_mount_common(const char* fsname, block_dev_t* bdev, const char* path) {
+    const fs_type_t* fst = vfs_find_fs(fsname);
+    if (!fst) return K_ENOENT;
+    vfs_super_t* sb = NULL;
+    int rc = fst->mount(bdev, &sb);
+    if (rc != 0) return rc;
+    vfs_mount_t* m = mount_alloc();
+    if (!m) { if (sb && sb->ops && sb->ops->put_super) sb->ops->put_super(sb); return K_ENOSPC; }
+    k_memset(m, 0, sizeof(*m));
+    k_strlcpy(m->mountpoint, path, sizeof(m->mountpoint));
+    k_strlcpy(m->fstype, fsname, sizeof(m->fstype));
+    m->sb = sb; sb->mnt = m;
+    if (streq(path, "/")) g_root = m;
+    KLOG_INFO("vfs", "mounted %s on %s", fsname, path);
+    return 0;
+}
+int vfs_mount_root(const char* fsname, block_dev_t* bdev) {
+    return vfs_mount_common(fsname, bdev, "/");
+}
+int vfs_mount_at(const char* fsname, block_dev_t* bdev, const char* path) {
+    if (!path || !*path) return K_EINVAL;
+    return vfs_mount_common(fsname, bdev, path);
+}
+
+static vnode_t* vfs_root_vnode(void) {
+    if (!g_root || !g_root->sb || !g_root->sb->ops || !g_root->sb->ops->get_root) return NULL;
+    return g_root->sb->ops->get_root(g_root->sb);
+}
+
+vnode_t* vfs_ref(vnode_t* vn) { return vn; }
+void     vfs_put(vnode_t* vn) {
+    if (!vn) return;
+    if (vn->ops && vn->ops->release) vn->ops->release(vn);
+}
+
+static int path_next(const char** ppath, const char** comp, size_t* clen) {
+    const char* p = *ppath;
+    while (*p == '/') p++;
+    if (*p == 0) { *ppath = p; return 0; }
+    const char* start = p;
+    while (*p && *p != '/') p++;
+    *comp = start; *clen = (size_t)(p - start);
+    *ppath = p;
+    return 0;
+}
+int vfs_lookup(const char* path, vnode_t** out) {
+    if (!path || !out) return K_EINVAL;
+    if (!g_root) return K_ENOENT;
+    vnode_t* cur = vfs_root_vnode();
+    if (!cur) return K_EIO;
+    if (streq(path, "/")) { *out = cur; return 0; }
+    const char* p = path;
+    const char* comp; size_t clen;
+    while (path_next(&p, &comp, &clen)) {
+        if (!cur->ops || !cur->ops->lookup) return K_ENOTDIR;
+        vnode_t* next = cur->ops->lookup(cur, comp, clen);
+        if (!next) return K_ENOENT;
+        cur = next;
+    }
+    *out = cur;
+    return 0;
+}
+
+int vfs_read(file_t* f, void* buf, u64 len, u64* out_rd) {
+    (void)f; (void)buf; (void)len; if (out_rd) *out_rd = 0; return K_ENOSYS;
+}
+// ...existing code...
+
+int vfs_listdir(const char* path, vfs_dirent_cb cb, void* ctx) {
+    vnode_t* vn;
+    int rc = vfs_lookup(path, &vn);
+    if (rc != 0) return rc;
+    if (!vn->ops || !vn->ops->readdir) return K_ENOTDIR;
+    return vn->ops->readdir(vn, cb, ctx);
+}
+
+/* Block IO helper: read arbitrary bytes; rounds down/up to sector size (assumed 512). */
+int bdev_read_bytes(block_dev_t* bdev, u64 off_bytes, void* buf, size_t len) {
+    if (!bdev || !buf || !len) return K_EINVAL;
+    u32 sec_sz = bdev->sector_sz ? bdev->sector_sz : 512;
+    u64 start_sec = off_bytes / sec_sz;
+    u32 pre = (u32)(off_bytes % sec_sz);
+    u32 total = (u32)len;
+    if (pre == 0 && (total % sec_sz) == 0) {
+        /* Aligned fast-path */
+        blk_io_t io = { .lba = start_sec, .count = total / sec_sz, .buf = buf };
+        return bdev->ops.read(bdev, &io);
+    }
+    /* Unaligned: use a small scratch buffer per sector */
+    u8 tmp[1024]; /* supports up to 1024-byte sectors; standard is 512 */
+    u64 cur_sec = start_sec;
+    u32 pos_in_buf = 0;
+    u32 remain = total;
+    if (pre) {
+        blk_io_t io = { .lba = cur_sec, .count = 1, .buf = tmp };
+        int rc = bdev->ops.read(bdev, &io);
+        if (rc != 0) return rc;
+        u32 n = sec_sz - pre; if (n > remain) n = remain;
+        k_memcpy((u8*)buf + pos_in_buf, tmp + pre, n);
+        pos_in_buf += n; remain -= n; cur_sec++;
+    }
+    while (remain >= sec_sz) {
+        blk_io_t io = { .lba = cur_sec, .count = 1, .buf = (u8*)buf + pos_in_buf };
+        int rc = bdev->ops.read(bdev, &io);
+        if (rc != 0) return rc;
+        pos_in_buf += sec_sz; remain -= sec_sz; cur_sec++;
+    }
+    if (remain) {
+        blk_io_t io = { .lba = cur_sec, .count = 1, .buf = tmp };
+        int rc = bdev->ops.read(bdev, &io);
+        if (rc != 0) return rc;
+        k_memcpy((u8*)buf + pos_in_buf, tmp, remain);
+    }
+    return 0;
+}
+
+/* Device lookup helper: tries a few common names */
+static block_dev_t* vfs_try_get_bdev_by_name(const char* name) {
+    if (block_get_by_name) return block_get_by_name(name);
+    /* Try other potential names by weak externs */
+    extern block_dev_t* block_find(const char* name) __attribute__((weak));
+    if (block_find) return block_find(name);
+    extern block_dev_t* blk_get(const char* name) __attribute__((weak));
+    if (blk_get) return blk_get(name);
+    extern block_dev_t* block_find_by_name(const char* name) __attribute__((weak));
+    if (block_find_by_name) return block_find_by_name(name);
+    return NULL;
+}
+
+/* Public helper for mounting via device name string (used by sys_mount if wired) */
+int vfs_mount_device_by_name(const char* fsname, const char* devname, const char* path) {
+    block_dev_t* bdev = vfs_try_get_bdev_by_name(devname);
+    if (!bdev) {
+        KLOG_ERROR("vfs", "device '%s' not found", devname);
+        return K_ENOENT;
+    }
+    return vfs_mount_at(fsname, bdev, path);
+}
+
+/* Bootstrap: mount root on vda and exec /sbin/init */
+#include "config.h"
+#include "fs/ext4.h" /* for run_ext4_extent_tests optional */
+int procfs_register(void); /* forward */
+int vfs_phase6_bootstrap_mount_and_exec(void) {
+    procfs_register();
+    block_dev_t* vda = vfs_try_get_bdev_by_name("vda");
+    if (!vda) {
+        KLOG_ERROR("vfs", "no virtio-blk device 'vda' found");
+        return K_ENOENT;
+    }
+    int rc = vfs_mount_root("ext4", vda);
+    if (rc != 0) {
+        KLOG_WARN("vfs", "ext4 mount failed (%d), trying fat32...", rc);
+        rc = vfs_mount_root("fat32", vda);
+        if (rc != 0) {
+            KLOG_ERROR("vfs", "fat32 mount failed (%d)", rc);
+            return rc;
+        }
+    } else {
+        /* Auto-run extent test suite on successful ext4 mount (guarded). */
+        #ifdef CONFIG_FS_TESTS
+        int trc = run_ext4_extent_tests();
+        if (trc != 0) {
+            KLOG_WARN("ext4test", "extent suite reported failures rc=%d", trc);
+        }
+        #endif
+    }
+    /* Mount /tmp as tmpfs if available */
+    const fs_type_t* tmp = vfs_find_fs("tmpfs");
+    if (tmp) {
+        vfs_mount_at("tmpfs", NULL, "/tmp");
+    }
+    const fs_type_t* proc = vfs_find_fs("proc"); if (proc) vfs_mount_at("proc", NULL, "/proc");
+    /* Start init */
+    if (start_init_process) return start_init_process("/sbin/init");
+    if (proc_exec_init)     return proc_exec_init("/sbin/init");
+    KLOG_ERROR("vfs", "start_init_process unavailable; ensure kernel init spawns /sbin/init");
+    return 0;
+}
+
+/* Block IO helper: write arbitrary bytes; reads-modify-writes for unaligned regions. */
+int bdev_write_bytes(block_dev_t* bdev, u64 off_bytes, const void* buf, size_t len) {
+    if (!bdev || !buf || !len) return K_EINVAL;
+    if (!bdev->ops.write) return K_ENOTSUP;
+    u32 sec_sz = bdev->sector_sz ? bdev->sector_sz : 512;
+    u64 start_sec = off_bytes / sec_sz;
+    u32 pre = (u32)(off_bytes % sec_sz);
+    u32 total = (u32)len;
+    if (pre == 0 && (total % sec_sz) == 0) {
+        blk_io_t io = { .lba = start_sec, .count = total / sec_sz, .buf = (void*)buf };
+        return bdev->ops.write(bdev, &io);
+    }
+    u8 tmp[1024];
+    u64 cur_sec = start_sec;
+    u32 pos_in_buf = 0;
+    u32 remain = total;
+    if (pre) {
+        blk_io_t r = { .lba = cur_sec, .count = 1, .buf = tmp };
+        int rc = bdev->ops.read(bdev, &r); if (rc != 0) return rc;
+        u32 n = sec_sz - pre; if (n > remain) n = remain;
+        k_memcpy(tmp + pre, (u8*)buf + pos_in_buf, n);
+        blk_io_t w = { .lba = cur_sec, .count = 1, .buf = tmp };
+        rc = bdev->ops.write(bdev, &w); if (rc != 0) return rc;
+        pos_in_buf += n; remain -= n; cur_sec++;
+    }
+    while (remain >= sec_sz) {
+        blk_io_t w = { .lba = cur_sec, .count = 1, .buf = (u8*)buf + pos_in_buf };
+        int rc = bdev->ops.write(bdev, &w); if (rc != 0) return rc;
+        pos_in_buf += sec_sz; remain -= sec_sz; cur_sec++;
+    }
+    if (remain) {
+        blk_io_t r = { .lba = cur_sec, .count = 1, .buf = tmp };
+        int rc = bdev->ops.read(bdev, &r); if (rc != 0) return rc;
+        k_memcpy(tmp, (u8*)buf + pos_in_buf, remain);
+        blk_io_t w = { .lba = cur_sec, .count = 1, .buf = tmp };
+        rc = bdev->ops.write(bdev, &w); if (rc != 0) return rc;
+    }
+    return 0;
+}
+#endif /* end legacy fs/vfs active */

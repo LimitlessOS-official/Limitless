@@ -1,0 +1,874 @@
+/*
+ * LimitlessOS Advanced Interrupt and Exception Handling
+ * Production-ready IRQ management with AI optimization and real-time support
+ * Supports MSI/MSI-X, IOMMUs, and intelligent interrupt balancing
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "kernel/include/interrupt.h"
+#include "kernel/include/apic.h"
+#include "kernel/include/idt.h"
+#include "kernel/include/exception.h"
+#include "kernel/include/msi.h"
+#include "kernel/include/ai_interrupt.h"
+
+// Maximum interrupt vectors
+#define MAX_IRQ_VECTORS 256
+#define MAX_MSI_VECTORS 2048
+
+// Global interrupt management structures
+struct interrupt_controller irq_ctrl;
+struct exception_handler_table exception_handlers;
+struct msi_controller msi_ctrl;
+struct ai_interrupt_optimizer ai_irq_opt;
+
+// Interrupt descriptor structure
+struct irq_desc {
+    struct irq_chip *chip;              // IRQ chip operations
+    struct irq_data irq_data;           // IRQ data
+    irq_flow_handler_t handle_irq;      // IRQ flow handler
+    struct irqaction *action;           // IRQ action chain
+    
+    unsigned int irq;                   // IRQ number
+    unsigned int hwirq;                 // Hardware IRQ number
+    unsigned int virq;                  // Virtual IRQ number
+    
+    // IRQ statistics
+    struct irq_stats {
+        uint64_t count;                 // IRQ count
+        uint64_t unhandled_count;       // Unhandled IRQ count
+        uint64_t spurious_count;        // Spurious IRQ count
+        uint64_t total_time;            // Total processing time
+        uint64_t max_time;              // Maximum processing time
+        uint64_t min_time;              // Minimum processing time
+        unsigned int cpu_last;          // Last CPU that handled IRQ
+        uint64_t last_timestamp;        // Last IRQ timestamp
+    } stats;
+    
+    // IRQ configuration
+    struct irq_config {
+        enum irq_type {
+            IRQ_TYPE_EDGE_RISING = 0x01,
+            IRQ_TYPE_EDGE_FALLING = 0x02,
+            IRQ_TYPE_EDGE_BOTH = 0x03,
+            IRQ_TYPE_LEVEL_HIGH = 0x04,
+            IRQ_TYPE_LEVEL_LOW = 0x08,
+            IRQ_TYPE_SENSE_MASK = 0x0f,
+            IRQ_TYPE_PROBE = 0x10
+        } trigger_type;
+        
+        bool edge_triggered;            // Edge or level triggered
+        bool active_low;                // Active low polarity
+        bool shared;                    // Shared IRQ
+        bool wakeup_capable;            // Can wake system from sleep
+        bool threaded;                  // Threaded IRQ handler
+        int priority;                   // IRQ priority (0=highest)
+        int affinity_hint;              // CPU affinity hint
+    } config;
+    
+    // CPU affinity and balancing
+    cpumask_t affinity;                 // CPU affinity mask
+    cpumask_t effective_affinity;       // Effective CPU affinity
+    cpumask_t pending_mask;             // Pending CPU mask
+    int target_cpu;                     // Target CPU for balancing
+    
+    // Power management
+    struct irq_pm {
+        bool suspend_enabled;           // IRQ enabled during suspend
+        bool runtime_pm_enabled;        // Runtime PM enabled
+        unsigned int wakeup_count;      // Wakeup event count
+    } pm;
+    
+    // AI optimization data
+    struct ai_irq_profile {
+        float predicted_load;           // Predicted IRQ load
+        float cpu_efficiency[MAX_CPUS]; // CPU efficiency for this IRQ
+        unsigned int optimal_cpu;       // AI-predicted optimal CPU
+        uint64_t migration_cost;        // Cost of migrating IRQ
+        bool ai_balancing_enabled;      // AI balancing enabled
+        float prediction_accuracy;      // Prediction accuracy
+    } ai_profile;
+    
+    // Real-time properties
+    struct rt_irq_data {
+        int rt_priority;                // Real-time priority
+        bool rt_enabled;                // Real-time IRQ handling
+        uint64_t deadline;              // IRQ deadline
+        uint64_t worst_case_time;       // Worst-case execution time
+    } rt_data;
+    
+    // Security and isolation
+    struct irq_security {
+        bool secure_irq;                // Secure IRQ (isolated)
+        int security_level;             // Security level (0-4)
+        bool audit_enabled;             // Audit IRQ events
+    } security;
+    
+    // Synchronization
+    raw_spinlock_t lock;                // IRQ descriptor lock
+    struct mutex request_mutex;         // Request/free mutex
+    
+    // Debug and tracing
+    const char *name;                   // IRQ name for debugging
+    struct proc_dir_entry *proc_entry;  // /proc entry
+    unsigned long flags;                // IRQ flags
+    
+    // MSI/MSI-X support
+    struct msi_desc *msi_desc;          // MSI descriptor
+    
+    // NUMA-aware data
+    int node;                           // NUMA node
+    
+    void *private_data;                 // Driver private data
+};
+
+// IRQ action structure (handler chain)
+struct irqaction {
+    irq_handler_t handler;              // IRQ handler function
+    void *dev_id;                      // Device ID
+    void __percpu *percpu_dev_id;      // Per-CPU device ID
+    struct irqaction *next;            // Next action in chain
+    irq_handler_t thread_fn;           // Threaded handler
+    struct task_struct *thread;        // IRQ thread
+    struct irqaction *secondary;       // Secondary action
+    unsigned int irq;                  // IRQ number
+    unsigned int flags;                // IRQ flags
+    unsigned long thread_flags;        // Thread flags
+    unsigned long thread_mask;         // Thread mask
+    const char *name;                  // Action name
+    struct proc_dir_entry *dir;        // /proc directory
+};
+
+// Exception handler structure
+struct exception_handler {
+    void (*handler)(struct pt_regs *regs, unsigned long error_code);
+    const char *name;                   // Exception name
+    bool recoverable;                   // Can recover from exception
+    bool user_fixable;                  // User can fix exception
+    int priority;                       // Handler priority
+    
+    // Exception statistics
+    struct exception_stats {
+        uint64_t count;                 // Exception count
+        uint64_t user_count;            // User-mode exceptions
+        uint64_t kernel_count;          // Kernel-mode exceptions
+        uint64_t recoverable_count;     // Recoverable exceptions
+        uint64_t fatal_count;           // Fatal exceptions
+        uint64_t last_timestamp;        // Last exception timestamp
+        int last_cpu;                   // Last CPU where exception occurred
+    } stats;
+    
+    // AI analysis
+    struct ai_exception_profile {
+        float prediction_rate;          // Exception prediction rate
+        float severity_score;           // Severity score (0.0-1.0)
+        bool pattern_detected;          // Pattern detected
+        uint64_t next_predicted_time;   // Next predicted occurrence
+    } ai_profile;
+};
+
+// Advanced Programmable Interrupt Controller (APIC) management
+struct apic_controller {
+    void __iomem *base_addr;           // APIC base address
+    uint32_t version;                  // APIC version
+    uint32_t max_lvt;                  // Maximum LVT entries
+    
+    // APIC configuration
+    struct apic_config {
+        bool x2apic_enabled;           // x2APIC mode enabled
+        bool virtualization_enabled;   // APIC virtualization
+        bool tsc_deadline_timer;       // TSC deadline timer
+        bool directed_eoi;             // Directed EOI
+        int spurious_vector;           // Spurious interrupt vector
+        int error_vector;              // Error interrupt vector
+        int thermal_vector;            // Thermal interrupt vector
+        int performance_vector;        // Performance monitoring vector
+    } config;
+    
+    // Per-CPU APIC data
+    struct per_cpu_apic {
+        uint32_t apic_id;              // APIC ID
+        uint32_t logical_id;           // Logical APIC ID
+        uint32_t version;              // Local APIC version
+        bool enabled;                  // APIC enabled
+        bool bsp;                      // Bootstrap processor
+        
+        // Local APIC registers (cached)
+        uint32_t task_priority;        // Task priority register
+        uint32_t processor_priority;   // Processor priority register
+        uint32_t arbitration_id;       // Arbitration ID register
+        
+        // Timer management
+        struct apic_timer {
+            uint32_t initial_count;    // Timer initial count
+            uint32_t current_count;    // Timer current count
+            uint32_t divide_config;    // Timer divide configuration
+            bool periodic;             // Periodic timer mode
+            bool tsc_deadline;         // TSC deadline mode
+            uint64_t deadline;         // TSC deadline value
+        } timer;
+        
+        // Interrupt statistics
+        struct apic_stats {
+            uint64_t interrupts_sent;  // Interrupts sent
+            uint64_t interrupts_received; // Interrupts received
+            uint64_t ipi_sent;         // IPIs sent
+            uint64_t ipi_received;     // IPIs received
+            uint64_t timer_interrupts; // Timer interrupts
+            uint64_t error_interrupts; // Error interrupts
+            uint64_t spurious_interrupts; // Spurious interrupts
+            uint64_t thermal_interrupts; // Thermal interrupts
+        } stats;
+    } per_cpu[MAX_CPUS];
+    
+    // AI optimization
+    struct ai_apic_optimizer {
+        bool enabled;                  // AI optimization enabled
+        float load_balance_efficiency; // Load balancing efficiency
+        uint64_t optimal_ipi_count;    // Optimal IPI count prediction
+        float cpu_utilization_target;  // Target CPU utilization
+    } ai_optimizer;
+};
+
+// MSI/MSI-X controller
+struct msi_controller {
+    bool msi_enabled;                  // MSI support enabled
+    bool msix_enabled;                 // MSI-X support enabled
+    int max_msi_vectors;              // Maximum MSI vectors
+    int max_msix_vectors;             // Maximum MSI-X vectors
+    
+    // MSI vector allocation
+    DECLARE_BITMAP(msi_vector_map, MAX_MSI_VECTORS);
+    spinlock_t vector_lock;           // Vector allocation lock
+    
+    // MSI statistics
+    struct msi_stats {
+        uint64_t msi_allocated;       // MSI vectors allocated
+        uint64_t msix_allocated;      // MSI-X vectors allocated
+        uint64_t msi_interrupts;      // MSI interrupts handled
+        uint64_t msix_interrupts;     // MSI-X interrupts handled
+    } stats;
+    
+    // AI optimization for MSI
+    struct ai_msi_optimizer {
+        bool enabled;                 // AI MSI optimization enabled
+        float vector_efficiency[MAX_MSI_VECTORS]; // Vector efficiency
+        int optimal_vector_count;     // Optimal vector count
+    } ai_optimizer;
+};
+
+// Function prototypes for interrupt handling
+
+// Core interrupt management
+int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,
+               const char *name, void *dev);
+int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+                        irq_handler_t thread_fn, unsigned long flags,
+                        const char *name, void *dev);
+void free_irq(unsigned int irq, void *dev_id);
+void disable_irq(unsigned int irq);
+void enable_irq(unsigned int irq);
+
+// Exception handlers
+void divide_error_handler(struct pt_regs *regs, unsigned long error_code);
+void debug_exception_handler(struct pt_regs *regs, unsigned long error_code);
+void nmi_handler(struct pt_regs *regs, unsigned long error_code);
+void breakpoint_handler(struct pt_regs *regs, unsigned long error_code);
+void overflow_handler(struct pt_regs *regs, unsigned long error_code);
+void bounds_check_handler(struct pt_regs *regs, unsigned long error_code);
+void invalid_opcode_handler(struct pt_regs *regs, unsigned long error_code);
+void device_not_available_handler(struct pt_regs *regs, unsigned long error_code);
+void double_fault_handler(struct pt_regs *regs, unsigned long error_code);
+void invalid_tss_handler(struct pt_regs *regs, unsigned long error_code);
+void segment_not_present_handler(struct pt_regs *regs, unsigned long error_code);
+void stack_segment_fault_handler(struct pt_regs *regs, unsigned long error_code);
+void general_protection_fault_handler(struct pt_regs *regs, unsigned long error_code);
+void page_fault_handler(struct pt_regs *regs, unsigned long error_code);
+void floating_point_error_handler(struct pt_regs *regs, unsigned long error_code);
+void alignment_check_handler(struct pt_regs *regs, unsigned long error_code);
+void machine_check_handler(struct pt_regs *regs, unsigned long error_code);
+void simd_exception_handler(struct pt_regs *regs, unsigned long error_code);
+void virtualization_exception_handler(struct pt_regs *regs, unsigned long error_code);
+
+// Interrupt controller implementation
+
+// Initialize interrupt subsystem
+int __init interrupt_init(void) {
+    int ret;
+    
+    pr_info("Initializing LimitlessOS interrupt subsystem\n");
+    
+    // Initialize interrupt controller
+    memset(&irq_ctrl, 0, sizeof(irq_ctrl));
+    
+    // Initialize APIC
+    ret = apic_init(&irq_ctrl.apic);
+    if (ret) {
+        pr_err("Failed to initialize APIC: %d\n", ret);
+        return ret;
+    }
+    
+    // Initialize IDT (Interrupt Descriptor Table)
+    ret = idt_init();
+    if (ret) {
+        pr_err("Failed to initialize IDT: %d\n", ret);
+        return ret;
+    }
+    
+    // Initialize exception handlers
+    ret = init_exception_handlers();
+    if (ret) {
+        pr_err("Failed to initialize exception handlers: %d\n", ret);
+        return ret;
+    }
+    
+    // Initialize MSI controller
+    ret = msi_init(&msi_ctrl);
+    if (ret) {
+        pr_warn("MSI initialization failed, MSI support disabled\n");
+        msi_ctrl.msi_enabled = false;
+        msi_ctrl.msix_enabled = false;
+    } else {
+        pr_info("MSI/MSI-X support enabled\n");
+    }
+    
+    // Initialize AI interrupt optimizer
+    if (CONFIG_LIMITLESS_AI) {
+        ret = ai_interrupt_optimizer_init(&ai_irq_opt);
+        if (ret) {
+            pr_warn("AI interrupt optimization disabled\n");
+            irq_ctrl.ai_enabled = false;
+        } else {
+            irq_ctrl.ai_enabled = true;
+            pr_info("AI interrupt optimization enabled\n");
+        }
+    }
+    
+    // Setup interrupt vectors
+    setup_interrupt_vectors();
+    
+    // Enable interrupts
+    local_irq_enable();
+    
+    pr_info("Interrupt subsystem initialized successfully\n");
+    return 0;
+}
+
+// Initialize APIC
+static int apic_init(struct apic_controller *apic) {
+    uint32_t eax, ebx, ecx, edx;
+    
+    // Check APIC availability
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    if (!(edx & (1 << 9))) {
+        pr_err("Local APIC not available\n");
+        return -ENODEV;
+    }
+    
+    // Map APIC base address
+    apic->base_addr = ioremap(APIC_DEFAULT_PHYS_BASE, PAGE_SIZE);
+    if (!apic->base_addr) {
+        pr_err("Failed to map APIC base address\n");
+        return -ENOMEM;
+    }
+    
+    // Read APIC version
+    apic->version = apic_read(APIC_LVR);
+    apic->max_lvt = GET_APIC_MAXLVT(apic->version);
+    
+    pr_info("Local APIC version 0x%x, max LVT entries: %d\n",
+            GET_APIC_VERSION(apic->version), apic->max_lvt);
+    
+    // Check for x2APIC support
+    if (cpu_has_x2apic && !disable_x2apic) {
+        enable_x2apic();
+        apic->config.x2apic_enabled = true;
+        pr_info("x2APIC mode enabled\n");
+    }
+    
+    // Initialize per-CPU APIC data
+    init_per_cpu_apic(apic);
+    
+    // Setup APIC configuration
+    setup_apic_config(apic);
+    
+    // Enable APIC
+    enable_local_apic();
+    
+    return 0;
+}
+
+// Setup interrupt vectors
+static void setup_interrupt_vectors(void) {
+    int i;
+    
+    // Setup exception vectors (0-31)
+    set_intr_gate(0, divide_error);
+    set_intr_gate(1, debug);
+    set_intr_gate_ist(2, nmi, IST_INDEX_NMI);
+    set_system_intr_gate(3, breakpoint);
+    set_system_intr_gate(4, overflow);
+    set_system_intr_gate(5, bounds);
+    set_intr_gate(6, invalid_op);
+    set_intr_gate(7, device_not_available);
+    set_intr_gate_ist(8, double_fault, IST_INDEX_DF);
+    set_intr_gate(10, invalid_TSS);
+    set_intr_gate(11, segment_not_present);
+    set_intr_gate(12, stack_segment);
+    set_intr_gate(13, general_protection);
+    set_intr_gate(14, page_fault);
+    set_intr_gate(16, coprocessor_error);
+    set_intr_gate(17, alignment_check);
+    set_intr_gate_ist(18, machine_check, IST_INDEX_MCE);
+    set_intr_gate(19, simd_coprocessor_error);
+    set_intr_gate(20, virtualization_exception);
+    
+    // Setup IRQ vectors (32-255)
+    for (i = 32; i < 256; i++) {
+        set_intr_gate(i, irq_entries_start + 8 * (i - 32));
+    }
+    
+    // Setup system vectors
+    set_intr_gate(RESCHEDULE_VECTOR, reschedule_interrupt);
+    set_intr_gate(CALL_FUNCTION_VECTOR, call_function_interrupt);
+    set_intr_gate(CALL_FUNCTION_SINGLE_VECTOR, call_function_single_interrupt);
+    set_intr_gate(IRQ_WORK_VECTOR, irq_work_interrupt);
+    set_intr_gate(THERMAL_APIC_VECTOR, thermal_interrupt);
+    set_intr_gate(THRESHOLD_APIC_VECTOR, threshold_interrupt);
+    set_intr_gate(DEFERRED_ERROR_VECTOR, deferred_error_interrupt);
+    set_intr_gate(LOCAL_TIMER_VECTOR, apic_timer_interrupt);
+    set_intr_gate(X86_PLATFORM_IPI_VECTOR, x86_platform_ipi);
+    set_intr_gate(POSTED_INTR_VECTOR, kvm_posted_intr_ipi);
+    set_intr_gate(POSTED_INTR_WAKEUP_VECTOR, kvm_posted_intr_wakeup_ipi);
+    set_intr_gate(POSTED_INTR_NESTED_VECTOR, kvm_posted_intr_nested_ipi);
+    set_intr_gate(IRQ_MOVE_CLEANUP_VECTOR, irq_move_cleanup_interrupt);
+    set_intr_gate(REBOOT_VECTOR, reboot_interrupt);
+}
+
+// Initialize exception handlers
+static int init_exception_handlers(void) {
+    int i;
+    
+    // Initialize exception handler table
+    memset(&exception_handlers, 0, sizeof(exception_handlers));
+    
+    // Setup exception handlers
+    exception_handlers.handlers[0] = (struct exception_handler) {
+        .handler = divide_error_handler,
+        .name = "Divide Error",
+        .recoverable = false,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[1] = (struct exception_handler) {
+        .handler = debug_exception_handler,
+        .name = "Debug Exception",
+        .recoverable = true,
+        .user_fixable = false,
+        .priority = 1
+    };
+    
+    exception_handlers.handlers[2] = (struct exception_handler) {
+        .handler = nmi_handler,
+        .name = "Non-Maskable Interrupt",
+        .recoverable = true,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[3] = (struct exception_handler) {
+        .handler = breakpoint_handler,
+        .name = "Breakpoint",
+        .recoverable = true,
+        .user_fixable = true,
+        .priority = 2
+    };
+    
+    exception_handlers.handlers[4] = (struct exception_handler) {
+        .handler = overflow_handler,
+        .name = "Overflow",
+        .recoverable = true,
+        .user_fixable = true,
+        .priority = 2
+    };
+    
+    exception_handlers.handlers[5] = (struct exception_handler) {
+        .handler = bounds_check_handler,
+        .name = "Bounds Check",
+        .recoverable = false,
+        .user_fixable = false,
+        .priority = 1
+    };
+    
+    exception_handlers.handlers[6] = (struct exception_handler) {
+        .handler = invalid_opcode_handler,
+        .name = "Invalid Opcode",
+        .recoverable = false,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[7] = (struct exception_handler) {
+        .handler = device_not_available_handler,
+        .name = "Device Not Available",
+        .recoverable = true,
+        .user_fixable = false,
+        .priority = 1
+    };
+    
+    exception_handlers.handlers[8] = (struct exception_handler) {
+        .handler = double_fault_handler,
+        .name = "Double Fault",
+        .recoverable = false,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[10] = (struct exception_handler) {
+        .handler = invalid_tss_handler,
+        .name = "Invalid TSS",
+        .recoverable = false,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[11] = (struct exception_handler) {
+        .handler = segment_not_present_handler,
+        .name = "Segment Not Present",
+        .recoverable = true,
+        .user_fixable = false,
+        .priority = 1
+    };
+    
+    exception_handlers.handlers[12] = (struct exception_handler) {
+        .handler = stack_segment_fault_handler,
+        .name = "Stack Segment Fault",
+        .recoverable = false,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[13] = (struct exception_handler) {
+        .handler = general_protection_fault_handler,
+        .name = "General Protection Fault",
+        .recoverable = true,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[14] = (struct exception_handler) {
+        .handler = page_fault_handler,
+        .name = "Page Fault",
+        .recoverable = true,
+        .user_fixable = true,
+        .priority = 1
+    };
+    
+    exception_handlers.handlers[16] = (struct exception_handler) {
+        .handler = floating_point_error_handler,
+        .name = "Floating Point Error",
+        .recoverable = true,
+        .user_fixable = true,
+        .priority = 2
+    };
+    
+    exception_handlers.handlers[17] = (struct exception_handler) {
+        .handler = alignment_check_handler,
+        .name = "Alignment Check",
+        .recoverable = true,
+        .user_fixable = false,
+        .priority = 1
+    };
+    
+    exception_handlers.handlers[18] = (struct exception_handler) {
+        .handler = machine_check_handler,
+        .name = "Machine Check",
+        .recoverable = false,
+        .user_fixable = false,
+        .priority = 0
+    };
+    
+    exception_handlers.handlers[19] = (struct exception_handler) {
+        .handler = simd_exception_handler,
+        .name = "SIMD Exception",
+        .recoverable = true,
+        .user_fixable = true,
+        .priority = 2
+    };
+    
+    exception_handlers.handlers[20] = (struct exception_handler) {
+        .handler = virtualization_exception_handler,
+        .name = "Virtualization Exception",
+        .recoverable = true,
+        .user_fixable = false,
+        .priority = 1
+    };
+    
+    // Initialize statistics for all handlers
+    for (i = 0; i < 32; i++) {
+        if (exception_handlers.handlers[i].handler) {
+            memset(&exception_handlers.handlers[i].stats, 0,
+                   sizeof(exception_handlers.handlers[i].stats));
+        }
+    }
+    
+    return 0;
+}
+
+// Generic IRQ handler entry point
+void handle_irq(struct pt_regs *regs) {
+    struct irq_desc *desc;
+    unsigned int irq;
+    
+    irq = regs->orig_ax & 0xff;
+    
+    // Get IRQ descriptor
+    desc = irq_to_desc(irq);
+    if (unlikely(!desc)) {
+        ack_bad_irq(irq);
+        return;
+    }
+    
+    // Update statistics
+    desc->stats.count++;
+    desc->stats.last_timestamp = sched_clock();
+    desc->stats.cpu_last = smp_processor_id();
+    
+    // AI-guided IRQ processing
+    if (irq_ctrl.ai_enabled) {
+        ai_process_irq_prediction(desc, regs);
+    }
+    
+    // Call the IRQ flow handler
+    generic_handle_irq_desc(desc);
+}
+
+// AI-guided interrupt balancing
+static void ai_balance_interrupts(void) {
+    struct ai_interrupt_optimizer *ai = &ai_irq_opt;
+    int cpu, target_cpu;
+    struct irq_desc *desc;
+    float cpu_loads[MAX_CPUS];
+    float irq_loads[MAX_IRQ_VECTORS];
+    
+    if (!ai->enabled)
+        return;
+    
+    // Calculate current CPU loads
+    for_each_online_cpu(cpu) {
+        cpu_loads[cpu] = ai_calculate_cpu_irq_load(cpu);
+    }
+    
+    // Calculate IRQ loads and find imbalances
+    for_each_active_irq(irq) {
+        desc = irq_to_desc(irq);
+        if (!desc || !desc->action)
+            continue;
+        
+        irq_loads[irq] = ai_calculate_irq_load(desc);
+        
+        // Check if IRQ should be migrated
+        target_cpu = ai_find_optimal_cpu_for_irq(desc, cpu_loads);
+        
+        if (target_cpu >= 0 && target_cpu != desc->stats.cpu_last) {
+            // Migrate IRQ to better CPU
+            if (ai_should_migrate_irq(desc, target_cpu)) {
+                migrate_irq_to_cpu(irq, target_cpu);
+                ai->migrations_performed++;
+            }
+        }
+    }
+    
+    // Update AI model with new measurements
+    ai_update_interrupt_model(ai, cpu_loads, irq_loads);
+}
+
+// MSI/MSI-X support
+int pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec) {
+    int nvec;
+    int rc;
+    
+    if (maxvec < minvec)
+        return -ERANGE;
+    
+    if (!msi_ctrl.msi_enabled)
+        return -ENOSYS;
+    
+    // AI-optimized vector count
+    if (irq_ctrl.ai_enabled) {
+        nvec = ai_optimize_msi_vector_count(dev, minvec, maxvec);
+    } else {
+        nvec = maxvec;
+    }
+    
+    rc = __pci_enable_msi_range(dev, minvec, nvec);
+    if (rc > 0) {
+        msi_ctrl.stats.msi_allocated += rc;
+    }
+    
+    return rc;
+}
+
+int pci_enable_msix_range(struct pci_dev *dev, struct msix_entry *entries,
+                         int minvec, int maxvec) {
+    int rc;
+    
+    if (maxvec < minvec)
+        return -ERANGE;
+    
+    if (!msi_ctrl.msix_enabled)
+        return -ENOSYS;
+    
+    rc = __pci_enable_msix_range(dev, entries, minvec, maxvec);
+    if (rc > 0) {
+        msi_ctrl.stats.msix_allocated += rc;
+    }
+    
+    return rc;
+}
+
+// Exception handlers implementation
+void divide_error_handler(struct pt_regs *regs, unsigned long error_code) {
+    struct exception_handler *handler = &exception_handlers.handlers[0];
+    
+    handler->stats.count++;
+    if (user_mode(regs)) {
+        handler->stats.user_count++;
+        do_trap(X86_TRAP_DE, SIGFPE, "divide error", regs, error_code, 
+                FPE_INTDIV, SEGV_MAPERR, get_user_regs(regs)->ip);
+    } else {
+        handler->stats.kernel_count++;
+        handler->stats.fatal_count++;
+        die("divide error", regs, error_code);
+    }
+}
+
+void page_fault_handler(struct pt_regs *regs, unsigned long error_code) {
+    struct exception_handler *handler = &exception_handlers.handlers[14];
+    unsigned long address;
+    
+    handler->stats.count++;
+    address = read_cr2();
+    
+    if (user_mode(regs)) {
+        handler->stats.user_count++;
+    } else {
+        handler->stats.kernel_count++;
+    }
+    
+    // AI page fault prediction and optimization
+    if (irq_ctrl.ai_enabled) {
+        ai_analyze_page_fault(regs, address, error_code);
+    }
+    
+    // Handle the page fault
+    do_page_fault(regs, error_code, address);
+    
+    handler->stats.last_timestamp = sched_clock();
+}
+
+void general_protection_fault_handler(struct pt_regs *regs, unsigned long error_code) {
+    struct exception_handler *handler = &exception_handlers.handlers[13];
+    
+    handler->stats.count++;
+    
+    if (user_mode(regs)) {
+        handler->stats.user_count++;
+        do_trap(X86_TRAP_GP, SIGSEGV, "general protection fault", regs,
+                error_code, SEGV_MAPERR, 0);
+    } else {
+        handler->stats.kernel_count++;
+        handler->stats.fatal_count++;
+        
+        // Try to recover from GPF in kernel mode
+        if (fixup_exception(regs, X86_TRAP_GP, error_code, 0)) {
+            handler->stats.recoverable_count++;
+            return;
+        }
+        
+        die("general protection fault", regs, error_code);
+    }
+}
+
+// Real-time interrupt support
+int request_rt_irq(unsigned int irq, irq_handler_t handler, 
+                  unsigned long flags, const char *name, void *dev,
+                  int rt_priority, uint64_t deadline) {
+    struct irq_desc *desc;
+    int ret;
+    
+    desc = irq_to_desc(irq);
+    if (!desc)
+        return -EINVAL;
+    
+    // Setup real-time properties
+    desc->rt_data.rt_enabled = true;
+    desc->rt_data.rt_priority = rt_priority;
+    desc->rt_data.deadline = deadline;
+    
+    // Request IRQ with RT flags
+    ret = request_irq(irq, handler, flags | IRQF_RT, name, dev);
+    if (ret == 0) {
+        // Configure RT scheduling for IRQ thread
+        configure_rt_irq_thread(desc);
+    }
+    
+    return ret;
+}
+
+// Performance monitoring and statistics
+void update_irq_statistics(void) {
+    struct irq_desc *desc;
+    unsigned int irq;
+    u64 now = sched_clock();
+    static u64 last_update;
+    
+    if (now - last_update < 1000000000) // Update once per second
+        return;
+    
+    last_update = now;
+    
+    for_each_active_irq(irq) {
+        desc = irq_to_desc(irq);
+        if (!desc)
+            continue;
+        
+        // Update IRQ load metrics
+        update_irq_load_metrics(desc);
+        
+        // AI learning from IRQ patterns
+        if (irq_ctrl.ai_enabled) {
+            ai_learn_from_irq_patterns(desc);
+        }
+        
+        // Check for IRQ storms
+        detect_irq_storm(desc);
+    }
+}
+
+// Interrupt cleanup on shutdown
+void interrupt_cleanup(void) {
+    pr_info("Shutting down interrupt subsystem\n");
+    
+    // Disable all interrupts
+    local_irq_disable();
+    
+    // Cleanup AI optimizer
+    if (irq_ctrl.ai_enabled) {
+        ai_interrupt_optimizer_cleanup(&ai_irq_opt);
+    }
+    
+    // Cleanup MSI controller
+    msi_cleanup(&msi_ctrl);
+    
+    // Cleanup APIC
+    disable_local_apic();
+    if (irq_ctrl.apic.base_addr) {
+        iounmap(irq_ctrl.apic.base_addr);
+    }
+    
+    pr_info("Interrupt subsystem shutdown complete\n");
+}

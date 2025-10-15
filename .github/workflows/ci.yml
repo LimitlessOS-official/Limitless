@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld nasm make grub-pc-bin xorriso mtools qemu-system-x86
+      - name: Build
+        run: make -j$(nproc) iso
+      - name: Smoke boot in QEMU (headless)
+        run: |
+          qemu-system-x86_64 -m 512M -cdrom dist/limitlessos.iso -nographic -serial mon:stdio -boot d -no-reboot &
+          PID=$!
+          # Wait up to 20s for a recognizable kernel message
+          for i in $(seq 1 40); do
+            sleep 0.5
+            if grep -q "Init: launching" <(tail -n +1 -f /proc/$PID/fd/1 2>/dev/null & sleep 0.5; kill $!); then
+              echo "Boot message detected"
+              kill $PID || true
+              exit 0
+            fi
+          done
+          echo "Boot message not detected"
+          kill $PID || true
+          exit 1

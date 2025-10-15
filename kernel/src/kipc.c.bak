@@ -1,0 +1,76 @@
+#include "kipc.h"
+#include "kernel.h"
+#include "net_ipc_hooks.h"
+
+#define KIPC_MAX_EP 64
+#define KIPC_Q_DEPTH 32
+
+typedef struct {
+    u8 alive;
+    kendpoint_t id;
+    kipc_msg_t q[KIPC_Q_DEPTH];
+    u32 head, tail;
+} ep_t;
+
+static ep_t g_eps[KIPC_MAX_EP];
+static kendpoint_t g_next = 1;
+
+static ep_t* ep_find(kendpoint_t id) {
+    for (int i=0;i<KIPC_MAX_EP;i++) if (g_eps[i].alive && g_eps[i].id == id) return &g_eps[i];
+    return NULL;
+}
+
+int kipc_endpoint_create(kendpoint_t* out) {
+    if (!out) return K_EINVAL;
+    for (int i=0;i<KIPC_MAX_EP;i++) {
+        if (!g_eps[i].alive) {
+            g_eps[i].alive = 1;
+            g_eps[i].id = g_next++;
+            g_eps[i].head = g_eps[i].tail = 0;
+            *out = g_eps[i].id;
+            return 0;
+        }
+    }
+    return K_EBUSY;
+}
+
+int kipc_endpoint_close(kendpoint_t ep) {
+    ep_t* e = ep_find(ep);
+    if (!e) return K_EINVAL;
+    e->alive = 0;
+    return 0;
+}
+
+int kipc_send(const kipc_msg_t* m) {
+    if (!m) return K_EINVAL;
+    int hr = __ipc_emit_send(m); if(hr<0) return hr;
+    ep_t* dst = ep_find(m->dst);
+    if (!dst || !dst->alive) return K_ENOENT;
+    u32 next = (dst->tail + 1) % KIPC_Q_DEPTH;
+    if (next == dst->head) return -11; /* EAGAIN */
+    dst->q[dst->tail] = *m;
+    dst->tail = next;
+    return 0;
+}
+
+extern u64 timer_get_ticks(void);
+
+int kipc_recv(kendpoint_t ep, kipc_msg_t* out, u32 timeout_ms) {
+    if (!out) return K_EINVAL;
+    ep_t* e = ep_find(ep);
+    if (!e) return K_ENOENT;
+    u64 start = timer_get_ticks();
+    u64 freq = timer_get_freq_hz();
+    while (e->head == e->tail) {
+        if (timeout_ms == 0) return -11;
+        if (timeout_ms != 0xFFFFFFFF) {
+            u64 elapsed_ms = ((timer_get_ticks() - start) * 1000) / (freq ? freq : 1000);
+            if (elapsed_ms >= timeout_ms) return 110; /* ETIMEDOUT-like */
+        }
+        __asm__ __volatile__("pause");
+    }
+    *out = e->q[e->head];
+    __ipc_emit_recv(out);
+    e->head = (e->head + 1) % KIPC_Q_DEPTH;
+    return 0;
+}

@@ -1,0 +1,30 @@
+#include "kernel.h"
+#include "apic.h"
+#include "scheduler.h"
+
+/*
+ * APIC timer setup (Phase 6)
+ * - One-shot periodic tick for scheduler
+ * - SMP-safe init per CPU
+ *
+ * TODO:
+ * - Calibrate against PIT/HPET
+ * - Per-CPU tickless scheduling
+ */
+
+static u32 apic_ticks_per_ms = 0;
+
+void apic_timer_calibrate(void) {
+    /* TODO: implement HPET/PIT calibration; use a fixed guess for now */
+    apic_ticks_per_ms = 100000; /* placeholder */
+}
+
+void apic_timer_start_periodic(u32 ms) {
+    if (!apic_ticks_per_ms) apic_timer_calibrate();
+    apic_timer_set_periodic(apic_ticks_per_ms * ms);
+}
+
+void apic_timer_isr(void) {
+    scheduler_tick();
+    apic_eoi();
+}

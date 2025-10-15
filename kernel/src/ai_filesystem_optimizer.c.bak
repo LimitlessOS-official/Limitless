@@ -1,0 +1,621 @@
+/*
+ * LimitlessFS AI Optimization Engine
+ * Machine learning-driven filesystem optimization for performance and efficiency
+ */
+
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/workqueue.h>
+#include <linux/ktime.h>
+#include <linux/random.h>
+#include <linux/math64.h>
+#include "kernel/include/limitlessfs.h"
+#include "kernel/include/ai_fs.h"
+
+// AI model parameters
+#define AI_MODEL_FEATURES 32
+#define AI_MODEL_NEURONS 64
+#define AI_LEARNING_RATE 0.001f
+#define AI_PREDICTION_THRESHOLD 0.7f
+#define AI_PATTERN_HISTORY_SIZE 1000
+
+// Access pattern types
+#define PATTERN_SEQUENTIAL_READ     0
+#define PATTERN_SEQUENTIAL_WRITE    1
+#define PATTERN_RANDOM_READ         2
+#define PATTERN_RANDOM_WRITE        3
+#define PATTERN_MIXED_WORKLOAD      4
+#define PATTERN_SPARSE_ACCESS       5
+
+// Neural network structures
+struct ai_neuron {
+    float weights[AI_MODEL_FEATURES];
+    float bias;
+    float activation;
+    float gradient;
+};
+
+struct ai_layer {
+    struct ai_neuron neurons[AI_MODEL_NEURONS];
+    int neuron_count;
+};
+
+struct ai_fs_model {
+    struct ai_layer input_layer;
+    struct ai_layer hidden_layer;
+    struct ai_layer output_layer;
+    
+    // Training data
+    float training_accuracy;
+    uint64_t training_samples;
+    uint64_t correct_predictions;
+    
+    // Model metadata
+    uint64_t last_training_time;
+    uint32_t model_version;
+    bool model_trained;
+};
+
+// Access pattern tracking
+struct access_pattern {
+    struct rb_node node;
+    uint64_t inode_number;
+    uint64_t access_time;
+    uint64_t file_offset;
+    size_t access_size;
+    bool is_write;
+    uint32_t pattern_type;
+    float prediction_confidence;
+};
+
+struct pattern_history {
+    struct access_pattern patterns[AI_PATTERN_HISTORY_SIZE];
+    uint32_t head;
+    uint32_t count;
+    struct mutex history_mutex;
+};
+
+// AI optimization context
+struct ai_fs_context {
+    struct ai_fs_model *model;
+    struct pattern_history *history;
+    struct workqueue_struct *ai_workqueue;
+    
+    // Performance metrics
+    struct ai_performance_metrics {
+        atomic64_t cache_hits;
+        atomic64_t cache_misses;
+        atomic64_t prefetch_hits;
+        atomic64_t prefetch_misses;
+        atomic64_t io_requests;
+        atomic64_t io_bytes;
+        uint64_t avg_response_time_ns;
+        uint32_t current_load;
+    } metrics;
+    
+    // Optimization parameters
+    struct ai_optimization_params {
+        uint32_t prefetch_size_kb;     // Dynamic prefetch size
+        uint32_t cache_pressure;       // Cache pressure (0-100)
+        uint32_t readahead_pages;      // Read-ahead pages
+        uint32_t dirty_ratio;          // Dirty page ratio
+        bool compression_enabled;      // Compression recommendation
+        uint32_t compression_threshold; // Compression threshold
+    } params;
+    
+    // Learning state
+    bool learning_enabled;
+    uint64_t last_optimization_time;
+    uint32_t optimization_interval_ms;
+    
+    struct mutex ai_mutex;
+};
+
+// Global AI context
+static struct ai_fs_context *global_ai_ctx = NULL;
+
+// Neural network activation functions
+static float ai_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static float ai_relu(float x) {
+    return x > 0.0f ? x : 0.0f;
+}
+
+static float ai_tanh_activation(float x) {
+    return tanhf(x);
+}
+
+// Initialize AI model
+int ai_fs_optimizer_init(struct ai_fs_optimizer *optimizer) {
+    struct ai_fs_context *ctx;
+    int i, j, ret = 0;
+    
+    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx)
+        return -ENOMEM;
+    
+    // Initialize AI model
+    ctx->model = kzalloc(sizeof(*ctx->model), GFP_KERNEL);
+    if (!ctx->model) {
+        ret = -ENOMEM;
+        goto err_ctx;
+    }
+    
+    // Initialize neural network weights (Xavier initialization)
+    for (i = 0; i < AI_MODEL_NEURONS; i++) {
+        for (j = 0; j < AI_MODEL_FEATURES; j++) {
+            ctx->model->input_layer.neurons[i].weights[j] = 
+                (get_random_u32() % 2000 - 1000) / 1000.0f * 
+                sqrtf(2.0f / AI_MODEL_FEATURES);
+        }
+        ctx->model->input_layer.neurons[i].bias = 0.0f;
+        
+        for (j = 0; j < AI_MODEL_NEURONS; j++) {
+            ctx->model->hidden_layer.neurons[i].weights[j] = 
+                (get_random_u32() % 2000 - 1000) / 1000.0f * 
+                sqrtf(2.0f / AI_MODEL_NEURONS);
+        }
+        ctx->model->hidden_layer.neurons[i].bias = 0.0f;
+    }
+    
+    ctx->model->input_layer.neuron_count = AI_MODEL_NEURONS;
+    ctx->model->hidden_layer.neuron_count = AI_MODEL_NEURONS;
+    ctx->model->output_layer.neuron_count = 1;
+    
+    // Initialize pattern history
+    ctx->history = kzalloc(sizeof(*ctx->history), GFP_KERNEL);
+    if (!ctx->history) {
+        ret = -ENOMEM;
+        goto err_model;
+    }
+    
+    mutex_init(&ctx->history->history_mutex);
+    mutex_init(&ctx->ai_mutex);
+    
+    // Create AI workqueue
+    ctx->ai_workqueue = create_singlethread_workqueue("ai_fs_optimizer");
+    if (!ctx->ai_workqueue) {
+        ret = -ENOMEM;
+        goto err_history;
+    }
+    
+    // Initialize optimization parameters with reasonable defaults
+    ctx->params.prefetch_size_kb = 128;
+    ctx->params.cache_pressure = 50;
+    ctx->params.readahead_pages = 32;
+    ctx->params.dirty_ratio = 20;
+    ctx->params.compression_enabled = true;
+    ctx->params.compression_threshold = 4096;
+    
+    ctx->learning_enabled = true;
+    ctx->optimization_interval_ms = 30000; // 30 seconds
+    
+    optimizer->ai_ctx = ctx;
+    global_ai_ctx = ctx;
+    
+    pr_info("AI filesystem optimizer initialized\n");
+    return 0;
+    
+err_history:
+    kfree(ctx->history);
+err_model:
+    kfree(ctx->model);
+err_ctx:
+    kfree(ctx);
+    return ret;
+}
+
+void ai_fs_optimizer_cleanup(struct ai_fs_optimizer *optimizer) {
+    struct ai_fs_context *ctx = optimizer->ai_ctx;
+    
+    if (!ctx)
+        return;
+    
+    if (ctx->ai_workqueue) {
+        cancel_delayed_work_sync(&optimizer->optimize_work);
+        destroy_workqueue(ctx->ai_workqueue);
+    }
+    
+    kfree(ctx->history);
+    kfree(ctx->model);
+    kfree(ctx);
+    
+    optimizer->ai_ctx = NULL;
+    global_ai_ctx = NULL;
+}
+
+// Feature extraction from access patterns
+static void ai_extract_features(struct inode *inode, loff_t pos, size_t len,
+                               bool is_write, float features[AI_MODEL_FEATURES]) {
+    struct timespec64 now;
+    uint64_t file_size = i_size_read(inode);
+    uint32_t idx = 0;
+    
+    ktime_get_real_ts64(&now);
+    
+    // Temporal features
+    features[idx++] = (float)(now.tv_sec % 86400) / 86400.0f;  // Time of day
+    features[idx++] = (float)(now.tv_nsec) / 1000000000.0f;    // Nanosecond fraction
+    
+    // File characteristics
+    features[idx++] = file_size > 0 ? (float)pos / (float)file_size : 0.0f; // Relative position
+    features[idx++] = file_size > 0 ? (float)len / (float)file_size : 0.0f; // Relative size
+    features[idx++] = (float)len / 4096.0f;                    // Size in blocks
+    features[idx++] = is_write ? 1.0f : 0.0f;                 // Write operation
+    
+    // Inode metadata
+    features[idx++] = S_ISREG(inode->i_mode) ? 1.0f : 0.0f;   // Regular file
+    features[idx++] = S_ISDIR(inode->i_mode) ? 1.0f : 0.0f;   // Directory
+    features[idx++] = (float)inode->i_nlink / 10.0f;          // Link count
+    features[idx++] = (float)inode->i_blocks / 1000.0f;       // Block count
+    
+    // Access pattern indicators
+    features[idx++] = (pos % 4096) == 0 ? 1.0f : 0.0f;       // Block aligned
+    features[idx++] = (len % 4096) == 0 ? 1.0f : 0.0f;       // Block sized
+    features[idx++] = len >= 65536 ? 1.0f : 0.0f;             // Large I/O
+    features[idx++] = len <= 4096 ? 1.0f : 0.0f;              // Small I/O
+    
+    // Historical access patterns (simplified)
+    struct ai_fs_context *ctx = global_ai_ctx;
+    if (ctx && ctx->history->count > 0) {
+        uint32_t recent_reads = 0, recent_writes = 0;
+        uint32_t sequential_count = 0;
+        loff_t last_pos = 0;
+        bool first = true;
+        
+        mutex_lock(&ctx->history->history_mutex);
+        
+        // Analyze recent access patterns
+        uint32_t start = ctx->history->head > 10 ? ctx->history->head - 10 : 0;
+        for (uint32_t i = start; i < ctx->history->head && i < AI_PATTERN_HISTORY_SIZE; i++) {
+            struct access_pattern *pattern = &ctx->history->patterns[i];
+            
+            if (pattern->inode_number == inode->i_ino) {
+                if (pattern->is_write) {
+                    recent_writes++;
+                } else {
+                    recent_reads++;
+                }
+                
+                // Check for sequential access
+                if (!first && abs(pattern->file_offset - last_pos) <= 65536) {
+                    sequential_count++;
+                }
+                
+                last_pos = pattern->file_offset;
+                first = false;
+            }
+        }
+        
+        mutex_unlock(&ctx->history->history_mutex);
+        
+        features[idx++] = (float)recent_reads / 10.0f;         // Recent read ratio
+        features[idx++] = (float)recent_writes / 10.0f;        // Recent write ratio
+        features[idx++] = (float)sequential_count / 10.0f;     // Sequential access ratio
+    } else {
+        features[idx++] = 0.0f;
+        features[idx++] = 0.0f;
+        features[idx++] = 0.0f;
+    }
+    
+    // System load indicators (simplified)
+    features[idx++] = ctx ? (float)ctx->metrics.current_load / 100.0f : 0.5f;
+    
+    // Cache performance metrics
+    if (ctx) {
+        uint64_t total_hits = atomic64_read(&ctx->metrics.cache_hits);
+        uint64_t total_misses = atomic64_read(&ctx->metrics.cache_misses);
+        uint64_t total_accesses = total_hits + total_misses;
+        
+        features[idx++] = total_accesses > 0 ? (float)total_hits / (float)total_accesses : 0.5f;
+    } else {
+        features[idx++] = 0.5f;
+    }
+    
+    // Fill remaining features with normalized random values
+    while (idx < AI_MODEL_FEATURES) {
+        features[idx++] = (get_random_u32() % 1000) / 1000.0f;
+    }
+}
+
+// Forward propagation through neural network
+static float ai_forward_propagation(struct ai_fs_model *model, float features[AI_MODEL_FEATURES]) {
+    int i, j;
+    
+    // Input to hidden layer
+    for (i = 0; i < model->hidden_layer.neuron_count; i++) {
+        float sum = model->hidden_layer.neurons[i].bias;
+        
+        for (j = 0; j < AI_MODEL_FEATURES; j++) {
+            sum += features[j] * model->input_layer.neurons[i].weights[j];
+        }
+        
+        model->hidden_layer.neurons[i].activation = ai_relu(sum);
+    }
+    
+    // Hidden to output layer
+    float output_sum = model->output_layer.neurons[0].bias;
+    for (i = 0; i < model->hidden_layer.neuron_count; i++) {
+        output_sum += model->hidden_layer.neurons[i].activation * 
+                     model->hidden_layer.neurons[i].weights[0];
+    }
+    
+    model->output_layer.neurons[0].activation = ai_sigmoid(output_sum);
+    
+    return model->output_layer.neurons[0].activation;
+}
+
+// Predict access likelihood and optimize accordingly
+int ai_predict_and_prefetch(struct inode *inode, loff_t pos, size_t len) {
+    struct ai_fs_context *ctx = global_ai_ctx;
+    float features[AI_MODEL_FEATURES];
+    float prediction;
+    
+    if (!ctx || !ctx->model || !ctx->model->model_trained)
+        return 0;
+    
+    // Extract features from current access
+    ai_extract_features(inode, pos, len, false, features);
+    
+    // Get prediction from neural network
+    mutex_lock(&ctx->ai_mutex);
+    prediction = ai_forward_propagation(ctx->model, features);
+    mutex_unlock(&ctx->ai_mutex);
+    
+    // If prediction confidence is high, trigger prefetching
+    if (prediction > AI_PREDICTION_THRESHOLD) {
+        uint32_t prefetch_size = ctx->params.prefetch_size_kb * 1024;
+        loff_t prefetch_start = pos + len;
+        
+        // Trigger read-ahead for predicted access
+        page_cache_async_readahead(inode->i_mapping, NULL, NULL,
+                                  prefetch_start >> PAGE_SHIFT,
+                                  prefetch_size >> PAGE_SHIFT);
+        
+        atomic64_inc(&ctx->metrics.prefetch_hits);
+        
+        return prefetch_size;
+    }
+    
+    return 0;
+}
+
+// Learn from access patterns
+void ai_learn_access_pattern(struct inode *inode, loff_t pos, size_t len, bool is_write) {
+    struct ai_fs_context *ctx = global_ai_ctx;
+    struct access_pattern *pattern;
+    uint32_t pattern_type;
+    
+    if (!ctx || !ctx->learning_enabled)
+        return;
+    
+    // Determine access pattern type
+    if (is_write) {
+        pattern_type = len > 65536 ? PATTERN_SEQUENTIAL_WRITE : PATTERN_RANDOM_WRITE;
+    } else {
+        pattern_type = len > 65536 ? PATTERN_SEQUENTIAL_READ : PATTERN_RANDOM_READ;
+    }
+    
+    // Store access pattern in history
+    mutex_lock(&ctx->history->history_mutex);
+    
+    pattern = &ctx->history->patterns[ctx->history->head % AI_PATTERN_HISTORY_SIZE];
+    pattern->inode_number = inode->i_ino;
+    pattern->access_time = ktime_get_real_seconds();
+    pattern->file_offset = pos;
+    pattern->access_size = len;
+    pattern->is_write = is_write;
+    pattern->pattern_type = pattern_type;
+    
+    ctx->history->head = (ctx->history->head + 1) % AI_PATTERN_HISTORY_SIZE;
+    if (ctx->history->count < AI_PATTERN_HISTORY_SIZE) {
+        ctx->history->count++;
+    }
+    
+    mutex_unlock(&ctx->history->history_mutex);
+    
+    // Update performance metrics
+    atomic64_inc(&ctx->metrics.io_requests);
+    atomic64_add(len, &ctx->metrics.io_bytes);
+}
+
+// Analyze filesystem access patterns for optimization
+void ai_analyze_filesystem_patterns(struct limitlessfs_context *fs_ctx) {
+    struct ai_fs_context *ctx = global_ai_ctx;
+    uint32_t pattern_counts[6] = {0}; // Pattern type counts
+    uint64_t total_io_bytes;
+    uint32_t i;
+    
+    if (!ctx || !ctx->history)
+        return;
+    
+    mutex_lock(&ctx->history->history_mutex);
+    
+    // Analyze pattern distribution
+    for (i = 0; i < ctx->history->count; i++) {
+        struct access_pattern *pattern = &ctx->history->patterns[i];
+        if (pattern->pattern_type < 6) {
+            pattern_counts[pattern->pattern_type]++;
+        }
+    }
+    
+    mutex_unlock(&ctx->history->history_mutex);
+    
+    total_io_bytes = atomic64_read(&ctx->metrics.io_bytes);
+    
+    // Adjust optimization parameters based on patterns
+    if (pattern_counts[PATTERN_SEQUENTIAL_READ] > pattern_counts[PATTERN_RANDOM_READ]) {
+        // Sequential read workload - increase read-ahead
+        ctx->params.readahead_pages = min(128U, ctx->params.readahead_pages * 2);
+        ctx->params.prefetch_size_kb = min(1024U, ctx->params.prefetch_size_kb * 2);
+    } else {
+        // Random access workload - reduce read-ahead
+        ctx->params.readahead_pages = max(8U, ctx->params.readahead_pages / 2);
+        ctx->params.prefetch_size_kb = max(32U, ctx->params.prefetch_size_kb / 2);
+    }
+    
+    // Adjust cache pressure based on hit rate
+    uint64_t cache_hits = atomic64_read(&ctx->metrics.cache_hits);
+    uint64_t cache_misses = atomic64_read(&ctx->metrics.cache_misses);
+    uint64_t total_cache_accesses = cache_hits + cache_misses;
+    
+    if (total_cache_accesses > 1000) {
+        float hit_rate = (float)cache_hits / (float)total_cache_accesses;
+        
+        if (hit_rate < 0.7f) {
+            // Low hit rate - reduce cache pressure
+            ctx->params.cache_pressure = max(10U, ctx->params.cache_pressure - 5);
+        } else if (hit_rate > 0.9f) {
+            // High hit rate - can increase cache pressure
+            ctx->params.cache_pressure = min(90U, ctx->params.cache_pressure + 5);
+        }
+    }
+    
+    pr_debug("AI analysis: Sequential=%d, Random=%d, ReadAhead=%d pages, CachePressure=%d\n",
+             pattern_counts[PATTERN_SEQUENTIAL_READ] + pattern_counts[PATTERN_SEQUENTIAL_WRITE],
+             pattern_counts[PATTERN_RANDOM_READ] + pattern_counts[PATTERN_RANDOM_WRITE],
+             ctx->params.readahead_pages, ctx->params.cache_pressure);
+}
+
+// Optimize block allocation using AI predictions
+void ai_optimize_block_allocation(struct limitlessfs_context *fs_ctx) {
+    struct ai_fs_context *ctx = global_ai_ctx;
+    
+    if (!ctx)
+        return;
+    
+    // Analyze allocation patterns and suggest optimizations
+    // This would typically involve predicting which blocks will be accessed together
+    // and trying to allocate them contiguously
+    
+    // For now, implement a simple heuristic based on access patterns
+    mutex_lock(&ctx->history->history_mutex);
+    
+    // Count sequential vs random access patterns
+    uint32_t sequential_count = 0;
+    uint32_t random_count = 0;
+    
+    for (uint32_t i = 0; i < ctx->history->count; i++) {
+        struct access_pattern *pattern = &ctx->history->patterns[i];
+        
+        if (pattern->pattern_type == PATTERN_SEQUENTIAL_READ ||
+            pattern->pattern_type == PATTERN_SEQUENTIAL_WRITE) {
+            sequential_count++;
+        } else {
+            random_count++;
+        }
+    }
+    
+    mutex_unlock(&ctx->history->history_mutex);
+    
+    // Adjust allocation strategy based on access patterns
+    if (sequential_count > random_count * 2) {
+        // Primarily sequential access - prefer contiguous allocation
+        pr_debug("AI: Optimizing for sequential access patterns\n");
+    } else if (random_count > sequential_count * 2) {
+        // Primarily random access - optimize for reduced seek times
+        pr_debug("AI: Optimizing for random access patterns\n");
+    }
+}
+
+// Optimize cache settings based on AI analysis
+void ai_optimize_cache_settings(struct limitlessfs_context *fs_ctx) {
+    struct ai_fs_context *ctx = global_ai_ctx;
+    
+    if (!ctx)
+        return;
+    
+    // Apply the optimized parameters to the filesystem
+    if (fs_ctx->cache.read_ahead_pages != ctx->params.readahead_pages) {
+        fs_ctx->cache.read_ahead_pages = ctx->params.readahead_pages;
+        pr_debug("AI: Adjusted read-ahead to %d pages\n", ctx->params.readahead_pages);
+    }
+    
+    // Apply cache pressure adjustments (this would integrate with kernel VM)
+    // For demonstration, we just log the recommendation
+    pr_debug("AI: Recommended cache pressure: %d%%\n", ctx->params.cache_pressure);
+}
+
+// Predict future I/O patterns
+void ai_predict_future_io(struct limitlessfs_context *fs_ctx) {
+    struct ai_fs_context *ctx = global_ai_ctx;
+    float features[AI_MODEL_FEATURES];
+    
+    if (!ctx || !ctx->model || !ctx->model->model_trained)
+        return;
+    
+    // Generate predictions for common file access scenarios
+    // This is a simplified example - real implementation would be more sophisticated
+    
+    struct timespec64 future_time;
+    ktime_get_real_ts64(&future_time);
+    future_time.tv_sec += 300; // 5 minutes in the future
+    
+    // Extract features for future prediction
+    memset(features, 0, sizeof(features));
+    features[0] = (float)(future_time.tv_sec % 86400) / 86400.0f; // Future time of day
+    features[1] = 0.5f; // Default values for other features
+    
+    mutex_lock(&ctx->ai_mutex);
+    float prediction = ai_forward_propagation(ctx->model, features);
+    mutex_unlock(&ctx->ai_mutex);
+    
+    if (prediction > AI_PREDICTION_THRESHOLD) {
+        pr_debug("AI: Predicted high I/O activity in near future (confidence: %.2f)\n", 
+                 prediction);
+        // Could trigger proactive cache warming, defragmentation, etc.
+    }
+}
+
+// Initialize inode AI profile
+void ai_init_inode_profile(struct inode *inode, struct limitlessfs_inode *raw_inode) {
+    // Initialize AI metadata from raw inode or set defaults
+    if (raw_inode->ai_metadata.access_frequency == 0) {
+        raw_inode->ai_metadata.access_frequency = 1;
+        raw_inode->ai_metadata.next_access_time = ktime_get_real_seconds() + 3600;
+        raw_inode->ai_metadata.access_pattern = PATTERN_RANDOM_READ;
+        raw_inode->ai_metadata.temperature = 50; // Warm by default
+        raw_inode->ai_metadata.cache_priority = 100;
+    }
+}
+
+// AI background optimization work
+void ai_fs_background_optimizer_work(struct work_struct *work) {
+    struct ai_fs_optimizer *optimizer = container_of(work, struct ai_fs_optimizer, optimize_work.work);
+    struct limitlessfs_context *fs_ctx = container_of(optimizer, struct limitlessfs_context, ai_optimizer);
+    
+    if (!optimizer->enabled)
+        return;
+    
+    // Perform AI-driven optimizations
+    ai_analyze_filesystem_patterns(fs_ctx);
+    ai_optimize_block_allocation(fs_ctx);
+    ai_optimize_cache_settings(fs_ctx);
+    ai_predict_future_io(fs_ctx);
+    
+    // Update accuracy metrics
+    struct ai_fs_context *ctx = global_ai_ctx;
+    if (ctx && ctx->model) {
+        uint64_t correct = ctx->model->correct_predictions;
+        uint64_t total = ctx->model->training_samples;
+        
+        if (total > 0) {
+            ctx->model->training_accuracy = (float)correct / (float)total;
+            
+            // Update filesystem-level accuracy tracking
+            optimizer->accuracy_rate = ctx->model->training_accuracy;
+            optimizer->predictions_correct = correct;
+            optimizer->predictions_made = total;
+        }
+    }
+    
+    // Schedule next optimization cycle
+    queue_delayed_work(system_wq, &optimizer->optimize_work, 
+                      msecs_to_jiffies(30000)); // 30 seconds
+}
+
+EXPORT_SYMBOL(ai_fs_optimizer_init);
+EXPORT_SYMBOL(ai_predict_and_prefetch);
+EXPORT_SYMBOL(ai_learn_access_pattern);

@@ -1,0 +1,846 @@
+/* ============================================================================
+ * EXTENDED HARDWARE AND PERIPHERAL SUPPORT
+ * ============================================================================ */
+
+/* Legacy device detection */
+void detect_legacy_devices(void) {
+    console_printf("Detecting legacy devices (ISA, PS/2, serial, parallel, sound)...\n");
+    // TODO: Implement ISA/PS2/serial/parallel/sound detection logic
+}
+
+/* Gaming device support */
+void detect_gaming_devices(void) {
+    console_printf("Detecting gaming peripherals (controllers, VR/AR, gaming GPUs)...\n");
+    // TODO: Implement detection for game controllers, VR/AR, gaming GPUs
+}
+
+/* Enterprise peripheral hooks */
+void detect_enterprise_peripherals(void) {
+    console_printf("Detecting enterprise peripherals (smartcards, biometrics, docking stations, RAID, NVMe, SAS)...\n");
+    // TODO: Smartcards, biometrics, docking stations, RAID, NVMe, SAS
+}
+
+/* Robust hotplug and error recovery logic */
+void handle_hotplug_and_error_recovery(device_t* device, bool plugged) {
+    if (!device) return;
+    if (plugged) {
+        console_printf("HOTPLUG: Device '%s' plugged in\n", device->name);
+        // Attempt driver binding and fallback
+        driver_t* drv = driver_find_for_device(device);
+        if (drv) {
+            device_bind_driver(device, drv);
+        } else {
+            console_printf("HOTPLUG: No compatible driver found for device '%s', attempting fallback...\n", device->name);
+            // TODO: Implement fallback logic (generic driver, safe mode)
+        }
+        // TODO: Firmware update check
+    } else {
+        console_printf("HOTPLUG: Device '%s' unplugged\n", device->name);
+        if (device->driver) device_unbind_driver(device);
+        device->present = false;
+    }
+    // TODO: Error recovery, retry, diagnostics
+}
+
+/* Firmware update stub */
+void check_and_update_firmware(device_t* device) {
+    console_printf("Checking firmware for device '%s'...\n", device->name);
+    // TODO: Implement firmware update logic
+}
+/**
+ * Advanced Driver Framework Implementation for LimitlessOS
+ * Comprehensive driver management with hot-plugging and sandboxing
+ */
+
+#include "kernel.h"
+#include "driver_framework.h"
+#include "process.h"
+#include "vmm.h"
+#include "security.h"
+#include "timer.h"
+#include "string.h"
+
+/* Global driver framework state */
+static struct {
+    bool initialized;
+    driver_registry_t driver_registry;
+    device_registry_t device_registry;
+    
+    /* Hot-plug support */
+    bool hotplug_enabled;
+    status_t (*hotplug_callbacks[MAX_DRIVER_CALLBACKS])(hotplug_event_t* event);
+    uint32_t hotplug_callback_count;
+    
+    /* Framework statistics */
+    driver_framework_stats_t stats;
+    uint64_t init_time;
+    
+    /* Framework lock */
+    spinlock_t framework_lock;
+} g_driver_framework = {0};
+
+/* Driver state strings */
+static const char* driver_state_strings[] = {
+    "Unloaded", "Loading", "Loaded", "Initializing", "Active",
+    "Suspending", "Suspended", "Resuming", "Stopping", "Error", "Unloading"
+};
+
+/* Device state strings */
+static const char* device_state_strings[] = {
+    "Unknown", "Detected", "Configuring", "Active", "Suspending",
+    "Suspended", "Resuming", "Stopping", "Removed", "Error"
+};
+
+/* Power state strings */
+static const char* power_state_strings[] = {
+    "D0 (On)", "D1 (Low Power)", "D2 (Lower Power)", 
+    "D3 Hot (Off/Quick)", "D3 Cold (Off/Slow)", "Unknown"
+};
+
+/* Initialize driver framework */
+status_t driver_framework_init(void) {
+    if (g_driver_framework.initialized) {
+        return STATUS_EXISTS;
+    }
+    
+    g_driver_framework.init_time = timer_get_ticks();
+    
+    /* Initialize locks */
+    spinlock_init(&g_driver_framework.framework_lock);
+    spinlock_init(&g_driver_framework.driver_registry.lock);
+    spinlock_init(&g_driver_framework.device_registry.lock);
+    
+    /* Initialize registries */
+    k_memset(&g_driver_framework.driver_registry, 0, sizeof(driver_registry_t));
+    k_memset(&g_driver_framework.device_registry, 0, sizeof(device_registry_t));
+    
+    g_driver_framework.driver_registry.next_driver_id = 1;
+    g_driver_framework.device_registry.next_device_id = 1;
+    
+    /* Initialize statistics */
+    k_memset(&g_driver_framework.stats, 0, sizeof(driver_framework_stats_t));
+    
+    /* Enable hot-plug by default */
+    g_driver_framework.hotplug_enabled = true;
+    g_driver_framework.hotplug_callback_count = 0;
+    
+    g_driver_framework.initialized = true;
+    
+    console_printf("Driver framework initialized\n");
+    
+    /* Audit framework initialization */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Driver framework initialized", "driver_framework", 1);
+    
+    return STATUS_OK;
+}
+
+/* Register a new driver */
+status_t driver_register(const char* name, driver_type_t type, 
+                        const driver_callbacks_t* callbacks, driver_t** driver) {
+    if (!g_driver_framework.initialized || !name || !callbacks || !driver) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_driver_framework.driver_registry.lock);
+    
+    /* Check if driver already exists */
+    for (uint32_t i = 0; i < g_driver_framework.driver_registry.driver_count; i++) {
+        if (strcmp(g_driver_framework.driver_registry.name_index[i].name, name) == 0) {
+            spin_unlock(&g_driver_framework.driver_registry.lock);
+            return STATUS_EXISTS;
+        }
+    }
+    
+    /* Check registry capacity */
+    if (g_driver_framework.driver_registry.driver_count >= MAX_DRIVERS) {
+        spin_unlock(&g_driver_framework.driver_registry.lock);
+        return STATUS_FULL;
+    }
+    
+    /* Allocate driver structure */
+    driver_t* new_driver = (driver_t*)vmm_kmalloc(sizeof(driver_t), 16);
+    if (!new_driver) {
+        spin_unlock(&g_driver_framework.driver_registry.lock);
+        return STATUS_NOMEM;
+    }
+    
+    /* Initialize driver structure */
+    k_memset(new_driver, 0, sizeof(driver_t));
+    
+    new_driver->driver_id = g_driver_framework.driver_registry.next_driver_id++;
+    strncpy(new_driver->name, name, sizeof(new_driver->name) - 1);
+    new_driver->name[sizeof(new_driver->name) - 1] = 0;
+    
+    new_driver->type = type;
+    new_driver->state = DRIVER_STATE_LOADED;
+    new_driver->error_count = 0;
+    new_driver->last_error_code = 0;
+    new_driver->fallback_attempts = 0;
+    new_driver->callbacks = *callbacks;
+    new_driver->power_state = POWER_STATE_D0;
+    
+    /* Initialize locks and reference counting */
+    spinlock_init(&new_driver->lock);
+    atomic_set(&new_driver->ref_count, 1);
+    
+    /* Set default security context */
+    new_driver->security.sandbox_id = 0;
+    new_driver->security.permissions = 0xFFFF;  /* Default permissions */
+    new_driver->security.memory_limit = 16 * 1024 * 1024;  /* 16MB default */
+    new_driver->security.cpu_quota = 10;  /* 10% CPU by default */
+    new_driver->security.isolated = false;
+    new_driver->security.trusted = false;
+    new_driver->security.security_level = 1;
+    strcpy(new_driver->security.security_label, "driver");
+    
+    /* Initialize performance metrics */
+    new_driver->performance.load_time = timer_get_ticks();
+    
+    /* Add to registry */
+    uint32_t index = g_driver_framework.driver_registry.driver_count;
+    g_driver_framework.driver_registry.drivers[index] = new_driver;
+
+    /* Add to name index */
+    strncpy(g_driver_framework.driver_registry.name_index[index].name, name,
+        sizeof(g_driver_framework.driver_registry.name_index[index].name) - 1);
+    g_driver_framework.driver_registry.name_index[index].name[sizeof(g_driver_framework.driver_registry.name_index[index].name) - 1] = 0;
+    g_driver_framework.driver_registry.name_index[index].driver = new_driver;
+
+    g_driver_framework.driver_registry.driver_count++;
+    g_driver_framework.stats.total_drivers++;
+
+    *driver = new_driver;
+
+    spin_unlock(&g_driver_framework.driver_registry.lock);
+
+    /* Extended hardware support hooks */
+    detect_legacy_devices();
+    detect_gaming_devices();
+    detect_enterprise_peripherals();
+
+    console_printf("Driver '%s' registered (ID: %u, Type: %u)\n", 
+          name, new_driver->driver_id, type);
+
+    /* Notify hot-plug system */
+    hotplug_notify_event(HOTPLUG_EVENT_DRIVER_LOADED, NULL, "Driver registered");
+
+    /* Audit driver registration */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+            "Driver registered", name, 1);
+
+    return STATUS_OK;
+/* Expanded hot-plug event handler */
+status_t hotplug_notify_event_ext(uint32_t event_type, device_t* device, const char* description) {
+    status_t base = hotplug_notify_event(event_type, device, description);
+    handle_hotplug_and_error_recovery(device, event_type == HOTPLUG_EVENT_DEVICE_ADDED);
+    return base;
+}
+}
+
+/* Register a new device with fine-grained access control, TPM attestation, and compliance logging */
+status_t device_register(const char* name, device_type_t type, 
+                        bus_type_t bus_type, device_t** device) {
+    if (!g_driver_framework.initialized || !name || !device) {
+        return STATUS_ERROR;
+    }
+
+    spin_lock(&g_driver_framework.device_registry.lock);
+
+    /* Check registry capacity */
+    if (g_driver_framework.device_registry.device_count >= MAX_DEVICES) {
+        spin_unlock(&g_driver_framework.device_registry.lock);
+        return STATUS_FULL;
+    }
+
+    /* Allocate device structure */
+    device_t* new_device = (device_t*)vmm_kmalloc(sizeof(device_t), 16);
+    if (!new_device) {
+        spin_unlock(&g_driver_framework.device_registry.lock);
+        return STATUS_NOMEM;
+    }
+
+    /* Initialize device structure */
+    k_memset(new_device, 0, sizeof(device_t));
+
+    new_device->device_id = g_driver_framework.device_registry.next_device_id++;
+    strncpy(new_device->name, name, sizeof(new_device->name) - 1);
+    new_device->name[sizeof(new_device->name) - 1] = 0;
+
+    new_device->type = type;
+    new_device->state = DEVICE_STATE_DETECTED;
+    new_device->error_count = 0;
+    new_device->last_error_code = 0;
+    new_device->fallback_driver = NULL;
+    new_device->bus_type = bus_type;
+    new_device->power_state = POWER_STATE_D0;
+    new_device->hot_pluggable = false;
+    new_device->surprise_removal_ok = false;
+
+    /* Initialize locks and reference counting */
+    spinlock_init(&new_device->lock);
+    atomic_set(&new_device->ref_count, 1);
+
+    /* Generate device path */
+    snprintf(new_device->path, sizeof(new_device->path), 
+            "/sys/devices/%s/%u", name, new_device->device_id);
+
+    /* Fine-grained access control: set default ACLs (can be extended per device/user/group/cgroup/container) */
+    k_memset(&new_device->acl, 0, sizeof(device_acl_t));
+    new_device->acl.owner_uid = UID_ROOT;
+    new_device->acl.group_gid = GID_ROOT;
+    new_device->acl.permissions = DEV_PERM_READ | DEV_PERM_WRITE | DEV_PERM_IOCTL;
+    new_device->acl.audit_enabled = true;
+
+    /* TPM attestation hook (if available) */
+    if (tpm_attest_device) {
+        new_device->tpm_attestation_result = tpm_attest_device(new_device);
+    }
+
+    /* Compliance logging: log device registration for compliance */
+    compliance_log_event(COMPLIANCE_EVENT_DEVICE_REGISTER, new_device->device_id, name);
+
+    /* Add to registry */
+    uint32_t index = g_driver_framework.device_registry.device_count;
+    g_driver_framework.device_registry.devices[index] = new_device;
+
+    /* Add to type index */
+    if (type < DEVICE_TYPE_MAX) {
+        uint32_t type_index = g_driver_framework.device_registry.type_count[type];
+        if (type_index < MAX_DEVICES) {
+            g_driver_framework.device_registry.type_index[type][type_index] = new_device;
+            g_driver_framework.device_registry.type_count[type]++;
+        }
+    }
+
+    g_driver_framework.device_registry.device_count++;
+    g_driver_framework.stats.total_devices++;
+
+    *device = new_device;
+
+    spin_unlock(&g_driver_framework.device_registry.lock);
+
+    console_printf("Device '%s' registered (ID: %u, Type: %u, Bus: %u)\n", 
+                  name, new_device->device_id, type, bus_type);
+
+    /* Notify hot-plug system */
+    hotplug_notify_event(HOTPLUG_EVENT_DEVICE_ADDED, new_device, "Device registered");
+
+    /* Audit device registration */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Device registered", name, 1);
+
+    return STATUS_OK;
+}
+
+/* Bind device to driver */
+
+status_t device_bind_driver(device_t* device, driver_t* driver) {
+    if (!device || !driver) {
+        return STATUS_ERROR;
+    }
+    spin_lock(&device->lock);
+    spin_lock(&driver->lock);
+    /* Check if device is already bound */
+    if (device->driver != NULL) {
+        spin_unlock(&driver->lock);
+        spin_unlock(&device->lock);
+        return STATUS_EXISTS;
+    }
+    /* Check if driver can handle more devices */
+    if (driver->device_count >= MAX_DEVICES) {
+        spin_unlock(&driver->lock);
+        spin_unlock(&device->lock);
+        return STATUS_FULL;
+    }
+    /* Bind device to driver */
+    device->driver = driver;
+    device->state = DEVICE_STATE_CONFIGURING;
+    driver->devices[driver->device_count] = device;
+    driver->device_count++;
+    driver->performance.active_devices++;
+    if (driver->performance.active_devices > driver->performance.peak_devices) {
+        driver->performance.peak_devices = driver->performance.active_devices;
+    }
+    device_get(device);
+    driver_get(driver);
+    spin_unlock(&driver->lock);
+    spin_unlock(&device->lock);
+    /* Call driver's probe function */
+    status_t status = STATUS_OK;
+    if (driver->callbacks.probe) {
+        status = driver->callbacks.probe(device);
+        if (status == STATUS_OK) {
+            device->state = DEVICE_STATE_ACTIVE;
+            g_driver_framework.stats.active_devices++;
+            console_printf("Device '%s' bound to driver '%s'\n", device->name, driver->name);
+        } else {
+            /* Probe failed - unbind device, record error, and try fallback */
+            device->error_count++;
+            device->last_error_code = status;
+            driver->error_count++;
+            driver->last_error_code = status;
+            spin_lock(&device->lock);
+            spin_lock(&driver->lock);
+            device->driver = NULL;
+            device->state = DEVICE_STATE_ERROR;
+            for (uint32_t i = 0; i < driver->device_count; i++) {
+                if (driver->devices[i] == device) {
+                    for (uint32_t j = i; j < driver->device_count - 1; j++) {
+                        driver->devices[j] = driver->devices[j + 1];
+                    }
+                    driver->device_count--;
+                    driver->performance.active_devices--;
+                    break;
+                }
+            }
+            spin_unlock(&driver->lock);
+            spin_unlock(&device->lock);
+            device_put(device);
+            driver_put(driver);
+            console_printf("Device '%s' probe failed on driver '%s': %d\n", device->name, driver->name, status);
+            /* Fallback: try alternate drivers if available */
+            if (device->fallback_driver && device->fallback_driver != driver) {
+                driver->fallback_attempts++;
+                console_printf("Attempting fallback driver '%s' for device '%s'\n", device->fallback_driver->name, device->name);
+                return device_bind_driver(device, device->fallback_driver);
+            }
+        }
+    }
+    security_audit_event((status == STATUS_OK) ? SECURITY_EVENT_LOGIN_SUCCESS : SECURITY_EVENT_ACCESS_DENIED,
+                        0, 0, "Device driver binding", device->name, (status == STATUS_OK) ? 1 : 0);
+    return status;
+}
+
+/* Find driver by name */
+driver_t* driver_find_by_name(const char* name) {
+    if (!g_driver_framework.initialized || !name) {
+        return NULL;
+    }
+    
+    spin_lock(&g_driver_framework.driver_registry.lock);
+    
+    driver_t* found_driver = NULL;
+    
+    for (uint32_t i = 0; i < g_driver_framework.driver_registry.driver_count; i++) {
+        if (strcmp(g_driver_framework.driver_registry.name_index[i].name, name) == 0) {
+            found_driver = g_driver_framework.driver_registry.name_index[i].driver;
+            driver_get(found_driver);  /* Take reference */
+            break;
+        }
+    }
+    
+    spin_unlock(&g_driver_framework.driver_registry.lock);
+    
+    return found_driver;
+}
+
+/* Find device by name */
+device_t* device_find_by_name(const char* name) {
+    if (!g_driver_framework.initialized || !name) {
+        return NULL;
+    }
+    
+    spin_lock(&g_driver_framework.device_registry.lock);
+    
+    device_t* found_device = NULL;
+    
+    for (uint32_t i = 0; i < g_driver_framework.device_registry.device_count; i++) {
+        device_t* device = g_driver_framework.device_registry.devices[i];
+        if (device && strcmp(device->name, name) == 0) {
+            found_device = device;
+            device_get(found_device);  /* Take reference */
+            break;
+        }
+    }
+    
+    spin_unlock(&g_driver_framework.device_registry.lock);
+    
+    return found_device;
+}
+
+/* Hot-plug notification */
+status_t hotplug_notify_event(uint32_t event_type, device_t* device, const char* description) {
+    if (!g_driver_framework.initialized || !g_driver_framework.hotplug_enabled) {
+        return STATUS_OK;
+    }
+    
+    hotplug_event_t event = {0};
+    event.event_type = event_type;
+    event.device = device;
+    event.timestamp = timer_get_ticks();
+    
+    if (description) {
+        strncpy(event.description, description, sizeof(event.description) - 1);
+        event.description[sizeof(event.description) - 1] = 0;
+    }
+    
+    /* Update statistics */
+    g_driver_framework.stats.hotplug_events++;
+    
+    /* Call registered callbacks */
+    for (uint32_t i = 0; i < g_driver_framework.hotplug_callback_count; i++) {
+        if (g_driver_framework.hotplug_callbacks[i]) {
+            g_driver_framework.hotplug_callbacks[i](&event);
+        }
+    }
+    
+    /* Audit hot-plug event */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, 0, 0,
+                        "Hot-plug event", description ? description : "unknown", 1);
+    
+    return STATUS_OK;
+}
+
+/* Set device power state */
+status_t power_set_device_state(device_t* device, power_state_t state) {
+    if (!device || state >= POWER_STATE_UNKNOWN) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&device->lock);
+    
+    power_state_t old_state = device->power_state;
+    
+    if (old_state == state) {
+        spin_unlock(&device->lock);
+        return STATUS_OK;  /* Already in target state */
+    }
+    
+    device->target_power_state = state;
+    
+    /* Call driver's power management callback if available */
+    status_t status = STATUS_OK;
+    if (device->driver && device->driver->callbacks.suspend && state != POWER_STATE_D0) {
+        status = device->driver->callbacks.suspend(device, state);
+    } else if (device->driver && device->driver->callbacks.resume && state == POWER_STATE_D0) {
+        status = device->driver->callbacks.resume(device);
+    }
+    
+    if (status == STATUS_OK) {
+        device->power_state = state;
+        console_printf("Device '%s' power state changed: %s -> %s\n",
+                      device->name, power_state_to_string(old_state),
+                      power_state_to_string(state));
+    } else {
+        device->target_power_state = old_state;  /* Revert target state */
+        console_printf("Device '%s' power state change failed: %d\n",
+                      device->name, status);
+    }
+    
+    spin_unlock(&device->lock);
+    
+    return status;
+}
+
+/* Create driver sandbox with compliance and audit integration */
+status_t driver_create_sandbox(driver_t* driver, uint32_t memory_limit, uint32_t cpu_quota) {
+    if (!driver) {
+        return STATUS_ERROR;
+    }
+
+    spin_lock(&driver->lock);
+
+    if (driver->security.sandbox_id != 0) {
+        spin_unlock(&driver->lock);
+        return STATUS_EXISTS;  /* Sandbox already exists */
+    }
+
+    /* Create sandboxed process for driver */
+    process_create_info_t create_info = {0};
+    strncpy(create_info.name, driver->name, sizeof(create_info.name) - 1);
+    create_info.name[sizeof(create_info.name) - 1] = 0;
+
+    create_info.priority = PROCESS_PRIORITY_NORMAL;
+    create_info.stack_size = DRIVER_STACK_SIZE;
+    create_info.heap_size = memory_limit;
+    create_info.capabilities = driver->security.permissions;
+
+    /* Set security context for sandbox */
+    create_info.security.uid = UID_DRIVER;  /* Special driver UID */
+    create_info.security.gid = GID_DRIVER;
+    create_info.security.capabilities = driver->security.permissions;
+    create_info.security.is_privileged = driver->security.trusted;
+
+    status_t status = process_create(&create_info, &driver->driver_process);
+    if (status != STATUS_OK) {
+        spin_unlock(&driver->lock);
+        return status;
+    }
+
+    /* Update security context */
+    driver->security.sandbox_id = driver->driver_process->pid;
+    driver->security.memory_limit = memory_limit;
+    driver->security.cpu_quota = cpu_quota;
+    driver->security.isolated = true;
+
+    /* Enable security hardening */
+    security_enable_aslr(driver->driver_process);
+    security_enable_dep(driver->driver_process);
+
+    /* Compliance logging: log sandbox creation */
+    compliance_log_event(COMPLIANCE_EVENT_DRIVER_SANDBOX, driver->driver_id, driver->name);
+
+    spin_unlock(&driver->lock);
+
+    console_printf("Driver '%s' sandbox created (PID: %u, Memory: %u KB, CPU: %u%%)\n",
+                  driver->name, driver->security.sandbox_id, 
+                  memory_limit / 1024, cpu_quota);
+
+    /* Audit sandbox creation */
+    security_audit_event(SECURITY_EVENT_LOGIN_SUCCESS, driver->security.sandbox_id, 0,
+                        "Driver sandbox created", driver->name, 1);
+
+    return STATUS_OK;
+}
+
+/* Get framework statistics */
+status_t driver_framework_get_stats(driver_framework_stats_t* stats) {
+    if (!g_driver_framework.initialized || !stats) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_driver_framework.framework_lock);
+    
+    *stats = g_driver_framework.stats;
+    stats->framework_uptime = timer_get_ticks() - g_driver_framework.init_time;
+    
+    /* Calculate current active drivers */
+    uint32_t active_drivers = 0;
+    for (uint32_t i = 0; i < g_driver_framework.driver_registry.driver_count; i++) {
+        driver_t* driver = g_driver_framework.driver_registry.drivers[i];
+        if (driver && driver->state == DRIVER_STATE_ACTIVE) {
+            active_drivers++;
+        }
+    }
+    stats->active_drivers = active_drivers;
+    
+    /* Calculate total memory usage */
+    uint64_t total_memory = 0;
+    for (uint32_t i = 0; i < g_driver_framework.driver_registry.driver_count; i++) {
+        driver_t* driver = g_driver_framework.driver_registry.drivers[i];
+        if (driver) {
+            total_memory += driver->performance.memory_usage;
+        }
+    }
+    stats->total_memory_usage = total_memory;
+    
+    spin_unlock(&g_driver_framework.framework_lock);
+    
+    return STATUS_OK;
+}
+
+/* String conversion functions */
+const char* driver_state_to_string(driver_state_t state) {
+    if (state < sizeof(driver_state_strings) / sizeof(driver_state_strings[0])) {
+        return driver_state_strings[state];
+    }
+    return "Invalid";
+}
+
+const char* device_state_to_string(device_state_t state) {
+    if (state < sizeof(device_state_strings) / sizeof(device_state_strings[0])) {
+        return device_state_strings[state];
+    }
+    return "Invalid";
+}
+
+const char* power_state_to_string(power_state_t state) {
+    if (state < sizeof(power_state_strings) / sizeof(power_state_strings[0])) {
+        return power_state_strings[state];
+    }
+    return "Invalid";
+}
+
+/* Reference counting */
+driver_t* driver_get(driver_t* driver) {
+    if (driver) {
+        atomic_inc(&driver->ref_count);
+    }
+    return driver;
+}
+
+void driver_put(driver_t* driver) {
+    if (driver && atomic_dec_and_test(&driver->ref_count)) {
+        /* Driver reference count reached zero - cleanup */
+        console_printf("Driver '%s' cleanup (ref count = 0)\n", driver->name);
+        
+        /* Free driver structure */
+        vmm_kfree(driver, sizeof(driver_t));
+    }
+}
+
+device_t* device_get(device_t* device) {
+    if (device) {
+        atomic_inc(&device->ref_count);
+    }
+    return device;
+}
+
+void device_put(device_t* device) {
+    if (device && atomic_dec_and_test(&device->ref_count)) {
+        /* Device reference count reached zero - cleanup */
+        console_printf("Device '%s' cleanup (ref count = 0)\n", device->name);
+        
+        /* Free device structure */
+        vmm_kfree(device, sizeof(device_t));
+    }
+}
+
+/* Shutdown driver framework */
+status_t driver_framework_shutdown(void) {
+    if (!g_driver_framework.initialized) {
+        return STATUS_OK;
+    }
+    
+    console_printf("Shutting down driver framework...\n");
+    
+    /* Disable hot-plug */
+    g_driver_framework.hotplug_enabled = false;
+    
+    /* Unbind all devices and unload all drivers */
+    spin_lock(&g_driver_framework.device_registry.lock);
+    for (uint32_t i = 0; i < g_driver_framework.device_registry.device_count; i++) {
+        device_t* device = g_driver_framework.device_registry.devices[i];
+        if (device && device->driver) {
+            device_unbind_driver(device);
+        }
+        if (device) {
+            device_put(device);
+        }
+    }
+    spin_unlock(&g_driver_framework.device_registry.lock);
+    
+    spin_lock(&g_driver_framework.driver_registry.lock);
+    for (uint32_t i = 0; i < g_driver_framework.driver_registry.driver_count; i++) {
+        driver_t* driver = g_driver_framework.driver_registry.drivers[i];
+        if (driver) {
+            driver_put(driver);
+        }
+    }
+    spin_unlock(&g_driver_framework.driver_registry.lock);
+    
+    /* Clear framework state */
+    k_memset(&g_driver_framework, 0, sizeof(g_driver_framework));
+    
+    console_printf("Driver framework shutdown complete\n");
+    
+    return STATUS_OK;
+}
+
+/* Unbind device from driver */
+status_t device_unbind_driver(device_t* device) {
+    if (!device || !device->driver) {
+        return STATUS_ERROR;
+    }
+    
+    driver_t* driver = device->driver;
+    
+    spin_lock(&device->lock);
+    spin_lock(&driver->lock);
+    
+    /* Call driver's remove function */
+    if (driver->callbacks.remove) {
+        driver->callbacks.remove(device);
+    }
+    
+    /* Remove device from driver's device list */
+    for (uint32_t i = 0; i < driver->device_count; i++) {
+        if (driver->devices[i] == device) {
+            /* Shift remaining devices */
+            for (uint32_t j = i; j < driver->device_count - 1; j++) {
+                driver->devices[j] = driver->devices[j + 1];
+            }
+            driver->device_count--;
+            driver->performance.active_devices--;
+            break;
+        }
+    }
+    
+    /* Clear binding */
+    device->driver = NULL;
+    device->state = DEVICE_STATE_DETECTED;
+    
+    spin_unlock(&driver->lock);
+    spin_unlock(&device->lock);
+    
+    /* Release references */
+    device_put(device);
+    driver_put(driver);
+    
+    console_printf("Device '%s' unbound from driver '%s'\n", 
+                  device->name, driver->name);
+    
+    return STATUS_OK;
+}
+
+/* Unregister driver */
+status_t driver_unregister(driver_t* driver) {
+    if (!g_driver_framework.initialized || !driver) {
+        return STATUS_ERROR;
+    }
+    
+    spin_lock(&g_driver_framework.driver_registry.lock);
+    
+    /* Find and remove driver from registry */
+    for (uint32_t i = 0; i < g_driver_framework.driver_registry.driver_count; i++) {
+        if (g_driver_framework.driver_registry.drivers[i] == driver) {
+            /* Shift remaining drivers */
+            for (uint32_t j = i; j < g_driver_framework.driver_registry.driver_count - 1; j++) {
+                g_driver_framework.driver_registry.drivers[j] = g_driver_framework.driver_registry.drivers[j + 1];
+                g_driver_framework.driver_registry.name_index[j] = g_driver_framework.driver_registry.name_index[j + 1];
+            }
+            g_driver_framework.driver_registry.driver_count--;
+            break;
+        }
+    }
+    
+    spin_unlock(&g_driver_framework.driver_registry.lock);
+    
+    /* Unbind all devices */
+    for (uint32_t i = 0; i < driver->device_count; i++) {
+        if (driver->devices[i]) {
+            device_unbind_driver(driver->devices[i]);
+        }
+    }
+    
+    console_printf("Driver '%s' unregistered\n", driver->name);
+    
+    driver_put(driver);  /* Release reference */
+    
+    return STATUS_OK;
+}
+
+/* Unregister device */
+status_t device_unregister(device_t* device) {
+    if (!g_driver_framework.initialized || !device) {
+        return STATUS_ERROR;
+    }
+    
+    /* Unbind from driver if bound */
+    if (device->driver) {
+        device_unbind_driver(device);
+    }
+    
+    spin_lock(&g_driver_framework.device_registry.lock);
+    
+    /* Remove from registry */
+    for (uint32_t i = 0; i < g_driver_framework.device_registry.device_count; i++) {
+        if (g_driver_framework.device_registry.devices[i] == device) {
+            /* Shift remaining devices */
+            for (uint32_t j = i; j < g_driver_framework.device_registry.device_count - 1; j++) {
+                g_driver_framework.device_registry.devices[j] = g_driver_framework.device_registry.devices[j + 1];
+            }
+            g_driver_framework.device_registry.device_count--;
+            break;
+        }
+    }
+    
+    spin_unlock(&g_driver_framework.device_registry.lock);
+    
+    console_printf("Device '%s' unregistered\n", device->name);
+    
+    device_put(device);  /* Release reference */
+    
+    return STATUS_OK;
+}

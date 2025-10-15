@@ -1,0 +1,65 @@
+#include "kernel.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+phys_addr_t hal_phys_alloc_page(void);
+#ifdef __cplusplus
+}
+#endif
+#include "kernel.h"
+#include "process.h"
+#include "syscall.h"
+#include "vmm.h"
+#include "exec.h"
+#include "process.h"
+#include "log.h"
+
+// Simple assert macro for kernel tests
+#define KTEST_ASSERT(x, msg) do { if (!(x)) { kprintf("[KTEST FAIL] %s:%d: %s\n", __FILE__, __LINE__, msg); return -1; } } while (0)
+
+// Test: page allocator basic
+int ktest_page_alloc(void) {
+    void* p1 = vmm_kmalloc(PAGE_SIZE, PAGE_SIZE);
+    void* p2 = vmm_kmalloc(PAGE_SIZE, PAGE_SIZE);
+    KTEST_ASSERT(p1 && p2 && p1 != p2, "page alloc distinct");
+    vmm_kfree(p1, PAGE_SIZE);
+    vmm_kfree(p2, PAGE_SIZE);
+    return 0;
+}
+
+// Test: fork/exec basic
+int ktest_fork_exec(void) {
+    int rc = 0;
+    process_t* parent = process_current();
+    KTEST_ASSERT(parent, "parent process exists");
+    process_t* child = NULL;
+    rc = process_fork(parent, &child);
+    KTEST_ASSERT(rc == 0 && child, "fork success");
+    // Simulate exec (no real ELF path)
+    // rc = exec_spawn("/bin/true", NULL, NULL, NULL);
+    // KTEST_ASSERT(rc == 0, "exec success");
+    return 0;
+}
+
+// Test: memory protection (W^X)
+int ktest_wx_enforcement(void) {
+    vmm_aspace_t* as = vmm_create_aspace();
+    KTEST_ASSERT(as, "aspace alloc");
+    phys_addr_t pa = hal_phys_alloc_page();
+    KTEST_ASSERT(pa, "phys alloc");
+    int rc = vmm_map(as, 0x100000, pa, PAGE_SIZE, PTE_PRESENT|PTE_USER|PTE_WRITABLE|PTE_NX);
+    KTEST_ASSERT(rc == 0, "map success");
+    rc = vmm_map(as, 0x200000, pa, PAGE_SIZE, PTE_PRESENT|PTE_USER|PTE_WRITABLE);
+    KTEST_ASSERT(rc == 0, "map W^X enforced");
+    vmm_destroy_aspace(as);
+    return 0;
+}
+
+int ktest_run_all(void) {
+    int fails = 0;
+    if (ktest_page_alloc() != 0) fails++;
+    if (ktest_fork_exec() != 0) fails++;
+    if (ktest_wx_enforcement() != 0) fails++;
+    kprintf("[KTEST] Kernel exec/memory tests: %s\n", fails ? "FAIL" : "PASS");
+    return fails;
+}

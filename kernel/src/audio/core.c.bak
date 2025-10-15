@@ -1,0 +1,33 @@
+#include "audio.h"
+#include "kernel.h"
+
+struct audio_stream {
+    pcm_params_t p;
+    u64 frames_written;
+};
+
+void audio_init(void) {
+    kprintf("Audio subsystem initialized (HDA/AC97 stubs)\n");
+}
+
+audio_stream_t* audio_pcm_open(const pcm_params_t* p) {
+    if (!p) return NULL;
+    audio_stream_t* s = (audio_stream_t*)vmm_kmalloc(sizeof(audio_stream_t), 64);
+    if (!s) return NULL;
+    s->p = *p;
+    s->frames_written = 0;
+    return s;
+}
+
+int audio_pcm_write(audio_stream_t* s, const void* frames, u32 frame_count) {
+    (void)frames;
+    if (!s) return K_EINVAL;
+    s->frames_written += frame_count;
+    return (int)frame_count;
+}
+
+int audio_pcm_close(audio_stream_t* s) {
+    if (!s) return K_EINVAL;
+    vmm_kfree(s, sizeof(*s));
+    return 0;
+}

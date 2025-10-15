@@ -1,0 +1,136 @@
+#include "usb.h"
+#include "kernel.h"
+
+/*
+ * EHCI (USB 2.0) Host Controller Driver
+ * Enhanced Host Controller Interface for USB 2.0
+ */
+
+#include "../../../hal/include/pci.h"
+#include "../../../hal/include/hal.h"
+#include "../../include/kernel.h"
+
+/* EHCI register offsets */
+#define EHCI_CAP_CAPLENGTH   0x00
+#define EHCI_CAP_HCIVERSION  0x02
+#define EHCI_CAP_HCSPARAMS   0x04
+#define EHCI_CAP_HCCPARAMS   0x08
+
+#define EHCI_OP_USBCMD      0x00
+#define EHCI_OP_USBSTS      0x04
+#define EHCI_OP_USBINTR     0x08
+#define EHCI_OP_FRINDEX     0x0C
+#define EHCI_OP_PERIODICBASE 0x14
+#define EHCI_OP_ASYNCBASE   0x18
+#define EHCI_OP_CONFIGFLAG  0x40
+
+/* EHCI controller structure */
+typedef struct {
+    pci_device_t pci_dev;
+    void* cap_regs;
+    void* op_regs;
+    uint32_t hci_version;
+    uint32_t n_ports;
+    bool in_use;
+} ehci_controller_t;
+
+#define MAX_EHCI_CONTROLLERS 8
+static ehci_controller_t g_ehci_controllers[MAX_EHCI_CONTROLLERS];
+static uint32_t g_ehci_controller_count = 0;
+
+/* Read EHCI register */
+static uint32_t ehci_read32(void* base, uint32_t offset) {
+    return *(volatile uint32_t*)((uintptr_t)base + offset);
+}
+
+/* Write EHCI register */
+static void ehci_write32(void* base, uint32_t offset, uint32_t value) {
+    *(volatile uint32_t*)((uintptr_t)base + offset) = value;
+}
+
+/* Initialize EHCI controller */
+static status_t ehci_init_controller(ehci_controller_t* ctrl) {
+    if (!ctrl) return STATUS_ERROR;
+    
+    /* Read capability registers */
+    uint8_t cap_length = *(uint8_t*)ctrl->cap_regs;
+    ctrl->hci_version = ehci_read32(ctrl->cap_regs, EHCI_CAP_HCIVERSION) & 0xFFFF;
+    
+    uint32_t hcsparams = ehci_read32(ctrl->cap_regs, EHCI_CAP_HCSPARAMS);
+    ctrl->n_ports = hcsparams & 0x0F;
+    
+    /* Calculate operational register base */
+    ctrl->op_regs = (uint8_t*)ctrl->cap_regs + cap_length;
+    
+    KLOG_INFO("ehci", "Version %u.%u, %u ports",
+              ctrl->hci_version >> 8, ctrl->hci_version & 0xFF, ctrl->n_ports);
+    
+    /* Reset controller */
+    uint32_t usbcmd = ehci_read32(ctrl->op_regs, EHCI_OP_USBCMD);
+    usbcmd |= (1 << 1); /* Host Controller Reset */
+    ehci_write32(ctrl->op_regs, EHCI_OP_USBCMD, usbcmd);
+    
+    /* Wait for reset to complete */
+    uint64_t timeout = timer_get_ticks() + timer_get_freq_hz();
+    while (timer_get_ticks() < timeout) {
+        usbcmd = ehci_read32(ctrl->op_regs, EHCI_OP_USBCMD);
+        if ((usbcmd & (1 << 1)) == 0) break;
+    }
+    
+    if (usbcmd & (1 << 1)) {
+        KLOG_ERROR("ehci", "Controller reset timeout");
+        return STATUS_ERROR;
+    }
+    
+    /* Configure and start controller */
+    ehci_write32(ctrl->op_regs, EHCI_OP_CONFIGFLAG, 1);
+    
+    usbcmd = ehci_read32(ctrl->op_regs, EHCI_OP_USBCMD);
+    usbcmd |= 1; /* Run/Stop */
+    ehci_write32(ctrl->op_regs, EHCI_OP_USBCMD, usbcmd);
+    
+    KLOG_INFO("ehci", "Controller initialized successfully");
+    return STATUS_OK;
+}
+
+/* PCI enumeration callback for EHCI */
+static void ehci_on_pci(const pci_device_t* dev, void* user) {
+    (void)user;
+    
+    /* Check for EHCI controller (class 0x0C, subclass 0x03, prog-if 0x20) */
+    if (dev->class_code == 0x0C && dev->subclass == 0x03 && dev->prog_if == 0x20) {
+        if (g_ehci_controller_count >= MAX_EHCI_CONTROLLERS) {
+            KLOG_WARN("ehci", "Too many EHCI controllers");
+            return;
+        }
+        
+        KLOG_INFO("ehci", "Found EHCI controller: %02x:%02x.%x vid=%04x did=%04x",
+                  dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id);
+        
+        ehci_controller_t* ctrl = &g_ehci_controllers[g_ehci_controller_count];
+        ctrl->pci_dev = *dev;
+        
+        /* Map BAR0 */
+        if (dev->bar[0] == 0) {
+            KLOG_ERROR("ehci", "BAR0 not configured");
+            return;
+        }
+        
+        ctrl->cap_regs = (void*)(dev->bar[0] & ~0x0F);
+        
+        if (ehci_init_controller(ctrl) == STATUS_OK) {
+            ctrl->in_use = true;
+            g_ehci_controller_count++;
+        }
+    }
+}
+
+void ehci_probe(void) {
+    KLOG_INFO("ehci", "Scanning for EHCI (USB 2.0) controllers...");
+    g_ehci_controller_count = 0;
+    k_memset(g_ehci_controllers, 0, sizeof(g_ehci_controllers));
+    
+    pci_enumerate(ehci_on_pci, NULL);
+    
+    KLOG_INFO("ehci", "Found %u EHCI controller(s)", g_ehci_controller_count);
+}
