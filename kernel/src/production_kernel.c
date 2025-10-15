@@ -217,7 +217,7 @@ static void pmm_init_production(uint64_t mem_start, uint64_t mem_size) {
  * Production Kernel Main Entry Point
  * ============================================================================ */
 
-void kernel_main_production(void) {
+void kernel_main(void) {
     vga_clear();
     
     /* Print banner */
