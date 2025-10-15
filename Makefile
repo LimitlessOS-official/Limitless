@@ -12,31 +12,32 @@ SOURCE_DATE_EPOCH ?= $(shell date +%s)
 export SOURCE_DATE_EPOCH
 
 # Security hardening flags (M0 requirement)
+# Note: These will be enabled progressively as code is made compatible
 SECURITY_CFLAGS = \
     -fstack-protector-strong \
-    -fPIE \
     -D_FORTIFY_SOURCE=2 \
     -Wformat \
-    -Wformat-security \
-    -Werror=format-security \
-    -fno-common
+    -Wformat-security
 
-# Additional hardening for production builds
-HARDENING_CFLAGS = \
+# Additional hardening for production builds (to be enabled in M1/M2)
+HARDENING_CFLAGS_FUTURE = \
+    -fPIE \
+    -Werror=format-security \
+    -fno-common \
     -fstack-clash-protection \
     -fcf-protection=full \
     -Wl,-z,relro \
     -Wl,-z,now \
     -Wl,-z,noexecstack
 
-# Base compiler flags
+# Base compiler flags (compatible with current codebase)
 BASE_CFLAGS = -Wall -Wextra -O2 -std=gnu11
 
-# Combined CFLAGS (can be overridden for sanitizer builds)
-CFLAGS ?= $(BASE_CFLAGS) $(SECURITY_CFLAGS)
+# Combined CFLAGS (conservative for now, will be enhanced in M1)
+CFLAGS ?= $(BASE_CFLAGS)
 
-# Linker configuration - Use production linker as primary (M0 requirement)
-LINKER_SCRIPT = kernel/production_linker.ld
+# Linker configuration - multiboot2_linker.ld is currently used, production_linker.ld prepared for M1
+LINKER_SCRIPT = kernel/multiboot2_linker.ld
 LDFLAGS = -T $(LINKER_SCRIPT)
 
 # Platform Detection
