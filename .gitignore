@@ -7,6 +7,7 @@ obj/
 bin/
 Debug/
 Release/
+iso_root/
 
 # Artifacts (binaries, images, maps)
 *.iso
@@ -28,6 +29,11 @@ Release/
 *.debug
 *.log
 *.tmp
+
+# Build system artifacts
+.build_number
+*.d
+*.dep
 
 # Editor/OS junk
 .vscode/
@@ -60,6 +66,18 @@ temp/
 config.local.mk
 .env.local
 
-# Idk
+# Test results
 test_results_*/
 test_results*/
+
+# SBOM and security artifacts (generated, not checked in during development)
+sbom.txt
+sbom.json
+
+# Docker build context
+.dockerignore
+
+# Backup files
+*.bak
+*.backup
+*~

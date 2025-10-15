@@ -7,6 +7,38 @@ VERSION_PATCH = 0
 BUILD_NUMBER_FILE = .build_number
 VERSION = $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 
+# Reproducible builds support
+SOURCE_DATE_EPOCH ?= $(shell date +%s)
+export SOURCE_DATE_EPOCH
+
+# Security hardening flags (M0 requirement)
+SECURITY_CFLAGS = \
+    -fstack-protector-strong \
+    -fPIE \
+    -D_FORTIFY_SOURCE=2 \
+    -Wformat \
+    -Wformat-security \
+    -Werror=format-security \
+    -fno-common
+
+# Additional hardening for production builds
+HARDENING_CFLAGS = \
+    -fstack-clash-protection \
+    -fcf-protection=full \
+    -Wl,-z,relro \
+    -Wl,-z,now \
+    -Wl,-z,noexecstack
+
+# Base compiler flags
+BASE_CFLAGS = -Wall -Wextra -O2 -std=gnu11
+
+# Combined CFLAGS (can be overridden for sanitizer builds)
+CFLAGS ?= $(BASE_CFLAGS) $(SECURITY_CFLAGS)
+
+# Linker configuration - Use production linker as primary (M0 requirement)
+LINKER_SCRIPT = kernel/production_linker.ld
+LDFLAGS = -T $(LINKER_SCRIPT)
+
 # Platform Detection
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
@@ -33,7 +65,7 @@ ISO_IMAGE_BASE = $(DIST_DIR)/LimitlessOS-v$(VERSION)
 
 # Phony targets
 
-.PHONY: all clean help test iso bootloader kernel libc init test-qemu installer
+.PHONY: all clean help test iso bootloader kernel libc init test-qemu installer sbom
 
 
 # Default target
@@ -174,7 +206,7 @@ LIBC_C_OBJECTS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(LIBC_C_SOURCES))
 # Link the kernel
 $(KERNEL_BINARY): $(KERNEL_OBJECTS)
 	@echo "🔗 Linking LimitlessOS kernel..."
-	@gcc -m32 -ffreestanding -nostdlib $(CFLAGS) -T kernel/multiboot2_linker.ld $^ -o $@ -L$(BUILD_DIR) -lc -lgcc $(LDFLAGS)
+	@gcc -m32 -ffreestanding -nostdlib $(CFLAGS) $(LDFLAGS) $^ -o $@ -L$(BUILD_DIR) -lc -lgcc
 	@echo "✅ Kernel linked successfully: $@"
 
 # Archive libc
@@ -237,7 +269,34 @@ help:
 	@echo "make all         - Build the entire OS and create an ISO (default)"
 	@echo "make iso         - Create a bootable ISO image"
 	@echo "make kernel      - Build the kernel binary"
+	@echo "make sbom        - Generate Software Bill of Materials"
 	@echo "make test-qemu   - Build and run the OS in QEMU"
 	@echo "make clean       - Remove all build artifacts"
 	@echo "make help        - Show this help message"
 	@exit 0
+
+# Generate Software Bill of Materials (SBOM)
+sbom:
+	@echo "📋 Generating SBOM..."
+	@mkdir -p $(DIST_DIR)
+	@echo "# LimitlessOS Software Bill of Materials (SBOM)" > $(DIST_DIR)/sbom.txt
+	@echo "# Generated: $(shell date --date=@$(SOURCE_DATE_EPOCH) -u +%Y-%m-%dT%H:%M:%SZ)" >> $(DIST_DIR)/sbom.txt
+	@echo "# Version: $(VERSION)" >> $(DIST_DIR)/sbom.txt
+	@echo "" >> $(DIST_DIR)/sbom.txt
+	@echo "## Toolchain" >> $(DIST_DIR)/sbom.txt
+	@echo "GCC: $(shell gcc --version | head -n1)" >> $(DIST_DIR)/sbom.txt
+	@echo "Clang: $(shell clang --version 2>/dev/null | head -n1 || echo 'Not installed')" >> $(DIST_DIR)/sbom.txt
+	@echo "NASM: $(shell nasm --version 2>/dev/null || echo 'Not installed')" >> $(DIST_DIR)/sbom.txt
+	@echo "Make: $(shell make --version | head -n1)" >> $(DIST_DIR)/sbom.txt
+	@echo "" >> $(DIST_DIR)/sbom.txt
+	@echo "## Build Configuration" >> $(DIST_DIR)/sbom.txt
+	@echo "Platform: $(PLATFORM)" >> $(DIST_DIR)/sbom.txt
+	@echo "SOURCE_DATE_EPOCH: $(SOURCE_DATE_EPOCH)" >> $(DIST_DIR)/sbom.txt
+	@echo "Security Flags: $(SECURITY_CFLAGS)" >> $(DIST_DIR)/sbom.txt
+	@echo "Linker Script: $(LINKER_SCRIPT)" >> $(DIST_DIR)/sbom.txt
+	@echo "" >> $(DIST_DIR)/sbom.txt
+	@echo "## Source Files" >> $(DIST_DIR)/sbom.txt
+	@echo "Kernel Sources: $(words $(KERNEL_C_SOURCES)) C files" >> $(DIST_DIR)/sbom.txt
+	@echo "Libc Sources: $(words $(LIBC_C_SOURCES)) C files" >> $(DIST_DIR)/sbom.txt
+	@echo "Assembly Sources: $(words $(KERNEL_ASM_SOURCES) $(KERNEL_S_SOURCES)) files" >> $(DIST_DIR)/sbom.txt
+	@echo "✅ SBOM generated: $(DIST_DIR)/sbom.txt"

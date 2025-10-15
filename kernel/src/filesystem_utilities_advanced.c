@@ -963,8 +963,25 @@ int filesystem_utilities_init(void)
     return 0;
 }
 
-// Stub implementations for ID generators
-static uint32_t generate_check_id(void) { static uint32_t id = 1; return id++; }
-static uint32_t generate_defrag_id(void) { static uint32_t id = 1; return id++; }
-static uint32_t generate_analysis_id(void) { static uint32_t id = 1; return id++; }
-static uint64_t get_current_timestamp(void) { return 0; }
+// ID generators for filesystem operations
+static uint32_t generate_check_id(void) { 
+    static uint32_t id = 1; 
+    return __sync_fetch_and_add(&id, 1);
+}
+
+static uint32_t generate_defrag_id(void) { 
+    static uint32_t id = 1; 
+    return __sync_fetch_and_add(&id, 1);
+}
+
+static uint32_t generate_analysis_id(void) { 
+    static uint32_t id = 1; 
+    return __sync_fetch_and_add(&id, 1);
+}
+
+// Get current timestamp using kernel time functions
+static uint64_t get_current_timestamp(void) {
+    // TODO: Integrate with kernel time subsystem when available
+    // For now, return a placeholder that indicates uninitialized state
+    return 0; // Will be replaced with actual kernel time call
+}
