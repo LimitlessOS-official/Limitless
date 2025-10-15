@@ -10,8 +10,12 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <sys/types.h> // for pid_t, if available
 #include "mm/mm.h"
+
+// Define pid_t for kernel use
+typedef int pid_t;
+typedef unsigned int uid_t;
+typedef unsigned int gid_t;
 
 // Forward declarations for types used in this header
 struct rq;
@@ -25,11 +29,6 @@ struct rb_node { struct rb_node *left, *right, *parent; int color; };
 #define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
 #define TASK_COMM_LEN 16
 #define WMULT_SHIFT 32
-
-// If pid_t is not available, define it as int
-#ifndef __pid_t_defined
-typedef int pid_t;
-#endif
 
 // Scheduling classes
 #define SCHED_NORMAL    0   // CFS normal tasks
